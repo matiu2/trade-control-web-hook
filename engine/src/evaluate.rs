@@ -146,6 +146,10 @@ pub fn initial_phase(plan: &TradePlan) -> Phase {
 /// rule's `last_close` from that candle, so the *next* tick can detect a cross
 /// against it. `fired` stays empty; the phase is [`initial_phase`].
 ///
+/// It does **not** seed `origin_open`: the origin (the side the plan starts on)
+/// is fixed from the first *live* bar during [`evaluate_plan`], not from the
+/// last warm-up bar — see the note in the body.
+///
 /// `candles` need not be sorted; the newest by `time` wins. An empty slice
 /// yields an unwatermarked seed (the next tick will itself seed once candles
 /// arrive).
@@ -161,10 +165,19 @@ pub fn seed_plan_state(
     state.watermark = Some(newest.time);
     for rule in &plan.rules {
         record_last_close(&rule.rule_id, &rule.trigger, newest, &mut state);
-        // Seed the origin side from the newest back-window bar's open — the arm
-        // bar, in practice. An `OnClose` directional cross then fires when a
-        // later bar's close settles on the *opposite* side of the line. Set once.
-        record_origin_open(&rule.rule_id, &rule.trigger, newest, &mut state);
+        // NOTE: `origin_open` is deliberately NOT seeded here. The origin is the
+        // side of the line the plan *starts* on — which is the first **live**
+        // bar (the cursor / arm bar), not the newest **warm-up** bar (the bar
+        // immediately before it). Seeding it from `newest` was an off-by-one:
+        // it anchored the origin to the last warm-up bar, whose open can sit on
+        // the opposite side of the line from where the setup actually begins.
+        // A whip-saw warm-up bar (one that gapped open across the line then
+        // reversed) would then wrongly record the plan as "already broken",
+        // and an `OnClose` break-and-close would never fire. Instead we let
+        // `fire_rule` / `stamp_retest` record the origin from the first live
+        // bar via `record_origin_open` (set-once) — matching the documented
+        // "the seed bar is not special" intent at `fire_rule`. See
+        // BUG-break-close-origin-seeded-from-warmup-bar.md.
     }
     state
 }
@@ -1583,6 +1596,10 @@ fn stamp_retest(
     // the default Intrabar retest ignores them). The retest is a latching prep,
     // so it uses SETTLED/origin semantics like the break-and-close.
     record_origin_open(&rule.rule_id, &rule.trigger, candle, state);
+    // Same dip re-seat as the break-and-close: an OnClose retest armed already
+    // on the far side re-anchors when a bar dips back. No-op for the default
+    // Intrabar retest (which ignores origin). See `reseat_origin_on_dip`.
+    reseat_origin_on_dip(rule, candle, window, state);
     let refs = OnCloseRefs {
         origin: state.origin_open.get(&rule.rule_id).copied(),
         prev_close: state.last_close.get(&rule.rule_id).copied(),
@@ -2059,6 +2076,12 @@ fn fire_rule(
     // other (the operator's "the first bar that closes across is the break" —
     // the seed bar is not special). `or_insert` keeps it set-once thereafter.
     record_origin_open(&rule.rule_id, &rule.trigger, candle, state);
+    // If the plan armed with price already on the FAR side of a directional
+    // break (e.g. an Up break-and-close armed above the neckline), a bar that
+    // now dips its open/close back to the NEAR side re-seats the origin there,
+    // so the subsequent close across still counts as the break-and-close. No-op
+    // once origin is already near-side. See `reseat_origin_on_dip`.
+    reseat_origin_on_dip(rule, candle, window, state);
     // Entry OnClose crosses use EDGE semantics (fire once per transition — a
     // multi-shot enter must not re-place every settled-past bar); every other
     // OnClose rule (break-and-close prep, invalidation/abort vetos, drawn lines)
@@ -2133,6 +2156,115 @@ fn record_origin_open(rule_id: &str, trigger: &Trigger, candle: &Candle, state: 
             .origin_open
             .entry(rule_id.to_string())
             .or_insert(candle.o);
+    }
+}
+
+/// Resolve an `OnClose` cross trigger's line price at `candle`, or `None` if the
+/// trigger isn't a level cross or a trendline that doesn't reach this bar. Used
+/// by the origin re-seat below; the fire path resolves it again inside
+/// [`eval_trigger`] (cheap, and keeps that path self-contained).
+fn onclose_level_at(trigger: &Trigger, candle: &Candle, window: &[Candle]) -> Option<f64> {
+    match trigger {
+        Trigger::HorizontalCross {
+            level,
+            bar: BarEvent::OnClose,
+            ..
+        }
+        | Trigger::PriceValueCross {
+            level,
+            bar: BarEvent::OnClose,
+            ..
+        } => Some(*level),
+        Trigger::TrendlineCross {
+            a,
+            b,
+            extend_forward,
+            bar_seconds,
+            bar: BarEvent::OnClose,
+            ..
+        } => line_price_at(a, b, candle, *extend_forward, *bar_seconds, window),
+        _ => None,
+    }
+}
+
+/// Re-seat a directional settled `OnClose` rule's origin to the near side once a
+/// bar **dips back** across the line, so a "broke, pulled back, closed across"
+/// sequence still counts as a break-and-close even when the plan armed already
+/// on the far side.
+///
+/// The settled break rule ([`level_crossed`]) fires an `Up` break only when
+/// `origin < level` (origin below) and a close settles above; a `Down` break
+/// mirrors. If the plan arms with price **already above** the neckline
+/// (`origin > level`), an `Up` break can never fire under that rule — even after
+/// price falls below and closes back above, which is a textbook break-and-close.
+///
+/// The operator's contract (2026-07-24): for an `Up` break, price must first
+/// have a bar that **opens or closes below** the line, and *then* a bar closes
+/// above. This re-seat implements exactly that: while the rule is unfired, if
+/// the origin is on the far side of the desired break and this bar's open or
+/// close is on the **near** side, move the origin to the near side. The next
+/// bar that closes across then fires the break naturally — no new state, and the
+/// "dip must be open-or-close (not just a wick)" requirement falls out of using
+/// `candle.o` / `candle.c` (never the wick).
+///
+/// Only touches directional (`Up`/`Down`) settled `OnClose` rules. `Either`
+/// crosses and intrabar/edge rules are left alone. Idempotent once the origin is
+/// already on the near side.
+fn reseat_origin_on_dip(
+    rule: &ConditionRule,
+    candle: &Candle,
+    window: &[Candle],
+    state: &mut PlanState,
+) {
+    // Directional settled OnClose only. Entry crosses use edge semantics (no
+    // origin); Either has no near/far side to re-seat toward.
+    if rule.intent.action == Action::Enter {
+        return;
+    }
+    let dir = match &rule.trigger {
+        Trigger::HorizontalCross {
+            dir,
+            bar: BarEvent::OnClose,
+            ..
+        }
+        | Trigger::PriceValueCross {
+            dir,
+            bar: BarEvent::OnClose,
+            ..
+        }
+        | Trigger::TrendlineCross {
+            dir,
+            bar: BarEvent::OnClose,
+            ..
+        } => *dir,
+        _ => return,
+    };
+    let (CrossDir::Up | CrossDir::Down) = dir else {
+        return;
+    };
+    let Some(level) = onclose_level_at(&rule.trigger, candle, window) else {
+        return;
+    };
+    let Some(&origin) = state.origin_open.get(&rule.rule_id) else {
+        return;
+    };
+    // For an Up break we want origin BELOW the line. If it's above (armed
+    // already-past) and this bar dips its open OR close below the line, re-seat
+    // origin to that near-side price so the next close-above fires. Mirror for
+    // Down. Re-seat to the actual dipped price (min of open/close for Up, max
+    // for Down) — a real, self-documenting near-side value, not a synthetic
+    // epsilon nudge.
+    let reseat = match dir {
+        CrossDir::Up if origin >= level && (candle.o < level || candle.c < level) => {
+            Some(candle.o.min(candle.c))
+        }
+        CrossDir::Down if origin <= level && (candle.o > level || candle.c > level) => {
+            Some(candle.o.max(candle.c))
+        }
+        _ => None,
+    };
+    if let Some(new_origin) = reseat {
+        state.origin_open.insert(rule.rule_id.clone(), new_origin);
     }
 }
 
@@ -5606,6 +5738,154 @@ mod tests {
         );
     }
 
+    /// Flat Up-break neckline at 1.2000 with the standard 3-rule plan. Helper
+    /// for the "armed already above" tests below.
+    fn up_break_plan() -> TradePlan {
+        let neckline = |dir, bar| Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: ts("2026-06-16T00:00:00Z").timestamp(),
+                price: 1.2000,
+            },
+            b: LinePoint {
+                at_epoch: ts("2026-06-16T01:00:00Z").timestamp(),
+                price: 1.2000,
+            },
+            extend_forward: true,
+            bar_seconds: 3600,
+            dir,
+            bar,
+        };
+        plan(vec![
+            rule(
+                "03-prep-break-and-close",
+                neckline(CrossDir::Up, BarEvent::OnClose),
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule(
+                "04-prep-retest",
+                neckline(CrossDir::Down, BarEvent::Intrabar),
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ])
+    }
+
+    #[test]
+    fn on_close_break_fires_when_armed_above_then_dips_below_and_closes_back_above() {
+        // Operator's secondary case (2026-07-24): the plan arms with price
+        // ALREADY ABOVE the neckline. Under the bare origin-side rule an Up break
+        // needs `origin < level`, so it could never fire. But if price then dips
+        // below (a bar opening or closing below the line) and later closes back
+        // above, that IS a break-and-close and must stamp. The dip re-seats the
+        // origin to the near side so the close-above fires.
+        let p = up_break_plan();
+        let prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T09:00:00Z");
+        // Tick 1: first live bar OPENS ABOVE (1.2050) and closes above — origin
+        // is fixed ABOVE the neckline. No dip yet, so NO break (must have a
+        // below open/close first).
+        let c1 = candle("2026-06-16T10:00:00Z", 1.2050, 1.2060, 1.2040, 1.2055);
+        let e1 = run(&p, &prior, &[c1]);
+        assert!(e1.fired.is_empty(), "armed above, no dip yet → no break");
+        assert_eq!(
+            e1.new_state
+                .origin_open
+                .get("03-prep-break-and-close")
+                .copied(),
+            Some(1.2050),
+            "origin fixed above from the first live bar"
+        );
+        // Tick 2: price DIPS — this bar closes BELOW the neckline (1.1985).
+        // Re-seats the origin to the near (below) side. Not itself a break.
+        let c2 = candle("2026-06-16T11:00:00Z", 1.2010, 1.2015, 1.1980, 1.1985);
+        let e2 = run(&p, &e1.new_state, &[c2]);
+        assert!(e2.fired.is_empty(), "the dip bar itself is not the break");
+        assert!(
+            e2.new_state
+                .origin_open
+                .get("03-prep-break-and-close")
+                .copied()
+                .unwrap()
+                < 1.2000,
+            "origin re-seated below the neckline after the dip"
+        );
+        // Tick 3: closes back ABOVE (1.2030) → break-and-close fires.
+        let c3 = candle("2026-06-16T12:00:00Z", 1.1990, 1.2035, 1.1988, 1.2030);
+        let e3 = run(&p, &e2.new_state, &[c3]);
+        assert_eq!(
+            e3.fired.len(),
+            1,
+            "close back above fires the break (got {:?})",
+            e3.fired
+        );
+        assert_eq!(e3.fired[0].rule_id, "03-prep-break-and-close");
+        assert_eq!(e3.new_state.phase, Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn on_close_break_does_not_fire_when_armed_above_and_never_dips() {
+        // The guard on the case above: if price arms above and simply STAYS above
+        // (never a bar with a below open/close), there is no fresh break — the
+        // rule must not stamp. This preserves the operator's "must dip below
+        // first" contract.
+        let p = up_break_plan();
+        let prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T09:00:00Z");
+        // Three bars, all entirely above the neckline — no open/close ever below.
+        let bars = [
+            candle("2026-06-16T10:00:00Z", 1.2050, 1.2060, 1.2045, 1.2055),
+            candle("2026-06-16T11:00:00Z", 1.2055, 1.2070, 1.2050, 1.2065),
+            candle("2026-06-16T12:00:00Z", 1.2065, 1.2075, 1.2060, 1.2070),
+        ];
+        let mut st = prior;
+        for c in bars {
+            let e = run(&p, &st, &[c]);
+            assert!(
+                e.fired.is_empty(),
+                "armed above and never dipped → no break (fired {:?})",
+                e.fired
+            );
+            st = e.new_state;
+        }
+        assert_eq!(
+            st.phase,
+            Phase::AwaitBreakAndClose,
+            "stays awaiting the break"
+        );
+    }
+
+    #[test]
+    fn on_close_break_does_not_double_stamp_after_reseat() {
+        // Once the break fires (via the re-seated origin), it latches: a later
+        // dip-and-close-above must NOT stamp a second time.
+        let p = up_break_plan();
+        let prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T09:00:00Z");
+        let c1 = candle("2026-06-16T10:00:00Z", 1.2050, 1.2060, 1.2040, 1.2055); // armed above
+        let c2 = candle("2026-06-16T11:00:00Z", 1.2010, 1.2015, 1.1980, 1.1985); // dip below
+        let c3 = candle("2026-06-16T12:00:00Z", 1.1990, 1.2035, 1.1988, 1.2030); // close above → fire
+        let e = run(&p, &prior, &[c1]);
+        let e = run(&p, &e.new_state, &[c2]);
+        let e = run(&p, &e.new_state, &[c3]);
+        assert_eq!(e.fired.len(), 1, "first break stamps once");
+        // A second dip + close-above must not re-stamp the latched break.
+        let c4 = candle("2026-06-16T13:00:00Z", 1.2010, 1.2015, 1.1980, 1.1985); // dip again
+        let c5 = candle("2026-06-16T14:00:00Z", 1.1990, 1.2040, 1.1988, 1.2035); // close above again
+        let e = run(&p, &e.new_state, &[c4]);
+        let e = run(&p, &e.new_state, &[c5]);
+        assert!(
+            !e.fired
+                .iter()
+                .any(|f| f.rule_id == "03-prep-break-and-close"),
+            "break-and-close must not re-stamp after latching (got {:?})",
+            e.fired
+        );
+    }
+
     #[test]
     fn spread_hour_bar_suppresses_an_intrabar_veto_cross() {
         // The rubbish-candle gate STILL applies to intrabar (wick-read) crosses:
@@ -5741,6 +6021,81 @@ mod tests {
         );
         // A break-and-close plan seeds into AwaitBreakAndClose.
         assert_eq!(st.phase, Phase::AwaitBreakAndClose);
+    }
+
+    #[test]
+    fn seed_does_not_anchor_origin_to_the_warmup_bar() {
+        // Regression: XAU_USD iH&S 2026-07-20 (ihs-xau-usd-2c1a9f2f). The last
+        // warm-up bar (07-20 22:00 Bris) gapped OPEN at its high, ABOVE the
+        // descending neckline (open 4025.325 vs line ~4025.18), then collapsed.
+        // Seeding origin from that warm-up bar's open wrongly recorded the plan
+        // as "already broken above", so the break-and-close never fired — the
+        // real live trade (a winner) was missed. The origin must instead come
+        // from the first LIVE bar, which opened well below the line.
+        //
+        // Flat neckline at 1.2000 (slope 0 keeps the arithmetic obvious).
+        let p = plan(vec![rule(
+            "03-prep-break-and-close",
+            Trigger::TrendlineCross {
+                a: LinePoint {
+                    at_epoch: ts("2026-06-16T10:00:00Z").timestamp(),
+                    price: 1.2000,
+                },
+                b: LinePoint {
+                    at_epoch: ts("2026-06-16T20:00:00Z").timestamp(),
+                    price: 1.2000,
+                },
+                extend_forward: true,
+                bar_seconds: 3600,
+                dir: CrossDir::Up,
+                bar: BarEvent::OnClose,
+            },
+            FireMode::Once,
+            Action::Prep,
+        )]);
+        // Warm-up bar: OPENS ABOVE the line (1.2050) — the whip-saw open — then
+        // closes back below. This is the bar the old code anchored origin to.
+        let warmup = [candle(
+            "2026-06-16T11:00:00Z",
+            1.2050,
+            1.2055,
+            1.1990,
+            1.1995,
+        )];
+        let st = seed_plan_state(&p, &warmup, ts("2026-06-30T00:00:00Z"));
+        // The fix: seeding records NO origin — it's left for the first live bar.
+        assert!(
+            st.origin_open.get("03-prep-break-and-close").is_none(),
+            "seed must not anchor origin to the warm-up bar"
+        );
+        // First LIVE bar opens BELOW (1.1980) and closes below — fixes origin
+        // "below", no break yet.
+        let c1 = candle("2026-06-16T12:00:00Z", 1.1980, 1.1998, 1.1975, 1.1990);
+        let eval1 = run(&p, &st, &[c1]);
+        assert!(
+            eval1.fired.is_empty(),
+            "opened+closed below → no up-break yet"
+        );
+        assert_eq!(
+            eval1
+                .new_state
+                .origin_open
+                .get("03-prep-break-and-close")
+                .copied(),
+            Some(1.1980),
+            "origin fixed from the first LIVE bar's open (below), not the warm-up bar"
+        );
+        // Next bar CLOSES ABOVE the line → settled close on the far side of the
+        // below origin → the break fires (the trade the live worker missed).
+        let c2 = candle("2026-06-16T13:00:00Z", 1.1985, 1.2030, 1.1980, 1.2020);
+        let eval2 = run(&p, &eval1.new_state, &[c2]);
+        assert_eq!(
+            eval2.fired.len(),
+            1,
+            "settled close above must fire the break"
+        );
+        assert_eq!(eval2.fired[0].rule_id, "03-prep-break-and-close");
+        assert_eq!(eval2.new_state.phase, Phase::AwaitEntry);
     }
 
     #[test]
