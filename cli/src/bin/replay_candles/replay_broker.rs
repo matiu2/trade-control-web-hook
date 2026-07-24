@@ -1100,6 +1100,55 @@ impl ReplayBroker {
         }
     }
 
+    /// The held-model `AttemptState` for an order id — the S4 read that replaces
+    /// the re-sim `resolve` for the retry-gate. Mirrors `resolve`'s exact mapping:
+    /// a resting order (uncancelled) → `Pending`; an open position → `OpenPosition`
+    /// with the `{order_id}-pos` trade id; a closed trade → `ClosedWin` /
+    /// `ClosedLossOrBreakeven` with the ±1.0 sentinel `realized_pl` the gate keys
+    /// on; a cancelled or absent order → `Cancelled`. An id we never placed →
+    /// `Unknown` (fail-safe). The categories are shadow-parity asserted vs
+    /// `resolve` bar-by-bar through S3–S7.
+    fn held_attempt_state(&self, order_id: &str) -> AttemptState {
+        // Advance the held state to the current `as_of` first, so an isolated
+        // caller (a unit test that sets `as_of` and reads, without the loop's
+        // per-bar advance) sees the same progression the loop produces. In the
+        // loop this is a no-op-or-forward: `advance` only ever promotes on a
+        // genuine transition by `as_of`, never backward. Bounds at `as_of`, which
+        // the caller set to the bar it's asking about.
+        self.advance(*self.as_of.borrow());
+        if let Some(o) = self
+            .resting
+            .borrow()
+            .iter()
+            .find(|o| o.order_id == order_id)
+        {
+            return if o.cancelled {
+                AttemptState::Cancelled
+            } else {
+                AttemptState::Pending
+            };
+        }
+        if self.open.borrow().iter().any(|p| p.order_id == order_id) {
+            return AttemptState::OpenPosition {
+                broker_trade_id: format!("{order_id}-pos"),
+            };
+        }
+        if let Some(t) = self.closed.borrow().iter().find(|t| t.order_id == order_id) {
+            return match t.reason {
+                ExitReason::TookProfit => AttemptState::ClosedWin { realized_pl: 1.0 },
+                // StoppedOut / Reversal / Expiry → loss-or-breakeven (re-sim maps
+                // any non-TP close to ClosedLossOrBreakeven with -1.0).
+                _ => AttemptState::ClosedLossOrBreakeven { realized_pl: -1.0 },
+            };
+        }
+        // Never placed (or dropped as unresolvable) — the gate only asks about ids
+        // it placed, so an unknown id is fail-safe `Unknown`; a dropped one reads
+        // as `Cancelled` via the resting/open/closed miss above is impossible
+        // (it's simply absent), so treat absent as `Unknown` to match the re-sim's
+        // `None => Unknown` arm in `lookup_attempt_state`.
+        AttemptState::Unknown
+    }
+
     /// Remove a resting order by id (filled, cancelled-and-dropped, or unresolvable).
     fn remove_resting(&self, order_id: &str) {
         self.resting.borrow_mut().retain(|o| o.order_id != order_id);
@@ -1244,14 +1293,14 @@ impl Broker for ReplayBroker {
         broker_order_id: &str,
         _broker_trade_id: Option<&str>,
     ) -> Result<AttemptState, LookupError> {
-        let placed = self.placed.borrow();
-        match placed.iter().find(|a| a.order_id == broker_order_id) {
-            Some(a) => Ok(self.resolve(a)),
-            // The gate only asks about ids we placed; an unknown id means the
-            // attempt was never recorded — treat as Unknown (fail-safe in the
-            // gate, though this shouldn't happen in the replay's closed loop).
-            None => Ok(AttemptState::Unknown),
-        }
+        // S4: READ held state (advanced by the loop's per-bar `advance(bar_open)`)
+        // instead of re-simulating. The held snapshot is current as-of the current
+        // bar's open — the same instant the dispatch-time gate lookups bound at
+        // (`fired.candle.time`). Categories mirror the re-sim's `resolve` exactly
+        // (shadow-parity asserted through S3–S7). `close_positions` (S5) removes a
+        // reversal/expiry-closed position from `open`, so this read then frees the
+        // slot for re-entry — the fix that unblocks the EUR/USD case.
+        Ok(self.held_attempt_state(broker_order_id))
     }
 
     async fn cancel_order(
@@ -1341,26 +1390,24 @@ impl Broker for ReplayBroker {
         &self,
         _account_id: &str,
     ) -> Result<Vec<OpenPosition>, LookupError> {
-        // The Bug #11 backstop: report a synthetic open position for any placed
-        // attempt that resolves to OpenPosition by the asking bar, keyed back to
-        // its order id so the gate's correlation matches.
-        let placed = self.placed.borrow();
-        let positions = placed
+        // The Bug #11 backstop: report an open position for every HELD open
+        // position (S4), keyed back to its order id so the gate's correlation
+        // matches. Reads held state instead of re-simulating — so once
+        // `close_positions` (S5) removes a reversal/expiry-closed position, the
+        // backstop no longer reports it and re-entry is freed (the EUR/USD fix).
+        self.advance(*self.as_of.borrow());
+        let positions = self
+            .open
+            .borrow()
             .iter()
-            .filter_map(|a| match self.resolve(a) {
-                AttemptState::OpenPosition { broker_trade_id } => Some(OpenPosition {
-                    instrument: a.intent.instrument.clone(),
-                    direction: a
-                        .intent
-                        .direction
-                        .unwrap_or(trade_control_core::intent::Direction::Long),
-                    stop_loss: None,
-                    take_profit: None,
-                    position_id: broker_trade_id,
-                    order_id: a.order_id.clone(),
-                    stake: 1.0,
-                }),
-                _ => None,
+            .map(|p| OpenPosition {
+                instrument: p.intent.instrument.clone(),
+                direction: p.direction,
+                stop_loss: None,
+                take_profit: None,
+                position_id: format!("{}-pos", p.order_id),
+                order_id: p.order_id.clone(),
+                stake: 1.0,
             })
             .collect();
         Ok(positions)

@@ -99,6 +99,25 @@ tests — the net working. Divergences found:
 Reverted the whole S3 attempt to clean S2 to redo it cleanly with the ordering
 facts in hand. Debug prints all removed.
 
+### ✅ S3 DONE + COMMITTED — shadow-parity GREEN across all 109 tests + fixtures
+ROOT CAUSE of the cancel-and-replace divergence: `advance()` was bounding at the
+bar-CLOSE `now`, but candle timestamps are bar-OPEN times and a bar's close ==
+the NEXT bar's open — so `window_to_as_of(<= now)` pulled the next bar's open
+price into the fill test and filled the stop a bar early, BEFORE the cancel
+landed. FIX: `advance(up_to)` + `prefix_from_fire(shell, up_to)` bound at the
+current bar's OPEN (`candles[i].time`), matching the re-sim's dispatch-time
+lookups. Loop sets `set_as_of(bar_open)` for advance+assert, then the existing
+`set_as_of(now)` at ~L555 restores the bar-close clock for the lifecycle.
+This proves `advance()` reproduces the sim EXACTLY as persisted state.
+
+### NEXT: S4 — switch reads to held state
+`list_open_positions` + `lookup_attempt_state` read held `open`/`resting`/`closed`
+instead of re-sim `resolve`. Must keep shadow-parity assert green AND all
+fixtures. The open-positions CAP count (place_entry, ~L1172) also currently uses
+`resolve` — decide whether to switch it in S4 or S6. EUR/USD re-entries only
+truly unblock after S5 (`close_positions` real removes the reversal-closed
+position from `open`).
+
 ### Stage list
 - [x] **S0. Baseline captured**: fixtures copied to scratchpad, golden test green.
 - [ ] **S1. Types + held state.** Add `HeldOrder`/`HeldPosition`/`ClosedTrade`,
