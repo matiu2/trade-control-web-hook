@@ -1,5 +1,32 @@
 # Plan — stateful ReplayBroker (kill the two-brain re-simulation)
 
+## ⏩ RESUME-FROM-HERE (read this first after a /compact)
+- Worktree: `/home/matiu/projects/trading-libraries/trade-control-web-hook-expiry-close`,
+  branch `replay-stateful-broker`. Main repo untouched. NOT yet merged to main;
+  parent gitlink NOT yet bumped.
+- STATUS: S1–S5b DONE + committed + green (110 tests, clippy clean). The core
+  fix WORKS and is VERIFIED: reversal-close and trade-expiry-flatten both book R
+  from the held ledger (uk-100 fixture: REV +0.55R, EXP +0.80R). The two-brain
+  bug class is dead — position-state (backstop) AND P&L both read the one held
+  `closed`/`open`/`resting` ledger in `replay_broker.rs`.
+- HARD RULE (operator): do NOT run `--rebless`. If any fixture test fails, STOP,
+  show the failure + proposed expected.json diff in PLAIN ENGLISH for sign-off.
+  Golden fixtures are computed via the reversal/expiry-BLIND `simulate_fill` path
+  in fixture.rs, so they DON'T move on report-P&L changes — no rebless expected.
+- SAFETY NET still active: `debug_assert_held_matches_resim` (shadow-parity) runs
+  in every test, asserting held-state == re-sim `resolve` for every non-
+  reversal/expiry order every bar. Keep it GREEN through S6/S7; retire it in S8.
+- REMAINING: S6 (open-positions cap count → held `open`; see place_entry
+  ~L1224 `filter(resolve == OpenPosition)`), S7 (confirm list_pending_orders
+  reads held `resting`), S8 (DELETE dead re-sim: `realize`, `realized_outcome`,
+  `apply_reversal_close`, `resolve`, `window_to_as_of`, retire shadow assert +
+  `held_class`; rewrite the 6 `shadow_parity_*` + realized_outcome parity tests),
+  S9 (final green + fixtures), S11 (move `simulate_fill*` out of engine/simulator.rs
+  into replay broker — replay-only; keep shared primitives in engine). Then merge
+  to this repo's main + bump parent gitlink (see submodule note in CLAUDE.md).
+- Commit cadence: one commit per stage, descriptive msg. All stages tagged S<n>
+  in the git log (`git log --oneline` shows S1–S5b).
+
 ## Goal
 
 Replace the "re-simulate position state on every query" model with a broker that
