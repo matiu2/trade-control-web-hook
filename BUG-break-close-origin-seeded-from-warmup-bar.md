@@ -82,6 +82,37 @@ Replay and the live worker share `seed_plan_state`, so the fix lands in both
   `--start 23:04:09` now converge to **+1.03R** (break-and-close stamps
   07-21 10:00, retest, entry fills, TP). Cursor-fragility gone.
 
+## Secondary effect: armed already on the far side (FIXED, same change)
+
+Even with origin seeded from the first *live* bar, a directional settled
+`OnClose` break could never fire if the plan **armed with price already on the
+far side** of the break. For an `Up` break-and-close (iH&S long), the settled
+rule needs `origin < level`; if the first live bar opens above the neckline the
+origin is above, and a later close above — a textbook break — was silently
+ignored. The setup was dead on arrival.
+
+Operator's contract (2026-07-24): for an `Up` break, price must first have a bar
+that **opens or closes below** the line, and *then* a bar closes above.
+
+Fix (`reseat_origin_on_dip`, called from `fire_rule` and `stamp_retest`): while
+a directional settled `OnClose` rule is unfired, if the origin is on the far
+side and this bar's **open or close** dips to the near side, re-seat the origin
+to that near-side price. The next close across then fires the break. Uses
+`open`/`close` (never the wick), so the "dip must be an open/close, not a graze"
+requirement falls out. Latching (`state.fired`) prevents a double-stamp. Mirror
+for `Down` (short). `Either` and intrabar/edge rules untouched.
+
+Verified:
+- Unit tests `on_close_break_fires_when_armed_above_then_dips_below_and_closes_back_above`,
+  `on_close_break_does_not_fire_when_armed_above_and_never_dips` (the guard), and
+  `on_close_break_does_not_double_stamp_after_reseat`.
+- End-to-end replay of `ihs-xau-usd-2c1a9f2f` from the **10 PM Brisbane
+  (`--start 22:00`)** cursor — which arms on the whip-saw bar that OPENS above
+  the neckline — now stamps break-and-close (07-21 10:00), retest, entry, TP:
+  **+1.03R**. Pre-fix it was stuck in `AwaitBreakAndClose` / +0.00R.
+- All 5 offline replay fixtures still match `expected.json` (replay==live parity
+  preserved).
+
 ## Follow-up (not done here)
 
 - Consider making the origin robust to whip-saw opens (e.g. anchor to the
