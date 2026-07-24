@@ -16,12 +16,20 @@
 - SAFETY NET still active: `debug_assert_held_matches_resim` (shadow-parity) runs
   in every test, asserting held-state == re-sim `resolve` for every non-
   reversal/expiry order every bar. Keep it GREEN through S6/S7; retire it in S8.
-- REMAINING: S6 (open-positions cap count → held `open`; see place_entry
-  ~L1224 `filter(resolve == OpenPosition)`), S7 (confirm list_pending_orders
-  reads held `resting`), S8 (DELETE dead re-sim: `realize`, `realized_outcome`,
-  `apply_reversal_close`, `resolve`, `window_to_as_of`, retire shadow assert +
-  `held_class`; rewrite the 6 `shadow_parity_*` + realized_outcome parity tests),
-  S9 (final green + fixtures), S11 (move `simulate_fill*` out of engine/simulator.rs
+- ✅ S6+S7 DONE + COMMITTED: open-positions cap counts held `open`;
+  list_pending_orders reads held `resting` (uncancelled) via pending_from_held.
+  ALL production reads now flow from held state. re-sim resolve/realize survive
+  ONLY for the shadow-parity assert + parity tests (delete in S8). 110 green.
+- IN PROGRESS S8 (agent ab42b245b0c2606f5 mapping the dead set): delete re-sim
+  `resolve`, `realize`, `realized_outcome` (NOT held_realized_outcome),
+  `apply_reversal_close`, `window_to_as_of`, maybe ReversalClose/LedgerGeometry/
+  record_order/CloseFire/collect_close_fires_from if now unused; retire
+  debug_assert_held_matches_resim + held_class; rewrite shadow_parity_* + any
+  test calling realized_outcome/.resolve. KEEP: resolved_for_sim (step_outcome
+  uses it), AttemptState, PlacedAttempt (armed/cancel/reactivate/record_attempt
+  still use it — it's the retry-gate attempt record, distinct from HeldOrder).
+- REMAINING after S8: S9 (final green + fixtures — golden fixtures independent,
+  no rebless expected), S11 (move `simulate_fill*` out of engine/simulator.rs
   into replay broker — replay-only; keep shared primitives in engine). Then merge
   to this repo's main + bump parent gitlink (see submodule note in CLAUDE.md).
 - Commit cadence: one commit per stage, descriptive msg. All stages tagged S<n>
