@@ -279,8 +279,28 @@ impl App {
         if !self.mark_in_flight(trade_id, JobKind::Replay) {
             return;
         }
+        // Reproduce the ORIGINAL plan's prep set when re-arming from the chart:
+        // a skip-BCR plan must replay with the skip flags, or tv-arm re-arms with
+        // the full break-and-close-then-retest and stalls in AwaitBreakAndClose.
+        let skip_flags: Vec<String> = self
+            .data
+            .get(trade_id)
+            .and_then(|d| d.detail.as_ref())
+            .map(|d| {
+                d.bcr_preps
+                    .tv_arm_skip_flags()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
         self.status = Status::info(format!("{trade_id}: running replay…"));
-        jobs::spawn_replay(self.job_tx.clone(), trade_id.to_string(), armed_at);
+        jobs::spawn_replay(
+            self.job_tx.clone(),
+            trade_id.to_string(),
+            armed_at,
+            skip_flags,
+        );
     }
 
     /// Add a job to the in-flight set. Returns `false` if it was already there

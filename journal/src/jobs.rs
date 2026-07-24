@@ -78,10 +78,18 @@ pub fn spawn_timeline(tx: Sender<JobResult>, trade_id: String) {
 /// (already loaded by the TV-load job) via `tv-arm --start <armed_at> replay`,
 /// so the instrument + broker come from the chart — no plan file, no `--source`,
 /// and no resolution failure for OANDA-only assets. `armed_at` is the plan's
-/// RFC3339 UTC arm time, used as the `--start` cursor.
-pub fn spawn_replay(tx: Sender<JobResult>, trade_id: String, armed_at: String) {
+/// RFC3339 UTC arm time, used as the `--start` cursor. `skip_flags` are the
+/// tv-arm prep-skip flags that reproduce the ORIGINAL plan's prep set (so a
+/// skip-BCR plan doesn't re-arm with the full break-and-close-then-retest).
+pub fn spawn_replay(
+    tx: Sender<JobResult>,
+    trade_id: String,
+    armed_at: String,
+    skip_flags: Vec<String>,
+) {
     spawn(tx, trade_id, JobKind::Replay, move || {
-        let report = cli::replay_via_tv_arm(&armed_at)?;
+        let flags: Vec<&str> = skip_flags.iter().map(String::as_str).collect();
+        let report = cli::replay_via_tv_arm(&armed_at, &flags)?;
         Ok(JobOutcome::Replay(report))
     });
 }

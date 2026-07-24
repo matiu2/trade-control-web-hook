@@ -129,6 +129,22 @@ impl BcrPreps {
             (false, true) => Some("skip-break-and-close"),
         }
     }
+
+    /// The `tv-arm` prep-skip flags that reproduce this plan's prep set when
+    /// re-arming from the chart (for the journal's `tv-arm … replay`). An absent
+    /// prep → the flag that drops it; the full set → no flags. Without these, a
+    /// re-arm defaults to the full break-and-close-then-retest and diverges from
+    /// a plan originally armed with `--skip-bcr`.
+    pub fn tv_arm_skip_flags(&self) -> Vec<&'static str> {
+        let mut flags = Vec::new();
+        if !self.break_and_close {
+            flags.push("--skip-break-and-close");
+        }
+        if !self.retest {
+            flags.push("--skip-retest");
+        }
+        flags
+    }
 }
 
 /// The order type of one enter leg, from the intent's `entry.type`.
@@ -378,6 +394,32 @@ mod tests {
         assert_eq!(d.entry_mode, EntryMode::Normal);
         // …but the preps are absent → skip-BCR.
         assert_eq!(d.bcr_preps.skip_slug(), Some("skip-bcr"));
+    }
+
+    /// The skip flags forwarded to `tv-arm … replay` reproduce the plan's preps.
+    #[test]
+    fn tv_arm_skip_flags_match_the_preps() {
+        let full = BcrPreps {
+            break_and_close: true,
+            retest: true,
+        };
+        assert!(full.tv_arm_skip_flags().is_empty(), "full → no flags");
+
+        let none = BcrPreps {
+            break_and_close: false,
+            retest: false,
+        };
+        assert_eq!(
+            none.tv_arm_skip_flags(),
+            vec!["--skip-break-and-close", "--skip-retest"],
+            "skip-bcr → both flags"
+        );
+
+        let no_retest = BcrPreps {
+            break_and_close: true,
+            retest: false,
+        };
+        assert_eq!(no_retest.tv_arm_skip_flags(), vec!["--skip-retest"]);
     }
 
     /// Missing just one prep is a half-skip, distinguished from full skip-BCR.
