@@ -1268,6 +1268,31 @@ impl ReplayBroker {
             stake: 1.0,
         }
     }
+
+    /// The held-order variant of [`pending_from_attempt`] (S7): same trigger/
+    /// direction resolution, off a `HeldOrder`'s intent+shell. Keeps the
+    /// `list_pending_orders` reconstruction reading held state.
+    fn pending_from_held(&self, o: &HeldOrder) -> PendingOrder {
+        use trade_control_core::intent::{Direction, Resolved, ResolvedEntry};
+        let direction = o.intent.direction.unwrap_or(Direction::Long);
+        let (trigger, is_stop) =
+            match Resolved::from_intent(&o.intent, &o.shell, self.pip_size, self.pip_size) {
+                Ok(r) => match r.entry {
+                    ResolvedEntry::Stop { trigger_price } => (trigger_price, true),
+                    ResolvedEntry::Limit { trigger_price } => (trigger_price, false),
+                    ResolvedEntry::Market { reference_price } => (reference_price, true),
+                },
+                Err(_) => (o.shell.close, true),
+            };
+        PendingOrder {
+            order_id: o.order_id.clone(),
+            instrument: o.intent.instrument.clone(),
+            direction,
+            trigger,
+            is_stop,
+            stake: 1.0,
+        }
+    }
 }
 
 impl Broker for ReplayBroker {
@@ -1296,18 +1321,15 @@ impl Broker for ReplayBroker {
                 cap: max_risk_pct,
             });
         }
-        // 2. Open-positions cap: count attempts open as-of the fire bar (the same
-        //    `resolve`-derived count `list_open_positions` reports) and reject at
-        //    the cap, mirroring the real broker's `open_position_count >= cap`.
-        //    In a single-plan replay this is that instrument's open count — the
-        //    best offline proxy for the account-wide count, and conservative (it
-        //    can only reject, never over-fill).
-        let open_now = self
-            .placed
-            .borrow()
-            .iter()
-            .filter(|a| matches!(self.resolve(a), AttemptState::OpenPosition { .. }))
-            .count();
+        // 2. Open-positions cap: count HELD open positions as-of the fire bar (S6 —
+        //    the same held state `list_open_positions` reports) and reject at the
+        //    cap, mirroring the real broker's `open_position_count >= cap`. In a
+        //    single-plan replay this is that instrument's open count — the best
+        //    offline proxy for the account-wide count, and conservative (it can
+        //    only reject, never over-fill). Advance to the current `as_of` first so
+        //    a fill/close that happened by this bar is reflected.
+        self.advance(*self.as_of.borrow());
+        let open_now = self.open.borrow().len();
         if open_now as u32 >= max_open_positions {
             return Err(EntryError::OpenPositionsCapExceeded);
         }
@@ -1571,19 +1593,19 @@ impl Broker for ReplayBroker {
         &self,
         _account_id: &str,
     ) -> Result<Vec<PendingOrder>, LookupError> {
-        // Report a synthetic resting order for every placed attempt that
-        // `resolve`s to `Pending` at `as_of` — i.e. an order that has been
-        // "placed" but not yet filled/cancelled by the asking bar. This is what
-        // the shared `pending_order_lifecycle` (core) lists to decide what to
-        // cancel through a spread hour; a mock that always returned `[]` (the
-        // pre-PR-3 stub) would make the lifecycle a no-op offline, so replay
-        // could never reproduce the live cancel/restore. Mirrors
-        // `list_open_positions`' reconstruction from `placed`.
-        let placed = self.placed.borrow();
-        let pendings = placed
+        // S7: report a resting order for every HELD resting order that is not
+        // cancelled and not yet filled by `as_of`. This is what the shared
+        // `pending_order_lifecycle` (core) lists to decide what to cancel through a
+        // spread hour; a mock that always returned `[]` would make the lifecycle a
+        // no-op offline, so replay could never reproduce the live cancel/restore.
+        // Reads held state (advanced to `as_of`) instead of re-simulating.
+        self.advance(*self.as_of.borrow());
+        let pendings = self
+            .resting
+            .borrow()
             .iter()
-            .filter(|a| matches!(self.resolve(a), AttemptState::Pending))
-            .map(|a| self.pending_from_attempt(a))
+            .filter(|o| !o.cancelled)
+            .map(|o| self.pending_from_held(o))
             .collect();
         Ok(pendings)
     }
