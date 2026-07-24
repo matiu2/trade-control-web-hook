@@ -85,7 +85,14 @@ pub enum FillKind {
     ClosedAtExpiry,
     /// A pending order that never triggered within the window. Not taken.
     NeverFilled,
-    /// An entry the worker declined to place (entry past a gate level). Not taken.
+    /// An entry the worker declined to place (entry past a baked at-entry level
+    /// veto, Bug #12). Not taken. Retained for the report render path + the
+    /// fixture `FillOutcome` mirror. In the stateful-broker model a decline is a
+    /// pre-broker `run_enter` rejection surfaced via `rejected_reason` →
+    /// `GateBlocked`, so `held_realized_outcome` no longer constructs this kind
+    /// (an order past a level never becomes a held resting order); the variant
+    /// stays so the render arm + `is_taken` classification remain total.
+    #[allow(dead_code)]
     Declined,
     /// An entry the worker's pre-broker gate would have rejected — the
     /// `allow_entry` script returned false/errored, the candle-quality

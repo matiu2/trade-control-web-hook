@@ -537,7 +537,12 @@ impl ReplayBroker {
         // one (spread-hour cancel / superseded), which is a true no-fill (`None`).
         // The report renders NeverFilled with its intended (unfilled) bracket
         // anchored at the fire bar; a `None` becomes the "order cancelled" no-fill.
-        if let Some(o) = self.resting.borrow().iter().find(|o| o.order_id == order_id) {
+        if let Some(o) = self
+            .resting
+            .borrow()
+            .iter()
+            .find(|o| o.order_id == order_id)
+        {
             if o.cancelled {
                 return None;
             }
@@ -1617,5 +1622,4 @@ mod tests {
             "a cancelled order is never resting"
         );
     }
-
 }
