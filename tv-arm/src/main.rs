@@ -29,6 +29,7 @@ mod mw_geometry;
 mod news_marker;
 mod news_window;
 mod pipeline;
+mod plan_geometry;
 mod position_trade;
 mod precision;
 mod register_post;

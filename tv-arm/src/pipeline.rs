@@ -2172,12 +2172,16 @@ fn register_trade_plan(
         }
         None => None,
     };
+    // Extract the chart geometry to plain data ONCE, here. Everything downstream
+    // reads `PlanGeometry`, not `Drawing`s — which is what makes a plan rebuildable
+    // without TradingView (and stops a future run picking a different drawing).
+    let geom = crate::plan_geometry::PlanGeometry::from_roles(roles);
     let mut plan = build_trade_plan(
         &built_trade.trade_id,
         &built_trade.instrument,
         &built_trade.alerts,
         direction,
-        roles,
+        &geom,
         granularity,
         is_mw,
         shadow,
@@ -3140,7 +3144,7 @@ mod tests {
             &built.instrument,
             &built.alerts,
             trade_control_conventions::Direction::Short,
-            &Roles::default(),
+            &crate::plan_geometry::PlanGeometry::from_roles(&Roles::default()),
             trade_control_core::broker::Granularity::H1,
             false,
             false,
