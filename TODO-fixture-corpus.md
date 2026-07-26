@@ -23,8 +23,12 @@ Each commit green (tests + clippy + fmt) before the next.
         need it, no trigger does.
   - [x] **6b.** Push `PlanGeometry` through validation / TP / entry-level vetos
         (feaa019). Found + fixed a 1-point-neckline hole in `check_required`.
-  - [ ] **6c.** Split `drop_past_control_pairs` / `build_*_bundles` off `&mut Roles`
-        onto the window vectors.
+  - [x] **6c.** `ControlWindows` owns the three calendar-derived fields + the
+        prune (60306b1); `Roles` is immutable after `classify`. Collapsed the two
+        near-identical bundle builders into one generic `build_all::<K>`. Found
+        two untested behaviours: `close_on_news` had **no** test at all, and
+        nothing asserted pause/news bundles land in disjoint dirs (both write
+        `manifest.yaml`, so a collision silently clobbers one).
   - [ ] **6d.** Extract `SetupInputs` + `arm_from_inputs`; `run` becomes a two-way
         branch (chart vs frozen). `mcp: Option<TvMcp>` makes "annotation is
         chart-only" structural.
@@ -137,8 +141,10 @@ Two adversarial reviews run on disjoint file sets.
 - **economics/batch: three real bugs, all fixed** in 18af721.
 
 ### Next (unstarted)
-- **6c** split `drop_past_control_pairs` / `build_*_bundles` off `&mut Roles`.
 - **6d** extract `SetupInputs` + `arm_from_inputs`; `run` becomes chart-vs-frozen.
+      This is also where `pipeline.rs` finally gets under control — 6c left its
+      non-test body at 2269 lines (it only shrank by 6; the generic bundle
+      machinery gave back what the module extraction took out).
 - **6e** `--spec-in` + `FrozenSpec` + round-trip test.
 - **6f** `--start` strict-RFC3339 fix.
 - **7** tier-2 scored corpus (aggregate Net R + baseline diff). Independent of 6.
