@@ -14,9 +14,21 @@
 //!
 //! The snapshot schema ([`ReplayOutcome`]) is owned here, not in the engine — it
 //! captures exactly what the test should assert (each fire's decision and its
-//! simulated fill), independent of `report.rs`'s human-facing text. Both the
-//! report and the snapshot compute their fill via the single [`fill_for`] path,
-//! so they can't diverge.
+//! simulated fill), independent of `report.rs`'s human-facing text.
+//!
+//! ## Two fill paths — mind the gap
+//!
+//! The per-fire `fill` recorded here still comes from [`fill_for`] →
+//! `fill_sim::simulate_fill`, an independent re-simulation. The **report** reads
+//! the `ReplayBroker` held ledger (`fire.realized`) instead. These are not the
+//! same computation, and `simulate_fill` has **no reversal- or expiry-close
+//! awareness** — so `fires[].fill` cannot represent either outcome.
+//!
+//! The *economics* half of the divergence is closed: both consumers now book
+//! through [`super::economics::ReplayEconomics`], so the printed Net R and the
+//! saved golden agree. `fires[].fill` is next — see commit 2 in
+//! `SCOPING-fixture-corpus.md`, which moves it onto `fire.realized` too. Until
+//! then, do not treat `fill` as authoritative for a reversal/expiry close.
 
 use std::fs;
 use std::path::Path;
@@ -377,12 +389,17 @@ mod tests {
 
     /// S5 regression guard: the stateful broker books reversal- and expiry-close
     /// P&L from the held ledger, instead of the old no-op `close_positions` that
-    /// left a reversal/expiry-closed position at 0R. The golden `expected.json`
-    /// snapshot is computed via the independent `simulate_fill` path (no
-    /// reversal/expiry awareness), so it CANNOT capture this — hence a separate
-    /// assertion on the rendered REPORT TEXT, which reads `fire.realized` from the
-    /// broker's held ledger. The `uk-100-…-close-on-reversal` fixture exercises
-    /// both a reversal-close and a trade-expiry flatten on OPEN positions.
+    /// left a reversal/expiry-closed position at 0R. The
+    /// `uk-100-…-close-on-reversal` fixture exercises both a reversal-close and a
+    /// trade-expiry flatten on OPEN positions.
+    ///
+    /// This used to grep the rendered REPORT TEXT, because the golden snapshot
+    /// was computed via the independent `simulate_fill` path — which has no
+    /// reversal/expiry awareness and so could not represent either outcome. Now
+    /// that both consumers share [`ReplayEconomics`], the assertion is on the
+    /// structured booking: counters and signed R, not substrings. The text
+    /// rendering is still checked once, to catch a formatting regression that
+    /// leaves the numbers right but stops showing them.
     #[tokio::test]
     async fn stateful_broker_books_reversal_and_expiry_closes_in_the_report() {
         let dir = super::fixtures_root().join("uk-100-news-blackout-rentry-close-on-reversal");
@@ -412,28 +429,55 @@ mod tests {
             &[],
         )
         .await;
-        let report =
+        let rendered =
             super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
-        // A reversal-close must book R off the held ledger (not sit at 0R / "still
-        // open"). Before S5 `close_positions` was a no-op and this line read
-        // "still open at window end".
-        assert!(
-            report.contains("CLOSED ON REVERSAL"),
-            "reversal-close must be booked from the held ledger:\n{report}"
+        let econ = &rendered.economics;
+
+        // A reversal-close must book a real position off the held ledger, not sit
+        // at 0R / "still open". Before S5 `close_positions` was a no-op.
+        assert_eq!(
+            econ.reversal_closes, 1,
+            "reversal-close must be booked from the held ledger: {econ:#?}"
         );
         // The trade-expiry ClosePositions veto must FLATTEN the open position at
         // the expiry candle's close — the operator's original ask. Before S5 the
-        // veto left the position open at 0R ("no fill simulated" with nothing
-        // closed).
-        assert!(
-            report.contains("CLOSED AT EXPIRY"),
-            "expiry veto must flatten the open position from the held ledger:\n{report}"
+        // veto left the position open at 0R.
+        assert_eq!(
+            econ.expiry_closes, 1,
+            "expiry veto must flatten the open position from the held ledger: {econ:#?}"
         );
-        // Both book a signed R into the tally summary (EXP marker present).
-        assert!(
-            report.contains("EXP: 1"),
-            "expiry-close tally must count the flatten:\n{report}"
-        );
+
+        // Both closes are booked as legs with a real exit and a signed R — the
+        // half the old `simulate_fill` golden could not represent at all. This is
+        // the assertion that now guards Net R against a silent regression.
+        let closed: Vec<_> = econ
+            .legs
+            .iter()
+            .filter(|l| {
+                matches!(
+                    l.exit_reason,
+                    super::super::economics::ExitReason::Reversal
+                        | super::super::economics::ExitReason::Expiry
+                )
+            })
+            .collect();
+        assert_eq!(closed.len(), 2, "both closes must book legs: {econ:#?}");
+        for leg in closed {
+            assert!(
+                leg.exit_price.is_some() && leg.exit_time.is_some(),
+                "a flattened position must carry its exit: {leg:#?}"
+            );
+            assert!(
+                leg.r.is_finite() && leg.r != 0.0,
+                "a flattened position must book a signed R, not 0R: {leg:#?}"
+            );
+        }
+
+        // The rendered text must still SHOW them (formatting regression guard).
+        let text = &rendered.text;
+        for want in ["CLOSED ON REVERSAL", "CLOSED AT EXPIRY", "EXP: 1"] {
+            assert!(text.contains(want), "report must show {want}:\n{text}");
+        }
     }
 
     fn sample_meta() -> FixtureMeta {

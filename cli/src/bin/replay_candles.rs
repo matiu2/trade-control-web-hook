@@ -41,6 +41,7 @@ mod replay_candles {
     pub mod annotate;
     pub mod brisbane;
     pub mod candles;
+    pub mod economics;
     pub mod fill_sim;
     pub mod fixture;
     pub mod granularity;
@@ -307,6 +308,7 @@ async fn run() -> Result<()> {
             replay_sentiment.as_ref(),
             &mark_cfg,
         )
+        .text
     );
 
     if annotate {
@@ -522,6 +524,7 @@ async fn run_test_mode(args: &Args) -> Result<()> {
             None,
             &mark_cfg,
         )
+        .text
     );
 
     if args.check {
