@@ -42,10 +42,10 @@ pub fn parse(raw: &str) -> Result<ReplayGranularity> {
         "4h" | "h4" => (CmGranularity::FourHours, EngineGranularity::H4),
         "1d" | "d" | "d1" => (CmGranularity::OneDay, EngineGranularity::D1),
         other => {
-            return Err(eyre!(
+            return Err(super::outcome::bad_input(eyre!(
                 "unsupported granularity {other:?}; the engine supports \
                  1m, 5m, 15m, 1h, 4h, 1d"
-            ));
+            )));
         }
     };
     Ok(ReplayGranularity { cm, engine })

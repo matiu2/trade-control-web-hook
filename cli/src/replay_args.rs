@@ -155,10 +155,13 @@ EXIT CODES:
      Nothing was measured; retry it
   4  bad input — unparseable window, missing plan, no such fixture.
      Retrying verbatim will fail identically; fix the input
+  5  --check ran and the fixture did not match expected.json. A regression
+     verdict, not a fault — do not retry; investigate or re-bless
 
 A terminal summary line is ALWAYS printed to stdout, success or failure, so its
 absence means the process died in a way nobody handled. Failures report
-`Net R: n/a` — never `+0.00`, which a sweep would average in as a real trade.";
+`Net R: n/a` — never `+0.00`, which a sweep would average in as a real trade.
+So does a successful run with `--simulate false` (nothing was simulated).";
 
 /// `replay-candles` command-line arguments. Shared between the standalone
 /// binary and `tv-arm ... replay`.

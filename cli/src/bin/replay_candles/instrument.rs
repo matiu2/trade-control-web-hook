@@ -21,10 +21,10 @@ pub fn resolve_for(raw: &str, source: CandleSource) -> Result<String> {
         .or(resolve(raw)
             .map_err(|e| eyre!("instrument-lookup overlay error resolving {raw:?}: {e}"))?)
         .ok_or_else(|| {
-            eyre!(
+            super::outcome::bad_input(eyre!(
                 "unsupported instrument {raw:?}: not in the instrument-lookup catalog. \
                  Add an `[[asset]]` entry to ~/.config/instrument-lookup/mappings.toml."
-            )
+            ))
         })?;
 
     let broker = broker_of(source);
