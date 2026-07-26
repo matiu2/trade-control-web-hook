@@ -127,8 +127,38 @@ New `cli/src/bin/replay_candles/outcome.rs` owns the whole taxonomy.
   corpus path was already parallel-safe. My storage fix is for the live-arm
   path, which is the one their sweep still runs once per trade.
 
-## Deferred (not this session, nobody has claimed)
+## 5. Review follow-ups — [x]
 
-- `--cache-dir` warns/rejects when the path doesn't map to a sane table name
-  (under Postgres `derive_table_name` turns it into a **table name**, not a dir;
-  it sanitizes to `[a-zA-Z0-9_]`, so two different dirs can collide on one table)
+An independent review of items 1–4 found three real defects (all fixed +
+verified by execution, `aeededb`), then two more in `derive_table_name`
+(`83becae`, `f333079`):
+
+- [x] **The cache was never actually shared.** Switching to `postgres-storage`
+      fixed concurrency but the table name derives from `cache_dir`, which was
+      left at `CacheConfig::default()` — so replays used a private 54MB table
+      while `candle_cache_tradenation_bid_ask` (431GB) sat unused beside it.
+      Now per-broker, matching `broker-trait`'s `broker_env`. Also removes a
+      latent cross-broker key collision.
+- [x] **Classifier was wrong in BOTH directions.** Substring-matching the error
+      chain meant an ENOENT on a dropped mount read as bad-input (recorded as a
+      permanent result — the dangerous direction), while a typo'd instrument
+      said "unsupported instrument" vs the marker's "unknown instrument" and was
+      retried forever. Now a typed `BadInput` marker. NB it must sit at the head
+      of the chain: eyre's `wrap_err` erases the context's concrete type.
+- [x] **`--check` mismatch exited 3** (retry forever) for a deterministic
+      regression verdict → new exit 5.
+- [x] **`Net R:` missing on `--simulate false`** (reachable by design since the
+      flag became overridable) → always emitted, `n/a` when nothing simulated.
+- [x] **Over-long table names silently lost an index.** Postgres truncates at 63
+      chars with only a NOTICE; this backend appends up to 26, so from a 38-char
+      base the two index names collide after truncation and the 3-column index
+      is **never created** — invisible full-scan cliff on a 431GB table, and
+      unfixable downstream since it arrives as a SQLSTATE
+      `execute_idempotent_ddl` tolerates. Now rejected (cap 37).
+- [x] **Unusable paths fell back to a real table.** `/`, `___`, `123`, and a
+      missing final component all returned the literal `candle_cache` —
+      production data, not a sentinel. Now an error.
+
+Deliberately NOT fixed (documented instead): the sanitizer is many-to-one, so
+`candle_cache-oanda` and `candle_cache_oanda` still collapse to one table.
+Inherent to deriving a name from a path.
