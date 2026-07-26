@@ -34,11 +34,12 @@ use trade_control_core::sig::KEY_LEN;
 
 use crate::args::Args;
 use crate::args::PositionEntry;
-use crate::geometry::{horizontal_price, pcl_exhausted_price};
+use crate::geometry::pcl_exhausted_price;
 use crate::instrument_resolution::ResolvedInstrument;
 use crate::mw_geometry;
 use crate::news_marker::{NewsMarker, news_marker_lines};
 use crate::news_window::NewsWindow;
+use crate::plan_geometry::PlanGeometry;
 use crate::position_trade::{core_direction, resolve_levels};
 use crate::register_post::{post_intent_blocking, post_register_blocking};
 use crate::roles::{Roles, SlotPref, classify};
@@ -177,6 +178,17 @@ pub fn run(args: Args) -> Result<i32> {
     };
     let mut roles = classify(&mcp, &drawings, view, slot_pref)?;
 
+    // Extract the chart geometry to plain data ONCE, here — immediately after role
+    // resolution and BEFORE any validation. Two reasons this belongs at the top:
+    //   * the wrong-drawing risk is resolved exactly once, so the same bytes that
+    //     get validated are the bytes that get planned;
+    //   * everything downstream (validation, TP/direction, entry-level vetos, the
+    //     plan build) reads `PlanGeometry`, which is what lets a frozen spec drive
+    //     an identical arm with no TradingView.
+    // `roles` is still needed below for the things that AREN'T geometry: the
+    // calendar windows it carries, the drawn S/R levels, and the position tool.
+    let geom = PlanGeometry::from_roles(&roles);
+
     // Resolve blackout/news windows straight from the economic calendar at real
     // event-minute precision and push them into `roles`. No chart lines are
     // drawn and nothing is read back — the old draw + re-classify round-trip
@@ -194,7 +206,7 @@ pub fn run(args: Args) -> Result<i32> {
         // A missing/unparseable expiry collapses the range to empty (no windows)
         // rather than fetching across all of time; check_required (step 3)
         // surfaces the absent expiry drawing as a hard error shortly anyway.
-        let expiry_hint = read_trade_expiry(&roles).ok();
+        let expiry_hint = read_trade_expiry(&geom).ok();
         let calendar_range = calendar_scope_range(cursor_unix, expiry_hint);
         match calendar_windows(
             &state.resolution,
@@ -283,6 +295,7 @@ pub fn run(args: Args) -> Result<i32> {
         resolve_hs_trade(
             &args,
             &roles,
+            &geom,
             &instrument,
             &account,
             broker,
@@ -633,27 +646,35 @@ impl From<color_eyre::eyre::Error> for ResolveError {
 /// the source of a wrong-direction bug when a stale invalidation from
 /// another setup got picked. Reading direction off raw point order was a
 /// *second* wrong-direction bug (AUD/CAD 2026-07: head at `points[1]`).
+/// Takes **both** `geom` and `roles`, which is not redundant: `geom` is the
+/// drawing-derived *geometry* (every level, line, and epoch this function reads),
+/// while `roles` is only forwarded to [`build_trade_spec`] for the two things that
+/// aren't geometry — the calendar-resolved `news_pairs` and the drawn S/R levels.
+/// A spec-driven arm supplies the former from a frozen file and the latter from
+/// re-read calendar data, so keeping them separate is what makes that possible.
+///
+/// Nine parameters trips clippy; splitting them into a struct would just relocate
+/// the same fields, and the geometry/roles split above is the distinction that
+/// actually matters.
+#[allow(clippy::too_many_arguments)]
 fn resolve_hs_trade(
     args: &Args,
     roles: &Roles,
+    geom: &PlanGeometry,
     instrument: &str,
     account: &str,
     broker: Broker,
     catalog_pip: f64,
     catalog_tick: f64,
 ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
-    if let Err(msg) = check_required(roles, args) {
+    if let Err(msg) = check_required(geom, args) {
         return Err(ResolveError::Reject(msg));
     }
     // A future prep-expiry cutoff with no matching prep drawing would
     // arm a setup that can never enter; a past cutoff is just a re-arm.
-    if let Err(msg) = check_prep_expiries(roles, Utc::now()) {
+    if let Err(msg) = check_prep_expiries(geom, Utc::now()) {
         return Err(ResolveError::Reject(msg));
     }
-    let tp_fib = roles
-        .tp_fib
-        .as_ref()
-        .ok_or_else(|| eyre!("missing tp_fib (already checked by check_required)"))?;
     // Rule 1: the FIB gives us the trade direction. Resolve which end is the
     // head (the fib's `0`-reading) via TradingView's `reverse` flag — NOT the
     // raw point order, which is unreliable (AUD/CAD 2026-07 had its head at
@@ -661,7 +682,7 @@ fn resolve_hs_trade(
     // Head above neckline → short (H&S); below → long (iH&S). We no longer read
     // direction off the `too-high`/`too-low` invalidation label either, which
     // could be a stale line from a *different* trade and silently flip it.
-    let (head, neckline) = tp_fib.fib_head_neckline().ok_or_else(|| {
+    let (head, neckline) = geom.fib_head_neckline.ok_or_else(|| {
         eyre!("cannot read the fib's two anchors (need two finite prices to set direction)")
     })?;
     let direction =
@@ -675,23 +696,22 @@ fn resolve_hs_trade(
     // inside the fib's head↔neckline range. A line outside that band belongs
     // to a different, larger pattern — reject it rather than bake a poison
     // level / mismatched setup.
-    if let Some(inv) = roles.invalidation.as_ref() {
-        let inv_price = horizontal_price(&inv.prices());
-        if !crate::geometry::price_within_fib_range(inv_price, head, neckline) {
-            let (lo, hi) = (head.min(neckline), head.max(neckline));
-            return Err(ResolveError::Reject(format!(
-                "invalidation line at {inv_price} is outside the fib range [{lo}, {hi}] — it \
-                 looks like a stale `too-high`/`too-low` from a different trade; redraw or \
-                 remove it"
-            )));
-        }
+    if let Some(inv_price) = geom.invalidation
+        && !crate::geometry::price_within_fib_range(inv_price, head, neckline)
+    {
+        let (lo, hi) = (head.min(neckline), head.max(neckline));
+        return Err(ResolveError::Reject(format!(
+            "invalidation line at {inv_price} is outside the fib range [{lo}, {hi}] — it \
+             looks like a stale `too-high`/`too-low` from a different trade; redraw or \
+             remove it"
+        )));
     }
     let tp = crate::geometry::tp_price(head, neckline);
     // Continuous at-entry level vetos (Bug #12): the pcl-exhausted (`too-low`)
     // and invalidation (`too-high`) levels, baked onto the enter so the worker
     // rejects an entry already past either — independent of the cross-guard.
-    let entry_level_vetos = hs_entry_level_vetos(roles, direction);
-    let expiry = read_trade_expiry(roles)?;
+    let entry_level_vetos = hs_entry_level_vetos(geom, direction);
+    let expiry = read_trade_expiry(geom)?;
     // --pip-size / --tick-size override the canonical catalog values when set.
     let pip_size = args.pip_size.unwrap_or(catalog_pip);
     let tick_size = args.tick_size.unwrap_or(catalog_tick);
@@ -795,7 +815,7 @@ fn resolve_mw_trade_with_spread(
     // gates below cannot diverge between a live arm and a rebuild. (The indexing
     // that was here is why `MwPath` must carry `runup_start`: it feeds direction
     // and both gates, though no *trigger* reads it.)
-    let path = crate::plan_geometry::PlanGeometry::from_roles(roles)
+    let path = PlanGeometry::from_roles(roles)
         .mw_path
         .ok_or_else(|| eyre!("resolve_mw_trade_with_spread called without an mw_path"))?;
     let runup_start = path.runup_start;
@@ -830,7 +850,7 @@ fn resolve_mw_trade_with_spread(
     // and again at fire time in the worker against the live spread. Not
     // duplicated here — see `cli/src/trade_patterns.rs::build_mw_pattern`.
 
-    let expiry = read_trade_expiry(roles)?;
+    let expiry = read_trade_expiry(&PlanGeometry::from_roles(roles))?;
     let pattern = match direction {
         Direction::Short => cli::TradePattern::M,
         Direction::Long => cli::TradePattern::W,
@@ -1051,25 +1071,25 @@ fn build_mw_trade_spec(
 
 /// Validate the chart has every drawing the bundle will need.
 /// Mirrors `tv_arm_hs.py:1614-1629`.
-fn check_required(roles: &Roles, args: &Args) -> std::result::Result<(), String> {
+fn check_required(geom: &PlanGeometry, args: &Args) -> std::result::Result<(), String> {
     let mut missing = Vec::new();
-    if roles.invalidation.is_none() {
+    if geom.invalidation.is_none() {
         missing.push("horizontal_line labeled 'too-high' or 'too-low'");
     }
-    if roles.break_and_close.is_none() && !args.skip_break_and_close {
+    if geom.neckline.is_none() && !args.skip_break_and_close {
         missing.push("trend_line labeled 'neckline' (or 'break-and-close')");
     }
-    // The retest reuses the neckline drawing (`resolve_retest`), so it's only
-    // *independently* missing when the retest is wanted but there's no neckline
-    // to derive it from — i.e. the neckline is skipped. A plain neckline setup
-    // satisfies both roles with one drawing.
-    if roles.retest.is_none() && !args.skip_retest && args.skip_break_and_close {
+    // The retest reuses the neckline drawing (`resolve_retest` assigns
+    // `roles.retest = break_and_close.clone()`), so `geom.neckline` covers both
+    // roles — it is only *independently* missing when the retest is wanted but the
+    // neckline is skipped, leaving nothing to derive it from.
+    if geom.neckline.is_none() && !args.skip_retest && args.skip_break_and_close {
         missing.push("trend_line labeled 'neckline' (needed for the retest)");
     }
-    if roles.tp_fib.is_none() {
+    if geom.fib_head_neckline.is_none() {
         missing.push("fib_retracement (TP)");
     }
-    if roles.trade_expiry.is_none() {
+    if geom.trade_expiry_epoch.is_none() {
         missing.push("vertical_line labeled 'trade-expiry'");
     }
     if missing.is_empty() {
@@ -1114,14 +1134,18 @@ fn prep_expiry_steps(roles: &Roles, skip_preps: &[String]) -> Vec<String> {
 ///   reason to abort.
 ///
 /// `now` is injected so the rule is unit-testable without a clock.
-fn check_prep_expiries(roles: &Roles, now: DateTime<Utc>) -> std::result::Result<(), String> {
+fn check_prep_expiries(geom: &PlanGeometry, now: DateTime<Utc>) -> std::result::Result<(), String> {
     let now_unix = now.timestamp();
     let mut errors = Vec::new();
-    for (step, drawing) in &roles.prep_expiries {
-        let line_unix = drawing.anchor_time_seconds();
+    // The epochs come from `PlanGeometry` (`points.first().time`) rather than
+    // `Drawing::anchor_time_seconds` (`min` over all points). Identical here:
+    // prep-expiry roles are VERTICAL lines, which carry exactly one anchor.
+    for (step, line_unix) in &geom.prep_expiry_epochs {
+        let line_unix = *line_unix;
         let prep_present = match step.as_str() {
-            trade_control_conventions::PREP_BREAK_AND_CLOSE => roles.break_and_close.is_some(),
-            trade_control_conventions::PREP_RETEST => roles.retest.is_some(),
+            // Both prep roles are served by the one neckline (see `check_required`).
+            trade_control_conventions::PREP_BREAK_AND_CLOSE
+            | trade_control_conventions::PREP_RETEST => geom.neckline.is_some(),
             // Unknown step shouldn't occur (classify only emits known
             // prep names), but treat it as "prep absent" defensively.
             _ => false,
@@ -1364,7 +1388,7 @@ fn build_trade_spec(
 /// missing fib / invalidation can't bake a poison level. Direction picks both
 /// the name and the side.
 fn hs_entry_level_vetos(
-    roles: &Roles,
+    geom: &PlanGeometry,
     direction: Direction,
 ) -> Vec<trade_control_core::intent::EntryLevelVeto> {
     use trade_control_core::intent::{EntryLevelVeto, VetoSide};
@@ -1373,11 +1397,8 @@ fn hs_entry_level_vetos(
     // pcl-exhausted (the "ran most of the way to TP" gate). Resolve head/
     // neckline via the fib's `reverse` flag (not point order) so the level
     // lands on the correct side even when the operator drew it neckline-first.
-    if let Some(fib) = roles.tp_fib.as_ref() {
-        let level = fib
-            .fib_head_neckline()
-            .map(|(head, neckline)| pcl_exhausted_price(head, neckline))
-            .unwrap_or(f64::NAN);
+    if let Some((head, neckline)) = geom.fib_head_neckline {
+        let level = pcl_exhausted_price(head, neckline);
         if level.is_finite() {
             let (name, past) = match direction {
                 Direction::Short => ("too-low", VetoSide::Below),
@@ -1392,19 +1413,18 @@ fn hs_entry_level_vetos(
     }
 
     // invalidation (the right-shoulder horizontal; thesis dead past it).
-    if let Some(inv) = roles.invalidation.as_ref() {
-        let level = horizontal_price(&inv.prices());
-        if level.is_finite() {
-            let (name, past) = match direction {
-                Direction::Short => ("too-high", VetoSide::Above),
-                Direction::Long => ("too-low", VetoSide::Below),
-            };
-            out.push(EntryLevelVeto {
-                name: name.into(),
-                level,
-                past,
-            });
-        }
+    if let Some(level) = geom.invalidation
+        && level.is_finite()
+    {
+        let (name, past) = match direction {
+            Direction::Short => ("too-high", VetoSide::Above),
+            Direction::Long => ("too-low", VetoSide::Below),
+        };
+        out.push(EntryLevelVeto {
+            name: name.into(),
+            level,
+            past,
+        });
     }
 
     out
@@ -1808,7 +1828,7 @@ fn run_position_entry(
     let levels = resolve_levels(pos, resolved.precision.tick_size)?;
 
     // Expiry: a drawn trade-expiry line wins; otherwise now + flag hours.
-    let trade_expiry = match read_trade_expiry(roles) {
+    let trade_expiry = match read_trade_expiry(&PlanGeometry::from_roles(roles)) {
         Ok(t) => t,
         Err(_) => now + chrono::Duration::hours(i64::from(args.expiry_hours)),
     };
@@ -1876,16 +1896,10 @@ fn run_position_entry(
 /// pre-auto-draw) as the lookahead horizon for calendar bars so the
 /// auto-draw covers the trade's full lifetime instead of just the
 /// next H1+ buffer window.
-fn read_trade_expiry(roles: &Roles) -> Result<DateTime<Utc>> {
-    let trade_expiry_d = roles
-        .trade_expiry
-        .as_ref()
+fn read_trade_expiry(geom: &PlanGeometry) -> Result<DateTime<Utc>> {
+    let expiry_unix = geom
+        .trade_expiry_epoch
         .ok_or_else(|| eyre!("missing trade_expiry"))?;
-    let expiry_unix = trade_expiry_d
-        .points
-        .first()
-        .ok_or_else(|| eyre!("trade_expiry has no points"))?
-        .time;
     Utc.timestamp_opt(expiry_unix, 0)
         .single()
         .ok_or_else(|| eyre!("invalid trade_expiry timestamp {expiry_unix}"))
@@ -2179,7 +2193,7 @@ fn register_trade_plan(
     // Extract the chart geometry to plain data ONCE, here. Everything downstream
     // reads `PlanGeometry`, not `Drawing`s — which is what makes a plan rebuildable
     // without TradingView (and stops a future run picking a different drawing).
-    let geom = crate::plan_geometry::PlanGeometry::from_roles(roles);
+    let geom = PlanGeometry::from_roles(roles);
     let mut plan = build_trade_plan(
         &built_trade.trade_id,
         &built_trade.instrument,
@@ -2323,7 +2337,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let err = check_prep_expiries(&roles, now()).unwrap_err();
+        let err = check_prep_expiries(&PlanGeometry::from_roles(&roles), now()).unwrap_err();
         assert!(err.contains("break-and-close-expiry"), "msg = {err}");
         assert!(err.contains("never enter"), "msg = {err}");
     }
@@ -2332,15 +2346,23 @@ mod tests {
     fn prep_expiry_future_with_prep_ok() {
         // Same future cutoff, but the break-and-close line is present →
         // a legitimate "pattern got too big" cutoff. No error.
+        //
+        // The neckline must be a genuine TWO-point trendline. This fixture used a
+        // one-point `vline`, which the old presence check
+        // (`roles.break_and_close.is_some()`) happily accepted — even though
+        // plan-building would then produce NO `TrendlineCross` rule for it
+        // (`points.get(1)?` → `None`). So the old check could pass a setup that
+        // could never enter. Reading presence off `geom.neckline`, which requires
+        // both anchors, makes the guard agree with what plan-building needs.
         let roles = Roles {
-            break_and_close: Some(vline("neck", now().timestamp() - 7200)),
+            break_and_close: Some(two_point("neck", "neckline", 1.10, 1.09)),
             prep_expiries: vec![(
                 "break-and-close".into(),
                 vline("e", now().timestamp() + 3600),
             )],
             ..Default::default()
         };
-        check_prep_expiries(&roles, now()).unwrap();
+        check_prep_expiries(&PlanGeometry::from_roles(&roles), now()).unwrap();
     }
 
     #[test]
@@ -2351,7 +2373,7 @@ mod tests {
             prep_expiries: vec![("retest".into(), vline("e", now().timestamp() - 3600))],
             ..Default::default()
         };
-        check_prep_expiries(&roles, now()).unwrap();
+        check_prep_expiries(&PlanGeometry::from_roles(&roles), now()).unwrap();
     }
 
     #[test]
@@ -2738,6 +2760,7 @@ mod tests {
         let (dir, spec) = resolve_hs_trade(
             &args,
             &roles,
+            &PlanGeometry::from_roles(&roles),
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
@@ -2760,6 +2783,7 @@ mod tests {
         let (dir, _) = resolve_hs_trade(
             &args,
             &roles,
+            &PlanGeometry::from_roles(&roles),
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
@@ -2782,6 +2806,7 @@ mod tests {
         match resolve_hs_trade(
             &args,
             &roles,
+            &PlanGeometry::from_roles(&roles),
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
@@ -2805,6 +2830,7 @@ mod tests {
         match resolve_hs_trade(
             &args,
             &roles,
+            &PlanGeometry::from_roles(&roles),
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
@@ -2901,6 +2927,7 @@ mod tests {
         let (_dir, spec) = resolve_hs_trade(
             &args,
             &roles,
+            &PlanGeometry::from_roles(&roles),
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
@@ -2926,6 +2953,7 @@ mod tests {
         let (_dir, spec) = resolve_hs_trade(
             &args,
             &roles,
+            &PlanGeometry::from_roles(&roles),
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
@@ -2949,6 +2977,7 @@ mod tests {
         let (_dir, spec) = resolve_hs_trade(
             &args,
             &roles,
+            &PlanGeometry::from_roles(&roles),
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
@@ -3148,7 +3177,7 @@ mod tests {
             &built.instrument,
             &built.alerts,
             trade_control_conventions::Direction::Short,
-            &crate::plan_geometry::PlanGeometry::from_roles(&Roles::default()),
+            &PlanGeometry::from_roles(&Roles::default()),
             trade_control_core::broker::Granularity::H1,
             false,
             false,
@@ -3372,7 +3401,7 @@ mod tests {
             invalidation: Some(path_n("inv", &[1.1050])),
             ..Default::default()
         };
-        let vetos = hs_entry_level_vetos(&roles, Direction::Short);
+        let vetos = hs_entry_level_vetos(&PlanGeometry::from_roles(&roles), Direction::Short);
         let by = |n: &str| vetos.iter().find(|v| v.name == n).expect("present");
         // pcl = fib 1.8 = neckline + 0.8×(TP − neckline).
         //   tp = 2×1.0900 − 1.1000 = 1.0800,
@@ -3386,7 +3415,7 @@ mod tests {
 
         // Missing fib → only the invalidation veto is baked (NaN is skipped).
         roles.tp_fib = None;
-        let vetos = hs_entry_level_vetos(&roles, Direction::Short);
+        let vetos = hs_entry_level_vetos(&PlanGeometry::from_roles(&roles), Direction::Short);
         assert_eq!(vetos.len(), 1);
         assert_eq!(vetos[0].name, "too-high");
     }
@@ -3401,7 +3430,7 @@ mod tests {
             invalidation: Some(path_n("inv", &[1.0850])),
             ..Default::default()
         };
-        let vetos = hs_entry_level_vetos(&roles, Direction::Long);
+        let vetos = hs_entry_level_vetos(&PlanGeometry::from_roles(&roles), Direction::Long);
         let pcl = vetos.iter().find(|v| v.name == "too-high").expect("pcl");
         assert_eq!(pcl.past, VetoSide::Above);
         let inv = vetos.iter().find(|v| v.name == "too-low").expect("inv");
