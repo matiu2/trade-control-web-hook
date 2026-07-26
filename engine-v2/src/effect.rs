@@ -148,10 +148,12 @@ pub enum Effect {
         /// How to place the order (stop/limit/market).
         mechanism: EntryMechanism,
         /// The price the order is trying to place *at* — the resting trigger.
-        /// `None` for a market order (no resting trigger) and, in this slice,
-        /// wherever the trigger has not yet been resolved from the intent's
-        /// `EntrySpec` (that resolution is the executor's job, a later slice); the
-        /// enter emits `None` today and the executor fills it in.
+        /// The **enter emits `None`**: it stays pure and mode-blind, with no
+        /// `pip_size`/`tick_size` or broker knowledge. The *executor* resolves the
+        /// real trigger (and SL/TP/risk) from the intent's `EntrySpec` against the
+        /// firing bar via `Resolved::from_intent` — see `executor::resolve_order`.
+        /// So a `Some` here would come only from a future rule that pre-resolves;
+        /// today it is always `None` on the wire out of the enter.
         trigger_price: Option<f64>,
         /// The close of the bar the enter fired on — the reference price the
         /// late-resolve parity check compares against. Filled by the enter from

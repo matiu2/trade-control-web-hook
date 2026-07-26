@@ -175,9 +175,10 @@ impl Rule for Enter<'_> {
             fired: Box::new(fired),
             mechanism: self.rule.mechanism,
             // The resting trigger is resolved from the intent's `EntrySpec` by the
-            // executor (a later slice); the enter doesn't compute it, so `None` for
-            // now. `candle_close` IS known here — the close of the firing bar, the
-            // reference the late-resolve parity check compares against.
+            // executor (`resolve_order`), which has the pip/tick sizes and the firing
+            // bar; the enter stays pure and emits `None`. `candle_close` IS known
+            // here — the close of the firing bar, the reference the late-resolve
+            // parity check compares against.
             trigger_price: None,
             candle_close: candle.c,
         }]

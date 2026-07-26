@@ -26,13 +26,32 @@
 //!
 //! # This slice — `PlaceOrder` only
 //!
-//! The first executor slice wires exactly one effect end-to-end:
-//! [`Effect::PlaceOrder`] → [`late_entry::resolve`](crate::late_entry::resolve) →
+//! The executor wires the acquisitive [`Effect::PlaceOrder`] end-to-end:
+//! **resolve** the intent into a concrete order
+//! ([`resolve_order`] → v1's [`Resolved::from_intent`], via [`shell_from_candle`]) →
+//! [`late_entry::resolve`](crate::late_entry::resolve) (catch-up parity) →
 //! [`EntryBroker::place`] → stamp the outcome. Everything else `tick_once` already
 //! handles inline (fact/scratch writes, the `Invalidate` retire stamp); this driver
-//! ignores those variants. `ClosePosition` (the news-reversal-close slice) and the
-//! real [`Broker`](trade_control_core::broker::Broker) adaptation (entry
-//! *resolution* — trigger/SL/TP/risk) land later, on this established path.
+//! ignores those variants.
+//!
+//! # Entry resolution lives here (not in the rule)
+//!
+//! The enter stays pure and mode-blind — it emits `PlaceOrder` with `trigger_price:
+//! None` and no SL/TP/risk. The executor owns *resolution*: it reads the intent's
+//! baked `pip_size`/`tick_size`, projects the firing bar (+ latched signal) onto a
+//! [`Shell`](trade_control_core::intent::Shell), and runs the **same** resolver the
+//! v1 worker uses ([`Resolved::from_intent`] — anchors, offsets, R-multiples,
+//! sizing, tick-rounding, in-range + min-R checks). On any
+//! [`ResolveError`](trade_control_core::intent::ResolveError) it logs loudly and
+//! **declines the bar** (`PlacementReport::Declined`) without stamping the enter
+//! done, so a transient failure (ATR warmup) recovers on a later bar — v1's
+//! decline-this-bar-stay-armed behaviour.
+//!
+//! Still deferred to a later slice: adapting the **live**
+//! [`Broker`](trade_control_core::broker::Broker) onto [`EntryBroker`] (a
+//! [`PlacedOrder`] → [`EntryRequest`](trade_control_core::broker::EntryRequest) map,
+//! now with nothing left to resolve) and `ClosePosition` (the news-reversal-close
+//! slice), both on this established path.
 //!
 //! # Late-entry parity lives here, not in the rule
 //!
@@ -45,20 +64,26 @@
 //! **missed** (the counterfactual order already triggered in the gap). Both outcomes
 //! are terminal for a single-shot enter — see [`stamp_outcome`].
 
-use trade_control_core::intent::Direction;
+use trade_control_core::intent::{
+    Direction, Intent, ResolveError, Resolved, ResolvedEntry, RiskBudget,
+};
+use trade_control_core::plan_eval::FiredIntent;
 
 use crate::effect::Effect;
 use crate::facts::{EntryOutcome, FactKind, FactValue, Facts};
 use crate::late_entry::{self, LateEntry, LateEntryOrder};
+use crate::shell::shell_from_candle;
 use crate::{Candle, EntryMechanism, TradePlan, tick_once};
 
-/// A resolved entry order, ready to place. The v2-native, broker-agnostic shape
-/// the [`EntryBroker`] receives — deliberately **decoupled** from the full
-/// [`EntryRequest`](trade_control_core::broker::EntryRequest) (which needs a
-/// resolved SL/TP/risk budget). Building that from the intent is entry
-/// *resolution*, a later slice; this slice carries only what identifies the
-/// placement so the driver + a fake broker can be exercised end-to-end.
-#[derive(Debug, Clone, PartialEq)]
+/// A **fully resolved** entry order, ready to place. The v2-native, broker-agnostic
+/// shape the [`EntryBroker`] receives — carrying the concrete trigger/SL/TP/risk the
+/// executor resolved from the intent via [`Resolved::from_intent`]. It mirrors the
+/// live [`EntryRequest`](trade_control_core::broker::EntryRequest) minus the
+/// broker-side fields (dry-run, caps): the deferred live-broker adaptation is a plain
+/// `PlacedOrder` → `EntryRequest` map with nothing left to resolve.
+// No `PartialEq`: [`RiskBudget`] carries `f64` and derives none, so a resolved
+// order isn't equatable. Tests assert on the individual fields instead.
+#[derive(Debug, Clone)]
 pub struct PlacedOrder {
     /// The instrument to trade (OANDA `EUR_USD` / TradeNation `EUR/USD`).
     pub instrument: String,
@@ -66,9 +91,17 @@ pub struct PlacedOrder {
     pub direction: Direction,
     /// How the order rests (stop / limit / market).
     pub mechanism: EntryMechanism,
-    /// The resolved resting trigger price. `None` for a market order (no resting
-    /// trigger) and, in this slice, wherever the enter has not yet resolved it.
+    /// The resolved resting trigger price. `None` for a **market** order (no
+    /// resting trigger — it fills at the current price); `Some` for stop/limit,
+    /// resolved from the intent's `EntrySpec` against the firing bar's [`Shell`].
     pub trigger: Option<f64>,
+    /// Resolved stop-loss price (absolute, tick-snapped).
+    pub stop_loss: f64,
+    /// Resolved take-profit price (absolute, tick-snapped).
+    pub take_profit: f64,
+    /// How much to commit — percent of equity, a fixed money amount, or explicit
+    /// units. Resolved from the intent's `risk_pct` / `risk_amount` / `size_units`.
+    pub risk: RiskBudget,
 }
 
 /// Failure placing an entry. Kept minimal for the slice — the real
@@ -148,6 +181,15 @@ pub enum PlacementReport {
     /// The broker rejected the placement — the enter is **not** stamped done, so a
     /// later bar may retry. Carries the reason for the log.
     Rejected { rule_id: String, reason: String },
+    /// Entry **resolution** failed (geometry not ready, ATR warmup, below-min-R,
+    /// out-of-range, …) — the intent could not be turned into concrete prices this
+    /// bar. Logged loudly (`error!`) with full context, then the enter is **not**
+    /// stamped done so it re-ticks and retries next bar. Distinct from
+    /// [`Rejected`](Self::Rejected) (the broker said no to a *resolved* order):
+    /// this is "couldn't even build the order yet". Matches v1's
+    /// `pine_entry_dispatchable`, which treats every `from_intent` `Err` as
+    /// decline-this-bar-stay-armed (so a transient warmup recovers on a later bar).
+    Declined { rule_id: String, reason: String },
 }
 
 /// The **execution context**: the "who executes" pair (a [`EntryBroker`] plus an
@@ -209,17 +251,33 @@ impl<B: EntryBroker, S: EntryStore> Execution<'_, B, S> {
             // Only PlaceOrder needs the async broker in this slice. Everything else
             // was already applied by tick_once (or is deferred to a later slice).
             if let Effect::PlaceOrder {
-                fired,
-                mechanism,
-                trigger_price,
-                ..
+                fired, mechanism, ..
             } = effect
             {
-                let order = PlacedOrder {
-                    instrument: fired.intent.instrument.clone(),
-                    direction: order_direction(plan, &fired),
-                    mechanism,
-                    trigger: trigger_price,
+                // Entry RESOLUTION — turn the intent + firing bar into concrete
+                // trigger/SL/TP/risk via v1's proven resolver. On failure, log
+                // loudly and DECLINE (don't stamp done): the enter re-ticks next bar
+                // and recovers if it was transient (ATR warmup). See `resolve_order`.
+                let order = match resolve_order(plan, &fired, mechanism) {
+                    Ok(order) => order,
+                    Err(err) => {
+                        let candle = &fired.candle;
+                        tracing::error!(
+                            rule_id = %fired.rule_id,
+                            instrument = %fired.intent.instrument,
+                            error = %err,
+                            error_debug = ?err,
+                            bar_time = %candle.time,
+                            bar_ohlc = ?(candle.o, candle.h, candle.l, candle.c),
+                            has_signal = fired.signal.is_some(),
+                            "entry resolution failed — declining this bar, staying armed (will retry next bar)"
+                        );
+                        placements.push(PlacementReport::Declined {
+                            rule_id: fired.rule_id.clone(),
+                            reason: err.to_string(),
+                        });
+                        continue;
+                    }
                 };
                 let report =
                     place_one(&fired.rule_id, &order, gap, self.broker, self.store, facts).await;
@@ -302,14 +360,49 @@ async fn stamp_outcome<S: EntryStore>(
     store.stamp_entry_outcome(rule_id, outcome).await;
 }
 
-/// The trade direction for the placement. The v2 plan carries the direction at the
-/// plan level; the fired intent's own `direction` is `Option` (control intents have
-/// none), so prefer the intent's when set and fall back to the plan's.
-fn order_direction(
+/// Resolve a fired enter intent into a concrete [`PlacedOrder`] — the entry
+/// *resolution* step. Reuses v1's [`Resolved::from_intent`] verbatim (anchor /
+/// offset / R-multiple / sizing / tick-rounding / in-range + min-R checks), bridged
+/// only by [`shell_from_candle`] which projects the v2 firing bar + latched signal
+/// onto the [`Shell`](trade_control_core::intent::Shell) the resolver consumes.
+///
+/// `pip_size` / `tick_size` come off the **intent** (baked by tv-arm from
+/// `instrument-lookup` — see the `pip_size_baked_into_intent` note), so the executor
+/// never consults a catalog. Fallbacks match the worker's: pip → `0.0001`, tick →
+/// `0.0` (identity, no rounding). The direction is the intent's when set, else the
+/// plan's (control intents carry none).
+///
+/// On any [`ResolveError`] the caller logs it loudly and declines the bar — the
+/// enter stays armed and retries, so a transient warmup (`AtrUnavailable`) recovers.
+fn resolve_order(
     plan: &TradePlan,
-    fired: &trade_control_core::plan_eval::FiredIntent,
-) -> Direction {
-    fired.intent.direction.unwrap_or(plan.direction)
+    fired: &FiredIntent,
+    mechanism: EntryMechanism,
+) -> Result<PlacedOrder, ResolveError> {
+    let intent: &Intent = &fired.intent;
+    let shell = shell_from_candle(&fired.candle, fired.signal.as_ref());
+    let pip_size = intent.pip_size.unwrap_or(0.0001);
+    let tick_size = intent.tick_size.unwrap_or(0.0);
+
+    let resolved = Resolved::from_intent(intent, &shell, pip_size, tick_size)?;
+
+    // A market order has no resting trigger; a stop/limit rests at its trigger.
+    let trigger = match resolved.entry {
+        ResolvedEntry::Market { .. } => None,
+        ResolvedEntry::Stop { trigger_price } | ResolvedEntry::Limit { trigger_price } => {
+            Some(trigger_price)
+        }
+    };
+
+    Ok(PlacedOrder {
+        instrument: resolved.instrument,
+        direction: intent.direction.unwrap_or(plan.direction),
+        mechanism,
+        trigger,
+        stop_loss: resolved.stop_loss,
+        take_profit: resolved.take_profit,
+        risk: resolved.risk,
+    })
 }
 
 #[cfg(test)]
@@ -382,12 +475,15 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    /// A candle with a real range around `close` (±20 pips) so a `Low`-anchored SL
+    /// resolves to a non-degenerate stop distance — otherwise `Resolved::from_intent`
+    /// would reject the entry with zero R. `o == c` (flat body); `h`/`l` span it.
     fn candle(time: &str, close: f64) -> Candle {
         Candle {
             time: ts(time),
             o: close,
-            h: close,
-            l: close,
+            h: close + 0.0020,
+            l: close - 0.0020,
             c: close,
         }
     }
@@ -402,9 +498,19 @@ mod tests {
             action: Action::Enter,
             instrument: "EUR_USD".into(),
             direction: Some(Direction::Long),
-            entry: None,
-            stop_loss: None,
-            take_profit: None,
+            // A resolvable long-market spec: fill at close, SL at the bar low − 2
+            // pips, TP at 2R. With the ±20-pip `candle()` range this resolves to a
+            // real trigger/SL/TP so the executor's resolution step succeeds.
+            entry: Some(trade_control_core::intent::EntrySpec::Market),
+            stop_loss: Some(trade_control_core::intent::PriceRef::Anchored {
+                from: trade_control_core::intent::PriceAnchor::Low,
+                offset_pips: -2.0,
+                offset_atr_pct: None,
+            }),
+            take_profit: Some(trade_control_core::intent::TakeProfit::RMultiple {
+                from: trade_control_core::intent::PriceAnchor::Close,
+                offset_r: 2.0,
+            }),
             risk_pct: Tunable::Static(1.0),
             risk_amount: None,
             size_units: None,
@@ -625,12 +731,19 @@ mod tests {
         }
     }
 
+    /// A resting long stop for the `place_one`-direct catch-up tests. Only
+    /// `mechanism`/`direction`/`trigger` feed the late-entry parity branch these
+    /// tests exercise; SL/TP/risk are inert placeholders (the parity check never
+    /// reads them).
     fn stop_long(trigger: f64) -> PlacedOrder {
         PlacedOrder {
             instrument: "EUR_USD".into(),
             direction: Direction::Long,
             mechanism: EntryMechanism::Stop,
             trigger: Some(trigger),
+            stop_loss: trigger - 0.0020,
+            take_profit: trigger + 0.0040,
+            risk: RiskBudget::Percent(1.0),
         }
     }
 
@@ -752,5 +865,123 @@ mod tests {
 
         assert!(r.placements.is_empty(), "paused → no placement");
         assert!(broker.placed.borrow().is_empty(), "broker never called");
+    }
+
+    // --- Entry resolution (this slice) ---------------------------------------
+
+    /// The resolvable long-market enter resolves to concrete SL/TP the broker sees.
+    /// close = 1.1000, bar low = 1.0980 (candle() spans ±20 pips), pip = 0.0001:
+    ///   SL = low − 2 pips = 1.0978; R = 1.1000 − 1.0978 = 0.0022;
+    ///   TP = close + 2R = 1.1044. Market entry ⇒ no resting trigger.
+    #[tokio::test]
+    async fn enter_resolves_concrete_sl_tp_for_the_broker() {
+        let p = plan(vec![enter_rule()]);
+        let mut facts = Facts::default();
+        let broker = FakeBroker::ok();
+        let store = FakeStore::default();
+
+        Execution {
+            broker: &broker,
+            store: &store,
+        }
+        .drive_bar(
+            &p,
+            &mut facts,
+            &[candle("2026-06-01T10:00:00Z", 1.1000)],
+            ts("2026-06-01T10:00:00Z"),
+            true,
+            &[],
+        )
+        .await;
+
+        let placed = broker.placed.borrow();
+        let order = placed.first().expect("one order placed");
+        assert!(
+            order.trigger.is_none(),
+            "market entry has no resting trigger"
+        );
+        assert!(
+            (order.stop_loss - 1.0978).abs() < 1e-9,
+            "SL = low − 2 pips, got {}",
+            order.stop_loss
+        );
+        assert!(
+            (order.take_profit - 1.1044).abs() < 1e-9,
+            "TP = close + 2R, got {}",
+            order.take_profit
+        );
+        assert!(
+            matches!(order.risk, RiskBudget::Percent(p) if (p - 1.0).abs() < 1e-9),
+            "risk resolves to the intent's 1% default, got {:?}",
+            order.risk
+        );
+    }
+
+    /// A resolve FAILURE (here: an intent missing its `stop_loss`) declines the bar
+    /// and does NOT stamp the enter done — so it re-ticks and retries next bar. This
+    /// is the key design decision: a resolution failure (geometry not ready) is
+    /// distinct from a caught-up miss and must never permanently retire a setup.
+    #[tokio::test]
+    async fn resolve_failure_declines_and_stays_armed() {
+        let mut broken = enter_rule();
+        broken.intent.stop_loss = None; // → ResolveError::MissingField("stop_loss")
+        let p = plan(vec![broken]);
+        let mut facts = Facts::default();
+        let broker = FakeBroker::ok();
+        let store = FakeStore::default();
+
+        let exec = Execution {
+            broker: &broker,
+            store: &store,
+        };
+
+        let r = exec
+            .drive_bar(
+                &p,
+                &mut facts,
+                &[candle("2026-06-01T10:00:00Z", 1.1000)],
+                ts("2026-06-01T10:00:00Z"),
+                true,
+                &[],
+            )
+            .await;
+
+        assert!(
+            matches!(
+                r.placements.as_slice(),
+                [PlacementReport::Declined { rule_id, .. }] if rule_id == "05-enter"
+            ),
+            "resolve failure → Declined, got {:?}",
+            r.placements
+        );
+        assert!(broker.placed.borrow().is_empty(), "nothing placed");
+        assert!(
+            store.stamps.borrow().is_empty(),
+            "NOT stamped done — the enter stays armed",
+        );
+        assert!(
+            !facts.is_set_named("05-enter", EntryOutcome::NAME),
+            "no fire-once fact — the enter re-ticks and retries next bar",
+        );
+
+        // Prove it retries: fix the geometry, tick again → it places this time.
+        let mut fixed = enter_rule();
+        fixed.intent.pip_size = None;
+        let p2 = plan(vec![fixed]);
+        let r2 = exec
+            .drive_bar(
+                &p2,
+                &mut facts,
+                &[candle("2026-06-01T11:00:00Z", 1.1000)],
+                ts("2026-06-01T11:00:00Z"),
+                true,
+                &[],
+            )
+            .await;
+        assert!(
+            matches!(r2.placements.as_slice(), [PlacementReport::Placed { .. }]),
+            "with geometry resolvable it places, got {:?}",
+            r2.placements
+        );
     }
 }

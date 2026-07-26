@@ -52,6 +52,7 @@ mod executor;
 mod facts;
 mod late_entry;
 mod rule;
+mod shell;
 mod world;
 
 mod rules;
