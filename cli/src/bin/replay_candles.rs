@@ -298,18 +298,18 @@ async fn run() -> Result<()> {
     // Fail-soft — `None` on any miss, and the report simply omits the block.
     let replay_sentiment = sentiment::resolve_replay_sentiment(&plan, start).await;
 
-    print!(
-        "{}",
-        report::render(
-            &plan,
-            &replay,
-            simulate,
-            args.verbose,
-            replay_sentiment.as_ref(),
-            &mark_cfg,
-        )
-        .text
+    // Render once and keep the economics it booked: `--save` records them into
+    // the fixture's `expected.json`, so the printed `Net R:` and the saved golden
+    // are the same computation.
+    let rendered = report::render(
+        &plan,
+        &replay,
+        simulate,
+        args.verbose,
+        replay_sentiment.as_ref(),
+        &mark_cfg,
     );
+    print!("{}", rendered.text);
 
     if annotate {
         let mcp = match &args.tv_mcp_root {
@@ -335,7 +335,7 @@ async fn run() -> Result<()> {
             end,
             message: args.message.clone(),
         };
-        let expected = ReplayOutcome::compute(&plan, &replay, simulate);
+        let expected = ReplayOutcome::compute(&plan, &replay, simulate, Some(&rendered.economics));
         let dir = fixtures_dir(&args).join(name);
         fixture::save(&dir, &plan, &candles, &meta, &expected)?;
         tracing::info!(dir = %dir.display(), "saved fixture");
@@ -514,21 +514,19 @@ async fn run_test_mode(args: &Args) -> Result<()> {
     // Market-hours blackout is read from the baked mask keyed on the instrument
     // (`core::intent::market_hours_blocked`) inside `sweep_reason`, so nothing to
     // pass here. Fixtures keep their saved verdict.
-    print!(
-        "{}",
-        report::render(
-            &inputs.plan,
-            &replay,
-            args.simulate,
-            args.verbose,
-            None,
-            &mark_cfg,
-        )
-        .text
+    let rendered = report::render(
+        &inputs.plan,
+        &replay,
+        args.simulate,
+        args.verbose,
+        None,
+        &mark_cfg,
     );
+    print!("{}", rendered.text);
+    let economics = Some(&rendered.economics);
 
     if args.check {
-        let computed = ReplayOutcome::compute(&inputs.plan, &replay, args.simulate);
+        let computed = ReplayOutcome::compute(&inputs.plan, &replay, args.simulate, economics);
         let expected = fixture::load_expected(&dir)?;
         if computed != expected {
             return Err(diff_error(&expected, &computed));
@@ -537,7 +535,7 @@ async fn run_test_mode(args: &Args) -> Result<()> {
     }
 
     if args.rebless {
-        let computed = ReplayOutcome::compute(&inputs.plan, &replay, args.simulate);
+        let computed = ReplayOutcome::compute(&inputs.plan, &replay, args.simulate, economics);
         fixture::save_expected(&dir, &computed)?;
         tracing::info!(dir = %dir.display(), "re-blessed expected.json from frozen inputs");
     }

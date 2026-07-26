@@ -9,26 +9,35 @@
 //! plan.json      — the TradePlan (input)
 //! candles.json   — the pulled window, frozen so the fixture needs no broker
 //! meta.json      — resolved scalars (instrument, granularity, source, window)
-//! expected.json  — the golden ReplayOutcome snapshot
+//! expected.json  — the golden ReplayOutcome snapshot: fires + what it EARNED
 //! ```
 //!
 //! The snapshot schema ([`ReplayOutcome`]) is owned here, not in the engine — it
-//! captures exactly what the test should assert (each fire's decision and its
-//! simulated fill), independent of `report.rs`'s human-facing text.
+//! captures exactly what the test should assert (each fire's decision, its
+//! simulated fill, and the run's economics), independent of `report.rs`'s
+//! human-facing text.
 //!
 //! ## Two fill paths — mind the gap
 //!
-//! The per-fire `fill` recorded here still comes from [`fill_for`] →
-//! `fill_sim::simulate_fill`, an independent re-simulation. The **report** reads
-//! the `ReplayBroker` held ledger (`fire.realized`) instead. These are not the
-//! same computation, and `simulate_fill` has **no reversal- or expiry-close
-//! awareness** — so `fires[].fill` cannot represent either outcome.
+//! `ReplayOutcome` carries **two** views of what happened, from two different
+//! computations. Know which one you're reading:
 //!
-//! The *economics* half of the divergence is closed: both consumers now book
-//! through [`super::economics::ReplayEconomics`], so the printed Net R and the
-//! saved golden agree. `fires[].fill` is next — see commit 2 in
-//! `SCOPING-fixture-corpus.md`, which moves it onto `fire.realized` too. Until
-//! then, do not treat `fill` as authoritative for a reversal/expiry close.
+//! - **`outcome`** ([`ReplayEconomics`]) — net R, counts, and per-position legs,
+//!   booked by `report::render` off the `ReplayBroker` held ledger
+//!   (`fire.realized`). **This is the authoritative economic result**, and it is
+//!   the same value the report prints, passed in rather than recomputed.
+//! - **`fires[].fill`** — a per-fire [`FillOutcome`] from [`fill_for`] →
+//!   `fill_sim::simulate_fill`, an *independent re-simulation*. It has **no
+//!   reversal- or expiry-close awareness**, so it cannot represent either
+//!   outcome: a position the ledger flattened on a reversal shows here as
+//!   whatever its bracket would have done on its own.
+//!
+//! So for a reversal/expiry close, `outcome.legs` is right and `fires[].fill`
+//! is misleading. `fill` is retained because it pins the *bracket* physics
+//! (where a resting order would fill, sweep, or never trigger) independently of
+//! the ledger — a genuine second opinion on entry mechanics. Collapsing it onto
+//! `fire.realized` too would lose that; if it ever moves, the reversal/expiry
+//! blindness is the reason, not a cosmetic cleanup.
 
 use std::fs;
 use std::path::Path;
@@ -40,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use trade_control_core::intent::{Action, Shell};
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan};
 
+use super::economics::ReplayEconomics;
 use super::replay::{Fire, Replay};
 use trade_control_cli::replay_args::CandleSource;
 
@@ -77,6 +87,22 @@ pub struct ReplayOutcome {
     /// The terminal spine phase (serde snake_case, e.g. `done` / `await_entry`).
     pub final_phase: trade_control_engine::Phase,
     pub warnings: Vec<String>,
+    /// What the run **earned**: net R, outcome counts, and the per-position legs.
+    ///
+    /// This is the number batch analysis actually wants — a 6-cell entry-rule ×
+    /// news grid is six of these — and it hardens `--check`: before this field
+    /// existed, a regression could silently halve Net R while firing exactly the
+    /// same rules and still pass the golden gate.
+    ///
+    /// Booked by `report::render` (see [`ReplayEconomics`]), so the printed
+    /// `Net R:` line and this field are the same computation, not two.
+    ///
+    /// `None` when the run had `--simulate` off — nothing was booked, matching
+    /// the report, which prints no summary in that mode. `#[serde(default)]` so
+    /// fixtures saved before this field existed still load; they read as `None`
+    /// until re-blessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ReplayEconomics>,
 }
 
 /// One fired intent's decision: which rule, what action, on which bar — plus the
@@ -204,7 +230,17 @@ pub fn fill_for(plan: &TradePlan, fire: &Fire, simulate: bool) -> Option<SimOutc
 impl ReplayOutcome {
     /// Build the golden snapshot from a completed [`Replay`]. `simulate` mirrors
     /// the run's `--simulate` flag (off → fills are `None`, matching the report).
-    pub fn compute(plan: &TradePlan, replay: &Replay, simulate: bool) -> Self {
+    ///
+    /// `economics` is what `report::render` booked for this same replay. It is
+    /// **passed in rather than recomputed** on purpose: booking it twice is how
+    /// the report and the golden diverged in the first place (see the module
+    /// doc). Pass `None` for a non-simulated run.
+    pub fn compute(
+        plan: &TradePlan,
+        replay: &Replay,
+        simulate: bool,
+        economics: Option<&ReplayEconomics>,
+    ) -> Self {
         let fires = replay
             .fires
             .iter()
@@ -222,6 +258,9 @@ impl ReplayOutcome {
             done: replay.done,
             final_phase: replay.final_state.phase,
             warnings: replay.warnings.clone(),
+            // Economics only exist for a simulated run; without `--simulate`
+            // there are no fills to book.
+            outcome: simulate.then(|| economics.cloned()).flatten(),
         }
     }
 }
@@ -374,8 +413,12 @@ mod tests {
             )
             .await;
             // Fixtures are saved from `--simulate` runs (the default), so the
-            // golden outcome carries fills; recompute with simulation on.
-            let computed = ReplayOutcome::compute(&inputs.plan, &replay, true);
+            // golden outcome carries fills AND economics; recompute both the same
+            // way the binary does — render (which books) then snapshot.
+            let rendered =
+                super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
+            let computed =
+                ReplayOutcome::compute(&inputs.plan, &replay, true, Some(&rendered.economics));
 
             assert_eq!(
                 computed,
@@ -478,6 +521,114 @@ mod tests {
         for want in ["CLOSED ON REVERSAL", "CLOSED AT EXPIRY", "EXP: 1"] {
             assert!(text.contains(want), "report must show {want}:\n{text}");
         }
+
+        // And the SNAPSHOT must carry the same economics — this is the half that
+        // `--check` gates on, and the reason a silent Net R regression can no
+        // longer pass while firing identical rules.
+        let snapshot = ReplayOutcome::compute(&inputs.plan, &replay, true, Some(econ));
+        assert_eq!(
+            snapshot.outcome.as_ref(),
+            Some(econ),
+            "the golden snapshot must record the booked economics verbatim"
+        );
+    }
+
+    /// The printed `Net R:` line and the saved `outcome.net_r` are the same
+    /// number, on a real fixture. They were two computations before
+    /// `ReplayEconomics`; this pins them together.
+    #[tokio::test]
+    async fn saved_net_r_matches_the_printed_summary() {
+        let dir = super::fixtures_root().join("uk-100-news-blackout-rentry-close-on-reversal");
+        if !dir.is_dir() {
+            eprintln!("uk-100 fixture missing — skipping");
+            return;
+        }
+        let inputs = load(&dir).expect("load uk-100 fixture");
+        let expires_at = inputs
+            .candles
+            .last()
+            .map(|c| c.time)
+            .unwrap_or_else(Utc::now)
+            + chrono::Duration::days(365);
+        let mark_cfg = DetectorMarkConfig::new(
+            DirectionFilter::None,
+            GoldenFilter::None,
+            inputs.plan.direction,
+        );
+        let replay = super::super::replay::run(
+            &inputs.plan,
+            &inputs.candles,
+            inputs.meta.granularity,
+            inputs.meta.start,
+            expires_at,
+            mark_cfg,
+            &[],
+        )
+        .await;
+        let rendered =
+            super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
+        let snapshot =
+            ReplayOutcome::compute(&inputs.plan, &replay, true, Some(&rendered.economics));
+
+        let net_r = snapshot
+            .outcome
+            .as_ref()
+            .expect("simulated run has economics")
+            .net_r;
+        // The report prints it as `Net R: {:+.2}` — find that exact rendering.
+        let printed = format!("Net R: {net_r:+.2}");
+        assert!(
+            rendered.text.contains(&printed),
+            "saved net_r {net_r} must match the printed summary; looked for {printed:?} in:\n{}",
+            rendered.text
+        );
+    }
+
+    /// With `--simulate` off nothing is booked, so the snapshot carries no
+    /// economics — matching the report, which prints no summary in that mode.
+    #[tokio::test]
+    async fn unsimulated_run_records_no_economics() {
+        let dir = super::fixtures_root().join("uk-100-news-blackout-rentry-close-on-reversal");
+        if !dir.is_dir() {
+            eprintln!("uk-100 fixture missing — skipping");
+            return;
+        }
+        let inputs = load(&dir).expect("load uk-100 fixture");
+        let expires_at = inputs
+            .candles
+            .last()
+            .map(|c| c.time)
+            .unwrap_or_else(Utc::now)
+            + chrono::Duration::days(365);
+        let mark_cfg = DetectorMarkConfig::new(
+            DirectionFilter::None,
+            GoldenFilter::None,
+            inputs.plan.direction,
+        );
+        let replay = super::super::replay::run(
+            &inputs.plan,
+            &inputs.candles,
+            inputs.meta.granularity,
+            inputs.meta.start,
+            expires_at,
+            mark_cfg,
+            &[],
+        )
+        .await;
+        let rendered =
+            super::super::report::render(&inputs.plan, &replay, false, false, None, &mark_cfg);
+        let snapshot =
+            ReplayOutcome::compute(&inputs.plan, &replay, false, Some(&rendered.economics));
+        assert!(
+            snapshot.outcome.is_none(),
+            "an unsimulated run must record no economics: {:?}",
+            snapshot.outcome
+        );
+        assert!(
+            !rendered.text.contains("Net R:"),
+            "an unsimulated report must print no summary:\n{}",
+            rendered.text
+        );
     }
 
     fn sample_meta() -> FixtureMeta {
@@ -509,7 +660,51 @@ mod tests {
             done: true,
             final_phase: trade_control_engine::Phase::Done,
             warnings: vec!["a warning".into()],
+            outcome: Some(ReplayEconomics {
+                net_r: 1.0,
+                tp_hits: 1,
+                legs: vec![super::super::economics::Leg {
+                    entry_time: Utc.with_ymd_and_hms(2026, 6, 18, 13, 0, 0).unwrap(),
+                    entry_price: 1.2300,
+                    stop_loss: 1.2200,
+                    take_profit: 1.2400,
+                    exit_time: Some(Utc.with_ymd_and_hms(2026, 6, 18, 18, 0, 0).unwrap()),
+                    exit_price: Some(1.2400),
+                    exit_reason: super::super::economics::ExitReason::TookProfit,
+                    r: 1.0,
+                }],
+                ..ReplayEconomics::new()
+            }),
         }
+    }
+
+    /// A fixture saved before `outcome` existed (no such key) still loads, with
+    /// `outcome: None` — so adding the field didn't invalidate the corpus.
+    #[test]
+    fn expected_without_outcome_still_loads() {
+        let legacy = r#"{
+            "fires": [],
+            "done": true,
+            "final_phase": "done",
+            "warnings": []
+        }"#;
+        let loaded: ReplayOutcome = serde_json::from_str(legacy).unwrap();
+        assert!(loaded.outcome.is_none());
+    }
+
+    /// A no-economics snapshot omits the key entirely, keeping unsimulated
+    /// fixtures byte-identical to their pre-field form.
+    #[test]
+    fn no_outcome_omits_the_key() {
+        let outcome = ReplayOutcome {
+            outcome: None,
+            ..sample_outcome()
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(
+            !json.contains("outcome"),
+            "a None outcome must omit the key: {json}"
+        );
     }
 
     /// Every `SimOutcome` variant maps to its `FillOutcome` twin (the report and

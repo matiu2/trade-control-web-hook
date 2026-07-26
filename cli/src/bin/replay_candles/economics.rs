@@ -129,10 +129,8 @@ pub struct ReplayEconomics {
     /// Positions still open when the window ended (0R, not scored either way).
     #[serde(default)]
     pub open_at_end: usize,
-    /// A $100k account compounding at 1% risk per taken trade.
-    pub account: f64,
     /// Per-position breakdown, in **fire order** (the order they were booked,
-    /// which is the order the account compounded in).
+    /// which is the order the account compounds in).
     #[serde(default)]
     pub legs: Vec<Leg>,
 }
@@ -146,7 +144,6 @@ impl Default for ReplayEconomics {
             reversal_closes: 0,
             expiry_closes: 0,
             open_at_end: 0,
-            account: START_ACCOUNT,
             legs: Vec::new(),
         }
     }
@@ -155,6 +152,23 @@ impl Default for ReplayEconomics {
 impl ReplayEconomics {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The $100k account compounded at 1% risk per taken trade, in leg order.
+    ///
+    /// **Derived, deliberately not stored.** It's a chain of multiply-accumulates
+    /// (`acct += 0.01 · acct · R`) whose low bits depend on floating-point
+    /// operation order, so two builds of the same code can land on
+    /// `100337.04422788607` vs `...609`. `ReplayOutcome` equality is exact float
+    /// comparison, so storing it made the golden fixture gate **flaky** — the
+    /// test binary and the release binary disagreed in the last two digits.
+    ///
+    /// `net_r` is a plain sum and is bit-stable, so the legs plus `net_r` are the
+    /// durable record; this is a presentation of them, recomputed on demand.
+    pub fn account(&self) -> f64 {
+        self.legs.iter().fold(START_ACCOUNT, |acct, leg| {
+            acct + RISK_FRACTION * acct * leg.r
+        })
     }
 
     /// Book one resolved fire. Not-taken outcomes are ignored (they have no
@@ -182,7 +196,6 @@ impl ReplayEconomics {
             .map(|e| realized_r(result.entry_price, result.stop_loss, e))
             .unwrap_or(0.0);
         self.net_r += r;
-        self.account += RISK_FRACTION * self.account * r;
 
         self.legs.push(Leg {
             entry_time: result.fill_at,
@@ -199,7 +212,7 @@ impl ReplayEconomics {
 
     /// Dollar P&L against the starting balance.
     pub fn profit(&self) -> f64 {
-        self.account - START_ACCOUNT
+        self.account() - START_ACCOUNT
     }
 
     /// The trailing summary segment: net R and the compounded $100k-account P&L.
@@ -207,7 +220,7 @@ impl ReplayEconomics {
         format!(
             "  |  Net R: {:+.2}  |  $100k acct (1%/trade): ${:.0} ({:+.0})",
             self.net_r,
-            self.account,
+            self.account(),
             self.profit()
         )
     }
@@ -267,7 +280,7 @@ mod tests {
         e.book(&long_fire(FillKind::StoppedOut, Some(1.09)));
         assert_eq!(e.sl_hits, 1);
         assert!((e.net_r + 1.0).abs() < 1e-9, "net_r was {}", e.net_r);
-        assert!(e.account < START_ACCOUNT);
+        assert!(e.account() < START_ACCOUNT);
     }
 
     /// A short mirrors without a direction branch: entry 1.10, stop 1.11
@@ -309,7 +322,7 @@ mod tests {
         assert_eq!(e.tp_hits, 0);
         assert_eq!(e.sl_hits, 0);
         assert_eq!(e.net_r, 0.0);
-        assert_eq!(e.account, START_ACCOUNT);
+        assert_eq!(e.account(), START_ACCOUNT);
         let leg = &e.legs[0];
         assert_eq!(leg.exit_reason, ExitReason::OpenAtWindowEnd);
         assert!(leg.exit_time.is_none());
@@ -329,7 +342,7 @@ mod tests {
         }
         assert!(e.legs.is_empty());
         assert_eq!(e.net_r, 0.0);
-        assert_eq!(e.account, START_ACCOUNT);
+        assert_eq!(e.account(), START_ACCOUNT);
     }
 
     /// A break-even scratch exits at the entry price: 0R, but it IS a stop-out.
@@ -339,7 +352,7 @@ mod tests {
         e.book(&long_fire(FillKind::StoppedOut, Some(1.10)));
         assert_eq!(e.sl_hits, 1);
         assert_eq!(e.net_r, 0.0);
-        assert_eq!(e.account, START_ACCOUNT);
+        assert_eq!(e.account(), START_ACCOUNT);
     }
 
     /// A zero-risk bracket (stop at entry) can't divide by zero.
@@ -365,11 +378,19 @@ mod tests {
         let mut e = ReplayEconomics::new();
         // +2R risking 1% of 100,000 → +$2,000 → 102,000.
         e.book(&long_fire(FillKind::TookProfit, Some(1.12)));
-        assert!((e.account - 102_000.0).abs() < 1e-6, "got {}", e.account);
+        assert!(
+            (e.account() - 102_000.0).abs() < 1e-6,
+            "got {}",
+            e.account()
+        );
         // −1R now risks 1% of 102,000 → −$1,020 → 100,980. A flat account would
         // have booked −$1,000; compounding off the running balance is the point.
         e.book(&long_fire(FillKind::StoppedOut, Some(1.09)));
-        assert!((e.account - 100_980.0).abs() < 1e-6, "got {}", e.account);
+        assert!(
+            (e.account() - 100_980.0).abs() < 1e-6,
+            "got {}",
+            e.account()
+        );
         assert!((e.net_r - 1.0).abs() < 1e-9);
         assert!((e.profit() - 980.0).abs() < 1e-6);
     }
@@ -397,7 +418,7 @@ mod tests {
         loss_first.book(&win); // +2% of 99,000 → 100,980
 
         assert!((win_first.net_r - loss_first.net_r).abs() < 1e-9);
-        assert!((win_first.account - loss_first.account).abs() < 1e-6);
+        assert!((win_first.account() - loss_first.account()).abs() < 1e-6);
         // The intermediate legs differ, though: −$1,020 booked after the win vs
         // −$1,000 booked first.
         assert!((win_first.legs[1].r + 1.0).abs() < 1e-9);

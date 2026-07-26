@@ -240,9 +240,6 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
 /// printed Net R and the saved golden can never disagree.
 pub struct Rendered {
     pub text: String,
-    // TODO(commit 2, SCOPING-fixture-corpus.md §4.1): serialize this into
-    // `expected.json` as its `outcome` block. Read by the fixture tests today,
-    // which is why this is dead code in the non-test build for now.
     pub economics: ReplayEconomics,
 }
 
@@ -831,11 +828,12 @@ fn bar_close(forward: &[EngineCandle], at: DateTime<Utc>) -> Option<f64> {
 /// An empty string means the fire booked no position — a not-taken outcome, or
 /// a bracket that never resolved.
 fn book_r(economics: &mut ReplayEconomics, result: &FireResult) -> String {
-    let before = economics.account;
+    let before = economics.account();
     let Some(leg) = economics.book(result) else {
         return String::new();
     };
-    let (r, after) = (leg.r, economics.account);
+    let r = leg.r;
+    let after = economics.account();
     format!(
         "  (R: {r:+.2}  |  $100k acct (1% risk): {:+.0} → ${after:.0})",
         after - before,
@@ -1054,7 +1052,7 @@ mod tests {
         );
         assert!(frag.is_empty());
         assert_eq!(e.net_r, 0.0);
-        assert_eq!(e.account, 100_000.0);
+        assert_eq!(e.account(), 100_000.0);
     }
 
     #[test]
@@ -1075,7 +1073,7 @@ mod tests {
             },
         );
         assert!((e.net_r - 1.0).abs() < 1e-9);
-        assert!((e.account - 101_000.0).abs() < 1e-6);
+        assert!((e.account() - 101_000.0).abs() < 1e-6);
         assert!(frag.contains("R: +1.00"), "got: {frag}");
         assert!(frag.contains("$101000"), "got: {frag}");
     }
