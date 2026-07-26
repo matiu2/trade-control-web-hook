@@ -164,6 +164,7 @@ absence means the process died in a way nobody handled. Failures report
 /// binary and `tv-arm ... replay`.
 #[derive(Parser, Debug)]
 #[command(name = "replay-candles")]
+#[command(version = env!("GIT_VERSION"))]
 #[command(about = "Replay a candle window through the engine's decision logic, offline")]
 #[command(after_long_help = EXIT_CODE_HELP)]
 pub struct ReplayArgs {
@@ -302,6 +303,50 @@ pub struct ReplayArgs {
     /// alongside `--save`; ignored otherwise.
     #[arg(long, value_name = "TEXT", requires = "save")]
     pub message: Option<String>,
+
+    /// Which entry rule the plan was armed with, recorded into the saved fixture's
+    /// `meta.json` as the grid's **column** axis: `normal` / `skip-bcr` /
+    /// `strategy-v2` (any other value is stored verbatim). Passed through by
+    /// `tv-arm … replay --save`, which knows its own flags; a fixture saved
+    /// without it reads as `normal`.
+    #[arg(long, value_name = "RULE", requires = "save")]
+    pub arm_entry_rule: Option<String>,
+
+    /// Record that the plan was armed with `--skip-calendar-bars` (news windows
+    /// suppressed) — the grid's **row** axis.
+    ///
+    /// Must be passed explicitly because it is **not inferable** from the saved
+    /// plan: a plan with no pause rules could equally mean "the calendar ran and
+    /// found no events in the window" or "the calendar was skipped".
+    #[arg(long, requires = "save")]
+    pub arm_skip_calendar_bars: bool,
+
+    /// Record that the plan was armed with `--skip-golden`.
+    #[arg(long, requires = "save")]
+    pub arm_skip_golden: bool,
+
+    /// The `--start` cursor as typed at arm time, stored verbatim so the exact
+    /// spelling round-trips for a later re-arm.
+    #[arg(long, value_name = "TS", requires = "save")]
+    pub arm_start: Option<String>,
+
+    /// The **broker-qualified** TradingView symbol the geometry was read from,
+    /// e.g. `TRADENATION:EURUSD`. Record it qualified: a bare `EURUSD` silently
+    /// resolves to the OANDA feed, so an unqualified capture can be off the wrong
+    /// price data and produce a plausible-but-wrong number.
+    #[arg(long, value_name = "SYMBOL", requires = "save")]
+    pub arm_chart_symbol: Option<String>,
+
+    /// `git describe` of the tv-arm build that armed the plan. (The engine version
+    /// is stamped automatically from this binary's own build.)
+    #[arg(long, value_name = "VERSION", requires = "save")]
+    pub arm_tv_arm_version: Option<String>,
+
+    /// A pointer back to the journal page this fixture documents, e.g.
+    /// `trade-124`. Makes the corpus cross-referenceable with the journal in both
+    /// directions — and "which pages still lack a fixture?" answerable.
+    #[arg(long, value_name = "REF", requires = "save")]
+    pub trade_ref: Option<String>,
 
     /// Replay a saved fixture **offline**: load plan + candles + meta from
     /// `<fixtures-dir>/<--fixture>/` instead of pulling from the broker (no

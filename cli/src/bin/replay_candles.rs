@@ -39,6 +39,7 @@
 
 mod replay_candles {
     pub mod annotate;
+    pub mod arm_record;
     pub mod brisbane;
     pub mod candles;
     pub mod economics;
@@ -67,6 +68,7 @@ use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
+use replay_candles::arm_record;
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::tv::TvDefaults;
 use replay_candles::{
@@ -334,6 +336,7 @@ async fn run() -> Result<()> {
             start,
             end,
             message: args.message.clone(),
+            arm: Some(arm_record(&args)),
         };
         let expected = ReplayOutcome::compute(&plan, &replay, simulate, Some(&rendered.economics));
         let dir = fixtures_dir(&args).join(name);
@@ -342,6 +345,31 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Build the saved fixture's arming provenance from the `--arm-*` flags plus what
+/// this binary knows about itself.
+///
+/// `engine_version` is stamped from **our own** build (`GIT_VERSION`, a `git
+/// describe --tags --dirty`) rather than passed in — it's the version that
+/// produced the outcome, so the binary computing it is the only honest source.
+/// `tv_arm_version` has to be passed, since that's a different binary.
+///
+/// An unrecognised `--arm-entry-rule` is preserved verbatim (`EntryRule::Other`)
+/// rather than coerced to `normal`: a future strategy flag should show up as
+/// itself in the corpus, not silently masquerade as the default.
+fn arm_record(args: &Args) -> arm_record::ArmRecord {
+    arm_record::ArmRecord {
+        entry_rule: arm_record::EntryRule::parse(args.arm_entry_rule.as_deref()),
+        skip_calendar_bars: args.arm_skip_calendar_bars,
+        skip_golden: args.arm_skip_golden,
+        start: args.arm_start.clone(),
+        broker: Some(args.source.as_str().to_string()),
+        chart_symbol: args.arm_chart_symbol.clone(),
+        tv_arm_version: args.arm_tv_arm_version.clone(),
+        engine_version: Some(env!("GIT_VERSION").to_string()),
+        journal_ref: args.trade_ref.clone(),
+    }
 }
 
 /// Max look-back back-off attempts before we give up widening the warm-up pull.
@@ -953,6 +981,13 @@ mod tests {
             candle_detector_golden: GoldenFilter::Golden,
             annotate: false,
             annotate_unfilled: false,
+            arm_entry_rule: None,
+            arm_skip_calendar_bars: false,
+            arm_skip_golden: false,
+            arm_start: None,
+            arm_chart_symbol: None,
+            arm_tv_arm_version: None,
+            trade_ref: None,
             warmup_bars: 200,
             cache_dir: None,
             print_completions: false,

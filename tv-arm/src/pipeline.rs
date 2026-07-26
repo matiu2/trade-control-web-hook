@@ -451,11 +451,25 @@ pub fn run(args: Args) -> Result<i32> {
     //    path for the `replay` subcommand). The replay is a post-build
     //    convenience: a failure here surfaces as an error.
     if args.replay() {
+        // Forward what this arm knew about itself, so a chained `--save` records
+        // WHICH variant the fixture froze. `state.symbol` is the broker-qualified
+        // chart symbol (`TRADENATION:EURUSD`) — recorded qualified on purpose: a
+        // bare symbol silently resolves to the OANDA feed, so an unqualified
+        // capture can be off the wrong price data and look perfectly plausible.
+        let arm = crate::replay::ArmContext {
+            skip_bcr: args.skip_bcr,
+            strategy_v2: args.strategy_v2,
+            skip_calendar_bars: args.skip_calendar_bars,
+            skip_golden: args.skip_golden,
+            start: args.start.as_deref(),
+            chart_symbol: Some(&state.symbol),
+        };
         crate::replay::run_replay(
             effective_plan_out.as_deref(),
             &trade_id,
             broker,
             args.replay_args(),
+            arm,
         )
         .wrap_err("replay after arm (--replay)")?;
     }

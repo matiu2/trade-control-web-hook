@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use trade_control_core::intent::{Action, Shell};
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan};
 
+use super::arm_record::ArmRecord;
 use super::economics::ReplayEconomics;
 use super::replay::{Fire, Replay};
 use trade_control_cli::replay_args::CandleSource;
@@ -74,6 +75,15 @@ pub struct FixtureMeta {
     /// (and older fixtures load fine) when no message was given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// **Which arming variant this fixture froze** — entry rule, calendar flag,
+    /// versions, journal ref. See [`ArmRecord`].
+    ///
+    /// A fixture captures one flag combination; without this, six variants of the
+    /// same trade are indistinguishable on disk except by filename. Journalling
+    /// and grouping only — never read back into the replay. Omitted when the save
+    /// carried no arm information (and pre-field fixtures load as `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm: Option<ArmRecord>,
 }
 
 /// The golden snapshot of a replay: every fire's decision plus its simulated
@@ -639,6 +649,7 @@ mod tests {
             start: Utc.with_ymd_and_hms(2026, 6, 18, 11, 0, 0).unwrap(),
             end: Utc.with_ymd_and_hms(2026, 6, 18, 23, 0, 0).unwrap(),
             message: None,
+            arm: None,
         }
     }
 
@@ -751,6 +762,58 @@ mod tests {
         let json = serde_json::to_string_pretty(&outcome).unwrap();
         let back: ReplayOutcome = serde_json::from_str(&json).unwrap();
         assert_eq!(outcome, back);
+    }
+
+    /// The arm block survives a full `meta.json` round-trip, and the grouping key
+    /// a batch tool needs comes back intact. This is the 4.2 deliverable: six
+    /// variants of one trade are now distinguishable **from data**, not filenames.
+    #[test]
+    fn meta_arm_block_round_trips_with_its_cell_key() {
+        use super::super::arm_record::{ArmRecord, EntryRule};
+        let meta = FixtureMeta {
+            arm: Some(ArmRecord {
+                entry_rule: EntryRule::SkipBcr,
+                skip_calendar_bars: true,
+                skip_golden: false,
+                start: Some("2026-07-17T17:00:00+10:00".into()),
+                broker: Some("tradenation".into()),
+                chart_symbol: Some("TRADENATION:EURUSD".into()),
+                tv_arm_version: Some("v116-1-gabc".into()),
+                engine_version: Some("v116-1-gabc".into()),
+                journal_ref: Some("trade-124".into()),
+            }),
+            ..sample_meta()
+        };
+        let back: FixtureMeta =
+            serde_json::from_str(&serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+        assert_eq!(meta, back);
+        let arm = back.arm.expect("arm block present");
+        assert_eq!(arm.cell_key(), "skip-bcr/news-off");
+        // The qualified chart symbol is what makes a wrong-feed capture findable.
+        assert_eq!(arm.chart_symbol.as_deref(), Some("TRADENATION:EURUSD"));
+        // engine_version is what flags numbers that predate an engine fix.
+        assert!(arm.engine_version.is_some());
+    }
+
+    /// A fixture saved before the `arm` field existed still loads (as `None`), so
+    /// adding it didn't invalidate the corpus.
+    #[test]
+    fn meta_without_arm_still_loads() {
+        let legacy = r#"{
+            "instrument": "EUR_USD",
+            "granularity": "h1",
+            "source": "tradenation",
+            "start": "2026-06-18T11:00:00Z",
+            "end": "2026-06-18T23:00:00Z"
+        }"#;
+        let loaded: FixtureMeta = serde_json::from_str(legacy).unwrap();
+        assert!(loaded.arm.is_none());
+        // And a no-arm meta omits the key entirely.
+        let json = serde_json::to_string(&sample_meta()).unwrap();
+        assert!(
+            !json.contains("arm"),
+            "no-arm meta must omit the key: {json}"
+        );
     }
 
     /// `save` then `load` reproduces the inputs; `load_expected` reproduces the
