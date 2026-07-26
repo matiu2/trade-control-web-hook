@@ -98,6 +98,14 @@ fn default_fixtures_dir() -> PathBuf {
 /// See `replay_candles::outcome`.
 #[tokio::main]
 async fn main() {
+    // `--json` owns stdout: the failure line below would append trailing text to
+    // the JSON document and make it unparseable, which is the *same* ambiguity
+    // this machinery exists to remove — a driver that can't parse the output is
+    // back to guessing. Under `--json` the failure is already reported IN the
+    // JSON (`ok: false` + `error` per row, `failed` in the roll-up), so the text
+    // line is redundant as well as harmful. Sniffed from raw argv because a
+    // failure can predate the clap parse.
+    let json_mode = std::env::args().any(|a| a == "--json");
     match run().await {
         Ok(()) => std::process::exit(outcome::EXIT_OK),
         Err(report) => {
@@ -105,13 +113,15 @@ async fn main() {
             // The human-readable chain first (stderr), then the machine-readable
             // terminal line (stdout, where the summary it mirrors goes).
             eprintln!("Error: {report:?}");
-            println!(
-                "{}",
-                outcome::FailureLine {
-                    kind,
-                    detail: &report.to_string(),
-                }
-            );
+            if !json_mode {
+                println!(
+                    "{}",
+                    outcome::FailureLine {
+                        kind,
+                        detail: &report.to_string(),
+                    }
+                );
+            }
             std::process::exit(kind.exit_code());
         }
     }
@@ -586,11 +596,24 @@ async fn run_test_mode_batch(args: &Args, pattern: &str) -> Result<()> {
         );
     }
     if summary.failed > 0 {
+        // Classify from the ROWS, not from this wrapper's own wording. A batch can
+        // fail for either reason — a corrupt/missing fixture is bad input (fix it),
+        // an unreachable resource is infrastructure (retry it) — and
+        // `FailureKind::classify` walks the error chain, which by the time it gets
+        // here only contains this summary sentence. So fold every row's reason into
+        // the message: any bad-input marker present makes the whole batch bad-input,
+        // which is right, because retrying verbatim cannot fix a corrupt fixture.
+        let reasons = summary
+            .results
+            .iter()
+            .filter_map(|r| r.error.as_deref())
+            .collect::<Vec<_>>()
+            .join(" | ");
         return Err(eyre!(
-            "{} of {} fixture(s) failed — see the rows above (net R {:+.2} excludes them)",
+            "{} of {} fixture(s) failed — see the rows above (net R {:+.2} excludes them): {reasons}",
             summary.failed,
             summary.matched,
-            summary.net_r
+            summary.net_r,
         ));
     }
     Ok(())

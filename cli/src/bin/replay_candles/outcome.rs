@@ -81,7 +81,7 @@ impl FailureKind {
     pub fn classify_text(haystack: &str) -> Self {
         // Bad-input phrasings. These are things the operator typed, so no
         // amount of retrying changes them.
-        const BAD_INPUT_MARKERS: [&str; 12] = [
+        const BAD_INPUT_MARKERS: [&str; 15] = [
             "is required",
             "not valid rfc3339",
             "premature end of input",
@@ -94,6 +94,15 @@ impl FailureKind {
             "is ambiguous in brisbane time",
             "does not match the plan",
             "unknown instrument",
+            // A fixture that won't load or parse is bad input, not a flaky
+            // environment: the bytes on disk are corrupt (or absent), so retrying
+            // verbatim fails identically. `fixture::read_json` wraps these as
+            // `parse <path>` / `read <path>`, and a batch folds every failing row's
+            // reason into its summary error so one corrupt fixture in 291 still
+            // classifies the run correctly.
+            "/plan.json",
+            "/candles.json",
+            "/meta.json",
         ];
         if BAD_INPUT_MARKERS.iter().any(|m| haystack.contains(m)) {
             return Self::BadInput;
@@ -151,6 +160,52 @@ mod tests {
                 "{text:?} should be bad input"
             );
         }
+    }
+
+    /// A corrupt or missing fixture is **bad input**, not a flaky environment:
+    /// the bytes on disk are wrong, so retrying verbatim fails identically. These
+    /// are the real wrappings `fixture::read_json` produces.
+    #[test]
+    fn a_corrupt_fixture_is_bad_input_not_infrastructure() {
+        for text in [
+            "parse /repo/replay-fixtures/trade-124/candles.json: expected ident at line 1 column 2",
+            "read /repo/replay-fixtures/trade-999/plan.json: no such file or directory (os error 2)",
+            "parse /repo/replay-fixtures/trade-7/meta.json: missing field `granularity`",
+        ] {
+            assert_eq!(
+                FailureKind::classify_text(&text.to_lowercase()),
+                FailureKind::BadInput,
+                "{text:?} should be bad input — retrying can't fix corrupt bytes"
+            );
+        }
+    }
+
+    /// A BATCH folds every failing row's reason into its summary error, so one
+    /// corrupt fixture among many still classifies the whole run as bad input.
+    /// (Without the fold, the chain would only carry the summary sentence and
+    /// default to `Infrastructure` — costing a pointless retry of 291 fixtures.)
+    #[test]
+    fn a_batch_summary_classifies_from_the_folded_row_reasons() {
+        let folded = "2 of 3 fixture(s) failed — see the rows above (net r +0.35 excludes them): \
+             parse /repo/replay-fixtures/a/candles.json: expected ident | \
+             read /repo/replay-fixtures/b/plan.json: no such file or directory";
+        assert_eq!(
+            FailureKind::classify_text(folded),
+            FailureKind::BadInput,
+            "a batch of corrupt fixtures must not read as retryable"
+        );
+    }
+
+    /// But a batch whose rows failed for an *environmental* reason stays
+    /// retryable — the fold must not blanket-classify everything as bad input.
+    #[test]
+    fn a_batch_of_infra_failures_stays_retryable() {
+        let folded = "1 of 3 fixture(s) failed — see the rows above: \
+             storage error: pool timed out while waiting for an open connection";
+        assert_eq!(
+            FailureKind::classify_text(folded),
+            FailureKind::Infrastructure
+        );
     }
 
     #[test]
