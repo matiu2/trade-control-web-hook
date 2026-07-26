@@ -175,6 +175,18 @@ fn capture_trade_expiry_anchor(template: &Value) -> Result<()> {
 /// instrument with a live trade-expiry anchor, suggest the anchor
 /// itself. Otherwise fall back to the legacy `8h` relative default.
 fn not_after_default(template: &Value, now: DateTime<Utc>) -> String {
+    not_after_default_in(template, now, None)
+}
+
+/// [`not_after_default`] against an explicit expiry root. `None` resolves the
+/// real one; tests pass a tempdir so they need no `$XDG_CONFIG_HOME` override
+/// (which was process-wide, `unsafe`, and the source of a ~5-10% flake — see
+/// `expiry::load_in`).
+fn not_after_default_in(
+    template: &Value,
+    now: DateTime<Utc>,
+    expiry_root: Option<&std::path::Path>,
+) -> String {
     let action = read_action(template);
     let uses_anchor = matches!(
         action,
@@ -182,22 +194,44 @@ fn not_after_default(template: &Value, now: DateTime<Utc>) -> String {
     );
     if uses_anchor
         && let Some(instrument) = template.get("instrument").and_then(|v| v.as_str())
-        && let Some(anchor) = expiry::load(instrument, now)
+        && let Some(anchor) = load_anchor(expiry_root, instrument, now)
     {
         return anchor.to_rfc3339();
     }
     "8h".into()
 }
 
+/// `expiry::load` (real root) or `expiry::load_in` (explicit root).
+fn load_anchor(
+    root: Option<&std::path::Path>,
+    instrument: &str,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    match root {
+        Some(r) => expiry::load_in(r, instrument, now),
+        None => expiry::load(instrument, now),
+    }
+}
+
 /// Default `ttl_hours` suggestion. For prep/veto on an instrument
 /// with a live trade-expiry anchor, suggest the hour-count between
 /// now and the anchor (rounded up). Otherwise fall back to `4`.
 fn ttl_hours_default(template: &Value, now: DateTime<Utc>) -> u32 {
+    ttl_hours_default_in(template, now, None)
+}
+
+/// [`ttl_hours_default`] against an explicit expiry root. See
+/// [`not_after_default_in`].
+fn ttl_hours_default_in(
+    template: &Value,
+    now: DateTime<Utc>,
+    expiry_root: Option<&std::path::Path>,
+) -> u32 {
     let action = read_action(template);
     let uses_anchor = matches!(action, Some(Action::Prep) | Some(Action::Veto));
     if uses_anchor
         && let Some(instrument) = template.get("instrument").and_then(|v| v.as_str())
-        && let Some(anchor) = expiry::load(instrument, now)
+        && let Some(anchor) = load_anchor(expiry_root, instrument, now)
     {
         let mins = (anchor - now).num_minutes().max(0);
         // Round up to the next whole hour so the TTL never expires
@@ -1088,30 +1122,23 @@ mod tests {
         }
     }
 
-    /// Mutex shared with `expiry` tests: any test that pokes
-    /// `$XDG_CONFIG_HOME` has to serialize. Distinct from the `expiry`
-    /// module's own guard because that one is private; the duplication
-    /// is fine — both write to the same env var.
-    static EXPIRY_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn isolated_xdg(tag: &str) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
-        let guard = EXPIRY_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = std::env::temp_dir().join(format!(
-            "trade-control-interactive-test-{}-{tag}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // SAFETY: serialized via EXPIRY_TEST_GUARD.
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", &dir);
-        }
-        (dir, guard)
+    /// A private expiry root per test — no `$XDG_CONFIG_HOME` override, no mutex.
+    ///
+    /// The removed `isolated_xdg` helper did `unsafe set_var("XDG_CONFIG_HOME")`
+    /// behind a mutex whose doc-comment claimed it was "shared with `expiry`
+    /// tests … the duplication is fine". It was NOT shared: `expiry.rs` had its
+    /// own separate mutex, and two different mutexes over one process-wide
+    /// variable give zero mutual exclusion. That is what made
+    /// `expiry::tests::instrument_name_is_uppercased` fail ~5-10% of full-suite
+    /// runs — whichever module won the `set_var` race decided where the *other*
+    /// module's tests looked for their anchors.
+    fn expiry_dir() -> tempfile::TempDir {
+        tempfile::TempDir::new().unwrap()
     }
 
     #[test]
     fn not_after_default_falls_back_to_8h_without_anchor() {
-        let (_root, _g) = isolated_xdg("not-after-fallback");
+        let dir = expiry_dir();
         let yaml = "
             v: 1
             action: prep
@@ -1119,30 +1146,30 @@ mod tests {
         ";
         let template: Value = serde_yaml::from_str(yaml).unwrap();
         let now: chrono::DateTime<chrono::Utc> = "2026-05-19T10:00:00Z".parse().unwrap();
-        assert_eq!(not_after_default(&template, now), "8h");
+        assert_eq!(not_after_default_in(&template, now, Some(dir.path())), "8h");
     }
 
     #[test]
     fn not_after_default_uses_anchor_for_prep_veto_enter() {
-        let (_root, _g) = isolated_xdg("not-after-anchor");
+        let dir = expiry_dir();
         let now: chrono::DateTime<chrono::Utc> = "2026-05-19T10:00:00Z".parse().unwrap();
         let anchor: chrono::DateTime<chrono::Utc> = "2026-05-22T14:00:00Z".parse().unwrap();
-        expiry::save("GBPJPY", anchor).unwrap();
+        expiry::save_in(dir.path(), "GBPJPY", anchor).unwrap();
 
         for action in ["prep", "veto", "enter"] {
             let yaml = format!("v: 1\naction: {action}\ninstrument: GBPJPY\n");
             let template: Value = serde_yaml::from_str(&yaml).unwrap();
-            let suggested = not_after_default(&template, now);
+            let suggested = not_after_default_in(&template, now, Some(dir.path()));
             assert_eq!(suggested, anchor.to_rfc3339(), "action={action}");
         }
     }
 
     #[test]
     fn not_after_default_ignores_anchor_for_other_actions() {
-        let (_root, _g) = isolated_xdg("not-after-other-actions");
+        let dir = expiry_dir();
         let now: chrono::DateTime<chrono::Utc> = "2026-05-19T10:00:00Z".parse().unwrap();
         let anchor: chrono::DateTime<chrono::Utc> = "2026-05-22T14:00:00Z".parse().unwrap();
-        expiry::save("EURUSD", anchor).unwrap();
+        expiry::save_in(dir.path(), "EURUSD", anchor).unwrap();
 
         // `invalidate`, `close`, `status`, `unlock`, `clear-prep`,
         // `clear-veto` shouldn't inherit the anchor — they're not part
@@ -1157,40 +1184,44 @@ mod tests {
         ] {
             let yaml = format!("v: 1\naction: {action}\ninstrument: EURUSD\n");
             let template: Value = serde_yaml::from_str(&yaml).unwrap();
-            assert_eq!(not_after_default(&template, now), "8h", "action={action}");
+            assert_eq!(
+                not_after_default_in(&template, now, Some(dir.path())),
+                "8h",
+                "action={action}"
+            );
         }
     }
 
     #[test]
     fn ttl_hours_default_falls_back_to_4() {
-        let (_root, _g) = isolated_xdg("ttl-fallback");
+        let dir = expiry_dir();
         let yaml = "v: 1\naction: prep\ninstrument: EURUSD\n";
         let template: Value = serde_yaml::from_str(yaml).unwrap();
         let now: chrono::DateTime<chrono::Utc> = "2026-05-19T10:00:00Z".parse().unwrap();
-        assert_eq!(ttl_hours_default(&template, now), 4);
+        assert_eq!(ttl_hours_default_in(&template, now, Some(dir.path())), 4);
     }
 
     #[test]
     fn ttl_hours_default_rounds_up_to_anchor() {
-        let (_root, _g) = isolated_xdg("ttl-anchor");
+        let dir = expiry_dir();
         let now: chrono::DateTime<chrono::Utc> = "2026-05-19T10:00:00Z".parse().unwrap();
         // Anchor is exactly 3h30m away — should round up to 4.
         let anchor = now + chrono::Duration::minutes(210);
-        expiry::save("GBPJPY", anchor).unwrap();
+        expiry::save_in(dir.path(), "GBPJPY", anchor).unwrap();
         let yaml = "v: 1\naction: prep\ninstrument: GBPJPY\n";
         let template: Value = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(ttl_hours_default(&template, now), 4);
+        assert_eq!(ttl_hours_default_in(&template, now, Some(dir.path())), 4);
     }
 
     #[test]
     fn ttl_hours_default_handles_full_day_anchor() {
-        let (_root, _g) = isolated_xdg("ttl-day");
+        let dir = expiry_dir();
         let now: chrono::DateTime<chrono::Utc> = "2026-05-19T10:00:00Z".parse().unwrap();
         let anchor = now + chrono::Duration::days(2);
-        expiry::save("USDJPY", anchor).unwrap();
+        expiry::save_in(dir.path(), "USDJPY", anchor).unwrap();
         let yaml = "v: 1\naction: veto\ninstrument: USDJPY\n";
         let template: Value = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(ttl_hours_default(&template, now), 48);
+        assert_eq!(ttl_hours_default_in(&template, now, Some(dir.path())), 48);
     }
 
     #[test]
