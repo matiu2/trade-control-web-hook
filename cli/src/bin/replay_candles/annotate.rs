@@ -237,9 +237,16 @@ mod tests {
         assert_eq!(outcome_label(FillKind::GateBlocked), "gate-blocked");
     }
 
+    /// Serializes the tests that overwrite `HOME`. `HOME` is process-global but
+    /// cargo runs tests on many threads, so without this the two tests below
+    /// clobber each other's value and fail intermittently (~1 run in 10).
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn manifest_path_is_under_config_trade_control() {
-        // SAFETY: single-threaded test; sets HOME only for this assertion.
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: HOME_LOCK holds off the other HOME-mutating test for the
+        // duration, so nothing else in this process reads or writes it here.
         unsafe {
             std::env::set_var("HOME", "/home/tester");
         }
@@ -252,7 +259,8 @@ mod tests {
 
     #[test]
     fn read_manifest_missing_file_is_empty() {
-        // SAFETY: single-threaded test.
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: see `manifest_path_is_under_config_trade_control`.
         unsafe {
             std::env::set_var("HOME", "/nonexistent-home-for-replay-test");
         }
