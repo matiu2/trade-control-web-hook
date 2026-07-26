@@ -111,3 +111,48 @@ parallel-safe already.
 **Merge hazard:** this branch's `cli/Cargo.toml` still lacks
 `features = ["postgres-storage"]` (their uncommitted fix is in the primary
 checkout). Take THEIR version of that line when merging.
+
+---
+
+## Session state (2026-07-26, before compact)
+
+Branch `feat/fixture-corpus`, 14 commits, rebased onto `origin/main` @ `aeededb`.
+All green: 772 tests (cli 274 lib + 193 bin + 22; tv-arm 283), clippy clean,
+fixture goldens unchanged, debug and release agree to full float precision.
+
+### Done
+- **4.1–4.5 delivered** (the journalling side's whole request).
+- **PlanGeometry** (commit 5) + **6a** (`MwPath.runup_start`) + **6b** (validation
+  /TP/entry-vetos read geometry).
+- **Two pre-existing bugs fixed**: the `XDG_CONFIG_HOME` test race (0/30 now, was
+  ~5-10%) and a unit test reading the operator's real credential store.
+
+### Reviewed
+Two adversarial reviews run on disjoint file sets.
+- **tv-arm refactor: clean.** Differential-tested old-vs-new exhaustively, zero
+  divergences; mutation-tested the harness first to prove it catches injected
+  bugs. Two guard tightenings, both proven to only reject setups that could never
+  have entered. Reviewer noted the changelog mentions only ONE of them — the
+  1-point *fib* tightening (Fatal → Reject) is undocumented. Worth a line.
+- **economics/batch: three real bugs, all fixed** in 18af721.
+
+### Next (unstarted)
+- **6c** split `drop_past_control_pairs` / `build_*_bundles` off `&mut Roles`.
+- **6d** extract `SetupInputs` + `arm_from_inputs`; `run` becomes chart-vs-frozen.
+- **6e** `--spec-in` + `FrozenSpec` + round-trip test.
+- **6f** `--start` strict-RFC3339 fix.
+- **7** tier-2 scored corpus (aggregate Net R + baseline diff). Independent of 6.
+- **8** `--save-matrix`. Independent of 6.
+
+### Open items for the operator
+- `broker-tradenation-v0.14.0` is pushed as a BRANCH (`feat/testable-account-store`)
+  for review, not merged. All seven Cargo.tomls here already point at the tag.
+  PR: https://github.com/matiu2/tradenation-api/pull/new/feat/testable-account-store
+- Backup at `~/.config/tradenation/accounts.enc.bak-before-test-fix` — safe to
+  delete once satisfied.
+- `annotate.rs` still has two `unsafe set_var("HOME")`. Deliberately left: that
+  one is honest (correct comment, lock genuinely covers both mutators). Separate
+  cleanup, not a bug.
+- Reviewer flagged `GIT_VERSION` staleness: `cli/build.rs` only reruns on
+  `.git/HEAD`/`refs/tags`, so `engine_version` can lag the code that produced an
+  outcome. Matters if it gates a blessed baseline.
