@@ -383,7 +383,17 @@ pub struct ReplayArgs {
     /// legitimately flat run (`ok: true`, `net_r: 0.0`) is never confused with a
     /// crash. That distinction is why this exists: scraping `Net R:` off stdout
     /// couldn't make it, and a concurrent batch silently lost cells because of it.
-    #[arg(long)]
+    ///
+    /// **`--test-mode` only**, and enforced by clap rather than trusted. The
+    /// guarantee above is a property of the fixture path, which owns a row schema
+    /// (`BatchResult`) and can therefore describe its own failure. The live
+    /// `--plan` path has no such schema: it emitted *zero bytes* under `--json` on
+    /// failure (the terminal `FailureLine` is suppressed to keep stdout pure, and
+    /// nothing replaced it), and the human report on success — the exact ambiguity
+    /// this flag exists to remove, on the path an operator would use to *build* a
+    /// corpus. A `requires` is the honest fix: better to refuse the flag than to
+    /// invent a second, half-specified schema a driver would have to sniff.
+    #[arg(long, requires = "test_mode")]
     pub json: bool,
 
     /// Under `--test-mode`, also compare the replay's outcome against the

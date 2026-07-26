@@ -367,9 +367,34 @@ mod tests {
     use std::path::PathBuf;
     use trade_control_cli::replay_args::{DetectorMarkConfig, DirectionFilter, GoldenFilter};
 
+    /// The uk-100 multi-shot fixture, which several tests below need
+    /// specifically: it's the one exercising a reversal-close AND a trade-expiry
+    /// flatten on open positions, over three legs.
+    const UK_100: &str = "uk-100-news-blackout-rentry-close-on-reversal";
+
+    /// Resolve a fixture directory by name, **panicking** if it isn't there.
+    ///
+    /// These tests used to `eprintln!("… missing — skipping")` and return, so a
+    /// renamed or deleted fixture turned them into vacuous passes — and `cargo
+    /// test` hides the note unless you pass `--nocapture`. A test that reports
+    /// `ok` when the thing it tests is gone is a false safety signal, which is
+    /// worse than a missing test. Fail loudly and name the fixture.
+    fn require_fixture(name: &str) -> PathBuf {
+        let dir = super::fixtures_root().join(name);
+        assert!(
+            dir.is_dir(),
+            "required fixture {name:?} is missing from {}. It was committed with the \
+             corpus; restore it (or, if it was intentionally renamed, update this \
+             test) — do not let this test pass without it.",
+            super::fixtures_root().display()
+        );
+        dir
+    }
+
     /// List the fixture directories under `replay-fixtures/` (each holding the
     /// four JSON files), sorted for deterministic test ordering. Empty when the
-    /// dir is absent or has no sub-dirs — the harness then no-ops.
+    /// dir is absent or has no sub-dirs — callers must treat empty as a failure,
+    /// not a skip (see `all_fixtures_match_expected`).
     fn fixture_dirs() -> Vec<PathBuf> {
         let root = super::fixtures_root();
         let Ok(entries) = fs::read_dir(&root) else {
@@ -387,17 +412,25 @@ mod tests {
     /// The offline regression gate: every saved fixture re-runs through the pure
     /// engine and must reproduce its `expected.json`. No network, no env vars —
     /// frozen candles in, golden outcome out. A future engine change that moves a
-    /// verified verdict fails here. No-ops (with a note) until fixtures exist.
+    /// verified verdict fails here.
+    ///
+    /// **Panics on an empty corpus.** This used to `eprintln!` and return, which
+    /// meant deleting or renaming `replay-fixtures/` made this test — and the
+    /// three below — report `ok` in 0.00s with zero coverage, and `cargo test`
+    /// swallows the note without `--nocapture`. A gate that goes green when its
+    /// evidence disappears is worse than no gate: it actively reports safety.
+    /// See `[[no_silent_degrade_prefer_loud_failure]]`.
     #[tokio::test]
     async fn all_fixtures_match_expected() {
         let dirs = fixture_dirs();
-        if dirs.is_empty() {
-            eprintln!(
-                "no fixtures under {} — save one with `replay-candles ... --save <name>`",
-                super::fixtures_root().display()
-            );
-            return;
-        }
+        assert!(
+            !dirs.is_empty(),
+            "no fixtures under {} — the golden gate has nothing to check. If you \
+             genuinely intend an empty corpus, delete this test rather than letting \
+             it pass vacuously; otherwise restore the directory (or save one with \
+             `replay-candles … --save <name>`).",
+            super::fixtures_root().display()
+        );
         for dir in dirs {
             let name = dir.file_name().unwrap_or_default().to_string_lossy();
             let inputs = load(&dir).unwrap_or_else(|e| panic!("load fixture {name}: {e:?}"));
@@ -468,11 +501,7 @@ mod tests {
     /// leaves the numbers right but stops showing them.
     #[tokio::test]
     async fn stateful_broker_books_reversal_and_expiry_closes_in_the_report() {
-        let dir = super::fixtures_root().join("uk-100-news-blackout-rentry-close-on-reversal");
-        if !dir.is_dir() {
-            eprintln!("uk-100 reversal/expiry fixture missing — skipping");
-            return;
-        }
+        let dir = require_fixture(UK_100);
         let inputs = load(&dir).expect("load uk-100 fixture");
         let expires_at = inputs
             .candles
@@ -561,11 +590,7 @@ mod tests {
     /// `ReplayEconomics`; this pins them together.
     #[tokio::test]
     async fn saved_net_r_matches_the_printed_summary() {
-        let dir = super::fixtures_root().join("uk-100-news-blackout-rentry-close-on-reversal");
-        if !dir.is_dir() {
-            eprintln!("uk-100 fixture missing — skipping");
-            return;
-        }
+        let dir = require_fixture(UK_100);
         let inputs = load(&dir).expect("load uk-100 fixture");
         let expires_at = inputs
             .candles
@@ -611,11 +636,7 @@ mod tests {
     /// economics — matching the report, which prints no summary in that mode.
     #[tokio::test]
     async fn unsimulated_run_records_no_economics() {
-        let dir = super::fixtures_root().join("uk-100-news-blackout-rentry-close-on-reversal");
-        if !dir.is_dir() {
-            eprintln!("uk-100 fixture missing — skipping");
-            return;
-        }
+        let dir = require_fixture(UK_100);
         let inputs = load(&dir).expect("load uk-100 fixture");
         let expires_at = inputs
             .candles

@@ -105,6 +105,14 @@ async fn main() {
     // JSON (`ok: false` + `error` per row, `failed` in the roll-up), so the text
     // line is redundant as well as harmful. Sniffed from raw argv because a
     // failure can predate the clap parse.
+    //
+    // Suppressing the line is only safe because `--json` now `requires =
+    // "test_mode"` and BOTH test-mode paths print their JSON *before* returning
+    // the error that sets the exit code (`run_test_mode_single` at the `--check`
+    // step, `run_test_mode_batch` before its `failed > 0` raise). So "exit != 0
+    // with `--json`" still comes with a document on stdout. If you add a
+    // test-mode failure that can return `Err` *before* its `println!`, this
+    // suppression turns it into zero bytes — emit a row there instead.
     let json_mode = std::env::args().any(|a| a == "--json");
     match run().await {
         Ok(()) => std::process::exit(outcome::EXIT_OK),
@@ -735,6 +743,22 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
     }
 
     if args.rebless {
+        // `--simulate false` computes no economics, so `computed.outcome` is
+        // `None` — and writing that over a golden that HAD economics silently
+        // deletes the Net R gate this whole corpus exists to hold. Exit 0, no
+        // diff, nothing in the log: the fixture just quietly stops checking the
+        // number. Refuse instead. (Recoverable — the next `--check --simulate
+        // true` exits 5 — but only if someone happens to run it.)
+        if !args.simulate {
+            return FixtureRun::failed(
+                name,
+                outcome::bad_input(eyre!(
+                    "refusing to re-bless {name} with --simulate false: the outcome would \
+                     carry no economics (net_r / legs), silently removing the Net R gate \
+                     from this fixture. Re-bless with simulation on (the default)."
+                )),
+            );
+        }
         if let Err(e) = fixture::save_expected(dir, &computed) {
             return FixtureRun::failed(name, e);
         }
