@@ -139,27 +139,52 @@ checkout). Take THEIR version of that line when merging.
 
 ---
 
-## Session state (2026-07-26, before compact)
+## Session state (2026-07-27)
 
-Branch `feat/fixture-corpus`, 14 commits, rebased onto `origin/main` @ `aeededb`.
-All green: 772 tests (cli 274 lib + 193 bin + 22; tv-arm 283), clippy clean,
-fixture goldens unchanged, debug and release agree to full float precision.
+Branch `feat/fixture-corpus`, 21 commits, on `origin/main` @ `aeededb`.
+All green: cli 277 lib + 200 bin + 22, tv-arm 293. Clippy clean on both crates,
+`--check` green, debug and release agree to full float precision.
 
 ### Done
 - **4.1–4.5 delivered** (the journalling side's whole request).
 - **PlanGeometry** (commit 5) + **6a** (`MwPath.runup_start`) + **6b** (validation
-  /TP/entry-vetos read geometry).
-- **Two pre-existing bugs fixed**: the `XDG_CONFIG_HOME` test race (0/30 now, was
-  ~5-10%) and a unit test reading the operator's real credential store.
+  /TP/entry-vetos read geometry) + **6c** (`ControlWindows`, generic bundle loop).
+- **Pre-existing bugs fixed**: the `XDG_CONFIG_HOME` test race (0/30, was ~5-10%);
+  a unit test reading the operator's real credential store; an empty
+  `XDG_CONFIG_HOME` writing expiry anchors to `/trade-control/expiry`.
 
-### Reviewed
-Two adversarial reviews run on disjoint file sets.
+### Reviewed — three rounds
+Two adversarial reviews on disjoint file sets, then a **clean-slate** review with
+no knowledge of the reasoning behind the code. The third round was the most
+valuable: everything it found looked deliberate from the inside.
+
 - **tv-arm refactor: clean.** Differential-tested old-vs-new exhaustively, zero
-  divergences; mutation-tested the harness first to prove it catches injected
-  bugs. Two guard tightenings, both proven to only reject setups that could never
-  have entered. Reviewer noted the changelog mentions only ONE of them — the
-  1-point *fib* tightening (Fatal → Reject) is undocumented. Worth a line.
-- **economics/batch: three real bugs, all fixed** in 18af721.
+  divergences; mutation-tested the harness first. Reviewer noted the changelog
+  mentions only ONE of two guard tightenings — the 1-point *fib* tightening
+  (Fatal → Reject) is undocumented. Still worth a line.
+- **economics/batch: three real bugs**, fixed in 18af721.
+- **Clean-slate round: 15 findings, 12 actioned** (41a17a2, 2d73632, 75363ec,
+  5b76cd7, dabf17b, 54ffe67). The three it called blockers were real:
+  - `--json` emitted **zero bytes** on the live path (now `requires` test-mode).
+  - `--rebless --simulate false` silently deleted a golden's economics (now
+    exit 4).
+  - **13 fixture tests reported `ok` in 0.00s with the corpus moved aside** — a
+    gate that goes green when its evidence vanishes. Now 4 loud failures.
+
+  Plus: a `--check` mismatch discarded the number it measured (now keeps
+  `outcome` + `expected_net_r`, so a red sweep is diagnosable); non-finite
+  prices could write an **unloadable** golden (`serde_json` writes `NaN` as
+  `null`); a zero-match glob exited 0; three tests provably could not fail.
+
+  **Two findings I disputed, with reasons** — a "clamp implausible R" suggestion
+  (declined: clamping hides the data glitch; it warns instead) and one
+  misattribution (the per-broker cache change is the other agent's, already on
+  `origin/main` in `aeededb`, and is documented).
+
+  Not actioned, deliberately: `--fixture` path traversal (single-user local
+  tool), and `held_realized_outcome` writing `stop_loss = entry_price` for an
+  open position (pre-existing, 0R either way — but the new economics module now
+  trusts it as input, so worth a look before tier-2 scoring).
 
 ### Next (unstarted)
 - **6d** extract `SetupInputs` + `arm_from_inputs`; `run` becomes chart-vs-frozen.
@@ -175,8 +200,9 @@ Two adversarial reviews run on disjoint file sets.
 - `broker-tradenation-v0.14.0` is pushed as a BRANCH (`feat/testable-account-store`)
   for review, not merged. All seven Cargo.tomls here already point at the tag.
   PR: https://github.com/matiu2/tradenation-api/pull/new/feat/testable-account-store
-- Backup at `~/.config/tradenation/accounts.enc.bak-before-test-fix` — safe to
-  delete once satisfied.
+- Backup at `~/.config/tradenation/accounts.enc.bak-before-test-fix` — re-verified
+  **byte-identical** to the live store, so nothing was corrupted. Safe to delete;
+  left in place because it's a credential file and that's your call.
 - `annotate.rs` still has two `unsafe set_var("HOME")`. Deliberately left: that
   one is honest (correct comment, lock genuinely covers both mutators). Separate
   cleanup, not a bug.
