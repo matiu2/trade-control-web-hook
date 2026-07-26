@@ -12,7 +12,7 @@
 //! is lossless. A data source that serves mid-only yields bid == ask == mid,
 //! and the simulator degrades cleanly to exact-level mid fills.
 
-use candle_cache::{CacheClient, CacheConfig};
+use candle_cache::{CacheClient, CacheConfig, CacheError};
 use chrono::{DateTime, FixedOffset, Utc};
 use color_eyre::eyre::{Context, Result, eyre};
 use oanda_client::{OandaClient, data_source::OandaDataSource};
@@ -100,7 +100,16 @@ fn default_cache_dir(source: CandleSource) -> PathBuf {
 /// cache must never be mistaken for one that ran: a wrong answer is worse than
 /// a hard failure, so this is loud and fatal, never a silent degrade to an
 /// empty cache (which would re-pull everything and can change fills).
-fn cache_unreachable(e: impl std::fmt::Display) -> color_eyre::Report {
+///
+/// One exception: a rejected `--cache-dir` (unusable or over-long final path
+/// component) is the operator's typo, not a sick environment, so it exits "fix
+/// your input" rather than "retry me".
+fn cache_unreachable(e: CacheError) -> color_eyre::Report {
+    // Matched on the VARIANT, not on message text: `Config` is exactly "the
+    // cache dir you gave me is unusable", which is the operator's to fix.
+    if let CacheError::Config(msg) = &e {
+        return super::outcome::bad_input(eyre!("{msg}"));
+    }
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgresql://candle_cache@localhost:5432/candle_cache".to_string());
     eyre!(
