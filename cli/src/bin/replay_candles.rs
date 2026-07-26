@@ -74,7 +74,8 @@ use replay_candles::batch;
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::tv::TvDefaults;
 use replay_candles::{
-    annotate, brisbane, candles, granularity, instrument, outcome, replay, report, sentiment, tv,
+    annotate, brisbane, candles, economics, granularity, instrument, outcome, replay, report,
+    sentiment, tv,
 };
 use trade_control_cli::replay_args::{CandleSource, DetectorMarkConfig, ReplayArgs as Args};
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan, Trigger};
@@ -684,6 +685,23 @@ impl FixtureRun {
             error: Some(err),
         }
     }
+
+    /// A fixture that replayed fine but disagreed with its golden.
+    ///
+    /// Unlike [`Self::failed`] this keeps the row's measurements — the run
+    /// produced a real `outcome`, and that number is exactly what you need to
+    /// judge whether the regression is benign. See `BatchResult::mismatched`.
+    fn mismatched(
+        row: batch::BatchResult,
+        expected: Option<&economics::ReplayEconomics>,
+        err: color_eyre::eyre::Error,
+    ) -> Self {
+        Self {
+            row: batch::BatchResult::mismatched(row, expected, format!("{err:#}")),
+            kind: Some(outcome::FailureKind::classify(&err)),
+            error: Some(err),
+        }
+    }
 }
 
 async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> FixtureRun {
@@ -734,8 +752,13 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
 
     if args.check {
         match fixture::load_expected(dir) {
+            // A mismatch keeps the row's measurements (`mismatched`, not
+            // `failed`): this run scored fine, and its Net R next to the
+            // golden's is what makes a red sweep diagnosable rather than just
+            // red. The full diff still goes in `error` for a human.
             Ok(expected) if computed != expected => {
-                return FixtureRun::failed(name, diff_error(&expected, &computed));
+                let err = diff_error(&expected, &computed);
+                return FixtureRun::mismatched(row, expected.outcome.as_ref(), err);
             }
             Ok(_) => tracing::info!(fixture = name, "fixture matches expected.json"),
             Err(e) => return FixtureRun::failed(name, e),

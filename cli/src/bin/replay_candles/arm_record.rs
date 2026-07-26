@@ -241,12 +241,80 @@ mod tests {
 
     /// Defaults serialize thin: only `entry_rule` (plus the two bools) is
     /// mandatory, so a minimally-described fixture stays readable.
+    ///
+    /// The names below are checked against the struct's real fields by
+    /// [`every_optional_field_is_named_in_the_omission_test`] — this list used to
+    /// contain `"broker"`, a field renamed to `candle_source` long before, so the
+    /// test was asserting the absence of a string that could never appear while
+    /// the actual field went untested.
     #[test]
     fn default_arm_record_omits_optional_keys() {
         let json = serde_json::to_string(&ArmRecord::default()).unwrap();
-        for absent in ["start", "broker", "chart_symbol", "journal_ref"] {
+        for absent in OPTIONAL_FIELDS {
             assert!(!json.contains(absent), "{absent} must be omitted: {json}");
         }
         assert!(json.contains("normal"));
+    }
+
+    /// Every `Option` field on [`ArmRecord`], i.e. every key that must vanish
+    /// from a default record.
+    const OPTIONAL_FIELDS: [&str; 6] = [
+        "start",
+        "candle_source",
+        "chart_symbol",
+        "tv_arm_version",
+        "engine_version",
+        "journal_ref",
+    ];
+
+    /// Guard against the list above going stale, which is how `"broker"` survived
+    /// a rename: serialize a record with EVERY optional field populated, and
+    /// require the list to name each optional key the struct actually emits.
+    ///
+    /// A renamed or newly-added optional field now fails here instead of quietly
+    /// dropping out of coverage.
+    #[test]
+    fn every_optional_field_is_named_in_the_omission_test() {
+        let full = ArmRecord {
+            entry_rule: EntryRule::Normal,
+            skip_calendar_bars: false,
+            skip_golden: false,
+            start: Some("2026-07-17T17:00:00+10:00".into()),
+            candle_source: Some("tradenation".into()),
+            chart_symbol: Some("TRADENATION:EURUSD".into()),
+            tv_arm_version: Some("v113".into()),
+            engine_version: Some("v113".into()),
+            journal_ref: Some("trade-124".into()),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        let keys: Vec<String> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .filter(|k| {
+                !matches!(
+                    k.as_str(),
+                    "entry_rule" | "skip_calendar_bars" | "skip_golden"
+                )
+            })
+            .cloned()
+            .collect();
+
+        for key in &keys {
+            assert!(
+                OPTIONAL_FIELDS.contains(&key.as_str()),
+                "optional field {key:?} is not covered by OPTIONAL_FIELDS — add it \
+                 (this is the check that would have caught the `broker` → \
+                 `candle_source` rename)"
+            );
+        }
+        assert_eq!(
+            keys.len(),
+            OPTIONAL_FIELDS.len(),
+            "OPTIONAL_FIELDS lists {} names but the struct emits {}: {keys:?}",
+            OPTIONAL_FIELDS.len(),
+            keys.len()
+        );
     }
 }

@@ -60,6 +60,21 @@ pub struct BatchResult {
     /// Why it failed. `None` when `ok`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The golden this run **disagreed with**, when the failure was a `--check`
+    /// mismatch rather than an inability to replay.
+    ///
+    /// A mismatch is a different animal from a broken fixture: the replay ran
+    /// fine and produced a perfectly good `outcome` — we just don't agree with
+    /// what was blessed. So the row keeps its `outcome` (see the field below) and
+    /// records the expected Net R here, which is what makes a red sweep
+    /// *readable*: "cell moved 0.35 → -0.62" instead of "cell failed". Without
+    /// it, the only place the numbers survived was inside a multi-KB error string
+    /// holding both pretty-printed JSON blobs — 291 regressed cells came to
+    /// ~3.3 MB of duplicated diffs with zero machine-readable values.
+    ///
+    /// `None` for every other failure (and for a pass).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_net_r: Option<f64>,
     /// How the fixture was armed — the grid axes. `None` for a fixture saved
     /// before the `arm` block existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,7 +87,15 @@ pub struct BatchResult {
     /// with `cell` this is the full grid coordinate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trade_id: Option<String>,
-    /// What it earned. `None` on failure, or when the run wasn't simulated.
+    /// What it earned.
+    ///
+    /// `None` when the fixture couldn't be replayed at all, or when the run
+    /// wasn't simulated. **Present on a `--check` mismatch** — see
+    /// [`Self::mismatched`]: that run scored fine, so throwing its number away
+    /// would be discarding the very thing you need to judge the regression.
+    ///
+    /// So `outcome.is_some()` does NOT imply `ok`. Filter on `ok` for the
+    /// aggregate; read `outcome` on a `!ok` row to see what it measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<ReplayEconomics>,
 }
@@ -89,6 +112,7 @@ impl BatchResult {
             fixture: fixture.to_string(),
             ok: true,
             error: None,
+            expected_net_r: None,
             cell: arm.as_ref().map(|a| a.cell_key()),
             arm,
             trade_id,
@@ -97,15 +121,43 @@ impl BatchResult {
     }
 
     /// A fixture that could not be replayed. Recorded as a row, never dropped.
+    ///
+    /// For a `--check` mismatch use [`Self::mismatched`] instead — that one ran,
+    /// and its numbers are worth keeping.
     pub fn failed(fixture: &str, error: impl std::fmt::Display) -> Self {
         Self {
             fixture: fixture.to_string(),
             ok: false,
             error: Some(error.to_string()),
+            expected_net_r: None,
             arm: None,
             cell: None,
             trade_id: None,
             outcome: None,
+        }
+    }
+
+    /// A fixture that replayed cleanly but **disagreed with its golden**.
+    ///
+    /// Takes the `ok` row this run produced and demotes it: `ok: false` (so it
+    /// stays out of the aggregate and the exit code still fails) while keeping
+    /// every measurement — `outcome`, `arm`, `cell`, `trade_id` — plus the
+    /// golden's Net R for comparison.
+    ///
+    /// This is the difference between a red sweep you can read and one you can't.
+    /// A driver can compute `outcome.net_r - expected_net_r` per cell and see
+    /// which regressions are noise and which are real, without parsing a
+    /// human-formatted diff out of an error string.
+    pub fn mismatched(
+        ok_row: Self,
+        expected: Option<&ReplayEconomics>,
+        error: impl std::fmt::Display,
+    ) -> Self {
+        Self {
+            ok: false,
+            error: Some(error.to_string()),
+            expected_net_r: expected.map(|e| e.net_r),
+            ..ok_row
         }
     }
 
@@ -322,6 +374,66 @@ mod tests {
         assert_eq!(r.net_r(), 0.0);
     }
 
+    /// A `--check` mismatch keeps every measurement it made, and records the
+    /// golden's Net R beside it.
+    ///
+    /// This is what makes a red sweep readable: 291 regressed cells that each say
+    /// "measured 0.35, expected -0.62" are diagnosable, whereas 291 rows that say
+    /// only "failed" (with the numbers buried in an 11 KB pretty-printed diff)
+    /// tell you *that* something moved and nothing about *what to*.
+    #[test]
+    fn a_check_mismatch_keeps_its_measurements_and_the_golden_it_missed() {
+        let ok_row = BatchResult::ok(
+            "trade-124-normal-news-on",
+            Some("hs-eurusd-abc".into()),
+            Some(arm(EntryRule::Normal, false)),
+            Some(econ(0.35)),
+        );
+        let r = BatchResult::mismatched(ok_row, Some(&econ(-0.62)), "golden mismatch: <big diff>");
+
+        // Still a failure: out of the aggregate, and the exit code fails.
+        assert!(!r.ok);
+        assert!(r.error.is_some());
+        // …but nothing measured was thrown away.
+        assert_eq!(r.outcome.as_ref().map(|o| o.net_r), Some(0.35));
+        assert_eq!(r.expected_net_r, Some(-0.62));
+        assert_eq!(r.cell.as_deref(), Some("normal/news-on"));
+        assert_eq!(r.trade_id.as_deref(), Some("hs-eurusd-abc"));
+        // The delta a driver actually wants is now computable from the row.
+        let delta =
+            r.outcome.as_ref().map(|o| o.net_r).unwrap_or(0.0) - r.expected_net_r.unwrap_or(0.0);
+        assert!((delta - 0.97).abs() < 1e-9, "delta was {delta}");
+    }
+
+    /// `outcome.is_some()` must NOT be read as "passed" — a mismatch row has one.
+    /// The aggregate has to filter on `ok`, and this pins that a mismatch really
+    /// does stay out of it.
+    #[test]
+    fn a_mismatch_row_has_an_outcome_but_is_excluded_from_the_aggregate() {
+        let ok_row = BatchResult::ok("b", None, None, Some(econ(0.35)));
+        let s = BatchSummary::from_results(vec![
+            BatchResult::ok("a", None, None, Some(econ(0.52))),
+            BatchResult::mismatched(ok_row, Some(&econ(-0.62)), "mismatch"),
+        ]);
+        assert_eq!(s.succeeded, 1);
+        assert_eq!(s.failed, 1);
+        assert!(
+            (s.net_r - 0.52).abs() < 1e-9,
+            "the mismatched row's 0.35 must not be summed in: {}",
+            s.net_r
+        );
+    }
+
+    /// A non-replay failure has no measurements to keep, so it carries neither an
+    /// outcome nor an expected value — `expected_net_r` is specifically the
+    /// "disagreed with the golden" signal, not a generic field.
+    #[test]
+    fn a_broken_fixture_carries_no_expected_net_r() {
+        let r = BatchResult::failed("t", "cache lock");
+        assert!(r.outcome.is_none());
+        assert!(r.expected_net_r.is_none());
+    }
+
     /// A legitimately flat run is a RESULT, not a failure. This is the distinction
     /// stdout-scraping could not make.
     #[test]
@@ -442,14 +554,31 @@ mod tests {
         ]
         .into_iter()
         .map(|(rule, news_off, r)| {
+            // Both axes in the directory name. This omitted `news_off` and so
+            // built 6 rows from only 3 distinct names — the test passed anyway
+            // (it groups by `cell`, which was correct), but it modelled a naming
+            // convention that would have collided on disk. The name is what a
+            // `--fixtures-glob` sweep iterates, so it has to be unique per cell.
+            let news = if news_off { "news-off" } else { "news-on" };
             BatchResult::ok(
-                &format!("trade-124-{}-news", rule.label()),
+                &format!("trade-124-{}-{news}", rule.label()),
                 Some("trade-124".into()),
                 Some(arm(rule, news_off)),
                 Some(econ(r)),
             )
         })
         .collect();
+
+        // Six cells means six directories: a colliding convention would silently
+        // overwrite fixtures at save time, long before this aggregation.
+        let names: std::collections::HashSet<&str> =
+            rows.iter().map(|r| r.fixture.as_str()).collect();
+        assert_eq!(
+            names.len(),
+            6,
+            "one directory per grid cell, got {}: {names:?}",
+            names.len()
+        );
 
         let summary = BatchSummary::from_results(rows);
         assert_eq!(summary.succeeded, 6);

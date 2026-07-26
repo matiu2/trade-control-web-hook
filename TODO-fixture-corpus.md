@@ -58,7 +58,18 @@ Each commit green (tests + clippy + fmt) before the next.
   fixture gate flaky — it's a multiply-accumulate chain whose low bits depend on
   FP operation order, so the test build and release build disagreed in the last
   two digits (`...607` vs `...609`) and `ReplayOutcome` equality is exact float
-  compare. `net_r` is a plain sum and bit-stable.
+  compare.
+
+  **Correction:** an earlier version of this line said `net_r` is "a plain sum
+  and bit-stable". That is wrong, and `economics.rs` says so at length. Float
+  addition isn't associative either: summing the real uk-100 legs
+  (`[0.549…, -1.0, 0.797…]`) over all 6 permutations yields **2 distinct bit
+  patterns**. `net_r` is stable here only because leg order is deterministic
+  (fire order) — not because summing is order-free. The difference from
+  `account` is *degree*, not kind: one multiply-accumulate chain amplified the
+  divergence enough to cross build profiles. Don't rely on "it's just a sum".
+  (Checking this in Python will mislead you — the builtin `sum` is not a plain
+  left fold.)
 - **`fires[].fill` keeps its independent `simulate_fill` path.** The plan said
   commit 2 would move it onto `fire.realized`. On reading it properly, it earns
   its place as a second opinion on *bracket* physics (fill/sweep/never-trigger).
