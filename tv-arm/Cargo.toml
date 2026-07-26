@@ -28,4 +28,5 @@ tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag =
 trading-view = { version = "0.1.0", path = "../trading-view" }
 
 [dev-dependencies]
+tempfile = "3.27.0"
 toml = "1.1.2"

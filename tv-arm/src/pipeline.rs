@@ -34,6 +34,7 @@ use trade_control_core::sig::KEY_LEN;
 
 use crate::args::Args;
 use crate::args::PositionEntry;
+use crate::control_windows::{AsOf, ControlWindows};
 use crate::geometry::pcl_exhausted_price;
 use crate::instrument_resolution::ResolvedInstrument;
 use crate::mw_geometry;
@@ -176,7 +177,10 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         SlotPref::WindowAware(view)
     };
-    let mut roles = classify(&mcp, &drawings, view, slot_pref)?;
+    // Immutable from here on: `Roles` is what the operator drew, resolved once.
+    // The calendar-derived control windows that used to be mutated onto it now
+    // live in their own type — see [`crate::control_windows`].
+    let roles = classify(&mcp, &drawings, view, slot_pref)?;
 
     // Extract the chart geometry to plain data ONCE, here — immediately after role
     // resolution and BEFORE any validation. Two reasons this belongs at the top:
@@ -189,13 +193,27 @@ pub fn run(args: Args) -> Result<i32> {
     // calendar windows it carries, the drawn S/R levels, and the position tool.
     let geom = PlanGeometry::from_roles(&roles);
 
+    let key = read_key()?;
+    let account = resolve_account(&args, broker);
+    let out_dir = arm_out_dir(&raw_sym)?;
+    let now = Utc::now();
+
+    // The as-of instant elapsed control windows are pruned against. Live
+    // (`--register-plan`) prunes against wall-clock now; an offline replay
+    // (`--plan-out`) prunes against the chart's replay cursor so a blackout
+    // still upcoming relative to the cursor survives a historical replay.
+    // See `pick_prune_as_of`.
+    let prune_as_of = pick_prune_as_of(&args, now, cursor_unix, start);
+
     // Resolve blackout/news windows straight from the economic calendar at real
-    // event-minute precision and push them into `roles`. No chart lines are
-    // drawn and nothing is read back — the old draw + re-classify round-trip
-    // (which snapped every window to a bar boundary and could split a window
-    // straddling `--start` into an orphaned half) is gone. `--skip-calendar-bars`
-    // opts out entirely.
-    if !args.skip_calendar_bars {
+    // event-minute precision. No chart lines are drawn and nothing is read back
+    // — the old draw + re-classify round-trip (which snapped every window to a
+    // bar boundary and could split a window straddling `--start` into an
+    // orphaned half) is gone. `--skip-calendar-bars` opts out entirely.
+    //
+    // `ControlWindows::new` prunes already-elapsed windows at construction, so
+    // there is no un-pruned set for anything downstream to observe.
+    let control = if !args.skip_calendar_bars {
         // Scope the news filter to the trade's own lifetime `[cursor, expiry]`,
         // NOT the chart's visible area:
         //   - left edge = the cursor (`--start` when given, else the last loaded
@@ -216,36 +234,24 @@ pub fn run(args: Args) -> Result<i32> {
             args.news_after_hours,
         ) {
             Ok((blackout, news, markers)) => {
-                roles.blackout_pairs = blackout;
-                roles.news_pairs = news;
-                roles.news_markers = markers;
+                ControlWindows::new(blackout, news, markers, prune_as_of)
             }
             Err(e) => {
                 warn!(error = ?e, "calendar window resolution failed; continuing with no news/blackout windows");
+                ControlWindows::empty()
             }
         }
-    }
-
-    let key = read_key()?;
-    let account = resolve_account(&args, broker);
-    let out_dir = arm_out_dir(&raw_sym)?;
-    let now = Utc::now();
-
-    // Drop blackout/news windows that have already fully elapsed as of the
-    // arm's reference time. Live (`--register-plan`) prunes against wall-clock
-    // now; an offline replay (`--plan-out`) prunes against the chart's replay
-    // cursor so a blackout still upcoming relative to the cursor survives a
-    // historical replay. See `drop_past_control_pairs` / `pick_prune_as_of`.
-    let prune_as_of = pick_prune_as_of(&args, now, cursor_unix, start);
-    drop_past_control_pairs(&mut roles, prune_as_of);
+    } else {
+        ControlWindows::empty()
+    };
 
     // Cosmetic chart annotation (default on): draw a vertical line for exactly
     // the news events tv-arm reacts to — the armed set, post-prune, so drawn ==
     // armed. Never touches the plan; a draw failure warns and continues.
     // `--skip-calendar-bars` opts out of the whole calendar step above, leaving
-    // `news_markers` empty, so this then draws nothing (that flag skips both the
+    // the marker set empty, so this then draws nothing (that flag skips both the
     // news windows and their markers).
-    draw_news_markers(&mcp, &roles, &state.resolution);
+    draw_news_markers(&mcp, control.markers(), &state.resolution);
 
     // 2c. Position-tool direct entry. When one of --market-entry /
     //     --stop-entry / --limit-entry is set, ignore the pattern
@@ -296,6 +302,7 @@ pub fn run(args: Args) -> Result<i32> {
             &args,
             &roles,
             &geom,
+            control.has_news(),
             &instrument,
             &account,
             broker,
@@ -317,8 +324,8 @@ pub fn run(args: Args) -> Result<i32> {
         pattern = ?trade_spec.pattern,
         trade_expiry = %trade_spec.trade_expiry.to_rfc3339(),
         sr_reversal_ranges = trade_spec.sr_reversal_ranges.len(),
-        news_pairs = roles.news_pairs.len(),
-        blackout_pairs = roles.blackout_pairs.len(),
+        news_windows = control.news().len(),
+        blackout_windows = control.blackout().len(),
         "trade spec built",
     );
     // `--plan-out` without `--register-plan` is an offline build (no worker
@@ -354,37 +361,27 @@ pub fn run(args: Args) -> Result<i32> {
         "trade bundle written"
     );
 
-    // 6. Pause bundles per blackout pair. Built against the prune as-of (replay
-    //    cursor offline, wall-clock now live) so a blackout that survived the
-    //    prune as still-upcoming-vs-cursor isn't then rejected as "stale" by
-    //    `build_pause_from_spec`'s own past-window guard.
-    let pause_bundles = build_pause_bundles(
-        &roles,
-        &trade_id,
-        &instrument,
-        &account,
+    // 6/7. One pause bundle per blackout window, one news bundle per news
+    //      window. Built against the prune as-of (replay cursor offline,
+    //      wall-clock now live) so a window that survived the prune as
+    //      still-upcoming-vs-cursor isn't then rejected as "stale" by
+    //      `build_pause_from_spec`'s own past-window guard.
+    let bundle_ctx = BundleContext {
+        trade_id: &trade_id,
+        instrument: &instrument,
+        account: &account,
         broker,
-        &out_dir,
-        &key,
-        prune_as_of.at,
-    )?;
-
-    // 7. News bundles per news pair (same as-of reasoning as pause bundles).
-    let news_bundles = build_news_bundles(
-        &roles,
-        &trade_id,
-        &instrument,
-        &account,
-        broker,
-        &out_dir,
-        &key,
-        prune_as_of.at,
-    )?;
+        out_dir: &out_dir,
+        key: &key,
+        now: prune_as_of.at,
+    };
+    let pause_bundles = bundle_ctx.build_all::<PauseKind>(control.blackout())?;
+    let news_bundles = bundle_ctx.build_all::<NewsKind>(control.news())?;
 
     // 8. Calendar control bars now come from the calendar directly, resolved in
-    //    step 2 into `roles.blackout_pairs` / `news_pairs` and built into
-    //    `pause_bundles` / `news_bundles` above. The old drawn-line-era
-    //    supplemental `built_calendar` path was retired in PR1b.
+    //    step 2 into the `ControlWindows` above and built into `pause_bundles` /
+    //    `news_bundles`. The old drawn-line-era supplemental `built_calendar`
+    //    path was retired in PR1b.
 
     // 8b. (`register`) Fold the whole trade — main alert conditions PLUS the
     //     pause/news/calendar control bars built above — into ONE signed
@@ -648,10 +645,13 @@ impl From<color_eyre::eyre::Error> for ResolveError {
 /// *second* wrong-direction bug (AUD/CAD 2026-07: head at `points[1]`).
 /// Takes **both** `geom` and `roles`, which is not redundant: `geom` is the
 /// drawing-derived *geometry* (every level, line, and epoch this function reads),
-/// while `roles` is only forwarded to [`build_trade_spec`] for the two things that
-/// aren't geometry — the calendar-resolved `news_pairs` and the drawn S/R levels.
-/// A spec-driven arm supplies the former from a frozen file and the latter from
-/// re-read calendar data, so keeping them separate is what makes that possible.
+/// while `roles` is only forwarded to [`build_trade_spec`] for the one thing that
+/// isn't geometry — the drawn S/R levels (and the prep-expiry steps derived from
+/// them). The news fact arrives separately as `close_on_news`, because news
+/// windows are calendar-derived rather than drawn (see
+/// [`crate::control_windows`]). A spec-driven arm supplies the geometry from a
+/// frozen file and re-reads the calendar, so keeping the three apart is what
+/// makes that possible.
 ///
 /// Nine parameters trips clippy; splitting them into a struct would just relocate
 /// the same fields, and the geometry/roles split above is the distinction that
@@ -661,6 +661,7 @@ fn resolve_hs_trade(
     args: &Args,
     roles: &Roles,
     geom: &PlanGeometry,
+    close_on_news: bool,
     instrument: &str,
     account: &str,
     broker: Broker,
@@ -724,6 +725,7 @@ fn resolve_hs_trade(
         expiry,
         tp,
         roles,
+        close_on_news,
         pip_size,
         tick_size,
         entry_level_vetos,
@@ -1223,6 +1225,11 @@ fn arm_out_dir(raw_sym: &str) -> Result<PathBuf> {
 }
 
 /// Assemble the `TradeSpec` from CLI args + classified roles.
+///
+/// `close_on_news` is passed in rather than derived here: the news windows are
+/// calendar-derived, not drawn, so they live in `ControlWindows` rather than
+/// `Roles` — see [`crate::control_windows`]. All this needs is the one fact
+/// "does this trade have a news window", so that's what it takes.
 #[allow(clippy::too_many_arguments)]
 fn build_trade_spec(
     args: &Args,
@@ -1233,6 +1240,7 @@ fn build_trade_spec(
     expiry: DateTime<Utc>,
     tp: f64,
     roles: &Roles,
+    close_on_news: bool,
     pip_size: f64,
     tick_size: f64,
     entry_level_vetos: Vec<trade_control_core::intent::EntryLevelVeto>,
@@ -1296,7 +1304,7 @@ fn build_trade_spec(
             },
             needs_golden: !args.skip_golden,
             needs_confirmed: args.require_confirmation,
-            close_on_news: !roles.news_pairs.is_empty(),
+            close_on_news,
             // Chart-drawn S/R bands, plus (default-on) a one-sided band pinned
             // to the take-profit so a reversal near TP flattens for a partial win
             // rather than round-tripping to the stop. `07-close-on-sr-reversal`
@@ -1494,85 +1502,178 @@ fn round5(v: f64) -> f64 {
 
 /// In-memory representation of one built pause / news bundle so the
 /// payload loop downstream can iterate without re-reading disk.
-struct PauseBundle {
-    built: cli::BuiltPause,
+struct Bundle<K: ControlKind> {
+    built: K::Built,
     out_dir: PathBuf,
 }
 
-struct NewsBundle {
-    built: cli::BuiltNews,
-    out_dir: PathBuf,
+/// The two flavours of control bundle differ only in their spec/built types and
+/// their output subdirectory prefix — the build loop, the guards, and the
+/// `trade_id` requirement are identical. This trait is that difference, so the
+/// loop exists once.
+///
+/// Worth doing rather than two hand-copied loops: the guards are the interesting
+/// part (an empty window set is fine; a non-empty set with no `trade_id` is a
+/// refusal), and a copy-paste pair drifts silently — one gets a fix, the other
+/// doesn't, and the divergence only shows up as a half-armed trade.
+trait ControlKind {
+    /// The signed bundle this kind produces.
+    type Built;
+    /// Subdirectory prefix under the arm's out-dir: `pause-1`, `news-2`, …
+    const DIR_PREFIX: &'static str;
+    /// Human name for the error/log text.
+    const NAME: &'static str;
+
+    /// Build and sign one bundle for `window`, writing it into `dir`.
+    fn build(
+        ctx: &BundleContext<'_>,
+        window: &NewsWindow,
+        dir: &Path,
+        idx: usize,
+    ) -> Result<Self::Built>;
 }
 
-/// Drop blackout/news pairs whose window has already fully closed
-/// (`end_time <= now`). The visible-window filter in [`classify`] only
-/// removes lines that are *off-screen*; when the operator arms off a chart
-/// that is showing historical bars (an old H&S whose trade-expiry is in the
-/// past), the news/blackout vertical lines are genuinely on-screen yet their
-/// window has elapsed in wall-clock terms. A past window has nothing left to
-/// pause / close-on-news for, so arming it is meaningless — and feeding it to
-/// `build_pause_from_spec` would hard-fail with "refusing to arm a stale
-/// blackout". Drop it here, once, so the log line, `close_on_news`, and both
-/// bundle builders all see a consistent live-only view.
-fn drop_past_control_pairs(roles: &mut Roles, as_of: AsOf) {
-    for (kind, pairs) in [
-        ("blackout", &mut roles.blackout_pairs),
-        ("news", &mut roles.news_pairs),
-    ] {
-        let before = pairs.len();
-        pairs.retain(|w| !w.is_past(as_of.at));
-        let dropped = before - pairs.len();
-        if dropped > 0 {
-            info!(
-                kind,
-                dropped,
-                as_of = %as_of.at.to_rfc3339(),
-                source = as_of.source,
-                "dropping control pair(s) whose window already closed (end_time <= as_of)"
-            );
+struct PauseKind;
+struct NewsKind;
+
+impl ControlKind for PauseKind {
+    type Built = cli::BuiltPause;
+    const DIR_PREFIX: &'static str = "pause";
+    const NAME: &'static str = "blackout";
+
+    fn build(
+        ctx: &BundleContext<'_>,
+        window: &NewsWindow,
+        dir: &Path,
+        idx: usize,
+    ) -> Result<Self::Built> {
+        let spec = cli::PauseSpec {
+            trade_id: ctx.trade_id.to_string(),
+            blackout_id: None,
+            instrument: ctx.instrument.to_string(),
+            account: ctx.account.to_string(),
+            broker: broker_to_kind(ctx.broker),
+            start_time: window.start(),
+            end_time: window.end(),
+            reason: Some(ctx.reason(window)),
+        };
+        let built = cli::build_pause_from_spec(spec, ctx.now)
+            .with_context(|| format!("build pause #{idx}"))?;
+        cli::write_pause(&built, ctx.key, dir).with_context(|| format!("write pause #{idx}"))?;
+        Ok(built)
+    }
+}
+
+impl ControlKind for NewsKind {
+    type Built = cli::BuiltNews;
+    const DIR_PREFIX: &'static str = "news";
+    const NAME: &'static str = "news";
+
+    fn build(
+        ctx: &BundleContext<'_>,
+        window: &NewsWindow,
+        dir: &Path,
+        idx: usize,
+    ) -> Result<Self::Built> {
+        let spec = cli::NewsSpec {
+            trade_id: ctx.trade_id.to_string(),
+            news_id: None,
+            instrument: ctx.instrument.to_string(),
+            account: ctx.account.to_string(),
+            broker: broker_to_kind(ctx.broker),
+            start_time: window.start(),
+            end_time: window.end(),
+            reason: Some(ctx.reason(window)),
+        };
+        let built = cli::build_news_from_spec(spec, ctx.now)
+            .with_context(|| format!("build news #{idx}"))?;
+        cli::write_news(&built, ctx.key, dir).with_context(|| format!("write news #{idx}"))?;
+        Ok(built)
+    }
+}
+
+/// Everything a control bundle needs beyond the window itself. Grouped because
+/// the two builders previously took eight positional arguments each — enough
+/// that two same-typed `&str`s (`instrument`, `account`) could be transposed at
+/// a call site with no compiler complaint.
+struct BundleContext<'a> {
+    trade_id: &'a str,
+    instrument: &'a str,
+    account: &'a str,
+    broker: Broker,
+    out_dir: &'a Path,
+    key: &'a [u8; KEY_LEN],
+    /// The as-of instant the bundle is built against — the same prune yardstick
+    /// the windows survived, so a window kept as upcoming-vs-cursor isn't then
+    /// rejected as stale by the builder's own past-window guard.
+    now: DateTime<Utc>,
+}
+
+impl<'a> BundleContext<'a> {
+    /// The `reason` string stamped on a control alert, identifying the trade and
+    /// the window it came from.
+    fn reason(&self, window: &NewsWindow) -> String {
+        format!("news:{}-{}", self.instrument, window.start().to_rfc3339())
+    }
+
+    /// Build one bundle per window, writing each into its own numbered
+    /// subdirectory.
+    ///
+    /// An empty window set is not an error — most trades have no news in their
+    /// lifetime. A *non-empty* set with no `trade_id`, though, is a refusal:
+    /// control alerts are trade-scoped, so an unscoped one would pause the whole
+    /// instrument rather than this trade.
+    fn build_all<K: ControlKind>(&self, windows: &[NewsWindow]) -> Result<Vec<Bundle<K>>> {
+        if windows.is_empty() {
+            return Ok(Vec::new());
         }
-    }
-    // Keep the cosmetic markers exactly in lock-step with the surviving news
-    // windows, so a drawn marker always corresponds to an armed window. A news
-    // window is `[event_time, event_time + after]`, so a marker survives iff a
-    // surviving news window opens at its event minute — this correctly keeps a
-    // marker whose event minute has passed but whose post-release window is
-    // still open (drawn == armed, not drawn == future).
-    let live_event_secs: std::collections::HashSet<i64> = roles
-        .news_pairs
-        .iter()
-        .map(|w| w.start().timestamp())
-        .collect();
-    let before = roles.news_markers.len();
-    roles
-        .news_markers
-        .retain(|m| live_event_secs.contains(&m.event_time.timestamp()));
-    let dropped = before - roles.news_markers.len();
-    if dropped > 0 {
+        if self.trade_id.is_empty() {
+            return Err(eyre!(
+                "have {} windows but trade has no trade_id; refusing to arm",
+                K::NAME
+            ));
+        }
+        let bundles = windows
+            .iter()
+            .enumerate()
+            .map(|(i, window)| {
+                let idx = i + 1;
+                let dir = self.out_dir.join(format!("{}-{idx}", K::DIR_PREFIX));
+                fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
+                Ok(Bundle {
+                    built: K::build(self, window, &dir, idx)?,
+                    out_dir: dir,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         info!(
-            dropped,
-            as_of = %as_of.at.to_rfc3339(),
-            source = as_of.source,
-            "dropping news marker(s) whose news window already closed",
+            kind = K::NAME,
+            count = bundles.len(),
+            "control bundles built"
         );
+        Ok(bundles)
     }
 }
 
-/// Draw one cosmetic vertical line per news event tv-arm reacts to (`roles.news_markers`),
-/// grouped so events sharing a chart bar collapse to a single line. Purely a chart
+/// Draw one cosmetic vertical line per news event tv-arm reacts to, grouped so
+/// events sharing a chart bar collapse to a single line. Purely a chart
 /// annotation for debugging / replay — it never affects the signed plan.
+///
+/// `markers` is the *armed* set (post-prune, via
+/// [`ControlWindows::markers`][crate::control_windows::ControlWindows::markers]),
+/// so drawn == armed.
 ///
 /// Failure is non-fatal: a tv-mcp draw error (or an empty marker set) logs a warning
 /// and returns. Unlike tv-news — which hard-errors on a half-drawn chart — a flaky
 /// tv-mcp must never block a live `--register-plan`, so every line is attempted and
 /// per-line failures are counted, not propagated.
-fn draw_news_markers(mcp: &TvMcp, roles: &Roles, resolution: &str) {
-    if roles.news_markers.is_empty() {
+fn draw_news_markers(mcp: &TvMcp, markers: &[NewsMarker], resolution: &str) {
+    if markers.is_empty() {
         info!("news markers: no armed news events to draw");
         return;
     }
     let bar_secs = news_marker_lines_bar_secs(resolution);
-    let lines = news_marker_lines(&roles.news_markers, bar_secs);
+    let lines = news_marker_lines(markers, bar_secs);
     let mut drawn = 0usize;
     let mut failed = 0usize;
     for line in &lines {
@@ -1594,7 +1695,7 @@ fn draw_news_markers(mcp: &TvMcp, roles: &Roles, resolution: &str) {
         }
     }
     info!(
-        events = roles.news_markers.len(),
+        events = markers.len(),
         lines = lines.len(),
         drawn,
         failed,
@@ -1607,17 +1708,6 @@ fn draw_news_markers(mcp: &TvMcp, roles: &Roles, resolution: &str) {
 fn news_marker_lines_bar_secs(resolution: &str) -> i64 {
     crate::news_marker::resolution_to_secs(resolution)
         .unwrap_or(crate::news_marker::DEFAULT_BAR_SECS)
-}
-
-/// The "as-of" time control pairs are pruned against, plus where it came from
-/// (for the drop log line). In a live `--register-plan` arm this is wall-clock
-/// `now`; in an offline / replay `--plan-out` build it's the chart's replay
-/// cursor (visible range right edge), so blackouts still *upcoming* relative to
-/// the cursor survive a historical replay. See `BUG-tv-arm-stale-blackout-*`.
-#[derive(Clone, Copy)]
-struct AsOf {
-    at: DateTime<Utc>,
-    source: &'static str,
 }
 
 /// Parse `--start` to a unix second, or `None` if the flag is absent. A
@@ -1695,102 +1785,6 @@ fn pick_prune_as_of(args: &Args, now: DateTime<Utc>, cursor_unix: i64, start: Op
         at: cursor.min(now),
         source: "replay-cursor",
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_pause_bundles(
-    roles: &Roles,
-    trade_id: &str,
-    instrument: &str,
-    account: &str,
-    broker: Broker,
-    out_dir: &Path,
-    key: &[u8; KEY_LEN],
-    now: DateTime<Utc>,
-) -> Result<Vec<PauseBundle>> {
-    let mut bundles = Vec::new();
-    if roles.blackout_pairs.is_empty() {
-        return Ok(bundles);
-    }
-    if trade_id.is_empty() {
-        return Err(eyre!(
-            "have blackout pairs but trade has no trade_id; refusing to arm"
-        ));
-    }
-    for (i, w) in roles.blackout_pairs.iter().enumerate() {
-        let pair_idx = i + 1;
-        let start_time = w.start();
-        let pause_dir = out_dir.join(format!("pause-{pair_idx}"));
-        fs::create_dir_all(&pause_dir).with_context(|| format!("mkdir {}", pause_dir.display()))?;
-        let spec = cli::PauseSpec {
-            trade_id: trade_id.to_string(),
-            blackout_id: None,
-            instrument: instrument.to_string(),
-            account: account.to_string(),
-            broker: broker_to_kind(broker),
-            start_time,
-            end_time: w.end(),
-            reason: Some(format!("news:{instrument}-{}", start_time.to_rfc3339())),
-        };
-        let built = cli::build_pause_from_spec(spec, now)
-            .with_context(|| format!("build pause #{pair_idx}"))?;
-        cli::write_pause(&built, key, &pause_dir)
-            .with_context(|| format!("write pause #{pair_idx}"))?;
-        bundles.push(PauseBundle {
-            built,
-            out_dir: pause_dir,
-        });
-    }
-    info!(count = bundles.len(), "pause bundles built");
-    Ok(bundles)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_news_bundles(
-    roles: &Roles,
-    trade_id: &str,
-    instrument: &str,
-    account: &str,
-    broker: Broker,
-    out_dir: &Path,
-    key: &[u8; KEY_LEN],
-    now: DateTime<Utc>,
-) -> Result<Vec<NewsBundle>> {
-    let mut bundles = Vec::new();
-    if roles.news_pairs.is_empty() {
-        return Ok(bundles);
-    }
-    if trade_id.is_empty() {
-        return Err(eyre!(
-            "have news pairs but trade has no trade_id; refusing to arm"
-        ));
-    }
-    for (i, w) in roles.news_pairs.iter().enumerate() {
-        let pair_idx = i + 1;
-        let start_time = w.start();
-        let news_dir = out_dir.join(format!("news-{pair_idx}"));
-        fs::create_dir_all(&news_dir).with_context(|| format!("mkdir {}", news_dir.display()))?;
-        let spec = cli::NewsSpec {
-            trade_id: trade_id.to_string(),
-            news_id: None,
-            instrument: instrument.to_string(),
-            account: account.to_string(),
-            broker: broker_to_kind(broker),
-            start_time,
-            end_time: w.end(),
-            reason: Some(format!("news:{instrument}-{}", start_time.to_rfc3339())),
-        };
-        let built = cli::build_news_from_spec(spec, now)
-            .with_context(|| format!("build news #{pair_idx}"))?;
-        cli::write_news(&built, key, &news_dir)
-            .with_context(|| format!("write news #{pair_idx}"))?;
-        bundles.push(NewsBundle {
-            built,
-            out_dir: news_dir,
-        });
-    }
-    info!(count = bundles.len(), "news bundles built");
-    Ok(bundles)
 }
 
 /// Position-tool direct entry. Read the drawn long/short position tool,
@@ -2145,8 +2139,8 @@ fn register_trade_plan(
     direction: Direction,
     roles: &Roles,
     resolution: &str,
-    pause_bundles: &[PauseBundle],
-    news_bundles: &[NewsBundle],
+    pause_bundles: &[Bundle<PauseKind>],
+    news_bundles: &[Bundle<NewsKind>],
     key: &[u8; KEY_LEN],
     account: &str,
     now: DateTime<Utc>,
@@ -2312,10 +2306,7 @@ mod tests {
     }
 
     fn wallclock(at: DateTime<Utc>) -> AsOf {
-        AsOf {
-            at,
-            source: "wallclock",
-        }
+        AsOf::wallclock(at)
     }
 
     /// A `NewsWindow` from two unix-second boundaries — the calendar-resolved
@@ -2325,6 +2316,130 @@ mod tests {
             DateTime::<Utc>::from_timestamp(start_unix, 0).expect("valid start"),
             DateTime::<Utc>::from_timestamp(end_unix, 0).expect("valid end"),
         )
+    }
+
+    // ===== control bundles ==============================================
+
+    /// Pause and news bundles must land in **disjoint** directories.
+    ///
+    /// Both `write_pause` and `write_news` emit a `manifest.yaml` into the
+    /// directory they're handed. If the two kinds ever shared a numbered
+    /// subdirectory, the second writer would silently overwrite the first's
+    /// manifest — a half-armed trade whose on-disk record is wrong, with no
+    /// error anywhere.
+    ///
+    /// This is the one thing that genuinely distinguishes the two `ControlKind`
+    /// impls now that the build loop is shared, so it's asserted rather than
+    /// assumed: swapping `DIR_PREFIX` on either impl must fail here.
+    #[test]
+    fn pause_and_news_bundles_never_share_a_directory() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let key = [7u8; KEY_LEN];
+        let t = now().timestamp();
+        let ctx = BundleContext {
+            trade_id: "t-abc123",
+            instrument: "EUR_USD",
+            account: "ms-oanda-1",
+            broker: Broker::Oanda,
+            out_dir: tmp.path(),
+            key: &key,
+            now: now(),
+        };
+        // Two of each, so the numbering (`-1`, `-2`) is exercised too — a
+        // shared counter across kinds would also collide.
+        let windows = vec![nw(t + 600, t + 1200), nw(t + 1800, t + 2400)];
+
+        let pauses = match ctx.build_all::<PauseKind>(&windows) {
+            Ok(b) => b,
+            Err(e) => panic!("pause bundles must build: {e}"),
+        };
+        let newses = match ctx.build_all::<NewsKind>(&windows) {
+            Ok(b) => b,
+            Err(e) => panic!("news bundles must build: {e}"),
+        };
+        assert_eq!(pauses.len(), 2);
+        assert_eq!(newses.len(), 2);
+        // Numbering is 1-based and per-kind. Nothing downstream parses it, but
+        // it's what the operator reads in the arm directory, so pin the spelling
+        // rather than let it drift silently.
+        fn dir_name<K: ControlKind>(b: &Bundle<K>) -> &str {
+            b.out_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<none>")
+        }
+        assert_eq!(dir_name(&pauses[0]), "pause-1");
+        assert_eq!(dir_name(&pauses[1]), "pause-2");
+        assert_eq!(dir_name(&newses[0]), "news-1");
+
+        let dirs: Vec<&Path> = pauses
+            .iter()
+            .map(|b| b.out_dir.as_path())
+            .chain(newses.iter().map(|b| b.out_dir.as_path()))
+            .collect();
+        let unique: std::collections::HashSet<&Path> = dirs.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            4,
+            "four bundles need four distinct directories, got {dirs:?}"
+        );
+
+        // …and each really wrote its own manifest, i.e. nothing was clobbered.
+        for dir in &dirs {
+            assert!(
+                dir.join("manifest.yaml").is_file(),
+                "{} has no manifest",
+                dir.display()
+            );
+        }
+        // The pause dirs hold pause specs and the news dirs hold news specs —
+        // proves the collision check above isn't passing on name alone.
+        for b in &pauses {
+            assert!(b.out_dir.join("pause.yaml").is_file());
+        }
+        for b in &newses {
+            assert!(b.out_dir.join("news.yaml").is_file());
+        }
+    }
+
+    /// An empty window set is normal (most trades have no news in their
+    /// lifetime) and must not error — whereas a non-empty set with no
+    /// `trade_id` must refuse, since an unscoped control alert would pause the
+    /// whole instrument instead of this one trade.
+    #[test]
+    fn build_all_allows_no_windows_but_refuses_windows_without_a_trade_id() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let key = [7u8; KEY_LEN];
+        let t = now().timestamp();
+        let mut ctx = BundleContext {
+            trade_id: "",
+            instrument: "EUR_USD",
+            account: "ms-oanda-1",
+            broker: Broker::Oanda,
+            out_dir: tmp.path(),
+            key: &key,
+            now: now(),
+        };
+
+        match ctx.build_all::<PauseKind>(&[]) {
+            Ok(b) => assert!(b.is_empty(), "no windows → no bundles"),
+            Err(e) => panic!("no windows must not error: {e}"),
+        }
+
+        match ctx.build_all::<PauseKind>(&[nw(t + 600, t + 1200)]) {
+            Ok(_) => panic!("windows with no trade_id must refuse"),
+            Err(e) => assert!(
+                e.to_string().contains("no trade_id"),
+                "unhelpful error: {e}"
+            ),
+        }
+
+        // With a trade_id it builds.
+        ctx.trade_id = "t-abc123";
+        match ctx.build_all::<PauseKind>(&[nw(t + 600, t + 1200)]) {
+            Ok(b) => assert_eq!(b.len(), 1),
+            Err(e) => panic!("should build with a trade_id: {e}"),
+        }
     }
 
     #[test]
@@ -2431,89 +2546,6 @@ mod tests {
         assert!(range.1 <= range.0, "empty range: to <= from");
     }
 
-    // ===== past control-pair drop =======================================
-
-    #[test]
-    fn drop_past_control_pairs_removes_elapsed_windows() {
-        // One live pair (ends in the future) and one elapsed pair (ends
-        // before `now`) for each of blackout + news. Only the live pairs
-        // survive — an elapsed window has nothing left to act on, and feeding
-        // it to build_pause/news_from_spec would hard-fail as a "stale" arm.
-        let t = now().timestamp();
-        let live = nw(t + 1800, t + 3600);
-        let past = nw(t - 7200, t - 3600);
-        let mut roles = Roles {
-            blackout_pairs: vec![past, live],
-            news_pairs: vec![past, live],
-            ..Default::default()
-        };
-
-        drop_past_control_pairs(&mut roles, wallclock(now()));
-
-        assert_eq!(roles.blackout_pairs.len(), 1);
-        assert_eq!(roles.blackout_pairs[0], live);
-        assert_eq!(roles.news_pairs.len(), 1);
-        assert_eq!(roles.news_pairs[0], live);
-    }
-
-    /// Cosmetic news markers stay in lock-step with the surviving news windows:
-    /// a marker survives iff a surviving news window opens at its event minute.
-    /// Crucially, a marker whose event minute has *passed* but whose post-release
-    /// news window is still open must survive — drawn == armed, not drawn ==
-    /// future. Uses `trade_control_cli::Impact` via the `NewsMarker` ctor.
-    #[test]
-    fn drop_past_control_pairs_keeps_markers_in_lockstep_with_news_windows() {
-        use trade_control_cli::Impact;
-        let t = now().timestamp();
-        // Live: event minute already passed (event = now-60), but the news
-        // window [event, event+1800] is still open → both window and marker live.
-        let live_event = DateTime::<Utc>::from_timestamp(t - 60, 0).unwrap();
-        // Past: whole news window elapsed → window dropped, marker dropped.
-        let past_event = DateTime::<Utc>::from_timestamp(t - 7200, 0).unwrap();
-        let mut roles = Roles {
-            news_pairs: vec![
-                nw(past_event.timestamp(), past_event.timestamp() + 1800), // ends t-5400 → past
-                nw(live_event.timestamp(), live_event.timestamp() + 1800), // ends t+1740 → live
-            ],
-            news_markers: vec![
-                NewsMarker::new("EUR", Impact::High, past_event),
-                NewsMarker::new("USD", Impact::High, live_event),
-            ],
-            ..Default::default()
-        };
-
-        drop_past_control_pairs(&mut roles, wallclock(now()));
-
-        // The past news window is gone; the live one (post-release tail still
-        // open, though its event minute already passed) survives.
-        assert_eq!(roles.news_pairs.len(), 1);
-        // The marker for the surviving window survives; the past one is dropped.
-        assert_eq!(roles.news_markers.len(), 1);
-        assert_eq!(roles.news_markers[0].currency, "USD");
-        assert_eq!(roles.news_markers[0].event_time, live_event);
-    }
-
-    #[test]
-    fn drop_past_control_pairs_keeps_window_ending_exactly_now() {
-        // Boundary: a window whose end is in the future by one second is
-        // live; one ending exactly at `now` is treated as elapsed (the gate
-        // is `end <= now`), mirroring build_pause_from_spec's own check.
-        let t = now().timestamp();
-        let live = nw(t, t + 1); // ends 1s out → live
-        let mut roles = Roles {
-            news_pairs: vec![
-                nw(t - 60, t), // ends exactly now → past
-                live,          // ends 1s out → live
-            ],
-            ..Default::default()
-        };
-
-        drop_past_control_pairs(&mut roles, wallclock(now()));
-
-        assert_eq!(roles.news_pairs.len(), 1);
-        assert_eq!(roles.news_pairs[0], live);
-    }
-
     // ===== as-of selection for control-pair pruning =====================
 
     /// Replay regression (the bug): a `--plan-out` build off a rewound chart
@@ -2535,17 +2567,17 @@ mod tests {
         assert_eq!(as_of.at, cursor);
         assert_eq!(as_of.source, "replay-cursor");
 
-        // An event 12h after the cursor (still in the past vs `now`) survives.
+        // …and that as-of actually reaches the prune: an event 12h after the
+        // cursor (still in the past vs `now`) survives. This is the integration
+        // half — `ControlWindows` owns and tests the prune rule itself; what
+        // matters here is that the *selected* yardstick is the one it's handed.
         let event_end = cursor.timestamp() + 12 * 3600;
-        let mut roles = Roles {
-            blackout_pairs: vec![nw(event_end - 1800, event_end)],
-            ..Default::default()
-        };
-        drop_past_control_pairs(&mut roles, as_of);
+        let control =
+            ControlWindows::new(vec![nw(event_end - 1800, event_end)], vec![], vec![], as_of);
         assert_eq!(
-            roles.blackout_pairs.len(),
+            control.blackout().len(),
             1,
-            "upcoming-vs-cursor pair kept"
+            "upcoming-vs-cursor window kept"
         );
     }
 
@@ -2761,6 +2793,7 @@ mod tests {
             &args,
             &roles,
             &PlanGeometry::from_roles(&roles),
+            false,
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
@@ -2784,6 +2817,7 @@ mod tests {
             &args,
             &roles,
             &PlanGeometry::from_roles(&roles),
+            false,
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
@@ -2807,6 +2841,7 @@ mod tests {
             &args,
             &roles,
             &PlanGeometry::from_roles(&roles),
+            false,
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
@@ -2831,6 +2866,7 @@ mod tests {
             &args,
             &roles,
             &PlanGeometry::from_roles(&roles),
+            false,
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
@@ -2928,6 +2964,7 @@ mod tests {
             &args,
             &roles,
             &PlanGeometry::from_roles(&roles),
+            false,
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
@@ -2954,6 +2991,7 @@ mod tests {
             &args,
             &roles,
             &PlanGeometry::from_roles(&roles),
+            false,
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
@@ -2978,6 +3016,7 @@ mod tests {
             &args,
             &roles,
             &PlanGeometry::from_roles(&roles),
+            false,
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
@@ -3096,6 +3135,7 @@ mod tests {
             now() + chrono::Duration::days(1),
             150.0,
             &Roles::default(),
+            false,
             0.01,
             // Distinct tick (finer than pip) to prove it's baked independently.
             0.001,
@@ -3122,6 +3162,7 @@ mod tests {
             now() + chrono::Duration::days(1),
             1.05,
             &Roles::default(),
+            false,
             0.0001,
             0.0001,
             Vec::new(),
@@ -3140,6 +3181,7 @@ mod tests {
             now() + chrono::Duration::days(1),
             1.05,
             &Roles::default(),
+            false,
             0.0001,
             0.0001,
             Vec::new(),
@@ -3148,6 +3190,58 @@ mod tests {
             !skipped.needs_golden,
             "--skip-golden must clear needs_golden on the spec"
         );
+    }
+
+    /// `close_on_news` reaches the spec verbatim from the caller's news fact.
+    ///
+    /// Previously this was derived inside `build_trade_spec` from a field on
+    /// `Roles` and no test covered it at all — a silent gap on the flag that
+    /// decides whether an open position gets flattened around a news release.
+    /// Now that the news windows live in `ControlWindows`, the fact is an
+    /// argument, so it's directly testable: assert both polarities so a
+    /// hard-coded `false` (or an inverted one) fails.
+    #[test]
+    fn close_on_news_is_carried_onto_the_spec_both_ways() {
+        let spec_for = |close_on_news| {
+            build_trade_spec(
+                &mw_args(&[]),
+                "EUR_USD",
+                "ms-oanda-1",
+                Broker::Oanda,
+                Direction::Long,
+                now() + chrono::Duration::days(1),
+                1.05,
+                &Roles::default(),
+                close_on_news,
+                0.0001,
+                0.0001,
+                Vec::new(),
+            )
+        };
+        assert!(
+            spec_for(true).close_on_news,
+            "a trade with a news window in its lifetime must close on news"
+        );
+        assert!(!spec_for(false).close_on_news, "…and one without must not");
+    }
+
+    /// The wiring the above can't see: `ControlWindows::has_news` is what the
+    /// pipeline actually passes, and it must read the PRUNED set. An all-elapsed
+    /// calendar would otherwise arm a news close for a window that has already
+    /// finished — arming a guard against an event that cannot recur.
+    #[test]
+    fn has_news_drives_close_on_news_from_the_pruned_window_set() {
+        let t = now().timestamp();
+        let as_of = wallclock(now());
+
+        let all_elapsed = ControlWindows::new(vec![], vec![nw(t - 7200, t - 3600)], vec![], as_of);
+        assert!(
+            !all_elapsed.has_news(),
+            "every news window elapsed → no close_on_news"
+        );
+
+        let live = ControlWindows::new(vec![], vec![nw(t + 60, t + 3600)], vec![], as_of);
+        assert!(live.has_news(), "a live news window → close_on_news");
     }
 
     /// End-to-end arm: build the HS spec the real `--plan-out` path builds,
@@ -3166,6 +3260,7 @@ mod tests {
             now() + chrono::Duration::days(1),
             1.05,
             &Roles::default(),
+            false,
             0.0001,
             0.0001,
             Vec::new(),
@@ -3380,6 +3475,7 @@ mod tests {
             now() + chrono::Duration::days(1),
             1.05,
             &Roles::default(),
+            false,
             pip_size,
             pip_size,
             Vec::new(),

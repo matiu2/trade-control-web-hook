@@ -39,8 +39,6 @@ use trade_control_conventions::{
     matches, prep_name_from_expiry_label,
 };
 
-use crate::news_marker::NewsMarker;
-use crate::news_window::NewsWindow;
 use trading_view::drawings::{Drawing, DrawingStub};
 use trading_view::mcp::TvMcp;
 // `TimedAnchor::anchor_time` is still used by the single-slot pickers
@@ -106,18 +104,10 @@ pub struct Roles {
     pub tp_fib: Option<Drawing>,
     /// Vertical line marking the trade-expiry veto.
     pub trade_expiry: Option<Drawing>,
-    /// Blackout (pause/resume) windows, resolved from the calendar at real
-    /// event-minute precision. No longer read back off drawn chart lines —
-    /// see [`crate::news_window`].
-    pub blackout_pairs: Vec<NewsWindow>,
-    /// News windows (`news-start`/`news-end`), same calendar-resolved source.
-    pub news_pairs: Vec<NewsWindow>,
-    /// The individual news events tv-arm reacts to (currency + stars + event
-    /// minute), carried alongside the windows purely so tv-arm can draw the
-    /// cosmetic markers annotating the *exact* armed set. Never signed, never
-    /// gate machinery — cosmetic. Same filter/scope as `news_pairs`, pruned
-    /// together in `drop_past_control_pairs`.
-    pub news_markers: Vec<NewsMarker>,
+    // NOTE: blackout / news windows and their markers are NOT here. They are
+    // calendar-derived, not drawn, and they carry a lock-step invariant of their
+    // own — see [`crate::control_windows::ControlWindows`]. `Roles` is strictly
+    // "what the operator drew on the chart".
     /// Support / resistance horizontal lines. Each one contributes
     /// an `[lo, hi]` price band to the consolidated
     /// `06-close-on-reversal` alert (`inside_window` gets `price`
@@ -1132,10 +1122,11 @@ mod tests {
         assert_eq!(roles.trade_expiry.as_ref().unwrap().id, "exp");
 
         // Drawn pause/resume and news-start/news-end lines are no longer
-        // classified — the calendar is the sole source of these windows.
-        assert!(roles.blackout_pairs.is_empty());
-        assert!(roles.news_pairs.is_empty());
-
+        // classified — the calendar is the sole source of those windows, and
+        // `Roles` no longer has anywhere to put them (they live in
+        // `ControlWindows`). Now enforced by the type system rather than an
+        // assertion; the drawn lines in this fixture must simply be ignored,
+        // which the role assertions above already prove.
         assert_eq!(roles.sr_levels.len(), 1);
         assert_eq!(roles.sr_levels[0].id, "sr");
     }
@@ -1263,11 +1254,15 @@ mod tests {
     #[test]
     fn drawn_pause_and_news_lines_are_ignored_regardless_of_window() {
         // Blackout/news windows are resolved from the calendar, not from drawn
-        // chart lines. Any pause/resume/news-start/news-end verticals left on
-        // the chart — in or out of the visible window — are simply ignored, so
-        // `classify` never populates the pair lists. (This replaces the old
-        // window-filter tests, whose independent start/end pruning caused the
-        // `--start` straddle "1 start / 2 ends" abort.)
+        // chart lines (they live in `ControlWindows`, which `classify` never
+        // touches). Any pause/resume/news-start/news-end verticals left on the
+        // chart must be ignored *entirely* — the risk worth testing is not that
+        // they populate a pair list (there is no longer one to populate) but that
+        // a leftover `pause` vertical gets mistaken for some OTHER vertical role
+        // and silently sets a bogus trade-expiry or prep-expiry cutoff.
+        // (This replaces the old window-filter tests, whose independent
+        // start/end pruning caused the `--start` straddle "1 start / 2 ends"
+        // abort.)
         let (stubs, mcp) = fixture(vec![
             (
                 stub("bs", "vertical_line"),
@@ -1288,8 +1283,20 @@ mod tests {
         ]);
 
         let roles = classify(&mcp, &stubs, (200, 500), SlotPref::LatestWins).expect("classify ok");
-        assert!(roles.blackout_pairs.is_empty());
-        assert!(roles.news_pairs.is_empty());
+        assert!(
+            roles.trade_expiry.is_none(),
+            "a leftover pause/news vertical must not become the trade-expiry"
+        );
+        assert!(
+            roles.prep_expiries.is_empty(),
+            "…nor a prep-expiry cutoff: {:?}",
+            roles.prep_expiries
+        );
+        // Nor any of the price-line roles.
+        assert!(roles.invalidation.is_none());
+        assert!(roles.break_and_close.is_none());
+        assert!(roles.retest.is_none());
+        assert!(roles.sr_levels.is_empty());
     }
 
     #[test]
@@ -1298,8 +1305,6 @@ mod tests {
         let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("classify ok");
         assert!(roles.invalidation.is_none());
         assert!(roles.break_and_close.is_none());
-        assert!(roles.blackout_pairs.is_empty());
-        assert!(roles.news_pairs.is_empty());
         assert!(roles.sr_levels.is_empty());
     }
 
@@ -1912,6 +1917,10 @@ mod tests {
         // `pause`/`resume` (and `blackout-start`/`blackout-end`) verticals used
         // to classify into a blackout pair. Windows now come from the calendar,
         // so these labels are ignored — a stray drawn line arms nothing.
+        // Uppercase `PAUSE` on purpose: label matching is case-insensitive, so
+        // the ignore has to hold for any casing, not just the canonical
+        // spelling. As above, what's checked is that they don't leak into some
+        // *other* vertical role.
         let (stubs, mcp) = fixture(vec![
             (
                 stub("ps", "vertical_line"),
@@ -1923,7 +1932,8 @@ mod tests {
             ),
         ]);
         let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
-        assert!(roles.blackout_pairs.is_empty());
+        assert!(roles.trade_expiry.is_none());
+        assert!(roles.prep_expiries.is_empty());
     }
 
     #[test]

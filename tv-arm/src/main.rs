@@ -22,6 +22,7 @@ use clap_complete::{Shell, generate};
 use color_eyre::eyre::Result;
 
 mod args;
+mod control_windows;
 mod geometry;
 mod instrument_recovery;
 mod instrument_resolution;
