@@ -144,10 +144,11 @@ async fn run() -> Result<()> {
         tracing::info!("annotation implies --simulate; running the fill simulator");
     }
 
-    let plan_path = args
-        .plan
-        .clone()
-        .ok_or_else(|| eyre!("--plan is required (or use --test-mode --fixture <name>)"))?;
+    let plan_path = args.plan.clone().ok_or_else(|| {
+        outcome::bad_input(eyre!(
+            "--plan is required (or use --test-mode --fixture <name>)"
+        ))
+    })?;
     let plan = load_plan(&plan_path)?;
 
     // Granularity comes from the plan; `--granularity` only overrides, and an
@@ -164,7 +165,9 @@ async fn run() -> Result<()> {
     let start = window.start;
     let end = window.end;
     if end <= start {
-        return Err(eyre!("end ({end}) must be after start ({start})"));
+        return Err(outcome::bad_input(eyre!(
+            "end ({end}) must be after start ({start})"
+        )));
     }
 
     // The engine evaluates a `TimeReached` (trade-expiry) against each candle's
@@ -490,7 +493,7 @@ async fn run_test_mode(args: &Args) -> Result<()> {
     let name = args
         .fixture
         .as_deref()
-        .ok_or_else(|| eyre!("--test-mode requires --fixture <name>"))?;
+        .ok_or_else(|| outcome::bad_input(eyre!("--test-mode requires --fixture <name>")))?;
     let dir = fixtures_dir(args).join(name);
     tracing::info!(dir = %dir.display(), "replaying fixture offline");
 
@@ -570,9 +573,9 @@ async fn run_frozen(
 fn diff_error(expected: &ReplayOutcome, got: &ReplayOutcome) -> color_eyre::eyre::Report {
     let exp = serde_json::to_string_pretty(expected).unwrap_or_default();
     let act = serde_json::to_string_pretty(got).unwrap_or_default();
-    eyre!(
+    outcome::check_mismatch(eyre!(
         "fixture outcome does not match expected.json\n--- expected ---\n{exp}\n--- got ---\n{act}"
-    )
+    ))
 }
 
 /// The fully-resolved replay window: instrument (or `None` to fall back to the
@@ -738,13 +741,13 @@ fn parse_start_end(s: &str) -> Result<DateTime<Utc>> {
                 .from_local_datetime(&naive)
                 .single()
                 .map(|dt| dt.with_timezone(&Utc))
-                .ok_or_else(|| eyre!("{s:?} is ambiguous in Brisbane time"));
+                .ok_or_else(|| outcome::bad_input(eyre!("{s:?} is ambiguous in Brisbane time")));
         }
     }
-    Err(eyre!(
+    Err(outcome::bad_input(eyre!(
         "{s:?} is not a valid datetime (expected Brisbane YYYY-MM-DDTHH:MM[:SS], \
          or an explicit offset like ...T07:00Z / ...T17:00+10:00)"
-    ))
+    )))
 }
 
 /// Brisbane's fixed UTC offset in seconds (+10:00, no DST).
