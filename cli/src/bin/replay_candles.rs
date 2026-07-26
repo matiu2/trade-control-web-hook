@@ -539,6 +539,20 @@ fn fixtures_dir(args: &Args) -> PathBuf {
 /// Replay saved fixtures offline: one (`--fixture`) or many
 /// (`--fixtures-glob`). Dispatches to the batch path when a glob is given.
 async fn run_test_mode(args: &Args) -> Result<()> {
+    // Chart annotation draws on a live TradingView chart, which test-mode has no
+    // connection to — so `--annotate` here is a no-op. Say so rather than accept
+    // it silently.
+    //
+    // Deliberately a warning and not a `conflicts_with`: `tv-arm … replay`
+    // *injects* `--annotate true` as its own default, so a hard conflict would
+    // reject a chained replay over a flag the operator never typed. Loud, not
+    // fatal.
+    if args.annotate || args.annotate_unfilled {
+        tracing::warn!(
+            "--annotate has no effect under --test-mode (there is no live chart to \
+             draw on) — ignoring it"
+        );
+    }
     match args.fixtures_glob.as_deref() {
         Some(pattern) => run_test_mode_batch(args, pattern).await,
         None => run_test_mode_single(args).await,
@@ -608,11 +622,22 @@ async fn run_test_mode_batch(args: &Args, pattern: &str) -> Result<()> {
     if dirs.is_empty() {
         // Not an error — but say so loudly, since an empty batch that reads as
         // success is exactly how a wrong glob produces a silently empty grid.
-        tracing::warn!(
-            root = %root.display(),
-            pattern,
-            "no fixtures matched — check the glob and --fixtures-dir"
-        );
+        //
+        // This used to be a `warn!` and `Ok(())`: exit 0, an honest `matched: 0`
+        // in the JSON, and a stderr line that vanishes under `RUST_LOG=error`. A
+        // driver that checks only the exit code — which is what an exit code is
+        // FOR — read a typo'd glob as a clean sweep. Exit 4 instead: the operator
+        // named fixtures that don't exist, which is a bad *input*, not an
+        // infrastructure blip to retry.
+        //
+        // The rows are still printed first (an empty `results: []` above), so the
+        // JSON contract holds: a document on stdout, plus a failing exit code.
+        return Err(outcome::bad_input(eyre!(
+            "no fixtures matched {pattern:?} under {} — check the glob and \
+             --fixtures-dir. (Nothing ran, so the {:+.2} net R above is vacuous.)",
+            root.display(),
+            summary.net_r,
+        )));
     }
     if summary.failed > 0 {
         let msg = eyre!(
