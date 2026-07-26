@@ -9,9 +9,9 @@ Each commit green (tests + clippy + fmt) before the next.
 - [x] **2. `outcome{}` in `expected.json`** (4.1) — DONE (164423a) — `net_r`, counts, `legs[]`,
       sourced from `fire.realized`. Re-bless the 5 existing fixtures; any change
       to their `fires[]` means stop and read.
-- [ ] **3. `arm{}` in `meta.json`** (4.2 + 4.5) — flags, versions, broker-qualified
+- [x] **3. `arm{}` in `meta.json`** (4.2 + 4.5) — DONE (e9704fb) — flags, versions, broker-qualified
       chart symbol, `journal_ref`. Wire `GIT_VERSION` into `replay-candles --version`.
-- [ ] **4. Batch replay** (4.4) — `--test-mode --fixtures-glob` + `--json`.
+- [x] **4. Batch replay** (4.4) — DONE (b2502d5) — `--test-mode --fixtures-glob` + `--json`.
       Also `--no-annotate` for unattended runs (after reproducing the collision).
 - [ ] **5. `HsSpec` on `TradeSpec`** (2a) — `build_trade_plan` reads spec not
       `&Roles`. Pure refactor: byte-identical plans, proven by round-trip test.
@@ -37,11 +37,16 @@ Each commit green (tests + clippy + fmt) before the next.
   `xau-xag-close-on-reversal`, `xau-xag-tp-resistance` are untracked WIP in the
   primary checkout and were deliberately left alone (not re-blessed).
 
-## Open questions
+**All of the journalling side's asks (4.1–4.5) are DELIVERED.** 5–8 below are the
+operator-requested expansion (re-armable spec + scored corpus).
 
-- `--annotate` collision (appendix): **reproduce before fixing**. `replay.rs:68-81`
-  injects defaults before passthrough, clap is last-wins, and `replay.rs:177-196`
-  tests the override works. The feature request says it fails.
+## Resolved questions
+
+- `--annotate` collision: **REAL, and fixed** (e9704fb). Both reports were right.
+  `ArgAction::Set` REJECTS a repeated flag — it is not last-wins. The existing test
+  passed because it asserted only on TOKEN POSITION and never parsed the argv; its
+  comment ("clap: last wins") was simply false. Lesson: when testing argv
+  assembly, parse the result.
 
 ## Interaction with DEV-BRIEF-postgres-candle-cache.md (3rd agent, in flight)
 
