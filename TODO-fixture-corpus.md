@@ -13,15 +13,42 @@ Each commit green (tests + clippy + fmt) before the next.
       chart symbol, `journal_ref`. Wire `GIT_VERSION` into `replay-candles --version`.
 - [x] **4. Batch replay** (4.4) — DONE (b2502d5) — `--test-mode --fixtures-glob` + `--json`.
       Also `--no-annotate` for unattended runs (after reproducing the collision).
-- [ ] **5. `HsSpec` on `TradeSpec`** (2a) — `build_trade_plan` reads spec not
-      `&Roles`. Pure refactor: byte-identical plans, proven by round-trip test.
-- [ ] **6. `tv-arm --spec-in`** (2a) — arm from frozen spec, no TV. Re-read
-      spread/mid/calendar per §3.5. Fix `--start` strict-RFC3339 here.
+- [x] **5. `PlanGeometry`** (2a) — DONE (3bfcab1). Landed as `tv-arm/src/plan_geometry.rs`
+      rather than `HsSpec` on `TradeSpec` (see the decision note below).
+      `build_trade_plan`/`trigger_for` read plain data; proven byte-identical by
+      `a_plan_built_from_frozen_geometry_matches_one_built_from_drawings`.
+- [ ] **6. `tv-arm --spec-in`** (2a) — arm from frozen spec, no TV. Bigger than
+      one commit; sequenced:
+  - [x] **6a.** `MwPath.runup_start` (4713acb) — latent bug: direction + 2 gates
+        need it, no trigger does.
+  - [x] **6b.** Push `PlanGeometry` through validation / TP / entry-level vetos
+        (feaa019). Found + fixed a 1-point-neckline hole in `check_required`.
+  - [ ] **6c.** Split `drop_past_control_pairs` / `build_*_bundles` off `&mut Roles`
+        onto the window vectors.
+  - [ ] **6d.** Extract `SetupInputs` + `arm_from_inputs`; `run` becomes a two-way
+        branch (chart vs frozen). `mcp: Option<TvMcp>` makes "annotation is
+        chart-only" structural.
+  - [ ] **6e.** `--spec-in` itself: `FrozenSpec` file, guards, round-trip test.
+        Reject `--market-entry`/`--stop-entry`/`--limit-entry` (position-tool SL/TP
+        are TV drawing properties, inherently live-chart).
+  - [ ] **6f.** `--start` strict-RFC3339 fix (seconds currently mandatory).
 - [ ] **7. Tier-2 scored corpus** (2b) — aggregate Net R, baseline diff, re-bless.
       Not in `cargo test`.
 - [ ] **8. `--save-matrix`** (4.3) — one-pass variants.
 
 ## Decisions made along the way
+
+- **`PlanGeometry` in tv-arm, NOT `HsSpec` on `TradeSpec`.** The scoping doc
+  proposed hanging the geometry off `cli::TradeSpec`. On reading the code,
+  `TradeSpec` is what arming *produces and signs* — putting frozen input geometry
+  on it would ride the geometry into every signed alert body with no consumer.
+  `PlanGeometry` is tv-arm's *input*; `TradeSpec` stays its output. One artifact
+  per job.
+- **News is re-read, so a spec-in arm is NOT bit-reproducible across time.**
+  `close_on_news` derives from the re-read calendar, so news-ON cells can move for
+  calendar reasons rather than engine reasons. Correct by design (you want fresh
+  news), but the tier-2 baseline diff must label news-sensitive rows so that
+  movement isn't mistaken for a regression. News-OFF rows stay reproducible.
 
 - **`account` is derived, not stored.** Storing the compounded balance made the
   fixture gate flaky — it's a multiply-accumulate chain whose low bits depend on
