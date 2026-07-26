@@ -44,14 +44,18 @@ pub async fn pull(
 
     let candles = match source {
         CandleSource::Oanda => {
-            let client = CacheClient::new(config, oanda_source()?).await?;
+            let client = CacheClient::new(config, oanda_source()?)
+                .await
+                .map_err(cache_unreachable)?;
             client
                 .get_candles_range_bid_ask(symbol, from_fx, to_fx, gran)
                 .await
                 .wrap_err("pull OANDA bid/ask candles")?
         }
         CandleSource::TradeNation => {
-            let client = CacheClient::new(config, tradenation_source()?).await?;
+            let client = CacheClient::new(config, tradenation_source()?)
+                .await
+                .map_err(cache_unreachable)?;
             client
                 .get_candles_range_bid_ask(symbol, from_fx, to_fx, gran)
                 .await
@@ -60,6 +64,23 @@ pub async fn pull(
     };
 
     Ok(candles.candles.iter().map(to_engine_candle).collect())
+}
+
+/// Turn a cache-open failure into an unmistakable one-liner.
+///
+/// Opening the client is where an unreachable database, a bad `DATABASE_URL`
+/// or a pool-acquire timeout (30s) surfaces, and the raw sqlx text for those is
+/// generic enough to scroll past in noisy stderr. A replay that can't reach the
+/// cache must never be mistaken for one that ran: a wrong answer is worse than
+/// a hard failure, so this is loud and fatal, never a silent degrade to an
+/// empty cache (which would re-pull everything and can change fills).
+fn cache_unreachable(e: impl std::fmt::Display) -> color_eyre::Report {
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://candle_cache@localhost:5432/candle_cache".to_string());
+    eyre!(
+        "{}",
+        super::outcome::cache_unreachable_banner(&url, &e.to_string())
+    )
 }
 
 /// Build an OANDA data source from `OANDA_TOKEN` / `OANDA_ACCOUNT_ID`.

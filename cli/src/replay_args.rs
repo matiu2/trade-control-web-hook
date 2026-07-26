@@ -144,11 +144,28 @@ impl DetectorMarkConfig {
     }
 }
 
+/// Exit-code contract, shown under `--help`. Batch drivers branch on these, so
+/// they are part of the interface: changing a number is a breaking change.
+const EXIT_CODE_HELP: &str = "\
+EXIT CODES:
+  0  the replay ran to completion — record the result, whatever it was
+     (including a legitimate no-fill 0R)
+  2  usage error (clap): an unknown or malformed flag
+  3  infrastructure failure — candle cache unreachable, broker auth/network.
+     Nothing was measured; retry it
+  4  bad input — unparseable window, missing plan, no such fixture.
+     Retrying verbatim will fail identically; fix the input
+
+A terminal summary line is ALWAYS printed to stdout, success or failure, so its
+absence means the process died in a way nobody handled. Failures report
+`Net R: n/a` — never `+0.00`, which a sweep would average in as a real trade.";
+
 /// `replay-candles` command-line arguments. Shared between the standalone
 /// binary and `tv-arm ... replay`.
 #[derive(Parser, Debug)]
 #[command(name = "replay-candles")]
 #[command(about = "Replay a candle window through the engine's decision logic, offline")]
+#[command(after_long_help = EXIT_CODE_HELP)]
 pub struct ReplayArgs {
     /// Path to the TradePlan JSON written by `tv-arm ... plan-out`. Required for a
     /// live replay; omitted (and ignored) under `--test-mode`, where the plan
