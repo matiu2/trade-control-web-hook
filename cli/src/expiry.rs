@@ -20,13 +20,34 @@ pub const DEFAULT_HORIZON: Duration = Duration::hours(48);
 /// Directory holding `<INSTRUMENT>.txt` anchor files. Honors
 /// `XDG_CONFIG_HOME`, otherwise falls back to `~/.config`.
 pub fn expiry_root() -> Result<PathBuf> {
-    let base = if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg)
-    } else {
-        let home = std::env::var("HOME").map_err(|_| eyre!("HOME not set"))?;
-        PathBuf::from(home).join(".config")
-    };
+    let base = config_base(
+        std::env::var("XDG_CONFIG_HOME").ok(),
+        std::env::var("HOME").ok(),
+    )?;
     Ok(base.join("trade-control").join("expiry"))
+}
+
+/// The config base directory from the two env values, as a **pure function** so
+/// the precedence is testable without touching the process environment.
+///
+/// `XDG_CONFIG_HOME` wins; otherwise `$HOME/.config`. Split out because the test
+/// that read the real env couldn't check the precedence at all: on a conventional
+/// machine `XDG_CONFIG_HOME` *is* `$HOME/.config`, so both branches produce the
+/// same path — deleting the XDG branch outright left the test green (verified).
+/// Passing the values in makes the two branches distinguishable.
+///
+/// An empty `XDG_CONFIG_HOME` counts as unset, per the XDG spec ("if
+/// $XDG_CONFIG_HOME is either not set or empty"). Without that, an
+/// exported-but-empty var resolves the base to `/` and puts anchor files in
+/// `/trade-control/expiry`.
+fn config_base(xdg: Option<String>, home: Option<String>) -> Result<PathBuf> {
+    if let Some(x) = xdg.filter(|s| !s.is_empty()) {
+        return Ok(PathBuf::from(x));
+    }
+    let home = home
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| eyre!("HOME not set"))?;
+    Ok(PathBuf::from(home).join(".config"))
 }
 
 /// The anchor file for `instrument` under an explicit root. Instrument names are
@@ -168,20 +189,51 @@ mod tests {
         );
     }
 
-    /// The env-resolving wrapper still composes the documented path
-    /// (`$XDG_CONFIG_HOME/trade-control/expiry/<INSTRUMENT>.txt`). Read-only — it
-    /// never touches the filesystem, so it needs no isolation.
+    /// `XDG_CONFIG_HOME` takes precedence over `HOME`, and the fallback appends
+    /// `.config`.
+    ///
+    /// Tested through the pure `config_base` with **distinct** values. The old
+    /// version read the ambient env, where `XDG_CONFIG_HOME == $HOME/.config` on
+    /// any conventional machine — so both branches produced the same path and
+    /// deleting the XDG branch outright left it passing (verified before this
+    /// rewrite). Distinct inputs are what make the precedence observable.
     #[test]
-    fn expiry_root_honours_xdg_config_home() {
-        let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") else {
-            // Unset in this environment: the HOME fallback is exercised instead.
-            let root = expiry_root().unwrap();
-            assert!(root.ends_with("trade-control/expiry"), "got {root:?}");
-            return;
-        };
+    fn xdg_config_home_wins_over_home() {
+        let base = config_base(Some("/xdg".into()), Some("/home/u".into())).expect("resolves");
+        assert_eq!(base, PathBuf::from("/xdg"), "XDG must win");
+
+        let fallback = config_base(None, Some("/home/u".into())).expect("resolves");
         assert_eq!(
-            expiry_root().unwrap(),
-            PathBuf::from(xdg).join("trade-control").join("expiry")
+            fallback,
+            PathBuf::from("/home/u/.config"),
+            "no XDG → $HOME/.config"
+        );
+    }
+
+    /// An exported-but-EMPTY `XDG_CONFIG_HOME` counts as unset (XDG spec). Without
+    /// this, the base resolves to `/` and anchors land in `/trade-control/expiry`.
+    #[test]
+    fn an_empty_xdg_config_home_falls_back_to_home() {
+        let base = config_base(Some(String::new()), Some("/home/u".into())).expect("resolves");
+        assert_eq!(base, PathBuf::from("/home/u/.config"));
+        // Same for an empty HOME on the fallback path — that's an error, not `/.config`.
+        assert!(config_base(None, Some(String::new())).is_err());
+    }
+
+    /// Neither var set is an error, not a silent relative path.
+    #[test]
+    fn no_config_vars_is_an_error() {
+        let err = config_base(None, None).expect_err("must not silently default");
+        assert!(err.to_string().contains("HOME"), "unhelpful: {err}");
+    }
+
+    /// And the wrapper composes the documented suffix onto whatever base it got.
+    #[test]
+    fn expiry_root_appends_the_documented_suffix() {
+        let root = expiry_root().expect("resolves in this environment");
+        assert!(
+            root.ends_with("trade-control/expiry"),
+            "documented layout is <base>/trade-control/expiry, got {root:?}"
         );
     }
 }

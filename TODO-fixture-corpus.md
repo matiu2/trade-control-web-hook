@@ -35,6 +35,16 @@ Each commit green (tests + clippy + fmt) before the next.
   - [ ] **6e.** `--spec-in` itself: `FrozenSpec` file, guards, round-trip test.
         Reject `--market-entry`/`--stop-entry`/`--limit-entry` (position-tool SL/TP
         are TV drawing properties, inherently live-chart).
+        **MUST carry `granularity`** — reviewer-flagged, verified. It feeds
+        `TrendlineCross.bar_seconds` and trendline prices interpolate in
+        *bar-index* space, so the same neckline read at H1 vs H4 gives different
+        prices at the same instant. It currently comes from the LIVE chart
+        (`resolution_to_granularity(state.resolution)`), so a re-arm off a chart
+        left on another timeframe silently reprices the whole neckline — plausible
+        numbers, wrong plan, no error. Deliberately not on `PlanGeometry` (a chart
+        resolution isn't geometry); the frozen spec must carry it and either use it
+        or refuse when the live chart disagrees. Noted in the `plan_geometry`
+        module doc too.
   - [ ] **6f.** `--start` strict-RFC3339 fix (seconds currently mandatory).
 - [ ] **7. Tier-2 scored corpus** (2b) — aggregate Net R, baseline diff, re-bless.
       Not in `cargo test`.

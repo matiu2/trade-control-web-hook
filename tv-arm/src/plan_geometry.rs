@@ -31,6 +31,24 @@
 //! **re-read on every arm**, never frozen. A frozen spread mis-sizes an entry; a
 //! frozen "price at arm time" is a contradiction. ATR isn't here either: the
 //! engine computes it from candles, so there's nothing to carry.
+//!
+//! ## ⚠ `granularity` is NOT here, and a `--spec-in` re-arm must still freeze it
+//!
+//! The chart's bar size feeds `TrendlineCross.bar_seconds`
+//! (`trade_plan_build`), and every trendline price is interpolated in
+//! **bar-index** space — so the same neckline read at H1 and at H4 yields
+//! *different prices* at the same wall-clock instant. Today it comes from the
+//! live chart (`resolution_to_granularity(state.resolution)`), which means a
+//! re-arm off a chart left on a different timeframe would silently reprice the
+//! whole neckline: plausible numbers, wrong plan, no error.
+//!
+//! It is deliberately **not** a field here — a chart resolution is a property of
+//! how the setup was *read*, not of the setup's geometry, and this struct's scope
+//! is the latter. But that makes it the enclosing frozen spec's job, and it must
+//! not be forgotten there: `--spec-in` has to carry the granularity and either
+//! use it directly or refuse when the live chart disagrees. Tracked in
+//! `TODO-fixture-corpus.md` under commit 6e; `SCOPING-fixture-corpus.md` §3.3
+//! already lists it in the Freeze column.
 
 use serde::{Deserialize, Serialize};
 use trade_control_core::trade_plan::LinePoint;

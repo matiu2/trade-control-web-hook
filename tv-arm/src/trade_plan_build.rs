@@ -658,6 +658,19 @@ mod tests {
         }
     }
 
+    /// A multi-anchor `path` drawing — the M/W form (3 anchors, or 4 with a drawn
+    /// right shoulder).
+    fn path(points: &[(i64, f64)]) -> Drawing {
+        Drawing {
+            id: "p".into(),
+            points: points
+                .iter()
+                .map(|&(time, price)| Point { time, price })
+                .collect(),
+            properties: Properties::default(),
+        }
+    }
+
     /// **The point of the `PlanGeometry` seam.** A plan built from geometry that
     /// has been through a JSON round-trip — i.e. frozen to disk and reloaded, with
     /// no `Drawing` and no TradingView anywhere — is **identical** to one built
@@ -721,6 +734,133 @@ mod tests {
             serde_json::to_value(build(&live)).unwrap(),
             serde_json::to_value(build(&frozen)).unwrap(),
             "a plan rebuilt from frozen geometry must be byte-identical"
+        );
+
+        // ⚠ The two assertions above are NECESSARY BUT NOT SUFFICIENT, and it's
+        // worth being explicit about why: both sides call the same `build` on
+        // values already asserted equal, so it is `f(x) == f(x)`. A field that
+        // `from_roles` silently drops disappears from BOTH sides and the test
+        // still passes — which is exactly what happened with `MwPath.runup_start`
+        // (fixed in 4713acb; this test would not have caught it).
+        //
+        // So the real check is below: every role the chart supplied must be
+        // PRESENT, with the right VALUE, in the extracted geometry.
+        assert_eq!(
+            live.invalidation,
+            Some(1.2000),
+            "invalidation lost/mis-wired"
+        );
+        assert_eq!(
+            live.trade_expiry_epoch,
+            Some(99_000),
+            "trade-expiry epoch lost/mis-wired"
+        );
+        let (head, neck) = live.fib_head_neckline.expect("fib anchors lost");
+        assert_eq!(
+            (head, neck),
+            (1.1900, 1.1700),
+            "fib head/neckline must resolve through the `reverse` flag: head is \
+             points[1] when reverse is unset"
+        );
+        let neckline = live.neckline.expect("neckline lost");
+        assert_eq!(
+            (neckline.a.price, neckline.b.price),
+            (1.1900, 1.1850),
+            "neckline anchors must carry the drawn prices in order"
+        );
+        assert_eq!(
+            (neckline.a.at_epoch, neckline.b.at_epoch),
+            (10, 20),
+            "…and their epochs, which is what bar-index interpolation needs"
+        );
+    }
+
+    /// The complement to the test above, and the one that actually guards the
+    /// `--spec-in` promise: a geometry extracted from a chart with **every** role
+    /// present must serialize **every** field.
+    ///
+    /// Asserted against the serialized key set rather than field-by-field, so a
+    /// NEWLY ADDED field is caught too — it'll be absent from the expected list
+    /// and force whoever adds it to decide whether it belongs in the frozen
+    /// contract. That's the check `runup_start` needed.
+    #[test]
+    fn a_fully_drawn_chart_freezes_every_geometry_field() {
+        let roles = Roles {
+            invalidation: Some(horz(1.2000)),
+            invalidation_label: Some("too-high".into()),
+            break_and_close: Some(trend((10, 1.1900), (20, 1.1850))),
+            retest: Some(trend((10, 1.1900), (20, 1.1850))),
+            trade_expiry: Some(vert(99_000)),
+            tp_fib: Some(trend((10, 1.1700), (20, 1.1900))),
+            prep_expiries: vec![("retest".to_string(), vert(98_000))],
+            ..Roles::default()
+        };
+        // The M/W half. H&S and M/W are mutually exclusive on a chart (an H&S has
+        // no path drawing, an M/W has no fib/invalidation), so no SINGLE chart
+        // populates every field — the contract is covered by their union.
+        let mw_roles = Roles {
+            mw_path: Some(path(&[(10, 1.1000), (20, 1.2000), (30, 1.1500)])),
+            trade_expiry: Some(vert(99_000)),
+            ..Roles::default()
+        };
+
+        let keys_of = |r: &Roles| -> std::collections::BTreeSet<String> {
+            serde_json::to_value(PlanGeometry::from_roles(r))
+                .expect("serialize")
+                .as_object()
+                .expect("an object")
+                .keys()
+                .cloned()
+                .collect()
+        };
+        let mut reachable = keys_of(&roles);
+        reachable.extend(keys_of(&mw_roles));
+
+        // Every field of the frozen contract. Update ONLY when you have decided
+        // whether a new field is part of what a `--spec-in` re-arm must restore.
+        let expected: std::collections::BTreeSet<String> = [
+            "neckline",
+            "invalidation",
+            "fib_head_neckline",
+            "trade_expiry_epoch",
+            "prep_expiry_epochs",
+            "mw_path",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        assert_eq!(
+            reachable, expected,
+            "PlanGeometry's frozen field set changed. If you ADDED a field, decide \
+             whether a re-arm must restore it, then update this list. If a field \
+             VANISHED (unreachable from BOTH an H&S and an M/W chart), `from_roles` \
+             stopped reading a role — that's the `runup_start` bug class."
+        );
+
+        // And the fields really are populated, so the key set above isn't passing
+        // on the strength of serialized `None`s.
+        let hs = PlanGeometry::from_roles(&roles);
+        assert!(hs.neckline.is_some());
+        assert!(hs.invalidation.is_some());
+        assert!(hs.fib_head_neckline.is_some());
+        assert!(hs.trade_expiry_epoch.is_some());
+        assert_eq!(hs.prep_expiry_epochs.len(), 1);
+        assert!(
+            hs.mw_path.is_none(),
+            "an H&S chart has no path drawing — the M/W key is legitimately absent"
+        );
+
+        let mw = PlanGeometry::from_roles(&mw_roles);
+        let mw_path = mw.mw_path.expect("M/W path extracted");
+        // `runup_start` specifically: the field whose loss this whole test class
+        // exists to catch. Direction and two gates read it.
+        assert_eq!(mw_path.runup_start, 1.1000);
+        assert_eq!(mw_path.first_point, 1.2000);
+        assert_eq!(mw_path.neckline, 1.1500);
+        assert!(
+            mw_path.right_shoulder.is_none(),
+            "a 3-anchor path has no drawn right shoulder"
         );
     }
 
