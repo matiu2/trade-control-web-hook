@@ -430,6 +430,7 @@ dependencies = [
  "color-eyre",
  "redb",
  "serde",
+ "sqlx",
  "strategy-common",
  "thiserror",
  "tokio",

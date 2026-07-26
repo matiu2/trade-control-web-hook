@@ -46,6 +46,7 @@ mod replay_candles {
     pub mod granularity;
     pub mod instrument;
     pub mod lifecycle;
+    pub mod outcome;
     pub mod replay;
     pub mod replay_broker;
     pub mod report;
@@ -68,7 +69,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::tv::TvDefaults;
 use replay_candles::{
-    annotate, brisbane, candles, granularity, instrument, replay, report, sentiment, tv,
+    annotate, brisbane, candles, granularity, instrument, outcome, replay, report, sentiment, tv,
 };
 use trade_control_cli::replay_args::{CandleSource, DetectorMarkConfig, ReplayArgs as Args};
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan, Trigger};
@@ -82,8 +83,36 @@ fn default_fixtures_dir() -> PathBuf {
         .join("replay-fixtures")
 }
 
+/// Classify whatever [`run`] returned, always print a terminal line, and exit
+/// with a code that tells a driver what to do about it.
+///
+/// `main` deliberately returns `()` rather than `Result`: letting eyre print
+/// and exit(1) makes every failure look the same, and — worse — prints
+/// *nothing* on the summary line a batch driver scrapes. A run that died at
+/// startup was then indistinguishable from one that ran and found no trade.
+/// See `replay_candles::outcome`.
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    match run().await {
+        Ok(()) => std::process::exit(outcome::EXIT_OK),
+        Err(report) => {
+            let kind = outcome::FailureKind::classify(&report);
+            // The human-readable chain first (stderr), then the machine-readable
+            // terminal line (stdout, where the summary it mirrors goes).
+            eprintln!("Error: {report:?}");
+            println!(
+                "{}",
+                outcome::FailureLine {
+                    kind,
+                    detail: &report.to_string(),
+                }
+            );
+            std::process::exit(kind.exit_code());
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     color_eyre::install()?;
 
     // Handle completions before clap's required-arg validation: `--plan` is

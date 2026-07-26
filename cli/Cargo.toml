@@ -12,7 +12,13 @@ name = "replay-candles"
 path = "src/bin/replay_candles.rs"
 
 [dependencies]
-candle-cache = { version = "0.1.2", path = "../../candle-cache" }
+# `postgres-storage` (NOT the default `redb-storage`): ReDB holds an exclusive
+# file lock for the process's lifetime, so a second concurrent `replay-candles`
+# dies with "Database already open. Cannot acquire lock." — which used to look
+# exactly like "the replay ran and no trade filled", silently dropping cells
+# from batch sweeps. Postgres gives multi-process access against the warm
+# shared cache the strategy crates already use.
+candle-cache = { version = "0.1.2", path = "../../candle-cache", features = ["postgres-storage"] }
 candle-model = { version = "0.1.0", path = "../../candle-model" }
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }

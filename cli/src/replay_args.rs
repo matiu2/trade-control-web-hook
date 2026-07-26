@@ -144,11 +144,28 @@ impl DetectorMarkConfig {
     }
 }
 
+/// Exit-code contract, shown under `--help`. Batch drivers branch on these, so
+/// they are part of the interface: changing a number is a breaking change.
+const EXIT_CODE_HELP: &str = "\
+EXIT CODES:
+  0  the replay ran to completion — record the result, whatever it was
+     (including a legitimate no-fill 0R)
+  2  usage error (clap): an unknown or malformed flag
+  3  infrastructure failure — candle cache unreachable, broker auth/network.
+     Nothing was measured; retry it
+  4  bad input — unparseable window, missing plan, no such fixture.
+     Retrying verbatim will fail identically; fix the input
+
+A terminal summary line is ALWAYS printed to stdout, success or failure, so its
+absence means the process died in a way nobody handled. Failures report
+`Net R: n/a` — never `+0.00`, which a sweep would average in as a real trade.";
+
 /// `replay-candles` command-line arguments. Shared between the standalone
 /// binary and `tv-arm ... replay`.
 #[derive(Parser, Debug)]
 #[command(name = "replay-candles")]
 #[command(about = "Replay a candle window through the engine's decision logic, offline")]
+#[command(after_long_help = EXIT_CODE_HELP)]
 pub struct ReplayArgs {
     /// Path to the TradePlan JSON written by `tv-arm ... plan-out`. Required for a
     /// live replay; omitted (and ignored) under `--test-mode`, where the plan
@@ -194,7 +211,9 @@ pub struct ReplayArgs {
     pub tv_mcp_root: Option<PathBuf>,
 
     /// Run the fill simulator on each fired enter (default on).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    ///
+    /// Repeatable, last one wins — see `--annotate`.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, overrides_with = "simulate")]
     pub simulate: bool,
 
     /// Print a bar-by-bar trace of the engine's silent state changes before the
@@ -228,14 +247,22 @@ pub struct ReplayArgs {
     /// sidecar manifest); your hand-drawn necklines/fibs are left alone. Implies
     /// `--simulate` (annotation needs the simulated fill). Uses the same tv-mcp
     /// chart as window resolution (`--tv-mcp-root`).
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    ///
+    /// Repeatable, last one wins. `tv-arm … replay` injects `--annotate true`
+    /// as a default, so an operator passthrough (`replay -- --annotate false`)
+    /// has to be able to override it — without `overrides_with`, `ArgAction::Set`
+    /// rejects the second occurrence outright and there is no way to run a
+    /// chained replay without drawing on the chart.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, overrides_with = "annotate")]
     pub annotate: bool,
 
     /// Also annotate *not-taken* trades — pending orders that never filled and
     /// entries the worker declined — as muted grey brackets at the fire bar. Only
     /// meaningful with `--annotate` (and implies it). Off by default, so a
     /// plain `--annotate` shows just the taken positions.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    ///
+    /// Repeatable, last one wins — see `--annotate`.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, overrides_with = "annotate_unfilled")]
     pub annotate_unfilled: bool,
 
     /// Number of **real** candles to pull *before* the window start as a silent
@@ -311,6 +338,41 @@ mod tests {
 
     fn cfg(d: DirectionFilter, g: GoldenFilter) -> DetectorMarkConfig {
         DetectorMarkConfig::new(d, g, Direction::Long)
+    }
+
+    /// `tv-arm … replay` injects `--annotate true` ahead of the operator's
+    /// passthrough tokens, so a later `--annotate false` must win rather than
+    /// being rejected as a duplicate. Without `overrides_with` clap errors with
+    /// "cannot be used multiple times" and there is no way to run a chained
+    /// replay without drawing on the chart — bad for unattended batches.
+    #[test]
+    fn repeated_bool_flags_take_the_last_value() {
+        use clap::Parser as _;
+
+        let args = ReplayArgs::try_parse_from([
+            "replay-candles",
+            "--annotate",
+            "true",
+            "--simulate",
+            "true",
+            "--annotate-unfilled",
+            "true",
+            // the operator's passthrough, appended last:
+            "--annotate",
+            "false",
+            "--simulate",
+            "false",
+            "--annotate-unfilled",
+            "false",
+        ])
+        .expect("repeated bool flags must parse, last one winning");
+
+        assert!(!args.annotate, "last --annotate should win");
+        assert!(!args.simulate, "last --simulate should win");
+        assert!(
+            !args.annotate_unfilled,
+            "last --annotate-unfilled should win"
+        );
     }
 
     #[test]
