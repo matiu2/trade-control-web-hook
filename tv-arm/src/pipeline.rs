@@ -790,15 +790,19 @@ fn resolve_mw_trade_with_spread(
     spread_pips: f64,
 ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
     check_mw_required(roles)?;
-    let path = roles
+    // Read the anchors through `PlanGeometry` — the same plain-data path a
+    // spec-driven arm uses — so the direction decision and the structure/retrace
+    // gates below cannot diverge between a live arm and a rebuild. (The indexing
+    // that was here is why `MwPath` must carry `runup_start`: it feeds direction
+    // and both gates, though no *trigger* reads it.)
+    let path = crate::plan_geometry::PlanGeometry::from_roles(roles)
         .mw_path
-        .as_ref()
         .ok_or_else(|| eyre!("resolve_mw_trade_with_spread called without an mw_path"))?;
-    let runup_start = path.points[0].price;
-    let first_point = path.points[1].price;
-    let neckline = path.points[2].price;
+    let runup_start = path.runup_start;
+    let first_point = path.first_point;
+    let neckline = path.neckline;
     // Optional 4th anchor: the drawn right shoulder (arms immediately).
-    let right_shoulder = path.points.get(3).map(|p| p.price);
+    let right_shoulder = path.right_shoulder;
 
     let direction = mw_geometry::mw_direction_from_anchors(runup_start, first_point)
         .ok_or_else(|| ResolveError::Reject(mw_flat_first_leg_msg(runup_start, first_point)))?;

@@ -75,11 +75,25 @@ pub struct Line {
 /// decorative. This is the copy plan-building actually uses.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MwPath {
+    /// `A` — the runup start.
+    ///
+    /// **No trigger reads this**, which is why it was initially left out. It is
+    /// load-bearing anyway: `resolve_mw_trade_with_spread` uses it for the trade's
+    /// **direction** (`mw_direction_from_anchors`) and for two rejection gates
+    /// (`check_mw_structure`, and the 40%/50% `neckline_retrace_pct` depth gate).
+    ///
+    /// Leaving it out would tempt a spec-driven arm to infer direction from the
+    /// pattern label instead — which agrees today, so tests would pass, while
+    /// silently skipping the retracement gate and arming a setup a live arm would
+    /// have **rejected**.
+    pub runup_start: f64,
     /// `B` — the first peak (M) / trough (W).
     pub first_point: f64,
     /// `C` — the neckline.
     pub neckline: f64,
-    /// `D` — the optional drawn right shoulder (4-point path).
+    /// `D` — the optional drawn right shoulder (4-point path). `None` is the
+    /// 3-point form, so `right_shoulder.is_some()` replaces a `points.len() == 4`
+    /// check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub right_shoulder: Option<f64>,
 }
@@ -156,6 +170,9 @@ impl PlanGeometry {
                 .collect(),
             mw_path: roles.mw_path.as_ref().and_then(|d| {
                 Some(MwPath {
+                    // `A` — needed for direction + the structure/retrace gates,
+                    // not by any trigger.
+                    runup_start: d.points.first()?.price,
                     first_point: d.points.get(1)?.price,
                     neckline: d.points.get(2)?.price,
                     right_shoulder: d.points.get(3).map(|p| p.price),
@@ -274,12 +291,70 @@ mod tests {
         assert_eq!(g.prep_expiry("nope"), None);
     }
 
+    /// `runup_start` is what decides M/W **direction**, so the geometry alone must
+    /// determine it. A W (trough-first: A low, B high) is a LONG; an M (A high, B
+    /// low) is a SHORT — and the same anchors also drive the retracement gate.
+    ///
+    /// This is the test that would have caught inferring direction from the pattern
+    /// LABEL instead: that shortcut agrees with the anchors today, so it looks
+    /// correct while silently bypassing `check_mw_structure` and the 40%/50%
+    /// `neckline_retrace_pct` gate — arming a setup a live arm would have rejected.
+    #[test]
+    fn mw_direction_is_decided_by_the_anchors_not_a_label() {
+        let path_of = |a: f64, b: f64, c: f64| {
+            PlanGeometry::from_roles(&Roles {
+                mw_path: Some(drawing(vec![pt(1, a), pt(2, b), pt(3, c)])),
+                ..Default::default()
+            })
+            .mw_path
+            .expect("path")
+        };
+
+        // W / iM: runup DOWN then up → long.
+        let w = path_of(1.30, 1.00, 1.20);
+        assert_eq!(
+            crate::mw_geometry::mw_direction_from_anchors(w.runup_start, w.first_point),
+            Some(trade_control_conventions::Direction::Long)
+        );
+        // M: runup UP then down → short.
+        let m = path_of(1.00, 1.30, 1.10);
+        assert_eq!(
+            crate::mw_geometry::mw_direction_from_anchors(m.runup_start, m.first_point),
+            Some(trade_control_conventions::Direction::Short)
+        );
+        // A flat first leg is undecidable — the arm must reject, not guess.
+        let flat = path_of(1.20, 1.20, 1.10);
+        assert_eq!(
+            crate::mw_geometry::mw_direction_from_anchors(flat.runup_start, flat.first_point),
+            None
+        );
+
+        // And the retracement gate is a function of all three anchors, so it can
+        // only run when `runup_start` survived the extraction. Note the value is a
+        // FRACTION despite the `_pct` name — `gate_neckline_pct` compares it against
+        // 0.40 / 0.50 and only scales by 100 for the message.
+        let frac =
+            crate::mw_geometry::neckline_retrace_pct(m.runup_start, m.first_point, m.neckline);
+        assert!(
+            (frac - 2.0 / 3.0).abs() < 1e-9,
+            "1.00 -> 1.30 retraced to 1.10 is 2/3 of the runup leg, got {frac}"
+        );
+        // 2/3 is past the 0.50 hard ceiling `gate_neckline_pct` enforces, so this
+        // setup gets REJECTED at arm — exactly the gate a label-derived direction
+        // would have skipped. (The gate itself is tested in `pipeline.rs`; here we
+        // only pin that the geometry yields a value on the reject side of it.)
+        assert!(
+            frac > 0.50,
+            "this fixture must land past the hard ceiling to be meaningful: {frac}"
+        );
+    }
+
     /// M/W reads path points [1]=B, [2]=C, and the OPTIONAL [3]=D right shoulder.
     #[test]
     fn mw_path_extracts_three_and_four_point_forms() {
         let three = Roles {
             mw_path: Some(drawing(vec![
-                pt(1, 1.00), // A (runup start — not used by the triggers)
+                pt(1, 1.00), // A (runup start — no trigger reads it, but direction does)
                 pt(2, 1.30), // B first point
                 pt(3, 1.10), // C neckline
             ])),
@@ -287,6 +362,9 @@ mod tests {
         };
         let g = PlanGeometry::from_roles(&three);
         let p = g.mw_path.expect("3-point path");
+        // `A` must be carried: it decides DIRECTION and feeds the structure +
+        // retracement gates, even though no trigger reads it.
+        assert_eq!(p.runup_start, 1.00);
         assert_eq!((p.first_point, p.neckline), (1.30, 1.10));
         assert!(p.right_shoulder.is_none());
 
@@ -321,6 +399,7 @@ mod tests {
             trade_expiry_epoch: Some(1784620800),
             prep_expiry_epochs: vec![("retest".into(), 1784600000)],
             mw_path: Some(MwPath {
+                runup_start: 1.00,
                 first_point: 1.30,
                 neckline: 1.10,
                 right_shoulder: None,
