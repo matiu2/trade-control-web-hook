@@ -53,11 +53,7 @@ pub enum EntryRule {
 }
 
 impl EntryRule {
-    /// The grid-column label. Stable across versions — a batch tool groups on it.
-    //
-    // TODO(commit 4, SCOPING-fixture-corpus.md §4.4): consumed by the batch
-    // `--fixtures-glob --json` grouping. Tested here; unused in the binary until
-    // then, hence the dead-code warning.
+    /// The grid-column label. Stable across versions — `batch.rs` groups on it.
     pub fn label(&self) -> &str {
         match self {
             Self::Normal => "normal",
@@ -135,10 +131,9 @@ impl ArmRecord {
     /// A stable grouping key for batch analysis: one grid **cell** is one
     /// `(entry_rule, news-on/off)` pair. Two fixtures with the same key are the
     /// same cell of the same grid and should be directly comparable.
-    //
-    // TODO(commit 4, SCOPING-fixture-corpus.md §4.4): this is what lets the batch
-    // tool group fixtures by cell from DATA instead of parsing filenames — the
-    // whole point of 4.2. Tested here; unused in the binary until commit 4.
+    ///
+    /// This is what lets `batch.rs` group fixtures by cell from **data** instead
+    /// of parsing filenames — the whole point of recording the arm block.
     pub fn cell_key(&self) -> String {
         let news = if self.skip_calendar_bars { "off" } else { "on" };
         format!("{}/news-{news}", self.entry_rule.label())

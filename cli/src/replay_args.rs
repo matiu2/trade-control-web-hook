@@ -358,6 +358,32 @@ pub struct ReplayArgs {
     #[arg(long, value_name = "NAME")]
     pub fixture: Option<String>,
 
+    /// Replay **every** fixture whose directory name matches this glob (`*` and
+    /// `?`), instead of the single `--fixture`. Turns grid generation into a pure
+    /// offline transform: `--test-mode --fixtures-glob 'trade-124-*' --json`.
+    ///
+    /// A failing fixture is **recorded and the batch continues** — one bad fixture
+    /// can't hide the rest. Combines with `--check` (gate the whole set) and
+    /// `--rebless` (re-bless the whole set).
+    #[arg(
+        long,
+        value_name = "GLOB",
+        requires = "test_mode",
+        conflicts_with = "fixture"
+    )]
+    pub fixtures_glob: Option<String>,
+
+    /// Emit the result as JSON on stdout instead of the human report.
+    ///
+    /// **Always emits an object, even when the replay fails** — a failure is a row
+    /// with `ok: false`, an `error`, and a null `outcome`, never a missing row. So
+    /// absence of output can only mean the process died unhandled, and a
+    /// legitimately flat run (`ok: true`, `net_r: 0.0`) is never confused with a
+    /// crash. That distinction is why this exists: scraping `Net R:` off stdout
+    /// couldn't make it, and a concurrent batch silently lost cells because of it.
+    #[arg(long)]
+    pub json: bool,
+
     /// Under `--test-mode`, also compare the replay's outcome against the
     /// fixture's `expected.json` and exit non-zero on any mismatch (printing the
     /// diff). The gate proof for a fixture.

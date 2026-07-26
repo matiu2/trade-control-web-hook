@@ -40,6 +40,7 @@
 mod replay_candles {
     pub mod annotate;
     pub mod arm_record;
+    pub mod batch;
     pub mod brisbane;
     pub mod candles;
     pub mod economics;
@@ -69,6 +70,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use replay_candles::arm_record;
+use replay_candles::batch;
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::tv::TvDefaults;
 use replay_candles::{
@@ -512,19 +514,115 @@ fn fixtures_dir(args: &Args) -> PathBuf {
         .unwrap_or_else(default_fixtures_dir)
 }
 
-/// Replay a saved fixture offline. Loads plan + candles + meta from the fixture
-/// dir, runs the pure engine over the frozen candles, prints the report, and —
-/// under `--check` — diffs the computed outcome against `expected.json`,
-/// returning an error (non-zero exit) on any mismatch.
+/// Replay saved fixtures offline: one (`--fixture`) or many
+/// (`--fixtures-glob`). Dispatches to the batch path when a glob is given.
 async fn run_test_mode(args: &Args) -> Result<()> {
+    match args.fixtures_glob.as_deref() {
+        Some(pattern) => run_test_mode_batch(args, pattern).await,
+        None => run_test_mode_single(args).await,
+    }
+}
+
+/// Replay one saved fixture. Prints the human report (or a single JSON object
+/// under `--json`), and under `--check` diffs the computed outcome against
+/// `expected.json`, returning an error (non-zero exit) on any mismatch.
+async fn run_test_mode_single(args: &Args) -> Result<()> {
     let name = args
         .fixture
         .as_deref()
-        .ok_or_else(|| eyre!("--test-mode requires --fixture <name>"))?;
-    let dir = fixtures_dir(args).join(name);
-    tracing::info!(dir = %dir.display(), "replaying fixture offline");
+        .ok_or_else(|| eyre!("--test-mode requires --fixture <name> or --fixtures-glob <glob>"))?;
+    let root = fixtures_dir(args);
+    let result = replay_one_fixture(args, &root.join(name), name).await;
+    if args.json {
+        // One object either way — a failure is a row, not silence.
+        println!("{}", serde_json::to_string_pretty(&result.row)?);
+    }
+    // Surface a failure as a non-zero exit, as before. The JSON row above is
+    // already printed, so a driver sees BOTH the machine-readable reason and the
+    // exit code.
+    result.error.map_or(Ok(()), Err)
+}
 
-    let inputs = fixture::load(&dir)?;
+/// Replay every fixture matching `pattern`. A failing fixture is **recorded and
+/// the batch continues** — one bad fixture must not hide the other 290.
+///
+/// Exits non-zero when any fixture failed (or, under `--check`, when any golden
+/// mismatched), so a driver can trust the exit code; but the per-fixture rows are
+/// always emitted first so it can see exactly which ones and why.
+async fn run_test_mode_batch(args: &Args, pattern: &str) -> Result<()> {
+    let root = fixtures_dir(args);
+    let dirs = batch::matching_fixtures(&root, pattern);
+    tracing::info!(
+        root = %root.display(),
+        pattern,
+        matched = dirs.len(),
+        "replaying fixture batch offline"
+    );
+
+    let mut rows = Vec::with_capacity(dirs.len());
+    for dir in &dirs {
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<unnamed>")
+            .to_string();
+        rows.push(replay_one_fixture(args, dir, &name).await.row);
+    }
+    let summary = batch::BatchSummary::from_results(rows);
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!("\n{}", summary.headline());
+    }
+
+    if dirs.is_empty() {
+        // Not an error — but say so loudly, since an empty batch that reads as
+        // success is exactly how a wrong glob produces a silently empty grid.
+        tracing::warn!(
+            root = %root.display(),
+            pattern,
+            "no fixtures matched — check the glob and --fixtures-dir"
+        );
+    }
+    if summary.failed > 0 {
+        return Err(eyre!(
+            "{} of {} fixture(s) failed — see the rows above (net R {:+.2} excludes them)",
+            summary.failed,
+            summary.matched,
+            summary.net_r
+        ));
+    }
+    Ok(())
+}
+
+/// One fixture's replay, as a [`batch::BatchResult`] row plus the error (if any)
+/// the single-fixture path re-raises.
+///
+/// Every failure mode — unreadable fixture, missing `expected.json`, a `--check`
+/// mismatch — becomes an `ok: false` row rather than an early return, which is
+/// what lets a batch keep going and what makes "no row" mean only "the process
+/// died unhandled".
+struct FixtureRun {
+    row: batch::BatchResult,
+    error: Option<color_eyre::eyre::Error>,
+}
+
+impl FixtureRun {
+    fn failed(name: &str, err: color_eyre::eyre::Error) -> Self {
+        Self {
+            row: batch::BatchResult::failed(name, format!("{err:#}")),
+            error: Some(err),
+        }
+    }
+}
+
+async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> FixtureRun {
+    tracing::info!(dir = %dir.display(), "replaying fixture offline");
+    let inputs = match fixture::load(dir) {
+        Ok(i) => i,
+        Err(e) => return FixtureRun::failed(name, e),
+    };
     let mark_cfg = DetectorMarkConfig::new(
         args.candle_detector_direction,
         args.candle_detector_golden,
@@ -550,24 +648,39 @@ async fn run_test_mode(args: &Args) -> Result<()> {
         None,
         &mark_cfg,
     );
-    print!("{}", rendered.text);
+    // Under --json the report text would corrupt the JSON on stdout; the rows
+    // carry the same numbers, so suppress it.
+    if !args.json {
+        print!("{}", rendered.text);
+    }
     let economics = Some(&rendered.economics);
+    let computed = ReplayOutcome::compute(&inputs.plan, &replay, args.simulate, economics);
+
+    let row = batch::BatchResult::ok(
+        name,
+        Some(inputs.plan.trade_id.clone()),
+        inputs.meta.arm.clone(),
+        computed.outcome.clone(),
+    );
 
     if args.check {
-        let computed = ReplayOutcome::compute(&inputs.plan, &replay, args.simulate, economics);
-        let expected = fixture::load_expected(&dir)?;
-        if computed != expected {
-            return Err(diff_error(&expected, &computed));
+        match fixture::load_expected(dir) {
+            Ok(expected) if computed != expected => {
+                return FixtureRun::failed(name, diff_error(&expected, &computed));
+            }
+            Ok(_) => tracing::info!(fixture = name, "fixture matches expected.json"),
+            Err(e) => return FixtureRun::failed(name, e),
         }
-        tracing::info!("fixture matches expected.json");
     }
 
     if args.rebless {
-        let computed = ReplayOutcome::compute(&inputs.plan, &replay, args.simulate, economics);
-        fixture::save_expected(&dir, &computed)?;
+        if let Err(e) = fixture::save_expected(dir, &computed) {
+            return FixtureRun::failed(name, e);
+        }
         tracing::info!(dir = %dir.display(), "re-blessed expected.json from frozen inputs");
     }
-    Ok(())
+
+    FixtureRun { row, error: None }
 }
 
 /// Run the pure engine over a frozen candle window. Mirrors the live path's
@@ -988,6 +1101,8 @@ mod tests {
             arm_chart_symbol: None,
             arm_tv_arm_version: None,
             trade_ref: None,
+            fixtures_glob: None,
+            json: false,
             warmup_bars: 200,
             cache_dir: None,
             print_completions: false,
