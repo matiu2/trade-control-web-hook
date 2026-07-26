@@ -330,7 +330,11 @@ pub fn save_expected(dir: &Path, expected: &ReplayOutcome) -> Result<()> {
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let json = serde_json::to_string_pretty(value)
         .wrap_err_with(|| format!("serialize {}", path.display()))?;
-    fs::write(path, json).wrap_err_with(|| format!("write {}", path.display()))
+    // Trailing newline: these files are committed, so without it every fixture
+    // shows `\ No newline at end of file` in a diff and a re-bless produces noise
+    // around the line that actually changed. Reading is unaffected — `serde_json`
+    // ignores trailing whitespace — so this is comparison-safe both ways.
+    fs::write(path, format!("{json}\n")).wrap_err_with(|| format!("write {}", path.display()))
 }
 
 /// Read + parse one of a fixture's JSON files.

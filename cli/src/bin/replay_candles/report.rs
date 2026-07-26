@@ -629,8 +629,35 @@ fn render_fire(
 
     // The bracket the broker placed this order at — all the display lines below
     // annotate THIS (the stored floored stop), so they match the ledger's scored
-    // outcome. `None` only if the intent didn't resolve (nothing was placed).
-    let Some(placed) = fire.placed_bracket.as_ref() else {
+    // outcome.
+    //
+    // `None` means nothing was placed, which is NOT only "the intent didn't
+    // resolve": a gate-REJECTED enter (veto, cooldown, missing prep, SL floor)
+    // also has no placed bracket, because the worker 412/422/423s it before any
+    // order goes on. Those are exactly the fires an operator most wants in the
+    // report — "why didn't this enter?" — and a bare `return events` made them
+    // vanish from it silently, even though `resolve_fire_any` below has explicit
+    // `GateBlocked` handling for them. So say the fire happened and why, then let
+    // the flow continue to the resolution below rather than dropping the row.
+    let placed = match fire.placed_bracket.as_ref() {
+        Some(p) => Some(p),
+        None => {
+            events.push(EntryEvent {
+                at: candle.time,
+                note: format!(
+                    "{ev} no order placed{} → 0R",
+                    fire.rejected_reason()
+                        .map(|r| format!(" ({r})"))
+                        .unwrap_or_default()
+                ),
+                close: Some(candle.c),
+            });
+            None
+        }
+    };
+    // Everything below annotates a *placed* bracket, so it only applies when one
+    // exists. The no-placement case already has its row above.
+    let Some(placed) = placed else {
         return events;
     };
 
