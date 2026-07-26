@@ -41,6 +41,18 @@ pub const START_ACCOUNT: f64 = 100_000.0;
 /// Fraction of the *remaining* account risked on each taken trade (1%).
 pub const RISK_FRACTION: f64 = 0.01;
 
+/// `|R|` above which a booked leg is warned about as implausible.
+///
+/// A take-profit is baked at arm time, so a fill can gap past it but not by
+/// orders of magnitude; the realistic ceiling on a runner is tens of R, not
+/// hundreds. `100` is well clear of any genuine trade while still catching the
+/// shape that actually occurs — a scaled or corrupt candle turning a 1R bracket
+/// into 990R, which would swamp a 291-trade aggregate on its own.
+///
+/// This is a **reporting** threshold only. Nothing is clamped or excluded; see
+/// the warning in [`ReplayEconomics::book`] for why.
+pub const IMPLAUSIBLE_R: f64 = 100.0;
+
 /// How one taken position ended. The serialized form of [`FillKind`]'s *taken*
 /// variants — the not-taken kinds (never-filled / declined / gate-blocked) book
 /// no leg at all, so they have no representation here.
@@ -204,17 +216,55 @@ impl ReplayEconomics {
         // whose ledger somehow carries no exit price. Resolve the exit ONCE here
         // — a `?` further down would bail out after the counter above had already
         // moved, leaving a counted outcome with no leg.
-        let exit = result.exit_price.filter(|_| reason.is_realized());
+        //
+        // A NON-FINITE exit is treated as no exit at all, not merely as 0R.
+        // `realized_r` already refuses to return NaN, but the price itself lands
+        // on the leg — and `serde_json` writes `NaN`/`±inf` as `null`, so storing
+        // it verbatim produces an `expected.json` that can never be read back
+        // (`invalid type: null, expected f64`). Dropping it keeps the golden
+        // loadable and, because `exit_time` is derived from the same `Option`,
+        // keeps the leg self-consistent: no exit price, no exit time.
+        let exit = result
+            .exit_price
+            .filter(|p| p.is_finite())
+            .filter(|_| reason.is_realized());
         let r = exit
             .map(|e| realized_r(result.entry_price, result.stop_loss, e))
             .unwrap_or(0.0);
+        // An implausible R is almost always a data glitch (a 10×-scaled candle,
+        // a bad tick), and one such leg can swamp a whole batch's net R — at 291
+        // trades nobody will spot it by eye.
+        //
+        // Deliberately NOT clamped: the number stays exactly what was measured.
+        // Clamping would silently rewrite a real measurement and hide the glitch
+        // that produced it, which is the failure mode this corpus exists to avoid
+        // (see `[[no_silent_degrade_prefer_loud_failure]]`). A warning surfaces it
+        // while keeping the arithmetic honest — a genuine 60R runner is possible,
+        // if rare, and must not be quietly truncated to fit a guess about limits.
+        if r.abs() > IMPLAUSIBLE_R {
+            tracing::warn!(
+                r,
+                entry = result.entry_price,
+                stop_loss = result.stop_loss,
+                exit = ?exit,
+                reason = ?reason,
+                "implausible R booked (|R| > {IMPLAUSIBLE_R}) — suspect a scaled or \
+                 corrupt candle; the value is recorded as measured, NOT clamped"
+            );
+        }
         self.net_r += r;
 
         self.legs.push(Leg {
             entry_time: result.fill_at,
-            entry_price: result.entry_price,
-            stop_loss: result.stop_loss,
-            take_profit: result.take_profit,
+            // Same reasoning for the bracket prices: these are non-optional
+            // fields, so a non-finite one has no `null`-free representation at
+            // all. Substituting 0.0 keeps the golden loadable and is visibly
+            // wrong to a reader, rather than silently unloadable. `r` is already
+            // 0.0 in that case (`realized_r` guards every input), so the
+            // economics don't move.
+            entry_price: finite_or_zero(result.entry_price),
+            stop_loss: finite_or_zero(result.stop_loss),
+            take_profit: finite_or_zero(result.take_profit),
             exit_time: exit.map(|_| result.until),
             exit_price: exit,
             exit_reason: reason,
@@ -256,15 +306,46 @@ impl ReplayEconomics {
 /// floors (`min_r >= 1.0`, the 10×-spread SL floor) mean such a bracket shouldn't
 /// reach here at all, but this guard's entire job is to be the last line of
 /// defence, so it should hold at every price scale.
+///
+/// **The result is always finite.** Every input is checked, not just `risk`:
+/// a non-finite `exit` used to sail through and yield `NaN`, which poisons
+/// `net_r` and every downstream `.sum()`. Worse, it doesn't fail loudly —
+/// `serde_json` serializes `NaN`/`±inf` as `null` rather than erroring, so
+/// `--save`/`--rebless` would write an `expected.json` that can **never be
+/// loaded again** (`invalid type: null, expected f64`), and the resulting
+/// failure classifies as exit 4 "bad input" — blaming the operator for bytes
+/// this tool wrote. A garbage price is worth 0R, not an unloadable corpus entry.
+/// A price that is safe to serialize into a golden: `0.0` if it isn't finite.
+///
+/// `serde_json` writes `NaN`/`±inf` as `null` instead of erroring, and a `null`
+/// in a non-`Option` field makes the whole `expected.json` unloadable forever
+/// (`invalid type: null, expected f64`) — a corpus entry that can only be
+/// deleted, not read. `0.0` is obviously-wrong-on-sight, which is what you want
+/// from a value that should never have existed.
+fn finite_or_zero(price: f64) -> f64 {
+    if price.is_finite() { price } else { 0.0 }
+}
+
 pub fn realized_r(entry: f64, stop_loss: f64, exit: f64) -> f64 {
     let risk = entry - stop_loss;
     // ~1e-9 of the price: far below any real tick (the finest FX pip is 1e-5, and
     // a fractional-pip tick 1e-6) yet far above the ULP at index scale.
     let floor = (entry.abs() * 1e-9).max(f64::MIN_POSITIVE);
-    if !risk.is_finite() || risk.abs() < floor {
+    // The explicit `exit` check is redundant with the `r.is_finite()` catch-all
+    // below (a non-finite exit can only produce a non-finite quotient), so
+    // deleting either one alone keeps every test green. Both are kept
+    // deliberately: this one states the precondition at the top where a reader
+    // looks for it, the other guarantees the postcondition whatever arithmetic
+    // lands between them.
+    if !risk.is_finite() || risk.abs() < floor || !exit.is_finite() {
         return 0.0;
     }
-    (exit - entry) / risk
+    let r = (exit - entry) / risk;
+    // Belt-and-braces: with all three inputs finite and `risk` above the floor,
+    // the quotient is finite too — but this function's output goes straight into
+    // a serialized golden, and `null` in a golden is unrecoverable. Never let a
+    // non-finite escape, whatever future arithmetic lands above.
+    if r.is_finite() { r } else { 0.0 }
 }
 
 #[cfg(test)]
@@ -401,6 +482,143 @@ mod tests {
         assert!((realized_r(entry, 10_470.0, 10_530.0) - 1.0).abs() < 1e-9);
         // And the finest real FX tick (a fractional pip, 1e-6) is still scored.
         assert!((realized_r(1.10000, 1.099999, 1.100001) - 1.0).abs() < 1e-6);
+    }
+
+    /// **No input can produce a non-finite R.** `risk` was guarded but `exit`
+    /// wasn't, so a garbage exit price yielded `NaN` — which then poisons `net_r`
+    /// and every downstream sum.
+    #[test]
+    fn no_input_yields_a_non_finite_r() {
+        let bad = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        for &exit in &bad {
+            assert_eq!(realized_r(1.10, 1.09, exit), 0.0, "exit {exit} → 0R");
+        }
+        for &entry in &bad {
+            assert_eq!(realized_r(entry, 1.09, 1.11), 0.0, "entry {entry} → 0R");
+        }
+        for &stop in &bad {
+            assert_eq!(realized_r(1.10, stop, 1.11), 0.0, "stop {stop} → 0R");
+        }
+        // Exhaustively: no combination of the three escapes finite.
+        let all = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, 1.10, -1.10];
+        for &e in &all {
+            for &s in &all {
+                for &x in &all {
+                    assert!(
+                        realized_r(e, s, x).is_finite(),
+                        "realized_r({e}, {s}, {x}) was not finite"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The reason the guard above matters: `serde_json` writes `NaN`/`inf` as
+    /// `null` rather than failing, so a non-finite R would be *silently* baked
+    /// into a golden — and that golden can then never be loaded again, with the
+    /// resulting error classified as the operator's bad input rather than ours.
+    ///
+    /// Documents the serde behaviour AND proves the booked economics survive a
+    /// round-trip when a garbage exit price is present.
+    #[test]
+    fn a_garbage_exit_price_still_leaves_a_loadable_golden() {
+        // The trap, stated explicitly: this is what would have been written.
+        assert_eq!(
+            serde_json::to_string(&f64::NAN).unwrap_or_default(),
+            "null",
+            "serde_json serializes NaN as null instead of erroring"
+        );
+        assert!(
+            serde_json::from_str::<f64>("null").is_err(),
+            "…and null can't be read back as f64, so the golden is unloadable"
+        );
+
+        // Every price on the leg, not just `r`. Guarding `realized_r` alone was
+        // not enough: the raw price is *stored* on the leg, so a non-finite one
+        // still serialized as `null`. Found by this test, which is why it checks
+        // all four fields rather than only the exit.
+        let bad = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        for &garbage in &bad {
+            let cases = [
+                (
+                    "exit",
+                    FireResult {
+                        exit_price: Some(garbage),
+                        ..long_fire(FillKind::TookProfit, None)
+                    },
+                ),
+                (
+                    "entry",
+                    FireResult {
+                        entry_price: garbage,
+                        ..long_fire(FillKind::TookProfit, Some(1.12))
+                    },
+                ),
+                (
+                    "stop",
+                    FireResult {
+                        stop_loss: garbage,
+                        ..long_fire(FillKind::TookProfit, Some(1.12))
+                    },
+                ),
+                (
+                    "take_profit",
+                    FireResult {
+                        take_profit: garbage,
+                        ..long_fire(FillKind::TookProfit, Some(1.12))
+                    },
+                ),
+            ];
+            for (which, fire) in cases {
+                let mut econ = ReplayEconomics::new();
+                econ.book(&fire);
+                let json = serde_json::to_string(&econ).expect("serialize");
+                assert!(
+                    !json.contains("null"),
+                    "a non-finite {which} ({garbage}) leaked a null into the golden: {json}"
+                );
+                // The whole point: it can be read back.
+                let back: ReplayEconomics =
+                    serde_json::from_str(&json).expect("golden must reload");
+                assert_eq!(back, econ, "round-trip must be exact for {which}");
+                assert!(econ.net_r.is_finite(), "net_r stayed finite for {which}");
+            }
+        }
+
+        // And a garbage exit books 0R rather than poisoning the sum.
+        let mut econ = ReplayEconomics::new();
+        econ.book(&long_fire(FillKind::TookProfit, Some(f64::INFINITY)));
+        assert_eq!(econ.net_r, 0.0, "a garbage exit books 0R, not NaN");
+        // Dropped, not stored — and `exit_time` stays consistent with it.
+        let leg = &econ.legs[0];
+        assert!(leg.exit_price.is_none());
+        assert!(
+            leg.exit_time.is_none(),
+            "no exit price means no exit time — the leg must stay self-consistent"
+        );
+    }
+
+    /// An implausible R is **recorded as measured, not clamped**.
+    ///
+    /// The reviewer's case: a 10×-scaled exit on a 1R bracket books 990R, enough
+    /// for one leg to swamp a 291-trade aggregate. The response is a `warn!`, not
+    /// a clamp — clamping would silently rewrite a real measurement and hide the
+    /// data glitch that caused it. This test exists so nobody "fixes" that into a
+    /// clamp without deciding to.
+    #[test]
+    fn an_implausible_r_is_recorded_not_clamped() {
+        let mut econ = ReplayEconomics::new();
+        // entry 1.10, stop 1.09 (1R = 0.01), exit 11.0 → 990R.
+        econ.book(&long_fire(FillKind::TookProfit, Some(11.0)));
+
+        let r = econ.legs[0].r;
+        assert!(r > IMPLAUSIBLE_R, "must exceed the warn threshold: {r}");
+        assert!(
+            (r - 990.0).abs() < 1e-6,
+            "the measured value must survive verbatim, not be clamped to \
+             {IMPLAUSIBLE_R}: got {r}"
+        );
+        assert!((econ.net_r - r).abs() < 1e-9, "and it must reach net_r");
     }
 
     /// A zero-risk bracket (stop at entry) can't divide by zero.
