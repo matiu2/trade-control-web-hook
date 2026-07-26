@@ -12,7 +12,7 @@
 //! is lossless. A data source that serves mid-only yields bid == ask == mid,
 //! and the simulator degrades cleanly to exact-level mid fills.
 
-use candle_cache::{CacheClient, CacheConfig};
+use candle_cache::{CacheClient, CacheConfig, CacheError};
 use chrono::{DateTime, FixedOffset, Utc};
 use color_eyre::eyre::{Context, Result, eyre};
 use oanda_client::{OandaClient, data_source::OandaDataSource};
@@ -34,10 +34,10 @@ pub async fn pull(
     to: DateTime<Utc>,
     cache_dir: Option<PathBuf>,
 ) -> Result<Vec<EngineCandle>> {
-    let config = match cache_dir {
-        Some(dir) => CacheConfig::default().with_cache_dir(dir),
-        None => CacheConfig::default(),
-    };
+    let config = CacheConfig::default().with_cache_dir(match cache_dir {
+        Some(dir) => dir,
+        None => default_cache_dir(source),
+    });
     let from_fx = from.fixed_offset();
     let to_fx = to.fixed_offset();
     let gran = granularity.candle_model();
@@ -66,6 +66,32 @@ pub async fn pull(
     Ok(candles.candles.iter().map(to_engine_candle).collect())
 }
 
+/// The per-broker cache location, matching what every strategy crate uses
+/// (`broker-trait`'s `broker_env`: `~/.cache/candle_cache_{oanda,tradenation}`).
+///
+/// Two reasons this must be per-broker, not one shared default:
+///
+/// 1. **It's what makes the cache warm.** Under `postgres-storage` the *table
+///    name* is derived from this path's filename, so the previous
+///    `CacheConfig::default()` (`./candle_cache`) put replays in their own
+///    small private table while the ~430GB TradeNation and ~119GB OANDA tables
+///    the strategy crates fill sat right beside it, unused. Sharing the ReDB
+///    file was never the point — sharing the *data* is.
+/// 2. **It prevents cross-broker collision.** Cache keys embed the broker's own
+///    symbol formatting (`ba_GBP/AUD_H1_…` for TradeNation, `ba_GBP_AUD_H1_…`
+///    for OANDA), so one shared table only stays correct while no two brokers
+///    spell an instrument identically. That holds in today's catalog by luck,
+///    not by design; separate tables make it structural.
+fn default_cache_dir(source: CandleSource) -> PathBuf {
+    let base = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".cache"))
+        .unwrap_or_else(|_| PathBuf::from("."));
+    match source {
+        CandleSource::Oanda => base.join("candle_cache_oanda"),
+        CandleSource::TradeNation => base.join("candle_cache_tradenation"),
+    }
+}
+
 /// Turn a cache-open failure into an unmistakable one-liner.
 ///
 /// Opening the client is where an unreachable database, a bad `DATABASE_URL`
@@ -74,7 +100,16 @@ pub async fn pull(
 /// cache must never be mistaken for one that ran: a wrong answer is worse than
 /// a hard failure, so this is loud and fatal, never a silent degrade to an
 /// empty cache (which would re-pull everything and can change fills).
-fn cache_unreachable(e: impl std::fmt::Display) -> color_eyre::Report {
+///
+/// One exception: a rejected `--cache-dir` (unusable or over-long final path
+/// component) is the operator's typo, not a sick environment, so it exits "fix
+/// your input" rather than "retry me".
+fn cache_unreachable(e: CacheError) -> color_eyre::Report {
+    // Matched on the VARIANT, not on message text: `Config` is exactly "the
+    // cache dir you gave me is unusable", which is the operator's to fix.
+    if let CacheError::Config(msg) = &e {
+        return super::outcome::bad_input(eyre!("{msg}"));
+    }
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgresql://candle_cache@localhost:5432/candle_cache".to_string());
     eyre!(

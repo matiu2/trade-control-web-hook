@@ -155,6 +155,8 @@ EXIT CODES:
      Nothing was measured; retry it
   4  bad input — unparseable window, missing plan, no such fixture.
      Retrying verbatim will fail identically; fix the input
+  5  --check ran and the fixture did not match expected.json. A regression
+     verdict, not a fault — do not retry; investigate or re-bless
 
 A terminal summary line is ALWAYS printed to stdout, success or failure, so its
 absence means the process died in a way nobody handled. Failures report

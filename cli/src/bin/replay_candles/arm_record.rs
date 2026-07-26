@@ -105,9 +105,17 @@ pub struct ArmRecord {
     /// (not parsed) so the exact spelling round-trips for a re-arm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<String>,
-    /// Broker the plan was armed against (`tradenation` / `oanda`).
+    /// Which broker's candles the replay pulled (`tradenation` / `oanda`) — i.e.
+    /// `--source`, **not** necessarily the broker the plan was armed against.
+    ///
+    /// Named for what it actually holds. `tv-arm … replay` derives `--source` from
+    /// the resolved arming broker, so in the normal flow they agree — but a
+    /// standalone `replay-candles --plan … --source oanda` on a TradeNation-armed
+    /// plan records `oanda` here, which is the truth worth having: the numbers came
+    /// off the OANDA feed. Mislabelling this "the arming broker" would hide exactly
+    /// the wrong-feed capture that `chart_symbol` is qualified to catch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub broker: Option<String>,
+    pub candle_source: Option<String>,
     /// The **broker-qualified** TradingView symbol the geometry was read from,
     /// e.g. `TRADENATION:EURUSD`. Unqualified is a bug waiting to happen — see
     /// the module doc.
@@ -206,7 +214,7 @@ mod tests {
             skip_calendar_bars: true,
             skip_golden: false,
             start: Some("2026-07-17T17:00:00+10:00".into()),
-            broker: Some("tradenation".into()),
+            candle_source: Some("tradenation".into()),
             chart_symbol: Some("TRADENATION:EURUSD".into()),
             tv_arm_version: Some("v113-4-gabc123".into()),
             engine_version: Some("v113-4-gabc123".into()),

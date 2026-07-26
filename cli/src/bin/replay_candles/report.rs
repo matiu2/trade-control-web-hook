@@ -351,6 +351,13 @@ pub fn render(
             out.push_str(&format!("  EXP: {}", tally.expiry_closes));
         }
         out.push_str(&tally.summary_line());
+    } else {
+        // `Net R:` is the field batch drivers scrape, so it must appear on
+        // EVERY terminal line — otherwise `--simulate false` (reachable on
+        // purpose since the flag became overridable) looks exactly like the
+        // crash it was supposed to be distinguishable from. `n/a`, never
+        // `+0.00`: nothing was simulated, so there is no result to average in.
+        out.push_str("  |  Net R: n/a (--simulate false)");
     }
     out.push('\n');
     Rendered {

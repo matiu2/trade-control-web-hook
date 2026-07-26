@@ -32,6 +32,12 @@ pub const EXIT_INFRASTRUCTURE: i32 = 3;
 /// verbatim will fail identically. **Fix the input.**
 pub const EXIT_BAD_INPUT: i32 = 4;
 
+/// Process exit code: `--check` ran fine and the fixture's outcome **did not
+/// match** `expected.json`. A regression verdict, not a fault — the run worked
+/// exactly as asked and the answer was "different". Kept distinct from
+/// [`EXIT_INFRASTRUCTURE`] so CI doesn't retry a genuine regression forever.
+pub const EXIT_CHECK_MISMATCH: i32 = 5;
+
 /// Why a replay failed, coarse enough that a driver can branch on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
@@ -39,6 +45,8 @@ pub enum FailureKind {
     Infrastructure,
     /// The request was malformed; the environment was fine.
     BadInput,
+    /// `--check` ran and the fixture disagreed with `expected.json`.
+    CheckMismatch,
 }
 
 impl FailureKind {
@@ -47,6 +55,7 @@ impl FailureKind {
         match self {
             Self::Infrastructure => EXIT_INFRASTRUCTURE,
             Self::BadInput => EXIT_BAD_INPUT,
+            Self::CheckMismatch => EXIT_CHECK_MISMATCH,
         }
     }
 
@@ -55,60 +64,86 @@ impl FailureKind {
         match self {
             Self::Infrastructure => "infrastructure",
             Self::BadInput => "bad-input",
+            Self::CheckMismatch => "check-mismatch",
         }
     }
 
-    /// Classify a failure from its error chain.
+    /// Classify a failure by looking for a [`BadInput`] marker in its chain.
     ///
-    /// Deliberately **fails toward `Infrastructure`**: an unrecognised error is
-    /// far more likely to be a flaky environment than a malformed request (bad
-    /// input is nearly always caught by clap or an explicit check, both of
-    /// which produce phrasing we match below). Getting this wrong in the
-    /// retryable direction costs a wasted retry; getting it wrong the other way
-    /// silently drops a cell from the grid, which is the failure this whole
-    /// module exists to prevent.
+    /// **Typed, not textual.** An earlier version substring-matched the
+    /// lowercased error chain, and it was wrong in both directions:
+    ///
+    /// - *Infrastructure read as bad input* — the dangerous direction. A plan on
+    ///   a dropped NFS mount reports `No such file or directory`, and any broker
+    ///   HTTP body containing "is required" matched too. Exit 4 tells a driver
+    ///   "retrying will fail identically", so a transient mount blip got
+    ///   recorded as a permanent result — the silent cell-loss this module
+    ///   exists to prevent.
+    /// - *Bad input read as infrastructure* — a typo'd instrument yields
+    ///   "unsupported instrument", but the marker list said "unknown
+    ///   instrument", so it exited 3 and a driver retried the typo forever.
+    ///
+    /// The chain is *data* — it includes remote text we don't control — so it
+    /// can't carry the verdict. Now only a call site that KNOWS the input was
+    /// malformed says so, by attaching [`BadInput`] via [`bad_input`].
+    /// Everything else is infrastructure: a wrong guess there costs one retry,
+    /// the other way loses a cell.
     pub fn classify(err: &color_eyre::Report) -> Self {
-        let haystack = err
-            .chain()
-            .map(|cause| cause.to_string().to_lowercase())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        Self::classify_text(&haystack)
-    }
-
-    /// The matching itself, split out so it can be tested without building a
-    /// real error chain.
-    pub fn classify_text(haystack: &str) -> Self {
-        // Bad-input phrasings. These are things the operator typed, so no
-        // amount of retrying changes them.
-        const BAD_INPUT_MARKERS: [&str; 15] = [
-            "is required",
-            "not valid rfc3339",
-            "premature end of input",
-            "input contains invalid characters",
-            "parse --start",
-            "parse --end",
-            "must be after start",
-            "no such file",
-            "parse plan json",
-            "is ambiguous in brisbane time",
-            "does not match the plan",
-            "unknown instrument",
-            // A fixture that won't load or parse is bad input, not a flaky
-            // environment: the bytes on disk are corrupt (or absent), so retrying
-            // verbatim fails identically. `fixture::read_json` wraps these as
-            // `parse <path>` / `read <path>`, and a batch folds every failing row's
-            // reason into its summary error so one corrupt fixture in 291 still
-            // classifies the run correctly.
-            "/plan.json",
-            "/candles.json",
-            "/meta.json",
-        ];
-        if BAD_INPUT_MARKERS.iter().any(|m| haystack.contains(m)) {
+        if err.chain().any(|c| c.is::<CheckMismatch>()) {
+            return Self::CheckMismatch;
+        }
+        if err.chain().any(|c| c.is::<BadInput>()) {
             return Self::BadInput;
         }
         Self::Infrastructure
     }
+}
+
+/// Marker for an error whose cause is the *request*, not the environment — a
+/// typo'd instrument, an unparseable window, a missing `--fixture`. Retrying
+/// such a run verbatim always fails the same way.
+///
+/// Deliberately a type rather than a phrase: see [`FailureKind::classify`].
+/// It carries the message so it can sit at the HEAD of the chain — `wrap_err`
+/// erases the context's concrete type, so a marker added that way would be
+/// invisible to `chain().any(|c| c.is::<BadInput>())`.
+#[derive(Debug)]
+pub struct BadInput(String);
+
+impl fmt::Display for BadInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BadInput {}
+
+/// Tag an error as operator-supplied bad input, so it exits 4 ("fix it")
+/// rather than 3 ("retry it").
+///
+/// Use at the point a check *knows* the input was malformed:
+/// `return Err(bad_input(eyre!("unsupported granularity {g:?}")));`
+pub fn bad_input(report: color_eyre::Report) -> color_eyre::Report {
+    color_eyre::Report::new(BadInput(format!("{report:#}")))
+}
+
+/// Marker for a `--check` fixture mismatch: the run succeeded, the answer
+/// differed. See [`EXIT_CHECK_MISMATCH`].
+#[derive(Debug)]
+pub struct CheckMismatch(String);
+
+impl fmt::Display for CheckMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CheckMismatch {}
+
+/// Tag a fixture-comparison failure so it exits [`EXIT_CHECK_MISMATCH`]
+/// instead of being mistaken for a retryable infrastructure fault.
+pub fn check_mismatch(report: color_eyre::Report) -> color_eyre::Report {
+    color_eyre::Report::new(CheckMismatch(format!("{report:#}")))
 }
 
 /// The always-printed terminal line for a failed run.
@@ -146,92 +181,81 @@ pub fn cache_unreachable_banner(url: &str, cause: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn bad_input_phrasings_are_not_retryable() {
-        for text in [
-            "--plan is required (or use --test-mode --fixture <name>)",
-            "parse --start: input contains invalid characters",
-            "end (x) must be after start (y)",
-            "parse plan json /tmp/p.json",
-        ] {
-            assert_eq!(
-                FailureKind::classify_text(&text.to_lowercase()),
-                FailureKind::BadInput,
-                "{text:?} should be bad input"
-            );
-        }
-    }
+    use color_eyre::eyre::eyre;
 
-    /// A corrupt or missing fixture is **bad input**, not a flaky environment:
-    /// the bytes on disk are wrong, so retrying verbatim fails identically. These
-    /// are the real wrappings `fixture::read_json` produces.
+    /// Only a `bad_input`-tagged error is non-retryable, and the tag survives
+    /// further `wrap_err` context added on the way up the stack.
     #[test]
-    fn a_corrupt_fixture_is_bad_input_not_infrastructure() {
-        for text in [
-            "parse /repo/replay-fixtures/trade-124/candles.json: expected ident at line 1 column 2",
-            "read /repo/replay-fixtures/trade-999/plan.json: no such file or directory (os error 2)",
-            "parse /repo/replay-fixtures/trade-7/meta.json: missing field `granularity`",
-        ] {
-            assert_eq!(
-                FailureKind::classify_text(&text.to_lowercase()),
-                FailureKind::BadInput,
-                "{text:?} should be bad input — retrying can't fix corrupt bytes"
-            );
-        }
-    }
+    fn tagged_errors_are_bad_input() {
+        let tagged = bad_input(eyre!("unsupported granularity \"3h\""));
+        assert_eq!(FailureKind::classify(&tagged), FailureKind::BadInput);
 
-    /// A BATCH folds every failing row's reason into its summary error, so one
-    /// corrupt fixture among many still classifies the whole run as bad input.
-    /// (Without the fold, the chain would only carry the summary sentence and
-    /// default to `Infrastructure` — costing a pointless retry of 291 fixtures.)
-    #[test]
-    fn a_batch_summary_classifies_from_the_folded_row_reasons() {
-        let folded = "2 of 3 fixture(s) failed — see the rows above (net r +0.35 excludes them): \
-             parse /repo/replay-fixtures/a/candles.json: expected ident | \
-             read /repo/replay-fixtures/b/plan.json: no such file or directory";
+        let wrapped = bad_input(eyre!("unsupported instrument \"xyz\"")).wrap_err("pull candles");
         assert_eq!(
-            FailureKind::classify_text(folded),
+            FailureKind::classify(&wrapped),
             FailureKind::BadInput,
-            "a batch of corrupt fixtures must not read as retryable"
+            "the marker must survive added context"
         );
     }
 
-    /// But a batch whose rows failed for an *environmental* reason stays
-    /// retryable — the fold must not blanket-classify everything as bad input.
+    /// Real infrastructure text — including phrases an earlier substring-based
+    /// classifier wrongly matched as bad input. Getting these wrong is the
+    /// dangerous direction: exit 4 tells a driver not to retry, so a transient
+    /// fault would be recorded as a permanent result.
     #[test]
-    fn a_batch_of_infra_failures_stays_retryable() {
-        let folded = "1 of 3 fixture(s) failed — see the rows above: \
-             storage error: pool timed out while waiting for an open connection";
-        assert_eq!(
-            FailureKind::classify_text(folded),
-            FailureKind::Infrastructure
-        );
-    }
-
-    #[test]
-    fn infrastructure_phrasings_are_retryable() {
+    fn untagged_errors_are_infrastructure() {
         for text in [
             "storage error: postgresql error: connection refused",
-            "database already open. cannot acquire lock.",
             "pool timed out while waiting for an open connection",
-            "error sending request for url (https://api.tradenation...)",
+            // ENOENT on a dropped mount — contains "no such file"
+            "read plan /mnt/nfs/p.json: No such file or directory (os error 2)",
+            // a broker response body that happens to contain "is required"
+            "tradenation api 400: field \"instrument\" is required",
+            // a truncated read of a plan being written concurrently
+            "parse plan JSON /tmp/p.json: EOF while parsing a value",
+            "something nobody has ever seen before",
         ] {
             assert_eq!(
-                FailureKind::classify_text(&text.to_lowercase()),
+                FailureKind::classify(&eyre!("{text}")),
                 FailureKind::Infrastructure,
-                "{text:?} should be infrastructure"
+                "{text:?} must stay retryable"
             );
         }
     }
 
-    /// An error we've never seen must be retryable, not silently recorded as a
-    /// result — see `classify`'s doc comment.
+    /// Guards the wiring, not the wording: these call the REAL error
+    /// constructors rather than hand-written strings, so a message reworded at
+    /// its source (or a `bad_input` tag dropped) fails here. The previous
+    /// version asserted a marker list against itself and could not fail.
     #[test]
-    fn unrecognised_errors_default_to_infrastructure() {
-        assert_eq!(
-            FailureKind::classify_text("something nobody has ever seen before"),
-            FailureKind::Infrastructure
-        );
+    fn real_bad_input_constructors_classify_as_bad_input() {
+        use crate::replay_candles::{granularity, instrument};
+        use trade_control_cli::replay_args::CandleSource;
+
+        let cases: Vec<(&str, color_eyre::Report)> = vec![
+            (
+                "unsupported granularity",
+                granularity::parse("3h").expect_err("3h is not a granularity"),
+            ),
+            (
+                "unsupported instrument",
+                instrument::resolve_for("totally-not-real", CandleSource::TradeNation)
+                    .expect_err("not a catalog instrument"),
+            ),
+            (
+                "unparseable datetime",
+                crate::parse_start_end("not-a-date").expect_err("not a datetime"),
+            ),
+        ];
+
+        for (what, err) in cases {
+            assert_eq!(
+                FailureKind::classify(&err),
+                FailureKind::BadInput,
+                "{what} must exit {EXIT_BAD_INPUT} (fix-the-input), not \
+                 {EXIT_INFRASTRUCTURE} (retry-forever); got: {err}"
+            );
+        }
     }
 
     #[test]

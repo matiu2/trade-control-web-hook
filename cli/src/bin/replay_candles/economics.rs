@@ -157,14 +157,27 @@ impl ReplayEconomics {
     /// The $100k account compounded at 1% risk per taken trade, in leg order.
     ///
     /// **Derived, deliberately not stored.** It's a chain of multiply-accumulates
-    /// (`acct += 0.01 · acct · R`) whose low bits depend on floating-point
-    /// operation order, so two builds of the same code can land on
-    /// `100337.04422788607` vs `...609`. `ReplayOutcome` equality is exact float
-    /// comparison, so storing it made the golden fixture gate **flaky** — the
-    /// test binary and the release binary disagreed in the last two digits.
+    /// (`acct += 0.01 · acct · R`), and `ReplayOutcome` equality is *exact* float
+    /// comparison, so storing it made the golden fixture gate **flaky**: the test
+    /// binary and the release binary disagreed in the last two digits
+    /// (`100337.04422788607` vs `...609`), most likely from FMA contraction or
+    /// other codegen differences between profiles.
     ///
-    /// `net_r` is a plain sum and is bit-stable, so the legs plus `net_r` are the
-    /// durable record; this is a presentation of them, recomputed on demand.
+    /// **What this does NOT claim:** that `net_r` is bit-stable and `account`
+    /// isn't. An earlier version of this comment said exactly that, and it was
+    /// wrong. Float addition is not associative, so a plain sum is the canonical
+    /// order-dependent reduction — reordering the *real* uk-100 fixture legs
+    /// (`+0.549 / −1.000 / +0.797`) through a left fold yields **two** distinct
+    /// bit patterns for `net_r`. (Beware checking this in Python: its builtin
+    /// `sum` is smarter than a naive fold and shows one pattern; Rust's
+    /// `Sum for f64` is a plain left fold.)
+    ///
+    /// So `net_r` and `legs[].r` — both still stored — carry the *same* residual
+    /// exposure. Removing `account` narrowed the surface (it was the longest
+    /// dependent chain, and the only value observed to actually differ across
+    /// profiles) but did not eliminate the class. If the golden gate ever flakes
+    /// again, look here first: the fix is a tolerance-based comparison for
+    /// `ReplayOutcome`, not another derived field.
     pub fn account(&self) -> f64 {
         self.legs.iter().fold(START_ACCOUNT, |acct, leg| {
             acct + RISK_FRACTION * acct * leg.r
@@ -230,11 +243,25 @@ impl ReplayEconomics {
 /// stop_loss` is the risk (positive for a long, negative for a short), and
 /// `exit − entry` is the reward with the trade's own sign, so the quotient is
 /// `+1` on a clean TP and `−1` on a clean SL for *both* directions without a
-/// direction branch. Returns `0.0` when the stop sits at the entry (a
-/// degenerate/zero-risk bracket) so it can't divide by zero.
+/// direction branch.
+///
+/// Returns `0.0` for a degenerate/zero-risk bracket (stop at or adjacent to
+/// entry) so it can't divide by zero or report an absurd R.
+///
+/// The guard is **relative to the price**, not absolute. It used to be
+/// `risk.abs() < f64::EPSILON` — 2.2e-16 flat — which is meaningless at index
+/// scale: on UK100 at ~10500 the gap between adjacent representable doubles is
+/// already ~1.8e-12, so a stop one float-step from entry passed the guard and
+/// produced R ≈ 10¹⁰, which would then swamp a whole batch's net R. Upstream
+/// floors (`min_r >= 1.0`, the 10×-spread SL floor) mean such a bracket shouldn't
+/// reach here at all, but this guard's entire job is to be the last line of
+/// defence, so it should hold at every price scale.
 pub fn realized_r(entry: f64, stop_loss: f64, exit: f64) -> f64 {
     let risk = entry - stop_loss;
-    if risk.abs() < f64::EPSILON {
+    // ~1e-9 of the price: far below any real tick (the finest FX pip is 1e-5, and
+    // a fractional-pip tick 1e-6) yet far above the ULP at index scale.
+    let floor = (entry.abs() * 1e-9).max(f64::MIN_POSITIVE);
+    if !risk.is_finite() || risk.abs() < floor {
         return 0.0;
     }
     (exit - entry) / risk
@@ -353,6 +380,27 @@ mod tests {
         assert_eq!(e.sl_hits, 1);
         assert_eq!(e.net_r, 0.0);
         assert_eq!(e.account(), START_ACCOUNT);
+    }
+
+    /// The zero-risk guard is RELATIVE to the price, so it holds at index scale
+    /// too. With the old absolute `f64::EPSILON` threshold, a stop one
+    /// representable step from entry on UK100 (~10500, ULP ~1.8e-12) sailed
+    /// through and produced R ~ 1e10 — one leg would have swamped a batch's net R.
+    #[test]
+    fn zero_risk_guard_holds_at_index_scale() {
+        let entry = 10_500.0_f64;
+        // One float step away: absolutely tiny, but ~1.8e-12 at this magnitude.
+        let stop = f64::from_bits(entry.to_bits() + 1);
+        assert_ne!(stop, entry, "must actually be a different double");
+        assert_eq!(
+            realized_r(entry, stop, 10_600.0),
+            0.0,
+            "a one-ULP stop at index scale must be treated as zero-risk"
+        );
+        // A REAL index stop (30 points) still scores normally.
+        assert!((realized_r(entry, 10_470.0, 10_530.0) - 1.0).abs() < 1e-9);
+        // And the finest real FX tick (a fractional pip, 1e-6) is still scored.
+        assert!((realized_r(1.10000, 1.099999, 1.100001) - 1.0).abs() < 1e-6);
     }
 
     /// A zero-risk bracket (stop at entry) can't divide by zero.

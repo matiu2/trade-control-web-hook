@@ -159,10 +159,11 @@ async fn run() -> Result<()> {
         tracing::info!("annotation implies --simulate; running the fill simulator");
     }
 
-    let plan_path = args
-        .plan
-        .clone()
-        .ok_or_else(|| eyre!("--plan is required (or use --test-mode --fixture <name>)"))?;
+    let plan_path = args.plan.clone().ok_or_else(|| {
+        outcome::bad_input(eyre!(
+            "--plan is required (or use --test-mode --fixture <name>)"
+        ))
+    })?;
     let plan = load_plan(&plan_path)?;
 
     // Granularity comes from the plan; `--granularity` only overrides, and an
@@ -179,7 +180,9 @@ async fn run() -> Result<()> {
     let start = window.start;
     let end = window.end;
     if end <= start {
-        return Err(eyre!("end ({end}) must be after start ({start})"));
+        return Err(outcome::bad_input(eyre!(
+            "end ({end}) must be after start ({start})"
+        )));
     }
 
     // The engine evaluates a `TimeReached` (trade-expiry) against each candle's
@@ -376,7 +379,7 @@ fn arm_record(args: &Args) -> arm_record::ArmRecord {
         skip_calendar_bars: args.arm_skip_calendar_bars,
         skip_golden: args.arm_skip_golden,
         start: args.arm_start.clone(),
-        broker: Some(args.source.as_str().to_string()),
+        candle_source: Some(args.source.as_str().to_string()),
         chart_symbol: args.arm_chart_symbol.clone(),
         tv_arm_version: args.arm_tv_arm_version.clone(),
         engine_version: Some(env!("GIT_VERSION").to_string()),
@@ -537,10 +540,11 @@ async fn run_test_mode(args: &Args) -> Result<()> {
 /// under `--json`), and under `--check` diffs the computed outcome against
 /// `expected.json`, returning an error (non-zero exit) on any mismatch.
 async fn run_test_mode_single(args: &Args) -> Result<()> {
-    let name = args
-        .fixture
-        .as_deref()
-        .ok_or_else(|| eyre!("--test-mode requires --fixture <name> or --fixtures-glob <glob>"))?;
+    let name = args.fixture.as_deref().ok_or_else(|| {
+        outcome::bad_input(eyre!(
+            "--test-mode requires --fixture <name> or --fixtures-glob <glob>"
+        ))
+    })?;
     let root = fixtures_dir(args);
     let result = replay_one_fixture(args, &root.join(name), name).await;
     if args.json {
@@ -570,13 +574,19 @@ async fn run_test_mode_batch(args: &Args, pattern: &str) -> Result<()> {
     );
 
     let mut rows = Vec::with_capacity(dirs.len());
+    // Each failing row's typed verdict, captured while its error chain is intact.
+    let mut kinds = Vec::new();
     for dir in &dirs {
         let name = dir
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("<unnamed>")
             .to_string();
-        rows.push(replay_one_fixture(args, dir, &name).await.row);
+        let run = replay_one_fixture(args, dir, &name).await;
+        if let Some(kind) = run.kind {
+            kinds.push(kind);
+        }
+        rows.push(run.row);
     }
     let summary = batch::BatchSummary::from_results(rows);
 
@@ -596,27 +606,43 @@ async fn run_test_mode_batch(args: &Args, pattern: &str) -> Result<()> {
         );
     }
     if summary.failed > 0 {
-        // Classify from the ROWS, not from this wrapper's own wording. A batch can
-        // fail for either reason — a corrupt/missing fixture is bad input (fix it),
-        // an unreachable resource is infrastructure (retry it) — and
-        // `FailureKind::classify` walks the error chain, which by the time it gets
-        // here only contains this summary sentence. So fold every row's reason into
-        // the message: any bad-input marker present makes the whole batch bad-input,
-        // which is right, because retrying verbatim cannot fix a corrupt fixture.
-        let reasons = summary
-            .results
-            .iter()
-            .filter_map(|r| r.error.as_deref())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        return Err(eyre!(
-            "{} of {} fixture(s) failed — see the rows above (net R {:+.2} excludes them): {reasons}",
+        let msg = eyre!(
+            "{} of {} fixture(s) failed — see the rows above (net R {:+.2} excludes them)",
             summary.failed,
             summary.matched,
             summary.net_r,
-        ));
+        );
+        // Re-tag with the aggregate of the rows' TYPED verdicts, so the batch exits
+        // the same code a single failing fixture would. Emphatically NOT by folding
+        // the rows' error text into this message and re-classifying it — the chain
+        // is data we don't control (a `--check` mismatch embeds the whole
+        // expected+got JSON), so a fixture whose warnings contained a marker phrase
+        // could hijack the verdict.
+        return Err(match aggregate_kind(&kinds) {
+            outcome::FailureKind::CheckMismatch => outcome::check_mismatch(msg),
+            outcome::FailureKind::BadInput => outcome::bad_input(msg),
+            // Untagged ⇒ infrastructure, the retryable default.
+            outcome::FailureKind::Infrastructure => msg,
+        });
     }
     Ok(())
+}
+
+/// The one verdict a batch of mixed failures reports.
+///
+/// Most-specific wins: a `--check` mismatch is a real regression and must never be
+/// masked by a co-occurring corrupt fixture or a flaky mount; bad input beats
+/// infrastructure because retrying verbatim cannot fix it. An empty set (or all
+/// rows somehow untagged) is infrastructure — the retryable default, since a wrong
+/// guess there costs one retry while the other way silently drops a result.
+fn aggregate_kind(kinds: &[outcome::FailureKind]) -> outcome::FailureKind {
+    if kinds.contains(&outcome::FailureKind::CheckMismatch) {
+        return outcome::FailureKind::CheckMismatch;
+    }
+    if kinds.contains(&outcome::FailureKind::BadInput) {
+        return outcome::FailureKind::BadInput;
+    }
+    outcome::FailureKind::Infrastructure
 }
 
 /// One fixture's replay, as a [`batch::BatchResult`] row plus the error (if any)
@@ -629,12 +655,24 @@ async fn run_test_mode_batch(args: &Args, pattern: &str) -> Result<()> {
 struct FixtureRun {
     row: batch::BatchResult,
     error: Option<color_eyre::eyre::Error>,
+    /// This row's **typed** verdict, classified at the point of failure while the
+    /// real error chain is still intact.
+    ///
+    /// Load-bearing: a batch has to report one exit code for many failures, and it
+    /// must not do that by concatenating the rows' error *text* and re-classifying
+    /// the result. The chain contains data we don't control — remote HTTP bodies,
+    /// and for a `--check` mismatch the entire pretty-printed expected+got JSON —
+    /// so a fixture whose rule ids or warnings happened to contain "no such file"
+    /// could flip the whole batch's verdict. Classify each row once, here, then
+    /// aggregate the *verdicts*. See `outcome::FailureKind::classify`.
+    kind: Option<outcome::FailureKind>,
 }
 
 impl FixtureRun {
     fn failed(name: &str, err: color_eyre::eyre::Error) -> Self {
         Self {
             row: batch::BatchResult::failed(name, format!("{err:#}")),
+            kind: Some(outcome::FailureKind::classify(&err)),
             error: Some(err),
         }
     }
@@ -703,7 +741,11 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
         tracing::info!(dir = %dir.display(), "re-blessed expected.json from frozen inputs");
     }
 
-    FixtureRun { row, error: None }
+    FixtureRun {
+        row,
+        error: None,
+        kind: None,
+    }
 }
 
 /// Run the pure engine over a frozen candle window. Mirrors the live path's
@@ -735,9 +777,9 @@ async fn run_frozen(
 fn diff_error(expected: &ReplayOutcome, got: &ReplayOutcome) -> color_eyre::eyre::Report {
     let exp = serde_json::to_string_pretty(expected).unwrap_or_default();
     let act = serde_json::to_string_pretty(got).unwrap_or_default();
-    eyre!(
+    outcome::check_mismatch(eyre!(
         "fixture outcome does not match expected.json\n--- expected ---\n{exp}\n--- got ---\n{act}"
-    )
+    ))
 }
 
 /// The fully-resolved replay window: instrument (or `None` to fall back to the
@@ -903,13 +945,13 @@ fn parse_start_end(s: &str) -> Result<DateTime<Utc>> {
                 .from_local_datetime(&naive)
                 .single()
                 .map(|dt| dt.with_timezone(&Utc))
-                .ok_or_else(|| eyre!("{s:?} is ambiguous in Brisbane time"));
+                .ok_or_else(|| outcome::bad_input(eyre!("{s:?} is ambiguous in Brisbane time")));
         }
     }
-    Err(eyre!(
+    Err(outcome::bad_input(eyre!(
         "{s:?} is not a valid datetime (expected Brisbane YYYY-MM-DDTHH:MM[:SS], \
          or an explicit offset like ...T07:00Z / ...T17:00+10:00)"
-    ))
+    )))
 }
 
 /// Brisbane's fixed UTC offset in seconds (+10:00, no DST).

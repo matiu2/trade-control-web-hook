@@ -333,9 +333,22 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     fs::write(path, json).wrap_err_with(|| format!("write {}", path.display()))
 }
 
+/// Read + parse one of a fixture's JSON files.
+///
+/// The two failure modes are classified **differently on purpose**:
+///
+/// - A **parse** failure is `bad_input` (exit 4, "fix it"): the bytes on disk are
+///   malformed, so retrying verbatim fails identically.
+/// - A **read** failure is left untagged → infrastructure (exit 3, "retry it").
+///   It is tempting to call a missing file bad input, but `ENOENT` is exactly what
+///   a dropped NFS mount reports, and mis-tagging that as permanent silently drops
+///   a result from a sweep. A genuinely absent fixture costs one wasted retry;
+///   the other way costs a wrong answer. See `outcome::FailureKind::classify`.
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let text = fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
-    serde_json::from_str(&text).wrap_err_with(|| format!("parse {}", path.display()))
+    serde_json::from_str(&text).map_err(|e| {
+        super::outcome::bad_input(color_eyre::eyre::eyre!("parse {}: {e}", path.display()))
+    })
 }
 
 /// The repo-root fixtures directory, resolved from the cli crate's manifest so
@@ -634,9 +647,19 @@ mod tests {
             "an unsimulated run must record no economics: {:?}",
             snapshot.outcome
         );
+        // The report still prints a terminal `Net R:` — as `n/a`, never `+0.00`.
+        // That is deliberate (commit aeededb): `Net R:` is what batch drivers
+        // scrape, so its ABSENCE must mean "the process died", never "nothing was
+        // simulated". A run with `--simulate false` is a successful run with no
+        // result, and has to say so rather than look like a crash.
         assert!(
-            !rendered.text.contains("Net R:"),
-            "an unsimulated report must print no summary:\n{}",
+            rendered.text.contains("Net R: n/a"),
+            "an unsimulated report must still carry a terminal Net R, as n/a:\n{}",
+            rendered.text
+        );
+        assert!(
+            !rendered.text.contains("+0.00"),
+            "n/a, never +0.00 — a sweep would average +0.00 in as a real trade:\n{}",
             rendered.text
         );
     }
@@ -776,7 +799,7 @@ mod tests {
                 skip_calendar_bars: true,
                 skip_golden: false,
                 start: Some("2026-07-17T17:00:00+10:00".into()),
-                broker: Some("tradenation".into()),
+                candle_source: Some("tradenation".into()),
                 chart_symbol: Some("TRADENATION:EURUSD".into()),
                 tv_arm_version: Some("v116-1-gabc".into()),
                 engine_version: Some("v116-1-gabc".into()),
