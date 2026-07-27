@@ -79,11 +79,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
         let warm = all.len() - tail.len();
 
+        let distinct: std::collections::BTreeSet<_> = tail.iter().map(|c| c.0).collect();
+        let dupes = tail.len() - distinct.len();
         print!(
-            "from={from}  total={:>5}  warmup={:>5}  live={:>5}",
+            "from={from}  total={:>5}  warmup={:>5}  live={:>5}  distinct={:>5}  DUPES={:>3}",
             all.len(),
             warm,
-            tail.len()
+            tail.len(),
+            distinct.len(),
+            dupes
         );
 
         match &baseline {

@@ -76,12 +76,42 @@ from=2026-07-11 16:54:38Z  (RAGGED)   total=319  warmup=185  live=134  *** -18 *
 from=2026-07-09 14:54:38Z  (RAGGED)   total=366  warmup=232  live=134  *** -18 ***
 ```
 
-**The discriminator is `from`'s alignment, not its distance.** A `from` on a
-bar boundary (`:00`, `:30`) is safe at any depth; a ragged `from`
-(`16:54:38`) silently drops 18 bars from the FAR END of the range. Two
-earlier probe runs using only whole hours passed cleanly and briefly made
-this look like a non-bug — align your probe timestamps or you will not see
-it.
+**CORRECTED — the ragged call is the CORRECT one.** Counting distinct
+timestamps inverts the reading:
+
+```
+from=2026-07-17 18:00:00Z (aligned)  live=152  distinct=134  DUPES=18
+from=2026-07-15 03:30:00Z (aligned)  live=152  distinct=134  DUPES=18
+from=2026-07-11 16:54:38Z (RAGGED)   live=134  distinct=134  DUPES= 0
+from=2026-07-09 14:54:38Z (RAGGED)   live=134  distinct=134  DUPES= 0
+```
+
+All four calls return the **same 134 real bars**, same first/last bar, same
+session gaps. The ALIGNED calls **duplicate 18 of them**. So the bug is not
+"widening loses bars" — it is **"an aligned `from` emits duplicate
+candles"**, and the replay's `live=153` was an inflated count while
+`live=135` was honest. Deterministic: 3 identical runs agree exactly (not a
+cache-population race).
+
+**Root cause — `candle-cache` merges without dedup.**
+`CacheClient::fill_cache_gaps` (`candle-cache/src/client.rs` ~645) does:
+
+```rust
+all_candles.extend(cached_range_entries);   // cached chunks
+all_candles.extend(fetched_candles);        // freshly-fetched chunks
+all_candles.sort_by_key(|c| c.timestamp()); // sorted...
+// ...but never deduped
+.take(requested_range.candle_count())       // truncates by COUNT
+```
+
+Overlapping cached/fetched chunks yield duplicate timestamps, and the
+count-based `take` then pushes real bars off the end. `get_candles_range`
+(~635) has the same sort-then-`truncate` with no dedup. There is **no
+`dedup`/`dedup_by_key` anywhere in the crate** — only `sort_by_key`.
+
+Whether a given `from` produces overlapping chunks depends on how it lands
+against the cached-range boundaries, which is why alignment (not distance)
+is the discriminator.
 
 Ragged `from` values come from `next_pull_from`'s density extrapolation
 (`cli/src/bin/replay_candles.rs`), which computes an instant from a
@@ -90,14 +120,19 @@ back-off loop's attempt 0/1 (naive `start - bar_secs * want`) are aligned
 and safe, while attempt 2+ (extrapolated) are ragged and lossy — exactly
 matching the observed `live=153, 153, 135, 135`.
 
-Fix candidates, in order:
-1. **candle-cache**: a range query must not let `from`'s sub-bar offset
-   affect which bars near `to` are returned. This is the real defect and it
-   affects every caller, not just replay.
-2. **`next_pull_from`**: snap the returned instant down to the granularity
-   grid. Cheap, and removes the trigger for this caller.
-3. **`pull_with_warmup` guard**: never accept a live count lower than a
-   previous attempt's — fail loudly instead of scoring it.
+Fix, in order:
+1. **candle-cache (the real defect)**: dedup by timestamp after every merge,
+   BEFORE the count-based `take`/`truncate`, in `fill_cache_gaps` and
+   `get_candles_range` (and the two bid/ask twins ~950/1009). Affects every
+   caller, not just replay — duplicated bars are fed to any indicator built
+   on a range fetch.
+2. **`pull_with_warmup` guard**: never accept a live count lower than a
+   previous attempt's, and assert distinct timestamps — fail loudly instead
+   of silently scoring a duplicated window
+   ([[no_silent_degrade_prefer_loud_failure]]).
+3. **`next_pull_from`** (optional): snapping to the granularity grid changes
+   which `from` values occur but does NOT fix the dedup bug — do not treat
+   it as a fix.
 
 ## Fixes (independent, do both)
 
