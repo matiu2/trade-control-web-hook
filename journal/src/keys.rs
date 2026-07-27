@@ -37,6 +37,16 @@ pub enum Action {
     Redraw,
     /// Copy the full content of the current view to the clipboard (the `c` key).
     Copy,
+    /// Open the `/` search prompt on the list.
+    SearchOpen,
+    /// Type a character into the live search query.
+    SearchPush(char),
+    /// Backspace one character from the search query.
+    SearchPop,
+    /// Close the prompt, keeping the filter (Enter).
+    SearchAccept,
+    /// Close the prompt and drop the filter (Esc).
+    SearchClear,
     None,
 }
 
@@ -50,6 +60,27 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
     // on any screen or modal.
     if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return Action::Redraw;
+    }
+
+    // An open `/` search prompt is a text field: it swallows every printable
+    // key so typing a query can't trigger a command binding (`q` would quit,
+    // `d` would delete). Only Enter/Esc/Backspace and the arrows escape it —
+    // the arrows so you can move the selection while still refining the query.
+    // This must sit above the confirm/popup blocks: the prompt is only open on
+    // the list screen, where neither of those can be showing.
+    if app.search.active {
+        return match key.code {
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::SearchPush(c)
+            }
+            KeyCode::Backspace => Action::SearchPop,
+            KeyCode::Enter => Action::SearchAccept,
+            KeyCode::Esc => Action::SearchClear,
+            KeyCode::Up => Action::SelectPrev,
+            KeyCode::Down => Action::SelectNext,
+            KeyCode::Right => Action::Deeper,
+            _ => Action::None,
+        };
     }
 
     // A pending confirm modal only listens for y/n/esc.
@@ -110,6 +141,12 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
     }
 
     match key.code {
+        // `/` opens the search prompt (list only; `open_search` no-ops elsewhere).
+        KeyCode::Char('/') => Action::SearchOpen,
+        // With a filter applied but the prompt closed, Esc clears the filter
+        // instead of quitting — otherwise the only way out of a filter is to
+        // reopen the prompt, and a stray Esc would exit the app unexpectedly.
+        KeyCode::Esc if app.search.is_filtering() => Action::SearchClear,
         KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
         KeyCode::Up | KeyCode::Char('k') => Action::SelectPrev,
         KeyCode::Down | KeyCode::Char('j') => Action::SelectNext,
@@ -148,6 +185,107 @@ pub fn apply(app: &mut App, action: Action) {
         Action::ReplayEnd => app.scroll_replay_end(),
         Action::Redraw => app.request_redraw(),
         Action::Copy => app.copy_current(),
+        Action::SearchOpen => app.open_search(),
+        Action::SearchPush(c) => app.search_push(c),
+        Action::SearchPop => app.search_pop(),
+        Action::SearchAccept => app.search_accept(),
+        Action::SearchClear => app.search_clear(),
         Action::None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::PlanRow;
+
+    fn app_with_one_plan() -> App {
+        App::from_rows(vec![PlanRow {
+            trade_id: "hs-eur-usd-1".into(),
+            account: "demo".into(),
+            instrument: "EUR_USD".into(),
+            granularity: "h1".into(),
+            phase: Some("done".into()),
+            shadow: false,
+            archived_at: None,
+            watermark: None,
+        }])
+    }
+
+    fn press(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// `/` opens the prompt from the list.
+    #[test]
+    fn slash_opens_search_on_the_list() {
+        let app = app_with_one_plan();
+        assert_eq!(map_key(&app, press('/')), Action::SearchOpen);
+    }
+
+    /// **The** thing that would break the feature: while typing a query, letters
+    /// that are command bindings elsewhere (`q` quit, `d` delete, `r` replay,
+    /// `c` copy) must be captured as text, not fire their commands.
+    #[test]
+    fn typing_in_the_prompt_never_triggers_commands() {
+        let mut app = app_with_one_plan();
+        app.open_search();
+        for c in ['q', 'd', 'r', 'c', 'l', 's', 'i', 'n', 'x', '/'] {
+            assert_eq!(
+                map_key(&app, press(c)),
+                Action::SearchPush(c),
+                "'{c}' must be typed into the query, not run as a command"
+            );
+        }
+    }
+
+    /// Ctrl-C still quits even mid-query — a text field must not trap the user.
+    #[test]
+    fn ctrl_c_still_quits_while_typing() {
+        let mut app = app_with_one_plan();
+        app.open_search();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(&app, ctrl_c), Action::Quit);
+    }
+
+    /// Enter keeps the filter, Esc drops it, Backspace edits.
+    #[test]
+    fn prompt_edit_keys() {
+        let mut app = app_with_one_plan();
+        app.open_search();
+        let key = |code| map_key(&app, KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(key(KeyCode::Enter), Action::SearchAccept);
+        assert_eq!(key(KeyCode::Esc), Action::SearchClear);
+        assert_eq!(key(KeyCode::Backspace), Action::SearchPop);
+        // Arrows still navigate so you can pick a row without closing the prompt.
+        assert_eq!(key(KeyCode::Down), Action::SelectNext);
+        assert_eq!(key(KeyCode::Up), Action::SelectPrev);
+    }
+
+    /// With the prompt closed but a filter applied, Esc clears the filter rather
+    /// than quitting the app (a stray Esc shouldn't drop you out).
+    #[test]
+    fn esc_clears_an_applied_filter_instead_of_quitting() {
+        let mut app = app_with_one_plan();
+        app.open_search();
+        app.search_push('e');
+        app.search_accept(); // prompt closed, filter still on
+        assert!(!app.search.active && app.search.is_filtering());
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(map_key(&app, esc), Action::SearchClear);
+        // With no filter, Esc quits as before.
+        app.search_clear();
+        assert_eq!(map_key(&app, esc), Action::Quit);
+    }
+
+    /// Off the list, `/` is not a search key (no prompt on deeper screens), and
+    /// the existing bindings are untouched.
+    #[test]
+    fn list_bindings_are_otherwise_unchanged() {
+        let app = app_with_one_plan();
+        assert_eq!(map_key(&app, press('q')), Action::Quit);
+        assert_eq!(map_key(&app, press('j')), Action::SelectNext);
+        assert_eq!(map_key(&app, press('r')), Action::Replay);
+        assert_eq!(map_key(&app, press('d')), Action::RequestDelete);
     }
 }

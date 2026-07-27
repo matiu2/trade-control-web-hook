@@ -65,7 +65,7 @@ fn render_body(f: &mut Frame, app: &App, area: Rect) {
 /// The one-line footer: context hints on the left, status on the right.
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = match app.screen {
-        Screen::List => "↑↓ move  →/n open  c copy  q quit",
+        Screen::List => "↑↓ move  →/n open  / search  c copy  q quit",
         Screen::Replay => {
             "↑↓/jk scroll  ←/→ nav  r replay  c copy  ^L refresh  i detail  x delete  q quit"
         }
@@ -154,6 +154,55 @@ mod tests {
             text.contains("hs-aud-chf-648e83cd"),
             "oldest plan should be at the top:\n{text}"
         );
+    }
+
+    /// The `/` filter reaches the render: only matching rows are drawn, the
+    /// title reports matched-of-total, and the search bar shows the query.
+    #[test]
+    fn list_screen_filters_and_shows_the_search_bar() {
+        let rows = parse_plan_list(LIST).unwrap();
+        let mut app = App::from_rows(rows);
+        app.open_search();
+        for c in "aud-cad".chars() {
+            app.search_push(c);
+        }
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| super::render(f, &app)).unwrap();
+        let text = buffer_text(&term);
+
+        assert!(
+            text.contains("matching"),
+            "title reports the filter:\n{text}"
+        );
+        assert!(
+            text.contains("/aud-cad"),
+            "search bar shows the query:\n{text}"
+        );
+        assert!(
+            text.contains("hs-aud-cad-"),
+            "a matching plan is listed:\n{text}"
+        );
+        assert!(
+            !text.contains("hs-aud-chf-"),
+            "a non-matching plan is filtered out:\n{text}"
+        );
+    }
+
+    /// A query matching nothing draws an empty list and says so, rather than
+    /// leaving an unexplained blank screen.
+    #[test]
+    fn list_screen_reports_no_matches() {
+        let rows = parse_plan_list(LIST).unwrap();
+        let mut app = App::from_rows(rows);
+        app.open_search();
+        for c in "zzzz".chars() {
+            app.search_push(c);
+        }
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| super::render(f, &app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("no matches"), "{text}");
+        assert!(text.contains("0/"), "title shows zero matched:\n{text}");
     }
 
     #[test]

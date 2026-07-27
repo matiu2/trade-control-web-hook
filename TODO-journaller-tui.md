@@ -197,11 +197,40 @@ LIST (depth 0)                     TIMELINE (depth 1)          REPLAY (depth 2) 
 | `↑`/`↓`/`j`/`k` | move selection (list screen only) |
 | `→` / `n` / `Enter` | push deeper (list→timeline→replay→compare) |
 | `←` | pop back one screen (from timeline → list) |
+| `/` | **search/filter the list** (list screen only) — see below |
 | `l` | (re)load current plan into TradingView (auto-fires on timeline push) |
 | `r` | (re)run replay for current plan |
+| `s` | **record** the trade's outcome to the journal DB (needs replay run) |
+| `c` | **copy** the full current view to the clipboard (not just the visible part) |
 | `i` | toggle the full plan-detail **popup** (overlay) |
 | `d` / `x` | **delete + done** — confirm modal; **disabled at depth 0** |
+| `Ctrl-L` | force a full repaint (recovers from residual screen corruption) |
 | `q` / `Ctrl-C` | quit |
+
+On the **Replay** screen the vim/arrow keys scroll the report instead of moving
+a selection (`j`/`k`/`u`/`d`/`g`/`G`, PgUp/PgDn/Home/End), so delete there is
+`x` only. Same scroll bindings inside the `i` popup.
+
+### Search (`/`)
+- `/` opens a one-line prompt under the list; the filter applies **as you type**.
+- **Case-insensitive substring** over everything the row shows (`trade_id`,
+  instrument, granularity, phase) plus `account` and the word `archived`.
+- **Space-separated terms are ANDed, in any order** — `eur h4` and `h4 eur` both
+  find the EUR H4 plans. Deliberately not fuzzy: you're usually typing a
+  fragment you can see, and fuzzy matching surfaces confusing hits.
+- **Separators are interchangeable** (`_`/`/` fold to `-`), so `audcad`,
+  `aud-cad` and `AUD_CAD` all match each other regardless of broker spelling.
+- `Enter` closes the prompt but **keeps** the filter (a dimmed `filter:` line
+  stays visible); `Esc` clears the filter and restores the full list. With a
+  filter applied and the prompt closed, `Esc` clears it rather than quitting.
+- While typing, every printable key goes into the query — `q`/`d`/`r` etc. can't
+  fire their commands. `Ctrl-C` still quits; `↑`/`↓` still move the selection so
+  you can pick a row without leaving the prompt.
+- The title reports `matched/total`, and clearing the filter keeps you on the
+  same plan you had highlighted.
+- **Implementation note:** `app.selected` indexes the **visible (filtered)** rows,
+  not `plans` — `App::visible()` maps back. Anything new that reads a row must go
+  through `current_plan()` / `visible_plans()`, never `plans[selected]`.
 
 ### Delete rules
 - `d` (alias `x`) means **delete (and "done")** — retire a plan you've finished
