@@ -413,6 +413,36 @@ pub struct ReplayArgs {
     /// repo root (relative to the cli crate's manifest).
     #[arg(long)]
     pub fixtures_dir: Option<PathBuf>,
+
+    /// Score this batch against a blessed baseline file and report what moved:
+    /// aggregate Net R, which fixtures changed, and by how much.
+    ///
+    /// This is **tier 2** — the scored corpus, not the pass/fail gate. It does
+    /// *not* affect the exit code on its own: a moved number is information, not
+    /// a failure. At 291 trades a legitimate engine fix moves hundreds of cells,
+    /// and if a bug fix moves nothing it either didn't matter or isn't fixed. Use
+    /// `--check` when you want a gate.
+    ///
+    /// Batch only — a one-fixture diff is just the fixture's own number.
+    #[arg(long, value_name = "FILE", requires = "fixtures_glob")]
+    pub baseline: Option<PathBuf>,
+
+    /// Write this batch's results to a baseline file, to be diffed against later
+    /// with `--baseline`.
+    ///
+    /// Only **successful** fixtures are blessed. A failed one is simply absent —
+    /// we don't know what it earns, and recording a `0.0` for it would bake an
+    /// infrastructure blip into the corpus as a real flat trade.
+    ///
+    /// Overwrites without asking, like `--rebless`. Keep baselines in git; the
+    /// review of a re-bless is the diff.
+    #[arg(long, value_name = "FILE", requires = "fixtures_glob")]
+    pub bless_baseline: Option<PathBuf>,
+
+    /// Label recorded in a blessed baseline (e.g. `v113`), shown in later diffs
+    /// as the "from" side. Defaults to the engine version the fixtures carry.
+    #[arg(long, value_name = "LABEL", requires = "bless_baseline")]
+    pub baseline_label: Option<String>,
 }
 
 #[cfg(test)]

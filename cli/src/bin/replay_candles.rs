@@ -40,6 +40,7 @@
 mod replay_candles {
     pub mod annotate;
     pub mod arm_record;
+    pub mod baseline;
     pub mod batch;
     pub mod brisbane;
     pub mod candles;
@@ -70,6 +71,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use replay_candles::arm_record;
+use replay_candles::baseline;
 use replay_candles::batch;
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::tv::TvDefaults;
@@ -639,6 +641,13 @@ async fn run_test_mode_batch(args: &Args, pattern: &str) -> Result<()> {
             summary.net_r,
         )));
     }
+    // Tier-2 scoring. Deliberately BEFORE the `failed > 0` return: a partial
+    // sweep is exactly when you most want to see which cells moved, and an early
+    // return would throw that report away in favour of a bare exit code. The
+    // diff labels itself INCOMPLETE in that case (`unscored`), so it can't be
+    // mistaken for a full answer.
+    score_against_baseline(args, &summary)?;
+
     if summary.failed > 0 {
         let msg = eyre!(
             "{} of {} fixture(s) failed — see the rows above (net R {:+.2} excludes them)",
@@ -658,6 +667,79 @@ async fn run_test_mode_batch(args: &Args, pattern: &str) -> Result<()> {
             // Untagged ⇒ infrastructure, the retryable default.
             outcome::FailureKind::Infrastructure => msg,
         });
+    }
+    Ok(())
+}
+
+/// How many movers the human diff lists before truncating.
+///
+/// The full set is always available as JSON (`--baseline … --json`); this only
+/// bounds the *terminal* rendering, and it says how many it withheld.
+const DIFF_ROWS_SHOWN: usize = 20;
+
+/// Tier-2 scoring: diff against a blessed baseline, and/or bless this run.
+///
+/// Both are no-ops unless the operator asked. Neither changes the exit code — a
+/// moved number is information, not a failure (that's `--check`'s job).
+///
+/// Ordering is deliberate: **diff first, then bless.** If both flags are given
+/// with the same file, the operator sees what changed before it's overwritten.
+/// The reverse order would silently bless a regression and then report a clean
+/// diff against the baseline it had just rewritten.
+fn score_against_baseline(args: &Args, summary: &batch::BatchSummary) -> Result<()> {
+    if let Some(path) = args.baseline.as_deref() {
+        let text = fs::read_to_string(path)
+            .wrap_err_with(|| format!("reading baseline {}", path.display()))
+            .map_err(outcome::bad_input)?;
+        let base: baseline::Baseline = serde_json::from_str(&text)
+            .wrap_err_with(|| format!("parsing baseline {}", path.display()))
+            .map_err(outcome::bad_input)?;
+
+        if !base.is_self_consistent() {
+            // Not fatal — the entries are still comparable — but a stored total
+            // that disagrees with its own rows means the file was edited by
+            // something other than a bless, and the "was" figure below is that
+            // stored total.
+            tracing::warn!(
+                stored = base.net_r,
+                recomputed = base.recomputed_net_r(),
+                "baseline's stored net R disagrees with its entries — it has been \
+                 hand-edited; the 'was' figure below is the stored one"
+            );
+        }
+
+        let diff = baseline::diff(&base, summary);
+        if args.json {
+            // A second document on stdout would break the one-object contract
+            // `--json` promises, so the diff goes to stderr when JSON is on.
+            eprintln!("{}", serde_json::to_string_pretty(&diff)?);
+        } else {
+            println!("\n{}", baseline::render(&diff, DIFF_ROWS_SHOWN));
+        }
+    }
+
+    if let Some(path) = args.bless_baseline.as_deref() {
+        let blessed = baseline::Baseline::from_summary(summary, args.baseline_label.clone());
+        let json = serde_json::to_string_pretty(&blessed)?;
+        fs::write(path, format!("{json}\n"))
+            .wrap_err_with(|| format!("writing baseline {}", path.display()))?;
+        tracing::info!(
+            path = %path.display(),
+            entries = blessed.entries.len(),
+            skipped = summary.failed,
+            net_r = blessed.net_r,
+            "blessed baseline"
+        );
+        if summary.failed > 0 {
+            // Say it on the way out, not just in a log line: a baseline blessed
+            // from a partial sweep is missing rows, and a later diff will report
+            // them as `added` rather than as the regressions they might be.
+            tracing::warn!(
+                skipped = summary.failed,
+                "blessed a PARTIAL batch — the failed fixtures are absent from the \
+                 baseline and will read as `added` when they come back"
+            );
+        }
     }
     Ok(())
 }
@@ -1239,6 +1321,9 @@ mod tests {
             arm_tv_arm_version: None,
             trade_ref: None,
             fixtures_glob: None,
+            baseline: None,
+            bless_baseline: None,
+            baseline_label: None,
             json: false,
             warmup_bars: 200,
             cache_dir: None,
