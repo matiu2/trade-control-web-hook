@@ -74,6 +74,48 @@ Each commit green (tests + clippy + fmt) before the next.
         `classify`, the calendar fetch); everything after builds from `geom` +
         flags. `SetupInputs` is that first half's output.
 
+        **Decomposition done (adfae48, 713ee08, 519e486).** The TODO named
+        getting `pipeline.rs` under control as part of 6d and the first pass
+        hadn't: after the `SetupInputs` split the non-test body was **2567**
+        lines, having *grown* ~300 rather than shrunk. Now **1460** (−43%),
+        across seven new modules, every one moved verbatim:
+
+        | module | body | what |
+        |---|---|---|
+        | `hs_resolve.rs` | 479 | H&S spec build + validation gates |
+        | `mw_resolve.rs` | 345 | M/W chain + its four operator-facing gates |
+        | `save_matrix.rs` | 220 | the 3×2 grid |
+        | `control_bundle.rs` | 183 | pause/news bundle building |
+        | `calendar.rs` | 152 | calendar → blackout/news windows |
+        | `frozen_setup.rs` | 149 | the `--spec-in` file |
+        | `setup_inputs.rs` | 79 | the chart/plan seam |
+        | `broker_read.rs` | 51 | live spread + mid reads |
+        | `resolve_error.rs` | 35 | `Reject` vs `Fatal` |
+        | `broker_kind.rs` | 31 | `Broker` ⇄ `cli::BrokerKind` |
+
+        Verified behaviour-preserving: a plan built from the same frozen spec
+        before and after is **byte-identical** (modulo the per-run trade id and
+        `not_after`), and `--save-matrix` still arms 6/6.
+
+        Found doing it: three `#[allow(clippy::too_many_arguments)]` were
+        **stranded** — they sat above doc comments rather than on their
+        functions, so cuts that walk doc comments left them on whatever landed
+        next. Two ended up guarding `read_key()` (one argument) and
+        `draw_news_markers()`, silently suppressing a real signal. Reattached;
+        the two unnecessary ones deleted. Clippy clean with two *fewer*
+        suppressions than before.
+
+        **Still in `pipeline.rs` (1460):** `run`/`arm_from_inputs`/
+        `read_setup_from_chart` (the flow itself, ~600 lines), instrument +
+        account resolution, key loading, `run_position_entry`, the `--replace`
+        machinery, `register_trade_plan`. The next natural cuts are
+        `register_trade_plan` + `--replace` (a "register" module, ~200 lines)
+        and `run_position_entry` (~96). **The test block was deliberately not
+        split** — the `// ===== M / W trade-spec resolution` section marker
+        turns out to cover a *mix* (it also holds H&S `build_trade_spec` and
+        `close_on_news` cases), so a marker-based split misfiles them. Doing it
+        properly means reading each test, which is its own commit.
+
         Found doing it: `MwPath` could not represent its own **anchor count** —
         a 5-anchor path truncated to four and armed as a different pattern than
         the one on screen, silently. Third instance of the dropped-geometry-field
