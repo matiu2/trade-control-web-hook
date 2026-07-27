@@ -1,5 +1,13 @@
 # Bug: candle-cache returns DUPLICATE candles, so replays score differently
 
+> **FIXED 2026-07-27 — `candle-cache` v3 (`8244a67`).** `merge::sort_and_dedup`
+> now collapses each merged series to one bar per timestamp BEFORE the
+> count-based trim, at all four `client.rs` merge sites; `aggregation.rs` dedups
+> within each bucket at grouping time so the completeness gate counts distinct
+> bars. Verified: all four probe calls report 134 distinct bars / 0 duplicates,
+> and **all four replay cursors now agree at Net R −0.40** (was −0.40 vs −3.00).
+> Remaining follow-up: the loud guard in `pull_with_warmup` (item 2 below).
+
 **Severity:** high — replays of the same plan on the same candles score
 -0.40R or -3.00R depending on `--start` / `--warmup-bars`, because some
 range fetches feed the engine **duplicated bars**.
