@@ -1802,9 +1802,14 @@ fn parse_start(args: &Args) -> Result<Option<i64>> {
     let Some(raw) = args.start.as_deref() else {
         return Ok(None);
     };
-    let ts = DateTime::parse_from_rfc3339(raw)
-        .wrap_err_with(|| format!("--start is not valid RFC3339: {raw:?}"))?;
-    Ok(Some(ts.with_timezone(&Utc).timestamp()))
+    // Shared with `replay-candles --start` — see `cli::start_time`. Using
+    // `DateTime::parse_from_rfc3339` directly here was a real trap: it demands
+    // SECONDS and rejects a bare local time, so `--start 2026-06-19T17:00+10:00`
+    // failed on tv-arm while working on replay-candles, even though
+    // `tv-arm ... replay` forwards the very same string to it.
+    let ts = cli::start_time::parse_start_end(raw)
+        .wrap_err_with(|| format!("--start is not a valid datetime: {raw:?}"))?;
+    Ok(Some(ts.timestamp()))
 }
 
 /// The instant a plan should be recorded as armed at.
@@ -2858,6 +2863,59 @@ mod tests {
         let mut argv = vec!["tv-arm"];
         argv.extend_from_slice(extra);
         Args::try_parse_from(argv).expect("parse mw args")
+    }
+
+    /// `--start` accepts the same forms `replay-candles --start` does.
+    ///
+    /// This used to call `DateTime::parse_from_rfc3339` directly, which demands
+    /// **seconds** and rejects a bare local time — so
+    /// `--start 2026-06-19T17:00+10:00` was a hard error on `tv-arm` while
+    /// working fine on `replay-candles`, even though `tv-arm ... replay`
+    /// forwards that exact string to it. The error read like a malformed
+    /// timestamp rather than like the two tools disagreeing.
+    #[test]
+    fn start_accepts_the_forms_replay_candles_accepts() {
+        // All five spell the same instant: 17:00 Brisbane == 07:00 UTC.
+        let want = parse_start(&mw_args(&["--start", "2026-06-20T17:00:00+10:00"]))
+            .expect("the one form raw RFC3339 also accepts");
+        assert!(want.is_some());
+        for s in [
+            "2026-06-20T17:00",       // bare local, minute precision
+            "2026-06-20T17:00:00",    // bare local, seconds
+            "2026-06-20T17:00+10:00", // offset, no seconds
+            "2026-06-20T07:00Z",      // Z, no seconds
+        ] {
+            assert!(
+                DateTime::parse_from_rfc3339(s).is_err(),
+                "{s:?} parses as raw RFC3339 — this test's premise is stale"
+            );
+            assert_eq!(
+                parse_start(&mw_args(&["--start", s])).expect(s),
+                want,
+                "disagreement on {s:?}"
+            );
+        }
+    }
+
+    /// A bare datetime is **Brisbane**, not UTC. Getting this wrong shifts the
+    /// journaling cursor by 10 hours — enough to arm against a different
+    /// session entirely, with no error anywhere.
+    #[test]
+    fn a_bare_start_is_brisbane_not_utc() {
+        let bne = parse_start(&mw_args(&["--start", "2026-06-20T17:00"])).expect("bare");
+        let utc = parse_start(&mw_args(&["--start", "2026-06-20T17:00Z"])).expect("Z");
+        assert_ne!(bne, utc, "a bare time must not be read as UTC");
+        assert_eq!(
+            bne.zip(utc).map(|(b, u)| b - u),
+            Some(-10 * 3600),
+            "Brisbane is UTC+10, so the same clock face is 10h EARLIER in UTC terms"
+        );
+    }
+
+    #[test]
+    fn start_absent_is_none_and_garbage_is_an_error() {
+        assert_eq!(parse_start(&mw_args(&[])).expect("no flag"), None);
+        assert!(parse_start(&mw_args(&["--start", "yesterday"])).is_err());
     }
 
     /// A two-point drawing (e.g. a neckline trend line): two anchors in draw

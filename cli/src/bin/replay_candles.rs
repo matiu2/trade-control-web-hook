@@ -62,7 +62,7 @@ mod replay_candles {
 use std::fs;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
@@ -1067,49 +1067,16 @@ fn load_plan(path: &PathBuf) -> Result<TradePlan> {
     serde_json::from_str(&text).wrap_err_with(|| format!("parse plan JSON {}", path.display()))
 }
 
-/// Parse a `--start` / `--end` datetime. A **bare** datetime (no offset) is
-/// interpreted as **Brisbane time (UTC+10, no DST)** — the operator's zone and
-/// the zone this tool renders every candle/fill/exit in, so the window flags
-/// read the same way as the report. An **explicit** offset or `Z` is honoured
-/// as written (e.g. `...T07:00Z` = UTC, `...T17:00+10:00` = Brisbane spelled
-/// out). Accepts both minute and second precision on the bare form
-/// (`...T17:00` and `...T17:00:00`).
+/// Parse a `--start` / `--end` datetime.
+///
+/// Delegates to the **shared** parser in the cli library so `tv-arm --start`
+/// and `replay-candles --start` cannot disagree — `tv-arm ... replay` forwards
+/// the flag verbatim, so two parsers meant the arm cursor and the replay window
+/// could point at different instants. Tagged as bad *input* here (the library
+/// returns a plain error, since it has no exit-code vocabulary).
 fn parse_start_end(s: &str) -> Result<DateTime<Utc>> {
-    // Explicit offset / Z wins — honour exactly what was written. `parse_from_rfc3339`
-    // requires seconds + a `Z`/offset; the `%z` forms below also accept an offset
-    // with minute-only precision (`...T17:00+10:00`), which RFC3339 rejects.
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.with_timezone(&Utc));
-    }
-    // Normalise a trailing `Z` to `+0000` so the `%z` parser accepts minute- and
-    // second-precision UTC (`...T07:00Z`), which RFC3339 rejects without seconds.
-    let normalised = s.strip_suffix('Z').map(|body| format!("{body}+0000"));
-    let candidate = normalised.as_deref().unwrap_or(s);
-    for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M%z"] {
-        if let Ok(dt) = DateTime::parse_from_str(candidate, fmt) {
-            return Ok(dt.with_timezone(&Utc));
-        }
-    }
-    // Bare datetime (no offset) → interpret in Brisbane (+10), convert to UTC.
-    let brisbane = FixedOffset::east_opt(BRISBANE_OFFSET_SECS)
-        .ok_or_else(|| eyre!("10h is a valid fixed offset"))?;
-    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
-            return brisbane
-                .from_local_datetime(&naive)
-                .single()
-                .map(|dt| dt.with_timezone(&Utc))
-                .ok_or_else(|| outcome::bad_input(eyre!("{s:?} is ambiguous in Brisbane time")));
-        }
-    }
-    Err(outcome::bad_input(eyre!(
-        "{s:?} is not a valid datetime (expected Brisbane YYYY-MM-DDTHH:MM[:SS], \
-         or an explicit offset like ...T07:00Z / ...T17:00+10:00)"
-    )))
+    trade_control_cli::start_time::parse_start_end(s).map_err(outcome::bad_input)
 }
-
-/// Brisbane's fixed UTC offset in seconds (+10:00, no DST).
-const BRISBANE_OFFSET_SECS: i32 = 10 * 3600;
 
 /// Emit the clap-generated zsh completion script. Binds the completion to the
 /// invoked binary name (argv[0] stem) so a renamed-on-install copy emits
