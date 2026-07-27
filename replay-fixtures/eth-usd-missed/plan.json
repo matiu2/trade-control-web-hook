@@ -1,0 +1,290 @@
+{
+  "trade_id": "hs-eth-usd-6ca20089",
+  "instrument": "ETH_USD",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.01,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 1938.68,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eth-usd-6ca20089-too-high",
+        "not_after": "2026-07-23T19:30:00Z",
+        "action": "veto",
+        "instrument": "ETH_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-high",
+        "ttl_hours": 1,
+        "level": "close-positions",
+        "trade_id": "hs-eth-usd-6ca20089"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 1875.298544274824,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eth-usd-6ca20089-too-low",
+        "not_after": "2026-07-23T19:30:00Z",
+        "action": "veto",
+        "instrument": "ETH_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-low",
+        "ttl_hours": 1,
+        "level": "stop-next-entry",
+        "trade_id": "hs-eth-usd-6ca20089"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784833200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eth-usd-6ca20089-trade-expiry",
+        "not_before": "2026-07-23T19:00:00Z",
+        "not_after": "2026-07-23T19:30:00Z",
+        "action": "veto",
+        "instrument": "ETH_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "trade-expiry",
+        "ttl_hours": 1,
+        "level": "close-positions",
+        "trade_id": "hs-eth-usd-6ca20089"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1784588400,
+          "price": 1894.48
+        },
+        "b": {
+          "at_epoch": 1784674800,
+          "price": 1919.95
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eth-usd-6ca20089-break-and-close",
+        "not_after": "2026-07-23T19:00:00Z",
+        "action": "prep",
+        "instrument": "ETH_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "hs-eth-usd-6ca20089"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1784588400,
+          "price": 1894.48
+        },
+        "b": {
+          "at_epoch": 1784674800,
+          "price": 1919.95
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "up",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eth-usd-6ca20089-retest",
+        "not_after": "2026-07-23T19:00:00Z",
+        "action": "prep",
+        "instrument": "ETH_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "hs-eth-usd-6ca20089"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eth-usd-6ca20089-enter",
+        "not_after": "2026-07-24T10:50:31.405558263Z",
+        "action": "enter",
+        "instrument": "ETH_USD",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 1867.4406
+        },
+        "broker": "oanda",
+        "account": "m-and-w",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 1875.298544274824,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 1938.68,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-eth-usd-6ca20089",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.01,
+        "tick_size": 0.01
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eth-usd-6ca20089-close-on-sr-reversal",
+        "not_after": "2026-07-23T19:00:00Z",
+        "action": "close",
+        "instrument": "ETH_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-eth-usd-6ca20089",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            1675.40292,
+            1678.75708
+          ],
+          [
+            1727.32095,
+            1730.77905
+          ],
+          [
+            1888.85925,
+            1892.64075
+          ],
+          [
+            1818.72945,
+            1822.37055
+          ],
+          [
+            1774.70352,
+            1778.25648
+          ],
+          [
+            1864.98315,
+            1868.71685
+          ],
+          [
+            1845.27288,
+            1848.96712
+          ],
+          [
+            1867.43874,
+            1871.17735
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1784692800,
+  "armed_at": "2026-07-22T04:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-21T04:00:00Z",
+    "period_end": "2026-07-22T04:00:00Z",
+    "overall_direction": "bullish",
+    "confidence": "low",
+    "currencies": [
+      {
+        "currency": "USD",
+        "direction": "bearish",
+        "net_score": -1.0,
+        "events": [
+          "ADP Weekly Employment Change: Actual (16.5K) declined from previous (19.3K)"
+        ]
+      }
+    ]
+  }
+}
