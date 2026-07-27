@@ -29,15 +29,14 @@ use chrono::{DateTime, Utc};
 use color_eyre::eyre::{Context, Result, eyre};
 use tracing::{info, warn};
 use trade_control_cli as cli;
-use trade_control_conventions::{Broker, Direction, split_symbol};
+use trade_control_conventions::{Broker, split_symbol};
 use trade_control_core::sig::KEY_LEN;
 
 use crate::args::Args;
 use crate::args::PositionEntry;
-use crate::broker_kind::{broker_to_kind, kind_to_broker};
-use crate::broker_read::read_mid_blocking;
+use crate::broker_kind::broker_to_kind;
 use crate::calendar::{calendar_scope_range, calendar_windows, read_trade_expiry};
-use crate::control_bundle::{Bundle, BundleContext, NewsKind, PauseKind};
+use crate::control_bundle::{BundleContext, NewsKind, PauseKind};
 use crate::control_windows::{AsOf, ControlWindows};
 use crate::hs_resolve::resolve_hs_trade;
 use crate::instrument_resolution::ResolvedInstrument;
@@ -45,12 +44,12 @@ use crate::mw_resolve::resolve_mw_trade;
 use crate::news_marker::{NewsMarker, news_marker_lines};
 use crate::plan_geometry::PlanGeometry;
 use crate::position_trade::{core_direction, resolve_levels};
-use crate::register_post::{post_intent_blocking, post_register_blocking};
+use crate::register::{register_trade_plan, replace_existing_plan};
+use crate::register_post::post_intent_blocking;
 use crate::resolve_error::ResolveError;
 use crate::roles::{Roles, SlotPref, classify};
 use crate::save_matrix;
 use crate::setup_inputs::SetupInputs;
-use crate::trade_plan_build::{append_control_rules, build_trade_plan, resolution_to_granularity};
 use trading_view::drawings::Drawing;
 use trading_view::mcp::TvMcp;
 
@@ -1067,7 +1066,7 @@ fn parse_start(args: &Args) -> Result<Option<i64>> {
 /// arm-time news sentiment is computed as of that point. Otherwise it's the
 /// real wall-clock `now`. A `replay_start` that can't be represented as a
 /// `DateTime` (out-of-range) falls back to `now` rather than failing arming.
-fn effective_arm_time(replay_start: Option<i64>, now: DateTime<Utc>) -> DateTime<Utc> {
+pub(crate) fn effective_arm_time(replay_start: Option<i64>, now: DateTime<Utc>) -> DateTime<Utc> {
     replay_start
         .and_then(|s| DateTime::<Utc>::from_timestamp(s, 0))
         .unwrap_or(now)
@@ -1221,228 +1220,6 @@ fn run_position_entry(
     Ok(0)
 }
 
-/// One registered plan as seen in the `plan-list` response — only the two
-/// fields `--replace` needs to resolve a target. Other fields are ignored.
-#[derive(serde::Deserialize)]
-struct PlanListEntry {
-    trade_id: String,
-    instrument: String,
-}
-
-/// Decide which trade_id `--replace` should delete.
-///
-/// - An explicit, non-empty `target` is used verbatim (delete exactly that).
-/// - An empty `target` (bare `--replace`) auto-resolves by instrument: exactly
-///   one registered plan on `instrument` → delete it; none → `Ok(None)`
-///   (nothing to clear, proceed); more than one → a hard error naming the
-///   candidates so the operator re-runs with an explicit id.
-///
-/// Pure (takes the parsed plan list), so the resolution rules are unit-tested
-/// without the worker.
-fn resolve_replace_target(
-    target: &str,
-    instrument: &str,
-    plans: &[PlanListEntry],
-) -> Result<Option<String>> {
-    let target = target.trim();
-    if !target.is_empty() {
-        return Ok(Some(target.to_string()));
-    }
-    let matches: Vec<&str> = plans
-        .iter()
-        .filter(|p| p.instrument == instrument)
-        .map(|p| p.trade_id.as_str())
-        .collect();
-    match matches.as_slice() {
-        [] => Ok(None),
-        [only] => Ok(Some((*only).to_string())),
-        many => Err(eyre!(
-            "--replace: {} plans registered for {instrument} ({}); \
-             pass the trade_id explicitly: --replace <trade-id>",
-            many.len(),
-            many.join(", "),
-        )),
-    }
-}
-
-/// Re-arm support for `--register-plan`: resolve the prior plan for this
-/// instrument (or the explicit `--replace <id>`) and delete it from the engine
-/// before the fresh register. Queries `plan-list`, applies
-/// [`resolve_replace_target`], then POSTs a signed `plan-delete` (which clears
-/// both the `plan:` and `plan-state:` KV rows). A no-target resolution is a
-/// logged no-op. Hard-errors on an ambiguous auto-resolve or a worker rejection
-/// — better to stop than to leave a stale plan ticking beside the new one.
-fn replace_existing_plan(
-    target: &str,
-    instrument: &str,
-    key: &[u8; KEY_LEN],
-    now: DateTime<Utc>,
-) -> Result<()> {
-    // Query the registered plans so an auto-resolve can count them per
-    // instrument. Live plans only (`include_archived: false`) — a terminated
-    // plan in the archive must not count against the per-instrument tally.
-    let list_intent = cli::build_plan_list_intent(now, &register_suffix(now), false);
-    let list_body = cli::wrap_signed(&list_intent, key, now).wrap_err("sign plan-list intent")?;
-    let yaml = post_intent_blocking(list_body).wrap_err("query plan-list for --replace")?;
-    let plans: Vec<PlanListEntry> =
-        serde_yaml::from_str(&yaml).wrap_err("parse plan-list response")?;
-
-    let Some(trade_id) = resolve_replace_target(target, instrument, &plans)? else {
-        info!(instrument = %instrument, "--replace: no existing plan for this instrument; nothing to delete");
-        return Ok(());
-    };
-
-    let del_intent = cli::build_plan_delete_intent(&trade_id, now, &register_suffix(now));
-    let del_body = cli::wrap_signed(&del_intent, key, now).wrap_err("sign plan-delete intent")?;
-    info!(trade_id = %trade_id, instrument = %instrument, "--replace: deleting prior registered plan");
-    post_intent_blocking(del_body).wrap_err("delete prior plan for --replace")?;
-    info!(trade_id = %trade_id, "--replace: prior plan deleted");
-    Ok(())
-}
-
-/// Fold the built trade into one signed `register` `TradePlan` and (when
-/// `register` is true) POST it to the worker's server-side engine.
-///
-/// When `register` is false (`--plan-out` without `--register-plan`) the plan is
-/// still built and, if `plan_out` is set, written to disk — but no worker POST
-/// happens. This is the offline "just give me the JSON for replay" path.
-///
-/// The plan re-expresses every alert's condition as an engine [`Trigger`] (via
-/// [`build_trade_plan`], the inverse of `alert_spec`) and carries each alert's
-/// embedded intent verbatim. The pause/news/calendar **control bars** built
-/// upstream are folded in too — one `TimeReached` rule per bundle alert (see
-/// [`append_control_rules`]) — so the registered plan opens/closes the same
-/// blackout + news windows the legacy TV-alert path used to POST. It's
-/// signed with the same key + whole-body HMAC as the control intents (the plan
-/// rides `trade_plan` as single-line flow JSON, so it's fully signed) and
-/// POSTed directly to the baked webhook.
-///
-/// Hard-errors on an unsupported chart resolution or a worker rejection — but
-/// the signed alert bundle is already on disk by the time this runs, so the
-/// trade isn't lost on a register failure.
-/// Takes `geom`, **not `Roles`** — the geometry is extracted exactly once, in
-/// [`run`], and passed down. This function used to take `&Roles` and re-derive
-/// `PlanGeometry::from_roles` itself, which meant the extraction ran *twice* per
-/// arm off two different borrows of the same drawings. Harmless in practice
-/// (`from_roles` is pure), but it re-opened the seam `PlanGeometry` exists to
-/// close: as long as a `&Roles` reaches this far, a future edit can read a
-/// drawing here that no frozen spec could supply. Same reasoning as
-/// `resolve_hs_trade` losing its `roles` parameter — close it by type.
-#[allow(clippy::too_many_arguments)]
-fn register_trade_plan(
-    built_trade: &cli::BuiltTrade,
-    direction: Direction,
-    geom: &PlanGeometry,
-    resolution: &str,
-    pause_bundles: &[Bundle<PauseKind>],
-    news_bundles: &[Bundle<NewsKind>],
-    key: &[u8; KEY_LEN],
-    account: &str,
-    now: DateTime<Utc>,
-    shadow: bool,
-    plan_out: Option<&Path>,
-    register: bool,
-    replay_start: Option<i64>,
-    retest_atr_step: f64,
-    cross_buffer_pct: f64,
-    cross_buffer_atr: f64,
-    bcr_require_golden: bool,
-    armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
-) -> Result<()> {
-    use cli::TradePattern;
-    let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
-    let granularity = resolution_to_granularity(resolution).ok_or_else(|| {
-        eyre!(
-            "chart resolution {resolution:?} has no engine granularity; \
-             cannot register a server-side plan (supported: 1/5/15/60/240/D)"
-        )
-    })?;
-    // Effective arm time: when `--start` (journaling replay) is given, record
-    // the plan *as if* it were armed at that cursor, not at the wall-clock run
-    // time — so a replayed arming reads back the historical moment. Otherwise
-    // use the real `now`.
-    let armed_at = effective_arm_time(replay_start, now);
-    // Pullback prep (--pull-back): capture the arm-time anchor (live mid) and the
-    // ATR multiple so `build_trade_plan` can bake them onto the trigger. Read only
-    // when a pullback is armed. A live-mid read failure is fatal — a bad/guessed
-    // anchor would silently mis-fire every pullback (same discipline as the M/W
-    // arm-time spread read).
-    let pullback_arm = match built_trade.spec.pull_back {
-        Some(atr_mult) => {
-            let broker = built_trade.spec.broker;
-            let anchor_open = read_mid_blocking(kind_to_broker(broker), &built_trade.instrument)
-                .wrap_err("read live mid for --pull-back anchor")?;
-            Some(crate::trade_plan_build::PullbackArm {
-                anchor_open,
-                atr_mult,
-            })
-        }
-        None => None,
-    };
-    let mut plan = build_trade_plan(
-        &built_trade.trade_id,
-        &built_trade.instrument,
-        &built_trade.alerts,
-        direction,
-        geom,
-        granularity,
-        is_mw,
-        shadow,
-        replay_start,
-        retest_atr_step,
-        cross_buffer_pct,
-        cross_buffer_atr,
-        bcr_require_golden,
-        armed_at,
-        armed_sentiment,
-        pullback_arm,
-    );
-    // Unwrap the tv-arm bundle wrappers to the cli `BuiltPause`/`BuiltNews` the
-    // appender reads (each carries the signed intents + window times).
-    let pauses: Vec<&cli::BuiltPause> = pause_bundles.iter().map(|b| &b.built).collect();
-    let newses: Vec<&cli::BuiltNews> = news_bundles.iter().map(|b| &b.built).collect();
-    append_control_rules(&mut plan, &pauses, &newses);
-    let rule_count = plan.rules.len();
-    // Dump the fully-built plan (control rules folded in) for offline replay,
-    // before `build_register_intent` moves it into the register intent.
-    if let Some(path) = plan_out {
-        let json = serde_json::to_string_pretty(&plan).wrap_err("serialise trade plan")?;
-        fs::write(path, json).wrap_err_with(|| format!("write plan to {}", path.display()))?;
-        info!(path = %path.display(), "wrote trade plan JSON");
-    }
-    // Offline path: `--plan-out` without `--register-plan` stops here — the JSON
-    // is on disk, but we never POST the plan to the worker.
-    if !register {
-        info!(
-            trade_id = %built_trade.trade_id,
-            "plan built (--plan-out only); not registering with worker"
-        );
-        return Ok(());
-    }
-    // Mint a fresh register intent carrying the plan, sign it, POST it.
-    let suffix = register_suffix(now);
-    let intent = cli::build_register_intent(plan, Some(account), now, &suffix);
-    let body = cli::wrap_signed(&intent, key, now).wrap_err("sign register intent")?;
-    info!(
-        trade_id = %built_trade.trade_id,
-        instrument = %built_trade.instrument,
-        granularity = ?granularity,
-        rules = rule_count,
-        shadow = shadow,
-        "registering server-side trade plan",
-    );
-    post_register_blocking(body).wrap_err("register trade plan with worker")?;
-    info!(trade_id = %built_trade.trade_id, "trade plan registered");
-    Ok(())
-}
-
-/// A short per-call tag for the register intent id so two arms of the same
-/// trade_id in the same second don't collide on the worker's seen-id check.
-/// Derived from the sub-second clock — no rand dependency.
-fn register_suffix(now: DateTime<Utc>) -> String {
-    format!("{:06}", now.timestamp_subsec_micros() % 1_000_000)
-}
-
 // `Drawing::anchor_time_seconds` shim — `TimedAnchor::anchor_time`
 // already exists, but lives behind a trait import. Inline a fn
 // here so the pipeline doesn't need to import the trait.
@@ -1469,8 +1246,10 @@ mod tests {
     use crate::mw_resolve::{MwSpecAnchors, build_mw_trade_spec};
     use crate::news_window::NewsWindow;
     use crate::test_drawings::{fib, now, path_n, two_point, vline};
+    use crate::trade_plan_build::build_trade_plan;
     use chrono::TimeZone;
     use clap::Parser;
+    use trade_control_conventions::Direction;
 
     /// `arm_from_inputs` must make **no chart calls**. That is the entire point
     /// of the split — everything below the seam has to work identically whether
@@ -2312,65 +2091,5 @@ mod tests {
         let inv = vetos.iter().find(|v| v.name == "too-low").expect("inv");
         assert_eq!(inv.past, VetoSide::Below);
         assert!((inv.level - 1.0850).abs() < 1e-9);
-    }
-
-    // ===== --replace target resolution =====
-
-    fn plan_entry(trade_id: &str, instrument: &str) -> PlanListEntry {
-        PlanListEntry {
-            trade_id: trade_id.into(),
-            instrument: instrument.into(),
-        }
-    }
-
-    #[test]
-    fn replace_explicit_target_used_verbatim() {
-        // An explicit id is deleted regardless of how many plans exist.
-        let plans = [
-            plan_entry("hs-eurusd-aaaa", "EUR_USD"),
-            plan_entry("hs-eurusd-bbbb", "EUR_USD"),
-        ];
-        let got = resolve_replace_target("hs-eurusd-bbbb", "EUR_USD", &plans).unwrap();
-        assert_eq!(got.as_deref(), Some("hs-eurusd-bbbb"));
-    }
-
-    #[test]
-    fn replace_auto_resolves_single_plan_for_instrument() {
-        let plans = [
-            plan_entry("hs-eurusd-aaaa", "EUR_USD"),
-            plan_entry("hs-gbpusd-cccc", "GBP_USD"),
-        ];
-        let got = resolve_replace_target("", "EUR_USD", &plans).unwrap();
-        assert_eq!(got.as_deref(), Some("hs-eurusd-aaaa"));
-    }
-
-    #[test]
-    fn replace_auto_no_plan_for_instrument_is_noop() {
-        let plans = [plan_entry("hs-gbpusd-cccc", "GBP_USD")];
-        let got = resolve_replace_target("", "EUR_USD", &plans).unwrap();
-        assert!(got.is_none(), "no plan on instrument → nothing to delete");
-    }
-
-    #[test]
-    fn replace_auto_multiple_plans_is_hard_error() {
-        let plans = [
-            plan_entry("hs-eurusd-aaaa", "EUR_USD"),
-            plan_entry("mw-eurusd-bbbb", "EUR_USD"),
-        ];
-        let err = resolve_replace_target("", "EUR_USD", &plans).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("2 plans"), "msg = {msg}");
-        assert!(msg.contains("hs-eurusd-aaaa"), "names candidates: {msg}");
-        assert!(msg.contains("mw-eurusd-bbbb"), "names candidates: {msg}");
-        // The error text points the operator at the *new* flag name.
-        assert!(msg.contains("--replace"), "error names --replace: {msg}");
-    }
-
-    #[test]
-    fn replace_whitespace_target_is_treated_as_auto() {
-        // clap's default_missing_value for a bare `--replace` is "" → auto.
-        let plans = [plan_entry("hs-eurusd-aaaa", "EUR_USD")];
-        let got = resolve_replace_target("  ", "EUR_USD", &plans).unwrap();
-        assert_eq!(got.as_deref(), Some("hs-eurusd-aaaa"));
     }
 }

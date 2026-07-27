@@ -40,6 +40,7 @@ mod pipeline;
 mod plan_geometry;
 mod position_trade;
 mod precision;
+mod register;
 mod register_post;
 mod replay;
 mod resolve_error;
