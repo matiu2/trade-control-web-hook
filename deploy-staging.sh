@@ -2,7 +2,8 @@
 # Deploy the STAGING environment (demo account).
 #
 #   worker : LOCAL native/Postgres worker on 127.0.0.1:8788  (branch: staging)
-#   CLIs   : trade-control-staging, tv-arm-staging, tv-news-staging
+#   CLIs   : trade-control-staging, tv-arm-staging, tv-news-staging,
+#            replay-candles-staging, journal-staging
 #
 # Staging runs the LOCAL native/Postgres worker (Cloudflare fully retired;
 # Oracle Cloud compute in uk-london-1 is out of capacity, so this week's demo
