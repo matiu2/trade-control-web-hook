@@ -22,6 +22,8 @@ use clap_complete::{Shell, generate};
 use color_eyre::eyre::Result;
 
 mod args;
+mod broker_kind;
+mod control_bundle;
 mod control_windows;
 mod frozen_setup;
 mod geometry;
