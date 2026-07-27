@@ -139,23 +139,35 @@ fn report_tail_diff(base: &[(DateTime<Utc>, f64, f64)], other: &[(DateTime<Utc>,
     );
     println!(
         "      base: {} rows, {} distinct ts   |   this: {} rows, {} distinct ts",
-        base.len(), base_times.len(), other.len(), other_times.len()
+        base.len(),
+        base_times.len(),
+        other.len(),
+        other_times.len()
     );
     // Largest inter-bar gaps in each, to spot a hole in the middle.
     for (label, v) in [("base", base), ("this", other)] {
         let mut gaps: Vec<_> = v.windows(2).map(|w| (w[1].0 - w[0].0, w[0].0)).collect();
         gaps.sort_by_key(|g| std::cmp::Reverse(g.0));
-        let top: Vec<String> = gaps.iter().take(3)
-            .map(|(d, at)| format!("{}min after {at}", d.num_minutes())).collect();
+        let top: Vec<String> = gaps
+            .iter()
+            .take(3)
+            .map(|(d, at)| format!("{}min after {at}", d.num_minutes()))
+            .collect();
         println!("      {label} largest gaps: {}", top.join(", "));
     }
     let missing: Vec<_> = base_times.difference(&other_times).take(8).collect();
     let added: Vec<_> = other_times.difference(&base_times).take(8).collect();
     if !missing.is_empty() {
-        println!("      dropped vs baseline (first {}): {missing:?}", missing.len());
+        println!(
+            "      dropped vs baseline (first {}): {missing:?}",
+            missing.len()
+        );
     }
     if !added.is_empty() {
-        println!("      added   vs baseline (first {}): {added:?}", added.len());
+        println!(
+            "      added   vs baseline (first {}): {added:?}",
+            added.len()
+        );
     }
     // Same-timestamp value drift is a different (worse) failure than a drop.
     let drifted: Vec<_> = base
@@ -170,7 +182,10 @@ fn report_tail_diff(base: &[(DateTime<Utc>, f64, f64)], other: &[(DateTime<Utc>,
         .take(5)
         .collect();
     if !drifted.is_empty() {
-        println!("      VALUE DRIFT at same timestamps (first {}): {drifted:?}", drifted.len());
+        println!(
+            "      VALUE DRIFT at same timestamps (first {}): {drifted:?}",
+            drifted.len()
+        );
     }
 }
 
