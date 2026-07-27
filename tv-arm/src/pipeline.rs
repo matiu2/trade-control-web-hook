@@ -44,6 +44,7 @@ use crate::plan_geometry::PlanGeometry;
 use crate::position_trade::{core_direction, resolve_levels};
 use crate::register_post::{post_intent_blocking, post_register_blocking};
 use crate::roles::{Roles, SlotPref, classify};
+use crate::setup_inputs::SetupInputs;
 use crate::timeframe::infer_calendar_timeframe;
 use crate::trade_plan_build::{append_control_rules, build_trade_plan, resolution_to_granularity};
 use trading_view::drawings::Drawing;
@@ -56,7 +57,27 @@ const ARM_OUT_ROOT: &str = "/tmp/trade-control-arm";
 /// Drive the full flow. Returns process exit code; non-zero means a
 /// step failed (chart classification, build-trade, etc.). All errors
 /// are logged before the function returns.
+///
+/// Two steps, deliberately: [`read_setup_from_chart`] does **all** the
+/// TradingView and calendar I/O and returns a [`SetupInputs`]; [`arm_from_inputs`]
+/// builds, signs, and registers from that value alone. Nothing below the seam
+/// touches a chart, which is the property a frozen-spec arm (`--spec-in`) needs
+/// — and it is enforced by the types, not by a comment: `arm_from_inputs` has no
+/// `TvMcp` to call.
+///
+/// `Roles` is returned alongside rather than folded in, because exactly one
+/// consumer still needs the raw drawings (the position-entry tools) and that
+/// path is inherently live-chart. See [`SetupInputs`]' module doc.
 pub fn run(args: Args) -> Result<i32> {
+    let (setup, roles) = read_setup_from_chart(&args)?;
+    arm_from_inputs(&args, setup, Some(&roles))
+}
+
+/// Read TradingView + the economic calendar into a [`SetupInputs`].
+///
+/// **Every** network / tv-mcp call in the arm flow lives in here. It also
+/// performs the cosmetic news-marker draw, which is chart-only by definition.
+fn read_setup_from_chart(args: &Args) -> Result<(SetupInputs, Roles)> {
     // 1. Read chart state + decide broker / instrument.
     let mcp = TvMcp::new(
         args.tv_mcp_root
@@ -66,7 +87,7 @@ pub fn run(args: Args) -> Result<i32> {
     let state = mcp.get_state().wrap_err("read TV chart state")?;
     let (_exchange, raw_sym) = split_symbol(&state.symbol);
     let raw_sym = raw_sym.to_string();
-    let broker = resolve_broker(&args, &state.symbol)?;
+    let broker = resolve_broker(args, &state.symbol)?;
     // Resolve through the instrument-lookup catalog: this both
     // validates that the asset is listed on the chosen broker and
     // gives us the broker-canonical symbol (`EUR/USD` for TN,
@@ -137,7 +158,7 @@ pub fn run(args: Args) -> Result<i32> {
     // `--replay` with no explicit `--start`: fall back to a chart Note saying
     // `start` — its first anchor's time becomes the journaling cursor. Lets an
     // operator mark live-now with a note instead of typing an RFC3339 stamp.
-    let start = match (parse_start(&args)?, args.replay()) {
+    let start = match (parse_start(args)?, args.replay()) {
         (Some(s), _) => Some(s),
         (None, true) => crate::start_note::resolve_start_from_note(&mcp, &drawings)
             .wrap_err("resolve --replay start from chart Note")?
@@ -193,17 +214,12 @@ pub fn run(args: Args) -> Result<i32> {
     // calendar windows it carries, the drawn S/R levels, and the position tool.
     let geom = PlanGeometry::from_roles(&roles);
 
-    let key = read_key()?;
-    let account = resolve_account(&args, broker);
-    let out_dir = arm_out_dir(&raw_sym)?;
-    let now = Utc::now();
-
     // The as-of instant elapsed control windows are pruned against. Live
     // (`--register-plan`) prunes against wall-clock now; an offline replay
     // (`--plan-out`) prunes against the chart's replay cursor so a blackout
     // still upcoming relative to the cursor survives a historical replay.
     // See `pick_prune_as_of`.
-    let prune_as_of = pick_prune_as_of(&args, now, cursor_unix, start);
+    let prune_as_of = pick_prune_as_of(args, Utc::now(), cursor_unix, start);
 
     // Resolve blackout/news windows straight from the economic calendar at real
     // event-minute precision. No chart lines are drawn and nothing is read back
@@ -253,6 +269,55 @@ pub fn run(args: Args) -> Result<i32> {
     // news windows and their markers).
     draw_news_markers(&mcp, control.markers(), &state.resolution);
 
+    Ok((
+        SetupInputs {
+            geom,
+            control,
+            instrument,
+            resolved,
+            broker,
+            effective,
+            resolution: state.resolution,
+            chart_symbol: state.symbol,
+            raw_symbol: raw_sym,
+            start,
+            prune_as_of,
+        },
+        roles,
+    ))
+}
+
+/// Build, sign, and register a trade from chart-independent inputs.
+///
+/// Takes **no `TvMcp`** — that is the whole point of the split. Everything below
+/// this line works identically whether `setup` was read from a live chart or
+/// loaded from a frozen spec.
+///
+/// `roles` is `Some` only on the live-chart path, and is used for exactly one
+/// thing: the position-entry tools (`--market-entry` / `--stop-entry` /
+/// `--limit-entry`), whose SL/TP are TradingView **drawing properties** with no
+/// frozen equivalent. A frozen arm passes `None`, and asking for a position
+/// entry there is a clean rejection rather than a silent wrong trade.
+fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Result<i32> {
+    let SetupInputs {
+        geom,
+        control,
+        instrument,
+        resolved,
+        broker,
+        effective,
+        resolution,
+        chart_symbol,
+        raw_symbol,
+        start,
+        prune_as_of,
+    } = setup;
+
+    let key = read_key()?;
+    let account = resolve_account(args, broker);
+    let out_dir = arm_out_dir(&raw_symbol)?;
+    let now = Utc::now();
+
     // 2c. Position-tool direct entry. When one of --market-entry /
     //     --stop-entry / --limit-entry is set, ignore the pattern
     //     machinery entirely: read the drawn long/short position tool,
@@ -260,11 +325,22 @@ pub fn run(args: Args) -> Result<i32> {
     //     signed enter straight to the worker (placed on receipt). This
     //     short-circuits the whole pattern flow below.
     if let Some(mode) = args.position_entry_mode() {
+        // The position tools read raw TradingView drawings (their SL/TP are
+        // drawing properties), so they exist only on the live-chart path. A
+        // frozen-spec arm has no `Roles` and must say so plainly rather than
+        // silently arming some other trade.
+        let roles = roles.ok_or_else(|| {
+            eyre!(
+                "--market-entry / --stop-entry / --limit-entry read the drawn position \
+                 tool from the chart, so they need a live TradingView session; they \
+                 cannot be used with a frozen setup"
+            )
+        })?;
         return run_position_entry(
-            &args,
+            args,
             mode,
             broker,
-            &roles,
+            roles,
             &resolved,
             &instrument,
             &account,
@@ -285,7 +361,7 @@ pub fn run(args: Args) -> Result<i32> {
         // TradingView precision when available, else the instrument-lookup
         // catalog. --pip-size / --tick-size override downstream.
         resolve_mw_trade(
-            &args,
+            args,
             &geom,
             &instrument,
             &account,
@@ -299,7 +375,7 @@ pub fn run(args: Args) -> Result<i32> {
         // broker's grid so it isn't rejected as over-precise. `effective`
         // prefers live TV; --pip-size / --tick-size override downstream.
         resolve_hs_trade(
-            &args,
+            args,
             &geom,
             control.has_news(),
             &instrument,
@@ -428,7 +504,7 @@ pub fn run(args: Args) -> Result<i32> {
             &built_trade,
             direction,
             &geom,
-            &state.resolution,
+            &resolution,
             &pause_bundles,
             &news_bundles,
             &key,
@@ -471,7 +547,7 @@ pub fn run(args: Args) -> Result<i32> {
             skip_calendar_bars: args.skip_calendar_bars,
             skip_golden: args.skip_golden,
             start: args.start.as_deref(),
-            chart_symbol: Some(&state.symbol),
+            chart_symbol: Some(&chart_symbol),
         };
         crate::replay::run_replay(
             effective_plan_out.as_deref(),
@@ -2282,6 +2358,62 @@ mod tests {
     use super::*;
     use clap::Parser;
     use trading_view::drawings::{Point, Properties};
+
+    /// `arm_from_inputs` must make **no chart calls**. That is the entire point
+    /// of the split — everything below the seam has to work identically whether
+    /// its `SetupInputs` came from TradingView or from a frozen file.
+    ///
+    /// This scans the source rather than relying on types, because the property
+    /// is *transitive*: `arm_from_inputs` holds no `TvMcp`, so the compiler
+    /// already stops a direct call — but nothing stops a future edit from
+    /// calling a **helper** that constructs its own `TvMcp::new(...)` internally
+    /// and reaches the chart that way. The type system can't express "and
+    /// nothing you call does it either"; a scan can.
+    ///
+    /// Deliberately a scan of the function body's own text, not a grep of the
+    /// whole file: the chart half legitimately contains all of these.
+    #[test]
+    fn arm_from_inputs_makes_no_chart_calls() {
+        let src = include_str!("pipeline.rs");
+        let start = src
+            .find("\nfn arm_from_inputs(")
+            .expect("arm_from_inputs must exist — did it get renamed?");
+        // The body ends at the next column-0 `}`.
+        let rest = &src[start + 1..];
+        let end = rest.find("\n}\n").map_or(rest.len(), |i| i + 2);
+        let body = &rest[..end];
+
+        for banned in [
+            "TvMcp",
+            "get_state(",
+            "get_range(",
+            "list_drawings(",
+            "get_symbol_info(",
+            "draw_news_markers(",
+            "classify(",
+            "calendar_windows(",
+        ] {
+            // Skip comment lines — one legitimately mentions the retired tv-mcp
+            // alert path in prose.
+            let hit = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains(banned));
+            assert!(
+                !hit,
+                "arm_from_inputs (or its inlined body) references {banned:?} — the \
+                 chart/plan seam is broken, and a frozen-spec arm would try to reach \
+                 TradingView"
+            );
+        }
+        // Sanity: the slice really is the function body, not an empty string —
+        // otherwise every assertion above passes vacuously.
+        assert!(
+            body.contains("build_trade_from_spec"),
+            "the extracted body doesn't look like arm_from_inputs; the scan would \
+             have passed vacuously"
+        );
+    }
 
     fn vline(id: &str, unix: i64) -> Drawing {
         Drawing {

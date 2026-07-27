@@ -37,6 +37,7 @@ mod register_post;
 mod replay;
 mod roles;
 mod sentiment;
+mod setup_inputs;
 mod spread;
 mod start_note;
 mod timeframe;
