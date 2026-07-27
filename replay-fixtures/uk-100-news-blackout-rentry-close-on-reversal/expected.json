@@ -4,27 +4,13 @@
       "rule_id": "09-enter-qm",
       "action": "enter",
       "candle_time": "2026-07-14T13:00:00Z",
-      "candle_close": 10535.6,
-      "fill": {
-        "kind": "stopped_out",
-        "fill_at": "2026-07-14T19:00:00Z",
-        "entry_price": 10484.1,
-        "exit_at": "2026-07-15T07:00:00Z",
-        "exit_price": 10447.8
-      }
+      "candle_close": 10535.6
     },
     {
       "rule_id": "09-enter-qm",
       "action": "enter",
       "candle_time": "2026-07-14T15:00:00Z",
-      "candle_close": 10502.2,
-      "fill": {
-        "kind": "stopped_out",
-        "fill_at": "2026-07-15T13:00:00Z",
-        "entry_price": 10544.3,
-        "exit_at": "2026-07-15T16:00:00Z",
-        "exit_price": 10488.5
-      }
+      "candle_close": 10502.2
     },
     {
       "rule_id": "01-pause-1784152800-1784181600",
@@ -54,14 +40,7 @@
       "rule_id": "09-enter-qm",
       "action": "enter",
       "candle_time": "2026-07-16T08:00:00Z",
-      "candle_close": 10478.3,
-      "fill": {
-        "kind": "stopped_out",
-        "fill_at": "2026-07-16T09:00:00Z",
-        "entry_price": 10477.3,
-        "exit_at": "2026-07-20T18:00:00Z",
-        "exit_price": 10477.3
-      }
+      "candle_close": 10478.3
     },
     {
       "rule_id": "09-enter-qm",
@@ -130,14 +109,7 @@
       "rule_id": "05-enter",
       "action": "enter",
       "candle_time": "2026-07-21T08:00:00Z",
-      "candle_close": 10533.2,
-      "fill": {
-        "kind": "stopped_out",
-        "fill_at": "2026-07-21T09:00:00Z",
-        "entry_price": 10538.0,
-        "exit_at": "2026-07-21T13:00:00Z",
-        "exit_price": 10508.2
-      }
+      "candle_close": 10533.2
     },
     {
       "rule_id": "05-enter",
@@ -149,12 +121,7 @@
       "rule_id": "05-enter",
       "action": "enter",
       "candle_time": "2026-07-21T14:00:00Z",
-      "candle_close": 10564.5,
-      "fill": {
-        "kind": "filled_open",
-        "fill_at": "2026-07-21T15:00:00Z",
-        "entry_price": 10574.7
-      }
+      "candle_close": 10564.5
     },
     {
       "rule_id": "05-enter",

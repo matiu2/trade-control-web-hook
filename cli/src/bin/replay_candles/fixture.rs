@@ -13,45 +13,56 @@
 //! ```
 //!
 //! The snapshot schema ([`ReplayOutcome`]) is owned here, not in the engine — it
-//! captures exactly what the test should assert (each fire's decision, its
-//! simulated fill, and the run's economics), independent of `report.rs`'s
-//! human-facing text.
+//! captures exactly what the test should assert (each fire's decision and the
+//! run's economics), independent of `report.rs`'s human-facing text.
 //!
-//! ## Two fill paths — mind the gap
+//! ## One fill path — do not add a second
 //!
-//! `ReplayOutcome` carries **two** views of what happened, from two different
-//! computations. Know which one you're reading:
+//! Economics live in exactly one place: **`outcome`** ([`ReplayEconomics`]) —
+//! net R, counts, and per-position legs, booked by `report::render` off the
+//! `ReplayBroker` held ledger (`fire.realized`). It is the same value the report
+//! prints, passed in rather than recomputed.
 //!
-//! - **`outcome`** ([`ReplayEconomics`]) — net R, counts, and per-position legs,
-//!   booked by `report::render` off the `ReplayBroker` held ledger
-//!   (`fire.realized`). **This is the authoritative economic result**, and it is
-//!   the same value the report prints, passed in rather than recomputed.
-//! - **`fires[].fill`** — a per-fire [`FillOutcome`] from [`fill_for`] →
-//!   `fill_sim::simulate_fill`, an *independent re-simulation*. It has **no
-//!   reversal- or expiry-close awareness**, so it cannot represent either
-//!   outcome: a position the ledger flattened on a reversal shows here as
-//!   whatever its bracket would have done on its own.
+//! There used to be a second, independent view — `fires[].fill`, a per-fire
+//! re-simulation via `fill_sim::simulate_fill`. It was **deleted on
+//! 2026-07-27** and should not come back. It was not a useful second opinion;
+//! it was confidently wrong in the same vocabulary as the right answer. Of the
+//! five fills it recorded on the tracked `uk-100-…-close-on-reversal` fixture:
 //!
-//! So for a reversal/expiry close, `outcome.legs` is right and `fires[].fill`
-//! is misleading. `fill` is retained because it pins the *bracket* physics
-//! (where a resting order would fill, sweep, or never trigger) independently of
-//! the ledger — a genuine second opinion on entry mechanics. Collapsing it onto
-//! `fire.realized` too would lose that; if it ever moves, the reversal/expiry
-//! blindness is the reason, not a cosmetic cleanup.
+//! - **two were phantom** — fills for superseded enters that never placed an
+//!   order at all,
+//! - **two were wrong** — a reversal-close reported as `stopped_out` at 0R
+//!   (really +0.549R), and an expiry-close reported as `filled_open`, never
+//!   resolved (really +0.797R). `simulate_fill` has no reversal- or
+//!   expiry-close awareness, so it walks the bracket on past the bar the ledger
+//!   actually flattened the position,
+//! - **one agreed.**
+//!
+//! Scoring a grid off it would have read ≈−1R on a trade that made +0.35R.
+//!
+//! The one thing it knew that `outcome.legs` does not is the **not-taken** case:
+//! whether a resting order would ever have triggered. That is now answered with
+//! real broker data on the dedicated `not-taken` demo account rather than by
+//! simulation — slower feedback, but true. Gate declines are separate again, and
+//! stay: [`FireOutcome::suppressed_by`] records what the engine *observed*, not
+//! what a simulator guessed.
+//!
+//! Note `fill_sim` itself is **not** dead — `replay_broker.rs` drives the held
+//! ledger with `simulate_fill_resolved_zoom`, and that is the one authority.
+//! What was removed is the fixture's *separate second call* into it.
 
 use std::fs;
 use std::path::Path;
 
-use super::fill_sim::{SimOutcome, simulate_fill};
 use chrono::{DateTime, Utc};
 use color_eyre::eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
-use trade_control_core::intent::{Action, Shell};
+use trade_control_core::intent::Action;
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan};
 
 use super::arm_record::ArmRecord;
 use super::economics::ReplayEconomics;
-use super::replay::{Fire, Replay};
+use super::replay::Replay;
 use trade_control_cli::replay_args::CandleSource;
 
 /// The resolved scalars a fixture replay needs, beyond the plan + candles. Saved
@@ -86,11 +97,19 @@ pub struct FixtureMeta {
     pub arm: Option<ArmRecord>,
 }
 
-/// The golden snapshot of a replay: every fire's decision plus its simulated
-/// fill, the terminal flag/phase, and the deduped warnings. Equality is by
-/// serialized JSON (floats compare exactly as written), which is what the test
-/// harness asserts.
+/// The golden snapshot of a replay: every fire's decision, what the run earned,
+/// the terminal flag/phase, and the deduped warnings. Equality is by serialized
+/// JSON (floats compare exactly as written), which is what the test harness
+/// asserts.
+///
+/// `deny_unknown_fields` because serde's default is to **silently ignore** a key
+/// it doesn't recognise, and that made the golden gate tolerate schema drift.
+/// Caught deleting `fires[].fill` on 2026-07-27: the goldens still carried five
+/// `"fill"` objects and every fixture test passed anyway, because the loader
+/// quietly dropped them. A stale key is now a load error naming the field, which
+/// is the prompt to re-bless.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayOutcome {
     pub fires: Vec<FireOutcome>,
     pub done: bool,
@@ -115,9 +134,17 @@ pub struct ReplayOutcome {
     pub outcome: Option<ReplayEconomics>,
 }
 
-/// One fired intent's decision: which rule, what action, on which bar — plus the
-/// simulated fill when it was an enter (and simulation was on).
+/// One fired intent's decision: which rule, what action, on which bar.
+///
+/// Deliberately carries **no fill or economic field** — what a position earned
+/// is `ReplayOutcome::outcome` and nothing else (see the module doc's "one fill
+/// path"). Everything here is an *observation* of what the engine decided, so
+/// there is no second computation to drift.
+///
+/// `deny_unknown_fields` for the reason on [`ReplayOutcome`] — and with extra
+/// force here, since this is the struct a re-added `fill` would land on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FireOutcome {
     pub rule_id: String,
     /// The intent's action (serde kebab-case, e.g. `enter` / `veto`).
@@ -126,131 +153,26 @@ pub struct FireOutcome {
     pub candle_time: DateTime<Utc>,
     /// Close of the triggering candle.
     pub candle_close: f64,
-    /// The simulated fill, present only for an enter when simulation was on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fill: Option<FillOutcome>,
     /// Active news-blackout ids that suppressed this enter (paused at fire
     /// time). Empty/omitted for any fire the blackout gate let through. A
-    /// suppressed enter has no `fill` — it's a 0R skip. Serialized so a fixture
+    /// suppressed enter books no leg — it's a 0R skip. Serialized so a fixture
     /// freezes the with-blackout SKIP as a regression.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suppressed_by: Vec<String>,
 }
 
-/// A flat, serializable mirror of [`SimOutcome`]. Mirroring it here (rather than
-/// serializing the engine type) keeps the golden value owned by the test harness
-/// and decoupled from any cosmetic change to the engine enum's shape.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum FillOutcome {
-    NeverFilled,
-    FilledOpen {
-        fill_at: DateTime<Utc>,
-        entry_price: f64,
-    },
-    StoppedOut {
-        fill_at: DateTime<Utc>,
-        entry_price: f64,
-        exit_at: DateTime<Utc>,
-        exit_price: f64,
-    },
-    TookProfit {
-        fill_at: DateTime<Utc>,
-        entry_price: f64,
-        exit_at: DateTime<Utc>,
-        exit_price: f64,
-    },
-    Unresolved {
-        reason: String,
-    },
-    Declined {
-        name: String,
-    },
-}
-
-impl From<&SimOutcome> for FillOutcome {
-    fn from(o: &SimOutcome) -> Self {
-        match o {
-            SimOutcome::NeverFilled => FillOutcome::NeverFilled,
-            SimOutcome::FilledOpen {
-                fill_at,
-                entry_price,
-            } => FillOutcome::FilledOpen {
-                fill_at: *fill_at,
-                entry_price: *entry_price,
-            },
-            SimOutcome::StoppedOut {
-                fill_at,
-                entry_price,
-                exit_at,
-                exit_price,
-            } => FillOutcome::StoppedOut {
-                fill_at: *fill_at,
-                entry_price: *entry_price,
-                exit_at: *exit_at,
-                exit_price: *exit_price,
-            },
-            SimOutcome::TookProfit {
-                fill_at,
-                entry_price,
-                exit_at,
-                exit_price,
-            } => FillOutcome::TookProfit {
-                fill_at: *fill_at,
-                entry_price: *entry_price,
-                exit_at: *exit_at,
-                exit_price: *exit_price,
-            },
-            SimOutcome::Unresolved(reason) => FillOutcome::Unresolved {
-                reason: reason.clone(),
-            },
-            SimOutcome::Declined { name } => FillOutcome::Declined { name: name.clone() },
-        }
-    }
-}
-
-/// Simulate one fire's fill, the single source both the report and the snapshot
-/// use. Returns `None` for a non-enter fire or when `simulate` is off — exactly
-/// the cases the report shows no fill for. Reconstructs the dispatch `Shell`
-/// from the fire (folding the latched H&S signal when present) so the simulator
-/// resolves the same entry/SL/TP levels the live worker would.
-pub fn fill_for(plan: &TradePlan, fire: &Fire, simulate: bool) -> Option<SimOutcome> {
-    if !simulate || fire.fired.intent.action != Action::Enter {
-        return None;
-    }
-    // An enter the real `run_enter` rejected (paused, cooled-down, vetoed, …)
-    // never placed an order, so its standalone fill is fiction — no fill, exactly
-    // like a superseded one.
-    if fire.rejected_reason().is_some() {
-        return None;
-    }
-    let candle = &fire.fired.candle;
-    let shell = match &fire.fired.signal {
-        Some(sig) => Shell::from_candle_and_signal(candle, sig),
-        None => Shell::from_candle(candle),
-    };
-    Some(simulate_fill(
-        &fire.fired.intent,
-        &shell,
-        plan.pip_size,
-        &fire.forward,
-    ))
-}
-
 impl ReplayOutcome {
     /// Build the golden snapshot from a completed [`Replay`]. `simulate` mirrors
-    /// the run's `--simulate` flag (off → fills are `None`, matching the report).
+    /// the run's `--simulate` flag (off → no economics, matching the report).
     ///
     /// `economics` is what `report::render` booked for this same replay. It is
     /// **passed in rather than recomputed** on purpose: booking it twice is how
     /// the report and the golden diverged in the first place (see the module
     /// doc). Pass `None` for a non-simulated run.
-    pub fn compute(
-        plan: &TradePlan,
-        replay: &Replay,
-        simulate: bool,
-        economics: Option<&ReplayEconomics>,
-    ) -> Self {
+    ///
+    /// Note there is deliberately no `plan` parameter. It used to be here only to
+    /// re-simulate each fire's fill a second way; that path is gone.
+    pub fn compute(replay: &Replay, simulate: bool, economics: Option<&ReplayEconomics>) -> Self {
         let fires = replay
             .fires
             .iter()
@@ -259,7 +181,6 @@ impl ReplayOutcome {
                 action: fire.fired.intent.action,
                 candle_time: fire.fired.candle.time,
                 candle_close: fire.fired.candle.c,
-                fill: fill_for(plan, fire, simulate).map(|o| (&o).into()),
                 suppressed_by: fire.suppressed_by(),
             })
             .collect();
@@ -477,8 +398,7 @@ mod tests {
             // way the binary does — render (which books) then snapshot.
             let rendered =
                 super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
-            let computed =
-                ReplayOutcome::compute(&inputs.plan, &replay, true, Some(&rendered.economics));
+            let computed = ReplayOutcome::compute(&replay, true, Some(&rendered.economics));
 
             assert_eq!(
                 computed,
@@ -581,7 +501,7 @@ mod tests {
         // And the SNAPSHOT must carry the same economics — this is the half that
         // `--check` gates on, and the reason a silent Net R regression can no
         // longer pass while firing identical rules.
-        let snapshot = ReplayOutcome::compute(&inputs.plan, &replay, true, Some(econ));
+        let snapshot = ReplayOutcome::compute(&replay, true, Some(econ));
         assert_eq!(
             snapshot.outcome.as_ref(),
             Some(econ),
@@ -619,8 +539,7 @@ mod tests {
         .await;
         let rendered =
             super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
-        let snapshot =
-            ReplayOutcome::compute(&inputs.plan, &replay, true, Some(&rendered.economics));
+        let snapshot = ReplayOutcome::compute(&replay, true, Some(&rendered.economics));
 
         let net_r = snapshot
             .outcome
@@ -665,8 +584,7 @@ mod tests {
         .await;
         let rendered =
             super::super::report::render(&inputs.plan, &replay, false, false, None, &mark_cfg);
-        let snapshot =
-            ReplayOutcome::compute(&inputs.plan, &replay, false, Some(&rendered.economics));
+        let snapshot = ReplayOutcome::compute(&replay, false, Some(&rendered.economics));
         assert!(
             snapshot.outcome.is_none(),
             "an unsimulated run must record no economics: {:?}",
@@ -708,12 +626,6 @@ mod tests {
                 action: Action::Enter,
                 candle_time: Utc.with_ymd_and_hms(2026, 6, 18, 12, 0, 0).unwrap(),
                 candle_close: 1.2345,
-                fill: Some(FillOutcome::TookProfit {
-                    fill_at: Utc.with_ymd_and_hms(2026, 6, 18, 13, 0, 0).unwrap(),
-                    entry_price: 1.2300,
-                    exit_at: Utc.with_ymd_and_hms(2026, 6, 18, 18, 0, 0).unwrap(),
-                    exit_price: 1.2400,
-                }),
                 suppressed_by: Vec::new(),
             }],
             done: true,
@@ -766,40 +678,26 @@ mod tests {
         );
     }
 
-    /// Every `SimOutcome` variant maps to its `FillOutcome` twin (the report and
-    /// the snapshot rely on this being total).
+    /// A fire record carries no fill or economic field — the "one fill path"
+    /// invariant, asserted on the serialized form so a re-added field is caught
+    /// even if it round-trips fine in memory.
+    ///
+    /// This replaces `sim_outcome_maps_to_fill_outcome`, which checked the
+    /// `SimOutcome` → `FillOutcome` mapping that no longer exists. Its subject
+    /// was the second fill path; see the module doc for why that was deleted.
     #[test]
-    fn sim_outcome_maps_to_fill_outcome() {
-        let at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let cases = [
-            (SimOutcome::NeverFilled, FillOutcome::NeverFilled),
-            (
-                SimOutcome::FilledOpen {
-                    fill_at: at,
-                    entry_price: 1.0,
-                },
-                FillOutcome::FilledOpen {
-                    fill_at: at,
-                    entry_price: 1.0,
-                },
-            ),
-            (
-                SimOutcome::Declined {
-                    name: "too-low".into(),
-                },
-                FillOutcome::Declined {
-                    name: "too-low".into(),
-                },
-            ),
-            (
-                SimOutcome::Unresolved("bad geometry".into()),
-                FillOutcome::Unresolved {
-                    reason: "bad geometry".into(),
-                },
-            ),
-        ];
-        for (sim, want) in cases {
-            assert_eq!(FillOutcome::from(&sim), want);
+    fn a_fire_record_carries_no_fill_or_economics() {
+        let json = serde_json::to_string(&sample_outcome()).expect("serialize");
+        let fires = json
+            .split("\"fires\":")
+            .nth(1)
+            .and_then(|s| s.split("\"done\":").next())
+            .expect("fires array");
+        for banned in ["fill", "entry_price", "exit_price", "net_r", "\"r\":"] {
+            assert!(
+                !fires.contains(banned),
+                "a fire must carry no economics — found {banned:?} in {fires}"
+            );
         }
     }
 

@@ -63,6 +63,16 @@ use trade_control_core::sweep_gate::{
 };
 
 /// What the simulator decided happened to one fired enter over the candle path.
+///
+/// The last two variants ([`SimOutcome::Unresolved`] / [`SimOutcome::Declined`])
+/// are **pre-placement** rejections, produced only by the `#[cfg(test)]`
+/// [`simulate_fill_windowed`] front door — the one that resolves a bracket from
+/// scratch. The production path ([`simulate_fill_resolved_zoom`], driven by
+/// `ReplayBroker`) is handed an already-`Resolved` bracket for an order the
+/// broker actually placed, so by construction it can only return the first four.
+/// `replay_broker`'s match still handles both defensively (drop the resting
+/// order); that arm being unreachable in a non-test build is expected, not dead
+/// code to delete.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SimOutcome {
     /// The pending order never filled within the recorded candles.
@@ -89,12 +99,18 @@ pub enum SimOutcome {
     },
     /// The intent couldn't be resolved to concrete levels (not an enter, M/W
     /// not armed, invalid geometry, …). Carries the resolver's reason.
+    ///
+    /// Constructed only under `cfg(test)` — see the enum doc.
+    #[cfg_attr(not(test), allow(dead_code))]
     Unresolved(String),
     /// The worker's at-entry level veto (Bug #12) would have rejected the
     /// entry: the resolved entry price is already past a baked
     /// `entry_level_veto` (pcl-exhausted / invalidation). No order placed.
     /// Carries the veto name (`too-low` / `too-high`). `simulate_fill`
     /// short-circuits here before any fill, mirroring `run_enter`'s gate.
+    ///
+    /// Constructed only under `cfg(test)` — see the enum doc.
+    #[cfg_attr(not(test), allow(dead_code))]
     Declined { name: String },
 }
 
@@ -133,6 +149,9 @@ fn replay_tick(intent: &Intent, pip_size: f64) -> f64 {
 /// Why the effective bracket couldn't be produced — the entry never became a
 /// live position, so both the fill sim and the break-even report treat it as "no
 /// fill". Each variant carries what the caller needs to render its own outcome.
+///
+/// Test-only, with [`resolve_effective_bracket`] — see its doc.
+#[cfg(test)]
 enum BracketReject {
     /// `Resolved::from_intent` failed (bad anchors / geometry).
     Unresolved(String),
@@ -152,13 +171,25 @@ enum BracketReject {
 /// 4. apply the SL-vs-spread floor, which **widens `stop_loss`** to the 10×
 ///    floor (or rejects when the wider stop drops R below `min_r`).
 ///
-/// This is the **single source of truth** for the floored stop. Both
-/// [`simulate_fill_windowed`] (the fill/exit sim) and [`breakeven_armed_at`] (the
-/// report's SL→break-even annotation) obtain their `Resolved` exclusively through
-/// here, so the two can never again walk the candle path against *different* stop
-/// levels — the divergence that silently dropped the break-even line when a wick
-/// sat between the signed and the floored SL (USD/SGD iH&S replay, 2026-07-10).
-/// Any future stop-modifying step added here is automatically visible to both.
+/// **Test-path only, since 2026-07-27.** Production no longer routes through
+/// here: `ReplayBroker::resolved_for_sim` resolves from the *stored placed
+/// levels* (the "orders are state" model — the broker already floored the stop
+/// at placement, so re-deriving it would be wrong), falling back to
+/// [`apply_entry_spread_floor`] only when there is no captured request.
+///
+/// It survives because the wrappers below ([`simulate_fill`],
+/// [`breakeven_armed_at`]) are the ergonomic entry points ~40 unit tests use to
+/// exercise the pre-placement rules — the entry-spread floor, the Bug #12
+/// at-entry level vetos, the SL-vs-spread widen. That is real coverage of real
+/// production logic, reached from a test-only front door.
+///
+/// It used to be the single source of truth for the floored stop, shared by the
+/// fill/exit sim and [`breakeven_armed_at`] so the two could not walk the candle
+/// path against *different* stop levels (the divergence that silently dropped
+/// the break-even line when a wick sat between the signed and the floored SL —
+/// USD/SGD iH&S replay, 2026-07-10). That invariant now lives in
+/// `resolved_for_sim`, which hands the SAME `Resolved` to both.
+#[cfg(test)]
 fn resolve_effective_bracket(
     intent: &Intent,
     shell: &Shell,
@@ -206,6 +237,16 @@ fn resolve_effective_bracket(
     Ok(resolved)
 }
 
+/// Resolve an intent's bracket from scratch and walk it — the unit-test front
+/// door to [`resolve_effective_bracket`] + [`simulate_fill_resolved`].
+///
+/// **Test-only** (`#[cfg(test)]`), and marked so the compiler enforces it. The
+/// production path is `ReplayBroker` → [`simulate_fill_resolved_zoom`], which
+/// walks the *stored placed levels* instead of re-resolving. The `#[cfg]` is
+/// deliberate: it was the entry point for the fixture's second fill path
+/// (deleted 2026-07-27), and without the attribute nothing stops that path being
+/// quietly rebuilt against it. See `fixture.rs`'s "one fill path".
+#[cfg(test)]
 pub fn simulate_fill(
     intent: &Intent,
     shell: &Shell,
@@ -223,6 +264,9 @@ pub fn simulate_fill(
 /// exit is floored off the SAME statistic the live worker's gate placed the
 /// stop with). `None` falls back to the fire bar's own close spread — identical
 /// to [`simulate_fill`].
+///
+/// Test-only for the same reason as [`simulate_fill`].
+#[cfg(test)]
 pub fn simulate_fill_windowed(
     intent: &Intent,
     shell: &Shell,
@@ -304,6 +348,10 @@ impl SubBars for NoZoom {
 /// On an ambiguous exit bar (range straddles both SL and TP) this keeps the
 /// pessimistic-stop assumption. A caller with a finer series should use
 /// [`simulate_fill_resolved_zoom`] to disambiguate instead.
+///
+/// Test-only: production always has a zoom source to offer, so it calls
+/// [`simulate_fill_resolved_zoom`] directly. This is the `NoZoom` convenience.
+#[cfg(test)]
 pub fn simulate_fill_resolved(
     resolved: &Resolved,
     intent: &Intent,

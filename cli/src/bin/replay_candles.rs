@@ -362,7 +362,7 @@ async fn run() -> Result<()> {
             message: args.message.clone(),
             arm: Some(arm_record(&args)),
         };
-        let expected = ReplayOutcome::compute(&plan, &replay, simulate, Some(&rendered.economics));
+        let expected = ReplayOutcome::compute(&replay, simulate, Some(&rendered.economics));
         let dir = fixtures_dir(&args).join(name);
         fixture::save(&dir, &plan, &candles, &meta, &expected)?;
         tracing::info!(dir = %dir.display(), "saved fixture");
@@ -766,7 +766,7 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
         print!("{}", rendered.text);
     }
     let economics = Some(&rendered.economics);
-    let computed = ReplayOutcome::compute(&inputs.plan, &replay, args.simulate, economics);
+    let computed = ReplayOutcome::compute(&replay, args.simulate, economics);
 
     let row = batch::BatchResult::ok(
         name,
