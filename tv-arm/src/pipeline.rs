@@ -35,16 +35,18 @@ use trade_control_core::sig::KEY_LEN;
 use crate::args::Args;
 use crate::args::PositionEntry;
 use crate::broker_kind::{broker_to_kind, kind_to_broker};
+use crate::broker_read::read_mid_blocking;
 use crate::control_bundle::{Bundle, BundleContext, NewsKind, PauseKind};
 use crate::control_windows::{AsOf, ControlWindows};
 use crate::geometry::pcl_exhausted_price;
 use crate::instrument_resolution::ResolvedInstrument;
-use crate::mw_geometry;
+use crate::mw_resolve::resolve_mw_trade;
 use crate::news_marker::{NewsMarker, news_marker_lines};
 use crate::news_window::NewsWindow;
 use crate::plan_geometry::PlanGeometry;
 use crate::position_trade::{core_direction, resolve_levels};
 use crate::register_post::{post_intent_blocking, post_register_blocking};
+use crate::resolve_error::ResolveError;
 use crate::roles::{Roles, SlotPref, classify};
 use crate::save_matrix;
 use crate::setup_inputs::SetupInputs;
@@ -901,21 +903,6 @@ fn resolve_account(args: &Args, broker: Broker) -> String {
     broker.default_account_index().to_string()
 }
 
-/// Outcome of trade-spec resolution. `Reject` is an operator-facing
-/// "fix your chart / flags" message (printed, process exits 1); `Fatal`
-/// is an internal failure that propagates as an error.
-#[derive(Debug)]
-enum ResolveError {
-    Reject(String),
-    Fatal(color_eyre::eyre::Error),
-}
-
-impl From<color_eyre::eyre::Error> for ResolveError {
-    fn from(e: color_eyre::eyre::Error) -> Self {
-        ResolveError::Fatal(e)
-    }
-}
-
 /// H&S / IH&S path: validate the constellation of drawings, read
 /// direction from the **fib** (its head↔neckline, where the head is the
 /// `0`-reading resolved via TradingView's `reverse` flag — *not* raw point
@@ -1020,345 +1007,6 @@ fn resolve_hs_trade(
         entry_level_vetos,
     );
     Ok((direction, spec))
-}
-
-/// M/W path: direction and geometry come from the 3-anchor path drawing
-/// (`mw_path`), not from the H&S drawing constellation. Required
-/// drawings are just the path + the trade-expiry line.
-///
-/// This is the live wrapper: it runs the cheap chart guards first (so an
-/// operator chart mistake fails fast without a network round-trip), then
-/// reads the broker spread live and delegates to
-/// [`resolve_mw_trade_with_spread`] for the geometry gates + baking. The
-/// pure inner fn is what the unit tests drive.
-fn resolve_mw_trade(
-    args: &Args,
-    geom: &PlanGeometry,
-    instrument: &str,
-    account: &str,
-    broker: Broker,
-    catalog_pip: f64,
-    catalog_tick: f64,
-) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
-    // --pip-size / --tick-size override the canonical catalog values when set.
-    let pip_size = args.pip_size.unwrap_or(catalog_pip);
-    let tick_size = args.tick_size.unwrap_or(catalog_tick);
-    check_mw_required(geom)?;
-    // The arm-time broker spread is read live (OANDA /pricing or the
-    // TradeNation chart endpoint) and baked into the enter intent so the
-    // worker can mid→bid/ask correct entry/SL/TP at fill time. There is
-    // no operator override — a failed read hard-errors rather than bake a
-    // guessed spread.
-    let spread_pips = read_spread_blocking(broker, instrument, pip_size)?;
-    resolve_mw_trade_with_spread(
-        args,
-        geom,
-        instrument,
-        account,
-        broker,
-        pip_size,
-        tick_size,
-        spread_pips,
-    )
-}
-
-/// Cheap, offline guards every M/W arm needs before the live spread
-/// read: exactly 3 path anchors and a trade-expiry line. Run first so a
-/// fat-fingered chart fails without a network round-trip.
-fn check_mw_required(geom: &PlanGeometry) -> std::result::Result<(), ResolveError> {
-    let path = geom
-        .mw_path
-        .as_ref()
-        .ok_or_else(|| eyre!("resolve_mw_trade called without an mw_path"))?;
-    if !matches!(path.anchors, 3 | 4) {
-        return Err(ResolveError::Reject(format!(
-            "M/W path must have 3 anchors [A runup-start, B first-point, C neckline] or 4 \
-             [+ D right-shoulder]; found {}",
-            path.anchors
-        )));
-    }
-    if geom.trade_expiry_epoch.is_none() {
-        return Err(ResolveError::Reject(
-            "missing required drawing for M/W:\n  - vertical_line labeled 'trade-expiry'\n".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Pure M/W resolution given an already-read `spread_pips`: direction
-/// from the anchors, structure + neckline-depth gates, then bakes the
-/// static `MwSpec`. No I/O — the live spread read happens in the
-/// [`resolve_mw_trade`] wrapper. Unit-tested directly.
-#[allow(clippy::too_many_arguments)]
-fn resolve_mw_trade_with_spread(
-    args: &Args,
-    geom: &PlanGeometry,
-    instrument: &str,
-    account: &str,
-    broker: Broker,
-    pip_size: f64,
-    tick_size: f64,
-    spread_pips: f64,
-) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
-    check_mw_required(geom)?;
-    // The anchors come straight off `PlanGeometry` — the same plain-data path a
-    // spec-driven arm uses — so the direction decision and the structure/retrace
-    // gates below cannot diverge between a live arm and a rebuild. (This is why
-    // `MwPath` must carry `runup_start`: it feeds direction and both gates,
-    // though no *trigger* reads it.)
-    let path = geom
-        .mw_path
-        .as_ref()
-        .ok_or_else(|| eyre!("resolve_mw_trade_with_spread called without an mw_path"))?;
-    let runup_start = path.runup_start;
-    let first_point = path.first_point;
-    let neckline = path.neckline;
-    // Optional 4th anchor: the drawn right shoulder (arms immediately).
-    let right_shoulder = path.right_shoulder;
-
-    let direction = mw_geometry::mw_direction_from_anchors(runup_start, first_point)
-        .ok_or_else(|| ResolveError::Reject(mw_flat_first_leg_msg(runup_start, first_point)))?;
-    // Coarse "is this even an M/W shape" gate (runup leg > retrace leg).
-    if let Err(e) = mw_geometry::check_mw_structure(runup_start, first_point, neckline) {
-        return Err(ResolveError::Reject(format!("{e}\n")));
-    }
-    // Neckline-retracement depth gate.
-    let pct = mw_geometry::neckline_retrace_pct(runup_start, first_point, neckline);
-    if let Err(msg) = gate_neckline_pct(pct, args.allow_50_pct_m_trades) {
-        return Err(ResolveError::Reject(msg));
-    }
-    // 4-point path: reject a drawing whose right shoulder is on the wrong
-    // side of the neckline or breaks the 1.3 alignment of the shorter
-    // shoulder. Drawing-level validity, so it fails arm here rather than
-    // silently baking a bad geometry.
-    if let Some(rs) = right_shoulder
-        && let Err(e) = mw_geometry::validate_right_shoulder(first_point, neckline, rs)
-    {
-        return Err(ResolveError::Reject(format!("{e}\n")));
-    }
-
-    // The SL-vs-spread floor (hard limit) is enforced at build time in the
-    // shared `cli::build_mw_pattern` chokepoint that this resolve feeds into,
-    // and again at fire time in the worker against the live spread. Not
-    // duplicated here — see `cli/src/trade_patterns.rs::build_mw_pattern`.
-
-    let expiry = read_trade_expiry(geom)?;
-    let pattern = match direction {
-        Direction::Short => cli::TradePattern::M,
-        Direction::Long => cli::TradePattern::W,
-    };
-    info!(
-        direction = direction.as_str(),
-        pattern = ?pattern,
-        runup_start, first_point, neckline,
-        right_shoulder = ?right_shoulder,
-        retrace_pct = %format!("{:.1}%", pct * 100.0),
-        spread_pips,
-        pip_size,
-        "M/W path resolved",
-    );
-    let spec = build_mw_trade_spec(
-        args,
-        instrument,
-        account,
-        broker,
-        pattern,
-        expiry,
-        MwSpecAnchors {
-            runup_start,
-            first_point,
-            neckline,
-            right_shoulder,
-            spread_pips,
-            pip_size,
-            tick_size,
-        },
-    );
-    Ok((direction, spec))
-}
-
-/// Read the live broker spread (in pips) on a short-lived runtime.
-///
-/// `resolve_mw_trade` is sync (it's called from the sync `run`), but the
-/// broker reads are async — so we spin a throwaway tokio runtime here,
-/// the same bridge `auto_draw_calendar_lines` uses for its calendar
-/// fetch. Any read failure (no token, network error, market closed,
-/// degenerate spread) surfaces as a `Fatal` resolve error carrying the
-/// actionable message from `spread::read_spread_pips`.
-fn read_spread_blocking(
-    broker: Broker,
-    instrument: &str,
-    pip_size: f64,
-) -> std::result::Result<f64, ResolveError> {
-    let runtime = tokio::runtime::Runtime::new()
-        .context("starting tokio runtime for live spread read")
-        .map_err(ResolveError::Fatal)?;
-    runtime
-        .block_on(crate::spread::read_spread_pips(
-            broker, instrument, pip_size,
-        ))
-        .map_err(ResolveError::Fatal)
-}
-
-/// Blocking live **mid** read — the pullback prep's arm-time anchor. Same
-/// runtime-bridge shape as [`read_spread_blocking`]; hard-errors on a
-/// stale/degenerate quote so a bad anchor can't silently mis-fire the pullback.
-fn read_mid_blocking(broker: Broker, instrument: &str) -> Result<f64> {
-    let runtime =
-        tokio::runtime::Runtime::new().context("starting tokio runtime for live mid read")?;
-    runtime.block_on(crate::spread::read_mid(broker, instrument))
-}
-
-/// The static M/W geometry baked into the signed enter intent — a
-/// complete mirror of `cli::MwSpec`. `pip_size` is the canonical catalog
-/// value (or the `--pip-size` override); `spread_pips` the arm-time
-/// broker spread.
-struct MwSpecAnchors {
-    runup_start: f64,
-    first_point: f64,
-    neckline: f64,
-    /// `D` — the optional drawn right shoulder (4-point path).
-    right_shoulder: Option<f64>,
-    spread_pips: f64,
-    pip_size: f64,
-    /// Canonical instrument tick size (or `--tick-size`), baked onto the enter
-    /// so the worker snaps the mid-correct M/W prices onto the broker's grid.
-    tick_size: f64,
-}
-
-/// Gate the neckline-retracement percentage. Default ceiling is
-/// `< 40%`; `--allow-50-pct-m-trades` raises it to `<= 50%`; `> 50%` is
-/// always rejected. A `NaN` pct (degenerate zero-runup path) is
-/// rejected too.
-fn gate_neckline_pct(pct: f64, allow_50: bool) -> std::result::Result<(), String> {
-    if pct.is_nan() {
-        return Err("M/W neckline retracement is undefined (zero-length runup leg)\n".into());
-    }
-    if pct > 0.50 {
-        return Err(format!(
-            "M/W neckline retracement {:.1}% exceeds the hard 50% ceiling — not a valid \
-             reversal\n",
-            pct * 100.0
-        ));
-    }
-    if pct >= 0.40 && !allow_50 {
-        return Err(format!(
-            "M/W neckline retracement {:.1}% is >= 40% — pass --allow-50-pct-m-trades to arm a \
-             marginal setup up to 50%\n",
-            pct * 100.0
-        ));
-    }
-    Ok(())
-}
-
-fn mw_flat_first_leg_msg(runup_start: f64, first_point: f64) -> String {
-    format!(
-        "M/W path has a flat first leg (A == B): runup_start={runup_start}, \
-         first_point={first_point} — cannot infer direction\n"
-    )
-}
-
-/// Build the M/W trade spec: no preps, single-shot, baked `MwSpec`. The
-/// worker derives entry/SL/TP from the path geometry, so `tp_price` is a
-/// placeholder the M/W build path ignores (it's `None` on the enter
-/// intent).
-fn build_mw_trade_spec(
-    args: &Args,
-    instrument: &str,
-    account: &str,
-    broker: Broker,
-    pattern: cli::TradePattern,
-    expiry: DateTime<Utc>,
-    anchors: MwSpecAnchors,
-) -> cli::TradeSpec {
-    cli::TradeSpec {
-        pattern,
-        instrument: instrument.to_string(),
-        account: account.to_string(),
-        broker: broker_to_kind(broker),
-        trade_expiry: expiry,
-        risk_pct: args.risk_pct.unwrap_or(1.0),
-        risk_amount: args.risk_amount,
-        dry_run: args.broker_dry_run,
-        // M/W is single-shot: a broker rejection of a placed order is
-        // terminal (no re-entry).
-        max_retries: 0,
-        // Order expiry is governed by trade_expiry + the cancel/abort
-        // vetos; the bar-count menu is an H&S feature.
-        expiry_bars: None,
-        skip_preps: Vec::new(),
-        // Pullback is an H&S retest alternative; the M/W path has its own
-        // geometry (cancel/abort/overshoot) and no retest, so no pullback.
-        pull_back: None,
-        entry_offset_pips: None,
-        sl_offset_pips: None,
-        // Both offset forms None → the shared builder applies the ATR-pct
-        // default (DEFAULT_BUFFER_ATR_PCT). Unused on the M/W path (worker
-        // computes geometry); the H&S enter inherits the volatility-scaled buffer.
-        entry_offset_atr_pct: None,
-        sl_offset_atr_pct: None,
-        sl_anchor: None,
-        // Worker computes the real TP (hard 1R); this field is unused on
-        // the M/W build path. Set to the neckline as a harmless,
-        // non-zero placeholder so any accidental serialization is sane.
-        tp_price: round5(anchors.neckline),
-        // M/W anchors SL via the worker-computed geometry, not an
-        // absolute drawn stop.
-        sl_price: None,
-        entry_deadline_pct: 80,
-        allow_entry: args.entry_filter_script.clone(),
-        // M/W entry is always a stop order at the worker-computed level;
-        // --entry-market is an H&S flag and is ignored here.
-        entry_mode: cli::EntryMode::Stop,
-        // Golden is a Head-and-Shoulders signal-candle concept; M/W entry is a
-        // geometry-driven stop the worker resolves, so it never gates on golden.
-        // (`--skip-golden` is an H&S-only lever and is irrelevant here.)
-        needs_golden: false,
-        needs_confirmed: args.require_confirmation,
-        // No close-on-reversal for M/W (TP is a hard 1R), so news/SR
-        // close coverage is not wired.
-        close_on_news: false,
-        sr_reversal_ranges: Vec::new(),
-        veto_on_reversal: false,
-        needs_confirmed_close: false,
-        prep_expiries: Vec::new(),
-        mw: Some(cli::MwSpec {
-            neckline: anchors.neckline,
-            first_point: anchors.first_point,
-            runup_start: anchors.runup_start,
-            right_shoulder: anchors.right_shoulder,
-            spread_pips: anchors.spread_pips,
-            pip_size: anchors.pip_size,
-            tick_size: Some(anchors.tick_size),
-        }),
-        // Mirror the M/W pip onto the top-level field (the cli M/W builder
-        // also does this); keeps the worker's sizing tail on the baked pip.
-        pip_size: Some(anchors.pip_size),
-        // Baked tick so the worker snaps the mid-correct M/W prices onto grid.
-        tick_size: Some(anchors.tick_size),
-        blackout_close: args.blackout_close.into_core(),
-        // M/W has no fib / invalidation drawing — its abort/cancel/overshoot
-        // vetos cover the level guards, so no continuous entry-level vetos.
-        entry_level_vetos: Vec::new(),
-        // M/W is out of scope for wrong-side stop recovery (it has no
-        // EntrySpec — resolves via intent.mw). Keep today's behaviour.
-        recover_entry: trade_control_core::intent::RecoverEntryAction::Skip,
-        // strategy-v2 (dual stop + QM enter) is H&S-only.
-        strategy_v2: false,
-        // No QM leg on this path; default keeps the spec yaml byte-identical.
-        qm_entry_mode: cli::EntryMode::Stop,
-        // Break-even on at 50% by default; `--no-breakeven` opts out,
-        // `--breakeven-pct` overrides. M/W honours it exactly like H&S — the
-        // worker resolves the M/W geometry at fill, so the cron's snapshot has
-        // a concrete entry/TP for the 50% level.
-        breakeven_pct: if args.no_breakeven {
-            None
-        } else {
-            Some(args.breakeven_pct.unwrap_or(0.5))
-        },
-        // Entry SL-spread floor window baked onto the enter; `None` → worker default (5).
-        spread_window: args.spread_window,
-    }
 }
 
 /// Validate the chart has every drawing the bundle will need.
@@ -1774,7 +1422,7 @@ fn tp_resistance_band(tp: f64, direction: Direction, pct: f64) -> [f64; 2] {
     [round5(center * (1.0 - pct)), round5(center * (1.0 + pct))]
 }
 
-fn round5(v: f64) -> f64 {
+pub fn round5(v: f64) -> f64 {
     (v * 1e5).round() / 1e5
 }
 
@@ -2018,7 +1666,7 @@ fn run_position_entry(
 /// pre-auto-draw) as the lookahead horizon for calendar bars so the
 /// auto-draw covers the trade's full lifetime instead of just the
 /// next H1+ buffer window.
-fn read_trade_expiry(geom: &PlanGeometry) -> Result<DateTime<Utc>> {
+pub fn read_trade_expiry(geom: &PlanGeometry) -> Result<DateTime<Utc>> {
     let expiry_unix = geom
         .trade_expiry_epoch
         .ok_or_else(|| eyre!("missing trade_expiry"))?;
@@ -2400,6 +2048,13 @@ impl AnchorTimeShim for Drawing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // M/W resolution moved to `crate::mw_resolve`; these tests exercise it
+    // directly. Imported HERE rather than at file scope so the non-test build
+    // doesn't carry unused imports.
+    use crate::mw_resolve::{
+        MwSpecAnchors, build_mw_trade_spec, check_mw_required, gate_neckline_pct,
+        resolve_mw_trade_with_spread,
+    };
     use clap::Parser;
     use trading_view::drawings::{Point, Properties};
 
@@ -2714,35 +2369,6 @@ mod tests {
         assert_eq!(as_of.source, "replay-cursor");
     }
 
-    // ===== M / W neckline-% gate ========================================
-
-    #[test]
-    fn gate_neckline_pct_default_ceiling_is_40() {
-        // < 40% passes without the flag.
-        assert!(gate_neckline_pct(0.399, false).is_ok());
-        // >= 40% needs the flag.
-        assert!(gate_neckline_pct(0.40, false).is_err());
-        assert!(gate_neckline_pct(0.499, false).is_err());
-    }
-
-    #[test]
-    fn gate_neckline_pct_flag_raises_ceiling_to_50() {
-        assert!(gate_neckline_pct(0.40, true).is_ok());
-        assert!(gate_neckline_pct(0.499, true).is_ok());
-        assert!(gate_neckline_pct(0.50, true).is_ok());
-    }
-
-    #[test]
-    fn gate_neckline_pct_above_50_always_errors() {
-        assert!(gate_neckline_pct(0.501, true).is_err());
-        assert!(gate_neckline_pct(0.501, false).is_err());
-    }
-
-    #[test]
-    fn gate_neckline_pct_nan_errors() {
-        assert!(gate_neckline_pct(f64::NAN, true).is_err());
-    }
-
     // ===== --spec-in ====================================================
 
     /// A frozen arm refuses the position tools **at runtime**, not just at the
@@ -2815,6 +2441,35 @@ mod tests {
             "--start must supply the missing cursor"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    // ===== M / W neckline-% gate ========================================
+
+    #[test]
+    fn gate_neckline_pct_default_ceiling_is_40() {
+        // < 40% passes without the flag.
+        assert!(gate_neckline_pct(0.399, false).is_ok());
+        // >= 40% needs the flag.
+        assert!(gate_neckline_pct(0.40, false).is_err());
+        assert!(gate_neckline_pct(0.499, false).is_err());
+    }
+
+    #[test]
+    fn gate_neckline_pct_flag_raises_ceiling_to_50() {
+        assert!(gate_neckline_pct(0.40, true).is_ok());
+        assert!(gate_neckline_pct(0.499, true).is_ok());
+        assert!(gate_neckline_pct(0.50, true).is_ok());
+    }
+
+    #[test]
+    fn gate_neckline_pct_above_50_always_errors() {
+        assert!(gate_neckline_pct(0.501, true).is_err());
+        assert!(gate_neckline_pct(0.501, false).is_err());
+    }
+
+    #[test]
+    fn gate_neckline_pct_nan_errors() {
+        assert!(gate_neckline_pct(f64::NAN, true).is_err());
     }
 
     // ===== M / W trade-spec resolution ==================================
