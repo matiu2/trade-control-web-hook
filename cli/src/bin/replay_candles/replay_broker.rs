@@ -313,6 +313,22 @@ impl ReplayBroker {
 
     /// Point all subsequent prior-attempt lookups at `as_of` (the open time of
     /// the bar the gate is evaluating). Call before each `retry_gate::evaluate`.
+    ///
+    /// **This MUST be a bar-OPEN time, never a bar CLOSE.** Candle timestamps are
+    /// bar-open times, so a bar's close equals the NEXT bar's open and the two are
+    /// indistinguishable by value — nothing here can detect the mistake. Every
+    /// held read (`list_pending_orders` / `list_open_positions` /
+    /// `held_attempt_state`) calls `advance(as_of)`, whose `prefix_from_fire`
+    /// bound is inclusive, so a close-bounded `as_of` admits the next bar into
+    /// the fill window and lets an order placed on bar N fill AND stop against
+    /// bar N+1 a whole bar early. That manufactured −1R losses whose presence
+    /// depended on the replay's `--start` cursor (BUG-same-bar-fill-and-stop;
+    /// Coffee M15 2026-07-21, −0.40R vs −3.00R on the same plan and candles,
+    /// from the lifecycle step passing the loop's `now`).
+    ///
+    /// The replay loop has both values in hand — pass `bar_open`, not `now`.
+    /// Rules that legitimately key on the bar close (the lifecycle's spread-hour
+    /// gate) take `now` as their own argument and are unaffected by this clock.
     pub fn set_as_of(&self, as_of: DateTime<Utc>) {
         *self.as_of.borrow_mut() = as_of;
     }
@@ -1621,6 +1637,48 @@ mod tests {
         assert!(
             b.list_pending_orders("").await.unwrap().is_empty(),
             "a cancelled order is never resting"
+        );
+    }
+
+    /// BUG-same-bar-fill-and-stop, broker half: with `as_of` at the placement
+    /// bar's OPEN — the contract [`ReplayBroker::set_as_of`] documents — an order
+    /// placed on bar N must NOT resolve against bar N+1, even when bar N+1
+    /// straddles both its trigger and its stop.
+    ///
+    /// The bug was a caller passing the bar CLOSE instead (the replay loop's
+    /// `now`, at the `pending_order_lifecycle` step). A close equals the next
+    /// bar's open by value, so the broker cannot detect the mistake from the
+    /// argument alone — the contract has to be honoured by the caller. What this
+    /// test pins is the half the broker CAN guarantee: given a bar-open `as_of`,
+    /// the fill window genuinely stops there and the next bar stays invisible.
+    #[tokio::test]
+    async fn as_of_at_bar_open_does_not_resolve_against_the_next_bar() {
+        let bar = 3600;
+        let fire_bar = candle(0, 1.1010); // above the 1.1000 sell-stop — no touch
+        // Bar 1 spans BOTH the trigger and the stop — the ambiguity that turns a
+        // one-bar peek into a fabricated fill-and-stop.
+        let mut straddle = candle(bar, 1.1010);
+        straddle.l = 1.0990;
+        straddle.bid_l = 1.0990;
+        straddle.h = 1.1030;
+        straddle.ask_h = 1.1030;
+        let b = ReplayBroker::new(vec![fire_bar, straddle], 0.0001);
+        b.record_attempt(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&fire_bar.mid()),
+            None,
+        );
+
+        b.set_as_of(Utc.timestamp_opt(0, 0).unwrap());
+        let st = b.lookup_attempt_state("EUR/USD", "o1", None).await.unwrap();
+        assert!(
+            matches!(st, AttemptState::Pending),
+            "as-of bar 0's OPEN the order has not filled, got {st:?}"
+        );
+        assert!(
+            b.closed.borrow().is_empty(),
+            "no trade may be closed before the loop reaches bar 1"
         );
     }
 }
