@@ -280,13 +280,13 @@ pub fn run(args: Args) -> Result<i32> {
     //    and the worker computes entry/SL/TP from baked params. The
     //    `?`-returning resolver hard-errors on a bad setup; a clean
     //    operator-facing rejection returns Ok(1).
-    let resolved_spec = if roles.mw_path.is_some() {
+    let resolved_spec = if geom.mw_path.is_some() {
         // Pip/tick for the baked MwSpec come from `effective` — live
         // TradingView precision when available, else the instrument-lookup
         // catalog. --pip-size / --tick-size override downstream.
         resolve_mw_trade(
             &args,
-            &roles,
+            &geom,
             &instrument,
             &account,
             broker,
@@ -427,7 +427,7 @@ pub fn run(args: Args) -> Result<i32> {
         register_trade_plan(
             &built_trade,
             direction,
-            &roles,
+            &geom,
             &state.resolution,
             &pause_bundles,
             &news_bundles,
@@ -749,7 +749,7 @@ fn resolve_hs_trade(
 /// pure inner fn is what the unit tests drive.
 fn resolve_mw_trade(
     args: &Args,
-    roles: &Roles,
+    geom: &PlanGeometry,
     instrument: &str,
     account: &str,
     broker: Broker,
@@ -759,7 +759,7 @@ fn resolve_mw_trade(
     // --pip-size / --tick-size override the canonical catalog values when set.
     let pip_size = args.pip_size.unwrap_or(catalog_pip);
     let tick_size = args.tick_size.unwrap_or(catalog_tick);
-    check_mw_required(roles)?;
+    check_mw_required(geom)?;
     // The arm-time broker spread is read live (OANDA /pricing or the
     // TradeNation chart endpoint) and baked into the enter intent so the
     // worker can mid→bid/ask correct entry/SL/TP at fill time. There is
@@ -768,7 +768,7 @@ fn resolve_mw_trade(
     let spread_pips = read_spread_blocking(broker, instrument, pip_size)?;
     resolve_mw_trade_with_spread(
         args,
-        roles,
+        geom,
         instrument,
         account,
         broker,
@@ -781,19 +781,19 @@ fn resolve_mw_trade(
 /// Cheap, offline guards every M/W arm needs before the live spread
 /// read: exactly 3 path anchors and a trade-expiry line. Run first so a
 /// fat-fingered chart fails without a network round-trip.
-fn check_mw_required(roles: &Roles) -> std::result::Result<(), ResolveError> {
-    let path = roles
+fn check_mw_required(geom: &PlanGeometry) -> std::result::Result<(), ResolveError> {
+    let path = geom
         .mw_path
         .as_ref()
         .ok_or_else(|| eyre!("resolve_mw_trade called without an mw_path"))?;
-    if !matches!(path.points.len(), 3 | 4) {
+    if !matches!(path.anchors, 3 | 4) {
         return Err(ResolveError::Reject(format!(
             "M/W path must have 3 anchors [A runup-start, B first-point, C neckline] or 4 \
              [+ D right-shoulder]; found {}",
-            path.points.len()
+            path.anchors
         )));
     }
-    if roles.trade_expiry.is_none() {
+    if geom.trade_expiry_epoch.is_none() {
         return Err(ResolveError::Reject(
             "missing required drawing for M/W:\n  - vertical_line labeled 'trade-expiry'\n".into(),
         ));
@@ -808,7 +808,7 @@ fn check_mw_required(roles: &Roles) -> std::result::Result<(), ResolveError> {
 #[allow(clippy::too_many_arguments)]
 fn resolve_mw_trade_with_spread(
     args: &Args,
-    roles: &Roles,
+    geom: &PlanGeometry,
     instrument: &str,
     account: &str,
     broker: Broker,
@@ -816,14 +816,15 @@ fn resolve_mw_trade_with_spread(
     tick_size: f64,
     spread_pips: f64,
 ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
-    check_mw_required(roles)?;
-    // Read the anchors through `PlanGeometry` — the same plain-data path a
+    check_mw_required(geom)?;
+    // The anchors come straight off `PlanGeometry` — the same plain-data path a
     // spec-driven arm uses — so the direction decision and the structure/retrace
-    // gates below cannot diverge between a live arm and a rebuild. (The indexing
-    // that was here is why `MwPath` must carry `runup_start`: it feeds direction
-    // and both gates, though no *trigger* reads it.)
-    let path = PlanGeometry::from_roles(roles)
+    // gates below cannot diverge between a live arm and a rebuild. (This is why
+    // `MwPath` must carry `runup_start`: it feeds direction and both gates,
+    // though no *trigger* reads it.)
+    let path = geom
         .mw_path
+        .as_ref()
         .ok_or_else(|| eyre!("resolve_mw_trade_with_spread called without an mw_path"))?;
     let runup_start = path.runup_start;
     let first_point = path.first_point;
@@ -857,7 +858,7 @@ fn resolve_mw_trade_with_spread(
     // and again at fire time in the worker against the live spread. Not
     // duplicated here — see `cli/src/trade_patterns.rs::build_mw_pattern`.
 
-    let expiry = read_trade_expiry(&PlanGeometry::from_roles(roles))?;
+    let expiry = read_trade_expiry(geom)?;
     let pattern = match direction {
         Direction::Short => cli::TradePattern::M,
         Direction::Long => cli::TradePattern::W,
@@ -2141,10 +2142,18 @@ fn replace_existing_plan(
 /// the signed alert bundle is already on disk by the time this runs, so the
 /// trade isn't lost on a register failure.
 #[allow(clippy::too_many_arguments)]
+/// Takes `geom`, **not `Roles`** — the geometry is extracted exactly once, in
+/// [`run`], and passed down. This function used to take `&Roles` and re-derive
+/// `PlanGeometry::from_roles` itself, which meant the extraction ran *twice* per
+/// arm off two different borrows of the same drawings. Harmless in practice
+/// (`from_roles` is pure), but it re-opened the seam `PlanGeometry` exists to
+/// close: as long as a `&Roles` reaches this far, a future edit can read a
+/// drawing here that no frozen spec could supply. Same reasoning as
+/// `resolve_hs_trade` losing its `roles` parameter — close it by type.
 fn register_trade_plan(
     built_trade: &cli::BuiltTrade,
     direction: Direction,
-    roles: &Roles,
+    geom: &PlanGeometry,
     resolution: &str,
     pause_bundles: &[Bundle<PauseKind>],
     news_bundles: &[Bundle<NewsKind>],
@@ -2191,16 +2200,12 @@ fn register_trade_plan(
         }
         None => None,
     };
-    // Extract the chart geometry to plain data ONCE, here. Everything downstream
-    // reads `PlanGeometry`, not `Drawing`s — which is what makes a plan rebuildable
-    // without TradingView (and stops a future run picking a different drawing).
-    let geom = PlanGeometry::from_roles(roles);
     let mut plan = build_trade_plan(
         &built_trade.trade_id,
         &built_trade.instrument,
         &built_trade.alerts,
         direction,
-        &geom,
+        geom,
         granularity,
         is_mw,
         shadow,
@@ -3146,7 +3151,14 @@ mod tests {
         let pip_size = args.pip_size.unwrap_or(catalog_pip);
         // Tests bake tick == pip (no separate catalog tick threaded here).
         resolve_mw_trade_with_spread(
-            args, roles, instrument, "ms-tn-1", broker, pip_size, pip_size, SPREAD,
+            args,
+            &PlanGeometry::from_roles(roles),
+            instrument,
+            "ms-tn-1",
+            broker,
+            pip_size,
+            pip_size,
+            SPREAD,
         )
     }
 
@@ -3696,13 +3708,66 @@ mod tests {
             trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
             ..Default::default()
         };
-        match check_mw_required(&roles) {
+        match check_mw_required(&PlanGeometry::from_roles(&roles)) {
             Err(ResolveError::Reject(msg)) => {
                 assert!(
                     msg.contains("3 anchors") && msg.contains("found 2"),
                     "msg = {msg}"
                 )
             }
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// A too-SHORT M/W path must still look like an M/W to the dispatcher.
+    ///
+    /// `geom.mw_path.is_some()` is the pattern discriminant in `run`. If a
+    /// 2-anchor path extracted to `None` (the `?`-on-missing shape every other
+    /// role in `from_roles` uses), a half-drawn M/W would fall through to the
+    /// **H&S** branch and be reported as missing `fib_retracement (TP)` and
+    /// `trend_line labeled 'neckline'` — drawings the operator was never making.
+    /// They'd go looking for an H&S bug in an M/W setup.
+    ///
+    /// Caught for real: an earlier version of this refactor used `?` here, and
+    /// `check_mw_required_rejects_wrong_anchor_count` failed with the internal
+    /// `Fatal("called without an mw_path")` instead of the operator-facing
+    /// "found 2".
+    #[test]
+    fn a_short_mw_path_still_dispatches_as_mw_not_hs() {
+        let roles = Roles {
+            mw_path: Some(path_n("p", &[1.1000, 1.1200])),
+            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
+            ..Default::default()
+        };
+        let geom = PlanGeometry::from_roles(&roles);
+        assert!(
+            geom.mw_path.is_some(),
+            "a short path must NOT vanish — that reroutes it to the H&S branch"
+        );
+        assert_eq!(geom.mw_path.as_ref().map(|p| p.anchors), Some(2));
+        // …and the gate turns that count into an operator-facing rejection.
+        match check_mw_required(&geom) {
+            Err(ResolveError::Reject(msg)) => assert!(msg.contains("found 2"), "msg = {msg}"),
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// An over-long path is rejected too — and it is the ONLY case the four named
+    /// anchor fields cannot represent, since extraction truncates to the first
+    /// four. Without `MwPath::anchors` a 5-anchor drawing arms silently as if the
+    /// operator had drawn a 4-anchor one: a different pattern than what's on
+    /// screen, with no error.
+    #[test]
+    fn an_over_long_mw_path_is_rejected_not_truncated() {
+        let roles = Roles {
+            mw_path: Some(path_n("p", &[1.1000, 1.1200, 1.1120, 1.1190, 1.1250])),
+            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
+            ..Default::default()
+        };
+        let geom = PlanGeometry::from_roles(&roles);
+        assert_eq!(geom.mw_path.as_ref().map(|p| p.anchors), Some(5));
+        match check_mw_required(&geom) {
+            Err(ResolveError::Reject(msg)) => assert!(msg.contains("found 5"), "msg = {msg}"),
             other => panic!("expected Reject, got {:?}", other.map(|_| ())),
         }
     }
@@ -3715,7 +3780,7 @@ mod tests {
             trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
             ..Default::default()
         };
-        assert!(check_mw_required(&roles).is_ok());
+        assert!(check_mw_required(&PlanGeometry::from_roles(&roles)).is_ok());
     }
 
     #[test]
@@ -3725,7 +3790,7 @@ mod tests {
             // no trade_expiry
             ..Default::default()
         };
-        match check_mw_required(&roles) {
+        match check_mw_required(&PlanGeometry::from_roles(&roles)) {
             Err(ResolveError::Reject(msg)) => assert!(msg.contains("trade-expiry"), "msg = {msg}"),
             other => panic!("expected Reject, got {:?}", other.map(|_| ())),
         }

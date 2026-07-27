@@ -114,6 +114,28 @@ pub struct MwPath {
     /// check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub right_shoulder: Option<f64>,
+    /// How many anchors the operator actually drew.
+    ///
+    /// Carried because the four named fields **cannot** represent it: a 5-anchor
+    /// path is silently truncated to the first four during extraction, so it
+    /// arrives here indistinguishable from a legitimate 4-anchor one. The arm
+    /// gate rejects anything outside `3 | 4` — an over-long path means the
+    /// operator drew something that isn't an M/W, and reading its first four
+    /// points would arm a *different pattern than the one on screen*.
+    ///
+    /// This is the same class of omission as [`Self::runup_start`]: no trigger
+    /// reads it, so it looks droppable, and dropping it fails **quietly** —
+    /// tests pass, an arm succeeds, and the rejection just stops happening.
+    ///
+    /// `default = 3` so a spec written before this field loads as the minimal
+    /// valid path rather than as `0` (which would reject every legacy spec).
+    #[serde(default = "three_anchors")]
+    pub anchors: usize,
+}
+
+/// Serde default for [`MwPath::anchors`] — see that field's doc.
+fn three_anchors() -> usize {
+    3
 }
 
 /// Everything plan-building needs about the setup's shape.
@@ -208,15 +230,37 @@ impl PlanGeometry {
                 .iter()
                 .filter_map(|(step, d)| Some((step.clone(), d.points.first()?.time)))
                 .collect(),
-            mw_path: roles.mw_path.as_ref().and_then(|d| {
-                Some(MwPath {
+            // An M/W path drawing is preserved even when it is too SHORT to fill
+            // the three required anchors — the missing ones read `f64::NAN` and
+            // `anchors` carries the real count, which `check_mw_required` turns
+            // into an operator-facing "found 2" rejection.
+            //
+            // The tempting shape here is `points.get(2)?` (collapsing a short path
+            // to `None`, like every other role above). That is wrong for this one
+            // field, because `mw_path.is_some()` is the **pattern discriminant**:
+            // a `None` sends a half-drawn M/W down the *H&S* branch, where it is
+            // reported as a pile of missing H&S drawings ("fib_retracement (TP)",
+            // "trend_line labeled 'neckline'") rather than as the short M/W path
+            // it actually is. Verified: that is exactly what happened when this
+            // used `?`, and the misleading message was the regression.
+            //
+            // NAN is deliberate over 0.0 — no arithmetic downstream can produce a
+            // plausible-looking result from it, and the gate rejects before any
+            // of it is read anyway.
+            mw_path: roles.mw_path.as_ref().map(|d| {
+                let price_at = |i: usize| d.points.get(i).map_or(f64::NAN, |p| p.price);
+                MwPath {
                     // `A` — needed for direction + the structure/retrace gates,
                     // not by any trigger.
-                    runup_start: d.points.first()?.price,
-                    first_point: d.points.get(1)?.price,
-                    neckline: d.points.get(2)?.price,
+                    runup_start: price_at(0),
+                    first_point: price_at(1),
+                    neckline: price_at(2),
                     right_shoulder: d.points.get(3).map(|p| p.price),
-                })
+                    // The RAW count, before the truncation the four fields above
+                    // impose — `check_mw_required` rejects anything outside 3|4,
+                    // and it can only do that if the real number survives here.
+                    anchors: d.points.len(),
+                }
             }),
             // Drawn S/R horizontals — no trigger reads them, but they gate whether
             // `07-close-on-sr-reversal` is armed. `filter_map` mirrors
@@ -452,12 +496,27 @@ mod tests {
                 first_point: 1.30,
                 neckline: 1.10,
                 right_shoulder: None,
+                anchors: 3,
             }),
             sr_levels: vec![1.0950, 1.1250],
         };
         let back: PlanGeometry =
             serde_json::from_str(&serde_json::to_string_pretty(&g).unwrap()).unwrap();
         assert_eq!(g, back);
+    }
+
+    /// A spec written before `anchors` existed loads as a 3-anchor path — the
+    /// minimal valid one — not as `0`, which the arm gate would reject.
+    ///
+    /// Without the serde default this is a hard load error, and with a plain
+    /// `#[serde(default)]` it is a silent `0` that rejects every legacy spec at
+    /// arm time. Both are worse than the explicit default.
+    #[test]
+    fn an_mw_path_without_anchors_defaults_to_three() {
+        let legacy = r#"{"runup_start":1.0,"first_point":1.3,"neckline":1.1}"#;
+        let p: MwPath = serde_json::from_str(legacy).expect("legacy spec must still load");
+        assert_eq!(p.anchors, 3);
+        assert!(p.right_shoulder.is_none());
     }
 
     /// A default geometry serializes thin (every field omitted), so a spec for a
