@@ -63,15 +63,41 @@ Runs are otherwise fully deterministic (3x identical invocations agree).
   50h wall-clock warm-up span land inside Coffee's 15h session gap, which
   is what makes the back-off loop run at all.
 
-## Where to look
+## CONFIRMED in isolation: a RAGGED (non-bar-aligned) `from` loses tail bars
 
-`cli/src/bin/replay_candles.rs::pull_with_warmup` (~line 374) calls
-`candles::pull` -> `CacheClient::get_candles_range_bid_ask(symbol, from,
-to, gran)` with `to` FIXED. A wider `from` returning fewer tail bars is a
-**candle-cache** defect (fetch/merge/dedup over a widened range), not
-replay logic. Confirm by calling `get_candles_range_bid_ask` twice for
-Coffee 15m with the same `to` and two different `from`s, and diffing the
-tail.
+Reproduced with `cli/examples/cache_range_tail_probe.rs` — pure
+`CacheClient::get_candles_range_bid_ask` calls, no replay logic, same `to`
+every time:
+
+```
+from=2026-07-17 18:00:00Z  (aligned)  total=152  warmup=  0  live=152  baseline
+from=2026-07-15 03:30:00Z  (aligned)  total=278  warmup=126  live=152  identical
+from=2026-07-11 16:54:38Z  (RAGGED)   total=319  warmup=185  live=134  *** -18 ***
+from=2026-07-09 14:54:38Z  (RAGGED)   total=366  warmup=232  live=134  *** -18 ***
+```
+
+**The discriminator is `from`'s alignment, not its distance.** A `from` on a
+bar boundary (`:00`, `:30`) is safe at any depth; a ragged `from`
+(`16:54:38`) silently drops 18 bars from the FAR END of the range. Two
+earlier probe runs using only whole hours passed cleanly and briefly made
+this look like a non-bug — align your probe timestamps or you will not see
+it.
+
+Ragged `from` values come from `next_pull_from`'s density extrapolation
+(`cli/src/bin/replay_candles.rs`), which computes an instant from a
+bars-per-second estimate and never snaps it to the granularity grid. So the
+back-off loop's attempt 0/1 (naive `start - bar_secs * want`) are aligned
+and safe, while attempt 2+ (extrapolated) are ragged and lossy — exactly
+matching the observed `live=153, 153, 135, 135`.
+
+Fix candidates, in order:
+1. **candle-cache**: a range query must not let `from`'s sub-bar offset
+   affect which bars near `to` are returned. This is the real defect and it
+   affects every caller, not just replay.
+2. **`next_pull_from`**: snap the returned instant down to the granularity
+   grid. Cheap, and removes the trigger for this caller.
+3. **`pull_with_warmup` guard**: never accept a live count lower than a
+   previous attempt's — fail loudly instead of scoring it.
 
 ## Fixes (independent, do both)
 
