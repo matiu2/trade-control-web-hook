@@ -479,3 +479,377 @@ pub fn tp_resistance_band(tp: f64, direction: Direction, pct: f64) -> [f64; 2] {
 pub fn round5(v: f64) -> f64 {
     (v * 1e5).round() / 1e5
 }
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the H&S half of trade-spec resolution: which drawings are
+    //! required, how direction is read, and how the take-profit resistance
+    //! band is derived.
+    //!
+    //! These lived in `pipeline`'s test module alongside the M/W tests and the
+    //! plan-emission tests, all under a single `// ===== M / W trade-spec
+    //! resolution` section marker that had stopped describing its contents.
+
+    use super::*;
+    use crate::args::Args;
+    use crate::plan_geometry::PlanGeometry;
+    use crate::roles::Roles;
+    use crate::test_drawings::{fib, hline, now, two_point, vline};
+    use clap::Parser;
+    use trading_view::drawings::Drawing;
+
+    /// Parse `Args` straight from an argv slice, as the binary would.
+    fn mw_args(extra: &[&str]) -> Args {
+        let mut argv = vec!["tv-arm"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).expect("parse args")
+    }
+
+    fn hs_roles(fib: Drawing, inv: Drawing) -> Roles {
+        Roles {
+            invalidation: Some(inv.clone()),
+            invalidation_label: inv.properties.text.clone(),
+            break_and_close: Some(two_point("neck", "neckline", 1.10, 1.10)),
+            retest: Some(two_point("neck", "neckline", 1.10, 1.10)),
+            tp_fib: Some(fib),
+            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
+            ..Default::default()
+        }
+    }
+
+    /// `check_required` is the guard between a malformed chart and an armed
+    /// trade, and it had **zero** tests: replacing its whole body with
+    /// `return Ok(())` left all 293 green (verified 2026-07-27). Worse, the
+    /// commit that changed it to read `geom.neckline` — fixing a bug where a
+    /// ONE-POINT drawing satisfied `roles.break_and_close.is_some()` — shipped
+    /// with no regression test, so reverting that fix was free.
+    ///
+    /// One case per branch, each dropping exactly one role from an otherwise
+    /// complete chart, asserting on the specific message rather than just "is
+    /// Err" (so a branch can't pass by another's error).
+    #[test]
+    fn check_required_names_each_missing_drawing() {
+        let complete = || hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        let args = mw_args(&[]);
+        assert!(
+            check_required(&PlanGeometry::from_roles(&complete()), &args).is_ok(),
+            "the complete chart must pass, or the cases below prove nothing"
+        );
+
+        // One case: the message `check_required` must produce, paired with the
+        // mutation that provokes it. A plain `fn` pointer — none of these capture.
+        type MissingCase = (&'static str, fn(&mut Roles));
+
+        let cases: [MissingCase; 4] = [
+            ("horizontal_line labeled 'too-high' or 'too-low'", |r| {
+                r.invalidation = None
+            }),
+            (
+                "trend_line labeled 'neckline' (or 'break-and-close')",
+                |r| r.break_and_close = None,
+            ),
+            ("fib_retracement (TP)", |r| r.tp_fib = None),
+            ("vertical_line labeled 'trade-expiry'", |r| {
+                r.trade_expiry = None
+            }),
+        ];
+
+        for (want, drop_one) in cases {
+            let mut roles = complete();
+            drop_one(&mut roles);
+            let err = check_required(&PlanGeometry::from_roles(&roles), &args)
+                .expect_err("a chart missing a required drawing must be rejected");
+            assert!(
+                err.contains(want),
+                "expected the error to name {want:?}, got: {err}"
+            );
+        }
+    }
+
+    /// The `feaa019` fix, pinned: a ONE-POINT drawing in the neckline slot is
+    /// **not** a usable neckline. `roles.break_and_close.is_some()` is true for
+    /// it (which is what the guard used to test), but `PlanGeometry` needs two
+    /// anchors to build a `Line`, so `geom.neckline` is `None` — and it is
+    /// `geom` that plan-building actually reads. Reverting the guard to the
+    /// `roles` form makes this test fail.
+    #[test]
+    fn check_required_rejects_a_one_point_neckline() {
+        let mut roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        // Present as a drawing, unusable as a line.
+        roles.break_and_close = Some(hline("neck", "neckline", 1.10));
+        let err = check_required(&PlanGeometry::from_roles(&roles), &mw_args(&[]))
+            .expect_err("a one-point neckline must be rejected");
+        assert!(err.contains("trend_line labeled 'neckline'"), "got: {err}");
+    }
+
+    /// `--skip-break-and-close` waives the neckline requirement — but only when
+    /// the retest is skipped too, since the retest derives from the same drawing.
+    /// Both halves asserted, so neither `args` branch is a free mutation.
+    #[test]
+    fn check_required_waives_the_neckline_only_when_both_preps_are_skipped() {
+        let mut roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        roles.break_and_close = None;
+        roles.retest = None;
+        let geom = PlanGeometry::from_roles(&roles);
+
+        // Skipping only break-and-close still leaves the retest needing a line.
+        let err = check_required(&geom, &mw_args(&["--skip-break-and-close"]))
+            .expect_err("the retest still needs the neckline");
+        assert!(err.contains("needed for the retest"), "got: {err}");
+
+        // Skipping both waives it entirely.
+        assert!(
+            check_required(
+                &geom,
+                &mw_args(&["--skip-break-and-close", "--skip-retest"])
+            )
+            .is_ok(),
+            "with both preps skipped no neckline is required"
+        );
+    }
+
+    #[test]
+    fn hs_direction_comes_from_fib_not_invalidation_label() {
+        // Rule 1: the fib is authoritative. Head at 1.20 (0-reading, clicked
+        // first) sits ABOVE neckline 1.10 → this is a SHORT (H&S), regardless
+        // of the invalidation *label*. The invalidation sits inside the fib
+        // range so it passes rule 2.
+        let fib = fib("fib", 1.20, 1.10);
+        let inv = hline("inv", "too-high", 1.18);
+        let roles = hs_roles(fib, inv);
+        let args = mw_args(&[]);
+        let (dir, spec) = resolve_hs_trade(
+            &args,
+            &PlanGeometry::from_roles(&roles),
+            false,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        )
+        .expect("valid HS resolves");
+        assert_eq!(dir, Direction::Short);
+        assert_eq!(spec.pattern, cli::TradePattern::Hs);
+    }
+
+    #[test]
+    fn hs_inverse_direction_comes_from_fib() {
+        // Mirror: head 1.00 BELOW neckline 1.10 → LONG (iH&S). too-low floor
+        // at 1.05 sits inside the fib range.
+        let fib = fib("fib", 1.00, 1.10);
+        let inv = hline("inv", "too-low", 1.05);
+        let roles = hs_roles(fib, inv);
+        let args = mw_args(&[]);
+        let (dir, _) = resolve_hs_trade(
+            &args,
+            &PlanGeometry::from_roles(&roles),
+            false,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        )
+        .expect("valid iH&S resolves");
+        assert_eq!(dir, Direction::Long);
+    }
+
+    #[test]
+    fn hs_stale_invalidation_outside_fib_range_is_rejected() {
+        // The bug: a `too-low` left over from a DIFFERENT trade at 0.95 sits
+        // well outside this setup's fib range [1.10, 1.20]. Rule 2 rejects it
+        // rather than baking a poison level / mismatched setup.
+        let fib = fib("fib", 1.20, 1.10);
+        let inv = hline("inv", "too-low", 0.95);
+        let roles = hs_roles(fib, inv);
+        let args = mw_args(&[]);
+        match resolve_hs_trade(
+            &args,
+            &PlanGeometry::from_roles(&roles),
+            false,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        ) {
+            Err(ResolveError::Reject(msg)) => {
+                assert!(msg.contains("outside the fib range"), "msg = {msg}");
+            }
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn hs_flat_fib_has_no_direction_and_errors() {
+        // A degenerate flat fib (both anchors equal) carries no direction.
+        let fib = fib("fib", 1.10, 1.10);
+        let inv = hline("inv", "too-high", 1.10);
+        let roles = hs_roles(fib, inv);
+        let args = mw_args(&[]);
+        match resolve_hs_trade(
+            &args,
+            &PlanGeometry::from_roles(&roles),
+            false,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        ) {
+            Err(ResolveError::Fatal(e)) => {
+                assert!(
+                    format!("{e}").contains("direction from the fib"),
+                    "err = {e}"
+                );
+            }
+            other => panic!("expected Fatal, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn tp_resistance_band_long_far_edge_is_tp() {
+        // Long: band hangs UNDER the TP (approach from below), TOP edge = TP.
+        // Centre one pct step below TP → the +pct edge lands back on TP.
+        let tp = 1.20;
+        let pct = 0.1 / 100.0;
+        let center = tp * (1.0 - pct);
+        let [lo, hi] = tp_resistance_band(tp, Direction::Long, 0.1);
+        assert_eq!(hi, round5(center * (1.0 + pct)), "far (top) edge is the TP");
+        assert_eq!(hi, round5(tp), "top edge lands exactly on TP");
+        assert_eq!(
+            lo,
+            round5(center * (1.0 - pct)),
+            "near edge is 2·pct below TP"
+        );
+        assert!(lo < hi, "lo < hi for a valid band");
+    }
+
+    #[test]
+    fn tp_resistance_band_short_far_edge_is_tp() {
+        // Short: band sits OVER the TP (approach from above), BOTTOM edge = TP.
+        // Centre one pct step above TP → the −pct edge lands back on TP.
+        let tp = 1.00;
+        let pct = 0.1 / 100.0;
+        let center = tp * (1.0 + pct);
+        let [lo, hi] = tp_resistance_band(tp, Direction::Short, 0.1);
+        assert_eq!(
+            lo,
+            round5(center * (1.0 - pct)),
+            "far (bottom) edge is the TP"
+        );
+        assert_eq!(lo, round5(tp), "bottom edge lands exactly on TP");
+        assert_eq!(
+            hi,
+            round5(center * (1.0 + pct)),
+            "near edge is 2·pct above TP"
+        );
+        assert!(lo < hi, "lo < hi for a valid band");
+    }
+
+    #[test]
+    fn tp_resistance_band_matches_a_drawn_sr_line_width() {
+        // The operator's requirement: the auto TP band must be the SAME total
+        // width as a drawn S/R line for the same pct — not the old half-width.
+        // A drawn line at price P → [P·(1−pct), P·(1+pct)]; its width is what the
+        // TP band must match. Compare at the TP band's own centre.
+        for (dir, tp) in [(Direction::Short, 1.00), (Direction::Long, 1.20)] {
+            let [lo, hi] = tp_resistance_band(tp, dir, 0.1);
+            let tp_width = hi - lo;
+            // A drawn band centred at this TP band's centre (the S/R "line").
+            let pct = 0.1 / 100.0;
+            let center = match dir {
+                Direction::Short => tp * (1.0 + pct),
+                Direction::Long => tp * (1.0 - pct),
+            };
+            let drawn = [round5(center * (1.0 - pct)), round5(center * (1.0 + pct))];
+            let drawn_width = drawn[1] - drawn[0];
+            assert!(
+                (tp_width - drawn_width).abs() < 1e-9,
+                "{dir:?}: TP band width {tp_width} must equal a drawn S/R band width {drawn_width}"
+            );
+            // And it must be ~twice the old one-sided width (pct·tp), the bug.
+            let old_one_sided = pct * tp;
+            assert!(
+                tp_width > old_one_sided * 1.9,
+                "{dir:?}: new width {tp_width} must be ~2× the old one-sided {old_one_sided}"
+            );
+        }
+    }
+
+    #[test]
+    fn hs_default_adds_tp_resistance_band() {
+        // Short H&S: head 1.20 above neckline 1.10 → TP = 2·1.10 − 1.20 = 1.00.
+        // No drawn S/R lines, default flags → exactly one auto band whose far
+        // (lower, for a short) edge is the TP.
+        let roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        let args = mw_args(&[]);
+        let (_dir, spec) = resolve_hs_trade(
+            &args,
+            &PlanGeometry::from_roles(&roles),
+            false,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        )
+        .expect("valid H&S resolves");
+        assert_eq!(
+            spec.sr_reversal_ranges.len(),
+            1,
+            "one auto band, no drawn S/R"
+        );
+        let [lo, _hi] = spec.sr_reversal_ranges[0];
+        assert_eq!(lo, round5(spec.tp_price), "short far edge (lo) == TP");
+    }
+
+    #[test]
+    fn hs_skip_tp_resistance_leaves_no_band() {
+        // Same setup, but --skip-tp-resistance and no drawn S/R → no bands, so
+        // no 07-close-on-sr-reversal alert gets emitted downstream.
+        let roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        let args = mw_args(&["--skip-tp-resistance"]);
+        let (_dir, spec) = resolve_hs_trade(
+            &args,
+            &PlanGeometry::from_roles(&roles),
+            false,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        )
+        .expect("valid H&S resolves");
+        assert!(
+            spec.sr_reversal_ranges.is_empty(),
+            "no drawn S/R and band skipped"
+        );
+    }
+
+    #[test]
+    fn hs_drawn_sr_plus_auto_band() {
+        // A drawn support/resistance line contributes its own band; the auto TP
+        // band is appended alongside it → two bands total.
+        let mut roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        roles.sr_levels = vec![hline("sr", "support", 1.05)];
+        let args = mw_args(&[]);
+        let (_dir, spec) = resolve_hs_trade(
+            &args,
+            &PlanGeometry::from_roles(&roles),
+            false,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        )
+        .expect("valid H&S resolves");
+        assert_eq!(
+            spec.sr_reversal_ranges.len(),
+            2,
+            "drawn band + auto TP band"
+        );
+    }
+}

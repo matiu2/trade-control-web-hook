@@ -343,3 +343,296 @@ pub fn build_mw_trade_spec(
         spread_window: args.spread_window,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Tests for M/W trade-spec resolution: the neckline-% gate, anchor-count
+    //! validation, direction, and the geometry baked onto the spec.
+    //!
+    //! These lived in `pipeline`'s test module in two clusters separated by the
+    //! plan-emission tests, both under a `// ===== M / W trade-spec resolution`
+    //! marker that also covered H&S and news cases.
+
+    use super::*;
+    use crate::args::Args;
+    use crate::plan_geometry::PlanGeometry;
+    use crate::roles::Roles;
+    use crate::test_drawings::{SPREAD, now, path, path_n, path4, vline};
+    use clap::Parser;
+    use trading_view::drawings::Drawing;
+
+    /// Parse `Args` straight from an argv slice, as the binary would.
+    fn mw_args(extra: &[&str]) -> Args {
+        let mut argv = vec!["tv-arm"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).expect("parse mw args")
+    }
+
+    #[test]
+    fn gate_neckline_pct_default_ceiling_is_40() {
+        // < 40% passes without the flag.
+        assert!(gate_neckline_pct(0.399, false).is_ok());
+        // >= 40% needs the flag.
+        assert!(gate_neckline_pct(0.40, false).is_err());
+        assert!(gate_neckline_pct(0.499, false).is_err());
+    }
+
+    #[test]
+    fn gate_neckline_pct_flag_raises_ceiling_to_50() {
+        assert!(gate_neckline_pct(0.40, true).is_ok());
+        assert!(gate_neckline_pct(0.499, true).is_ok());
+        assert!(gate_neckline_pct(0.50, true).is_ok());
+    }
+
+    #[test]
+    fn gate_neckline_pct_above_50_always_errors() {
+        assert!(gate_neckline_pct(0.501, true).is_err());
+        assert!(gate_neckline_pct(0.501, false).is_err());
+    }
+
+    #[test]
+    fn gate_neckline_pct_nan_errors() {
+        assert!(gate_neckline_pct(f64::NAN, true).is_err());
+    }
+    fn mw_roles(p: Drawing) -> Roles {
+        Roles {
+            mw_path: Some(p),
+            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
+            ..Default::default()
+        }
+    }
+
+    /// Drive the pure resolver with an injected spread — what the tests
+    /// use in place of `resolve_mw_trade` (which now reads the spread
+    /// live over the network).
+    fn resolve(
+        args: &Args,
+        roles: &Roles,
+        instrument: &str,
+        broker: Broker,
+        catalog_pip: f64,
+    ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
+        let pip_size = args.pip_size.unwrap_or(catalog_pip);
+        // Tests bake tick == pip (no separate catalog tick threaded here).
+        resolve_mw_trade_with_spread(
+            args,
+            &PlanGeometry::from_roles(roles),
+            instrument,
+            "ms-tn-1",
+            broker,
+            pip_size,
+            pip_size,
+            SPREAD,
+        )
+    }
+
+    #[test]
+    fn resolve_mw_m_is_short_and_bakes_geometry() {
+        // Worked M: A=1.1000, B=1.1200, C=1.1120 → pct 0.40 (needs flag).
+        // No --pip-size, so the catalog pip (passed here) is baked.
+        let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1120]));
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        let (dir, spec) = match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
+            Ok(v) => v,
+            Err(_) => panic!("expected Ok"),
+        };
+        assert_eq!(dir, Direction::Short);
+        assert_eq!(spec.pattern, cli::TradePattern::M);
+        assert_eq!(spec.max_retries, 0);
+        assert!(spec.prep_expiries.is_empty());
+        let mw = spec.mw.expect("mw baked");
+        assert!((mw.neckline - 1.1120).abs() < 1e-9);
+        assert!((mw.first_point - 1.1200).abs() < 1e-9);
+        assert!((mw.runup_start - 1.1000).abs() < 1e-9);
+        // The injected live spread flows through to the baked intent.
+        assert!((mw.spread_pips - SPREAD).abs() < 1e-9);
+        // Catalog pip flows through unchanged.
+        assert!((mw.pip_size - 0.0001).abs() < 1e-12);
+        // ...and is mirrored onto the top-level spec field.
+        assert_eq!(spec.pip_size, Some(0.0001));
+    }
+
+    #[test]
+    fn resolve_mw_4point_bakes_right_shoulder() {
+        // 4-point M: A=1.1000, B=1.1200, C=1.1120, D=1.1190 (valid: inside
+        // the 1.3 ceiling of the shorter shoulder, same side as B).
+        let roles = mw_roles(path4("p", [1.1000, 1.1200, 1.1120, 1.1190]));
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        let (dir, spec) = resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001)
+            .expect("valid 4-point M resolves");
+        assert_eq!(dir, Direction::Short);
+        let mw = spec.mw.expect("mw baked");
+        assert_eq!(mw.right_shoulder, Some(1.1190));
+    }
+
+    #[test]
+    fn resolve_mw_4point_rejects_misaligned_right_shoulder() {
+        // D=1.1300 breaks the 1.3 alignment (taller shoulder past the
+        // ceiling of the shorter) → the drawing is rejected at arm.
+        let roles = mw_roles(path4("p", [1.1000, 1.1200, 1.1120, 1.1300]));
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
+            Err(ResolveError::Reject(msg)) => {
+                assert!(msg.contains("1.3 alignment"), "msg = {msg}")
+            }
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn resolve_mw_4point_rejects_wrong_side_right_shoulder() {
+        // D=1.1100 sits below the neckline (wrong side for an M) → rejected.
+        let roles = mw_roles(path4("p", [1.1000, 1.1200, 1.1120, 1.1100]));
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
+            Err(ResolveError::Reject(msg)) => assert!(msg.contains("wrong side"), "msg = {msg}"),
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+    #[test]
+    fn resolve_mw_bakes_catalog_pip_when_no_override() {
+        // A JPY-like catalog pip of 0.01 is baked when --pip-size is absent.
+        let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1180])); // pct 0.10
+        let args = mw_args(&[]);
+        let (_dir, spec) =
+            resolve(&args, &roles, "USD_JPY", Broker::TradeNation, 0.01).expect("ok");
+        assert!((spec.mw.expect("mw").pip_size - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn resolve_mw_pip_size_flag_overrides_catalog() {
+        // --pip-size beats the catalog value passed in.
+        let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1180])); // pct 0.10
+        let args = mw_args(&["--pip-size", "0.25"]);
+        let (_dir, spec) =
+            resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001).expect("ok");
+        assert!((spec.mw.expect("mw").pip_size - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn resolve_mw_w_is_long() {
+        // Worked W: A=1.1200, B=1.1000, C=1.1080 → pct 0.40 (needs flag).
+        let roles = mw_roles(path("p", [1.1200, 1.1000, 1.1080]));
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        let (dir, spec) =
+            resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001).expect("ok");
+        assert_eq!(dir, Direction::Long);
+        assert_eq!(spec.pattern, cli::TradePattern::W);
+    }
+
+    #[test]
+    fn resolve_mw_rejects_40_pct_without_flag() {
+        let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1120])); // pct 0.40
+        let args = mw_args(&[]); // no --allow-50-pct-m-trades
+        match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
+            Err(ResolveError::Reject(msg)) => {
+                assert!(msg.contains("40%"), "msg = {msg}");
+                assert!(msg.contains("--allow-50-pct-m-trades"), "msg = {msg}");
+            }
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn check_mw_required_rejects_wrong_anchor_count() {
+        // A 2-anchor path fails the cheap guard before any spread read.
+        let roles = mw_roles(path_n("p", &[1.1, 1.12]));
+        match check_mw_required(&PlanGeometry::from_roles(&roles)) {
+            Err(ResolveError::Reject(msg)) => {
+                assert!(
+                    msg.contains("3 anchors") && msg.contains("found 2"),
+                    "msg = {msg}"
+                )
+            }
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// A too-SHORT M/W path must still look like an M/W to the dispatcher.
+    ///
+    /// `geom.mw_path.is_some()` is the pattern discriminant in `run`. If a
+    /// 2-anchor path extracted to `None` (the `?`-on-missing shape every other
+    /// role in `from_roles` uses), a half-drawn M/W would fall through to the
+    /// **H&S** branch and be reported as missing `fib_retracement (TP)` and
+    /// `trend_line labeled 'neckline'` — drawings the operator was never making.
+    /// They'd go looking for an H&S bug in an M/W setup.
+    ///
+    /// Caught for real: an earlier version of this refactor used `?` here, and
+    /// `check_mw_required_rejects_wrong_anchor_count` failed with the internal
+    /// `Fatal("called without an mw_path")` instead of the operator-facing
+    /// "found 2".
+    #[test]
+    fn a_short_mw_path_still_dispatches_as_mw_not_hs() {
+        let roles = Roles {
+            mw_path: Some(path_n("p", &[1.1000, 1.1200])),
+            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
+            ..Default::default()
+        };
+        let geom = PlanGeometry::from_roles(&roles);
+        assert!(
+            geom.mw_path.is_some(),
+            "a short path must NOT vanish — that reroutes it to the H&S branch"
+        );
+        assert_eq!(geom.mw_path.as_ref().map(|p| p.anchors), Some(2));
+        // …and the gate turns that count into an operator-facing rejection.
+        match check_mw_required(&geom) {
+            Err(ResolveError::Reject(msg)) => assert!(msg.contains("found 2"), "msg = {msg}"),
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// An over-long path is rejected too — and it is the ONLY case the four named
+    /// anchor fields cannot represent, since extraction truncates to the first
+    /// four. Without `MwPath::anchors` a 5-anchor drawing arms silently as if the
+    /// operator had drawn a 4-anchor one: a different pattern than what's on
+    /// screen, with no error.
+    #[test]
+    fn an_over_long_mw_path_is_rejected_not_truncated() {
+        let roles = Roles {
+            mw_path: Some(path_n("p", &[1.1000, 1.1200, 1.1120, 1.1190, 1.1250])),
+            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
+            ..Default::default()
+        };
+        let geom = PlanGeometry::from_roles(&roles);
+        assert_eq!(geom.mw_path.as_ref().map(|p| p.anchors), Some(5));
+        match check_mw_required(&geom) {
+            Err(ResolveError::Reject(msg)) => assert!(msg.contains("found 5"), "msg = {msg}"),
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn check_mw_required_accepts_four_anchor_path() {
+        // A 4-anchor path (right shoulder drawn) passes the count guard.
+        let roles = Roles {
+            mw_path: Some(path4("p", [1.1000, 1.1200, 1.1120, 1.1190])),
+            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
+            ..Default::default()
+        };
+        assert!(check_mw_required(&PlanGeometry::from_roles(&roles)).is_ok());
+    }
+
+    #[test]
+    fn check_mw_required_rejects_missing_trade_expiry() {
+        let roles = Roles {
+            mw_path: Some(path("p", [1.1000, 1.1200, 1.1180])),
+            // no trade_expiry
+            ..Default::default()
+        };
+        match check_mw_required(&PlanGeometry::from_roles(&roles)) {
+            Err(ResolveError::Reject(msg)) => assert!(msg.contains("trade-expiry"), "msg = {msg}"),
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn resolve_mw_rejects_bad_structure() {
+        // retrace deeper than runup: A=1.1120, B=1.1200, C=1.1000.
+        let roles = mw_roles(path("p", [1.1120, 1.1200, 1.1000]));
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
+            Err(ResolveError::Reject(msg)) => assert!(msg.contains("runup leg"), "msg = {msg}"),
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+}

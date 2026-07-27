@@ -110,11 +110,21 @@ Each commit green (tests + clippy + fmt) before the next.
         account resolution, key loading, `run_position_entry`, the `--replace`
         machinery, `register_trade_plan`. The next natural cuts are
         `register_trade_plan` + `--replace` (a "register" module, ~200 lines)
-        and `run_position_entry` (~96). **The test block was deliberately not
-        split** — the `// ===== M / W trade-spec resolution` section marker
-        turns out to cover a *mix* (it also holds H&S `build_trade_spec` and
-        `close_on_news` cases), so a marker-based split misfiles them. Doing it
-        properly means reading each test, which is its own commit.
+        and `run_position_entry` (~96).
+
+        **The test block is now split too** (done as its own commit, as
+        planned). The `// ===== M / W trade-spec resolution` marker did cover a
+        mix, so the split was done by reading each test rather than by marker:
+        13 H&S cases → `hs_resolve`, 18 M/W cases → `mw_resolve`, 38 genuinely
+        pipeline-level cases stay. The test block went 1665 → 931 lines. The
+        drawing constructors the three suites share (`fib`, `hline`,
+        `two_point`, `path*`, `vline`, `now`, `SPREAD`) moved to a
+        `#[cfg(test)] mod test_drawings` rather than being copied three times —
+        a fixture that drifts between copies is a suite that stops testing the
+        same thing. Move verified behaviour-preserving by mutation: neutering
+        `check_required` fails exactly the 3 relocated H&S tests, neutering
+        `gate_neckline_pct` fails exactly the 4 relocated M/W ones, and the
+        total stays 337 either side (nothing lost or double-counted).
 
         Found doing it: `MwPath` could not represent its own **anchor count** —
         a 5-anchor path truncated to four and armed as a different pattern than

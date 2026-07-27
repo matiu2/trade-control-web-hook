@@ -49,6 +49,8 @@ mod sentiment;
 mod setup_inputs;
 mod spread;
 mod start_note;
+#[cfg(test)]
+mod test_drawings;
 mod timeframe;
 mod trade_plan_build;
 
