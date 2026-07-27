@@ -37,6 +37,7 @@ mod precision;
 mod register_post;
 mod replay;
 mod roles;
+mod save_matrix;
 mod sentiment;
 mod setup_inputs;
 mod spread;

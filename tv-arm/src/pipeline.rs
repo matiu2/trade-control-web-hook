@@ -44,6 +44,7 @@ use crate::plan_geometry::PlanGeometry;
 use crate::position_trade::{core_direction, resolve_levels};
 use crate::register_post::{post_intent_blocking, post_register_blocking};
 use crate::roles::{Roles, SlotPref, classify};
+use crate::save_matrix;
 use crate::setup_inputs::SetupInputs;
 use crate::timeframe::infer_calendar_timeframe;
 use crate::trade_plan_build::{append_control_rules, build_trade_plan, resolution_to_granularity};
@@ -69,31 +70,90 @@ const ARM_OUT_ROOT: &str = "/tmp/trade-control-arm";
 /// consumer still needs the raw drawings (the position-entry tools) and that
 /// path is inherently live-chart. See [`SetupInputs`]' module doc.
 pub fn run(args: Args) -> Result<i32> {
-    match args.spec_in.as_deref() {
-        // Frozen: no chart, and therefore no `Roles` — the position-entry tools
-        // are refused rather than silently skipped.
-        Some(path) => arm_from_inputs(&args, read_setup_from_spec(&args, path)?, None),
+    // Source the setup: a frozen spec, or the live chart. `Roles` only exists on
+    // the chart path — the position-entry tools need raw drawings, so a frozen
+    // arm refuses them rather than silently arming something else.
+    let (setup, roles) = match args.spec_in.as_deref() {
+        Some(path) => (read_setup_from_spec(&args, path)?, None),
         None => {
             let (setup, roles) = read_setup_from_chart(&args)?;
             if let Some(path) = args.spec_out.as_deref() {
-                let frozen = crate::frozen_setup::FrozenSetup::capture(
-                    setup.geom.clone(),
-                    setup.resolution.clone(),
-                    setup.chart_symbol.clone(),
-                    setup.start,
-                    args.spec_note.clone(),
-                );
-                frozen.write(path)?;
-                info!(
-                    path = %path.display(),
-                    resolution = %frozen.resolution,
-                    chart_symbol = %frozen.chart_symbol,
-                    "froze setup — re-arm with --spec-in"
-                );
+                freeze_setup(&args, &setup, path)?;
             }
-            arm_from_inputs(&args, setup, Some(&roles))
+            (setup, Some(roles))
         }
+    };
+
+    // Both sources feed the same two exits. The matrix in particular has to work
+    // off a FROZEN setup: "confirm once on the chart, then generate the grid
+    // offline" is the whole corpus workflow, and wiring it to the chart path
+    // alone made `--spec-in --save-matrix` silently arm a single cell.
+    if args.save_matrix {
+        return arm_the_matrix(&args, setup, roles.as_ref());
     }
+    arm_from_inputs(&args, setup, roles.as_ref())
+}
+
+/// Write the chart-derived setup to a `--spec-out` file for later `--spec-in`.
+fn freeze_setup(args: &Args, setup: &SetupInputs, path: &Path) -> Result<()> {
+    let frozen = crate::frozen_setup::FrozenSetup::capture(
+        setup.geom.clone(),
+        setup.resolution.clone(),
+        setup.chart_symbol.clone(),
+        setup.start,
+        args.spec_note.clone(),
+    );
+    frozen.write(path)?;
+    info!(
+        path = %path.display(),
+        resolution = %frozen.resolution,
+        chart_symbol = %frozen.chart_symbol,
+        "froze setup — re-arm with --spec-in"
+    );
+    Ok(())
+}
+
+/// Arm every cell of the entry-sensitivity grid from ONE chart read.
+///
+/// The setup is cloned per cell, so all six share byte-identical geometry — the
+/// only difference between the resulting fixtures is the flag under test. Six
+/// separate `tv-arm` runs could not promise that: each would re-classify roles
+/// against a chart that may have scrolled and re-read a calendar that may have
+/// moved, so the grid would be comparing setups rather than gates.
+///
+/// A cell that fails is **recorded and the run continues**. A variant can
+/// legitimately be rejected (a Quasimodo leg the drawing doesn't support, a
+/// validation gate that objects to one entry rule), and aborting on the first
+/// would throw away the cells that did work. Exit code is 0 only if every cell
+/// armed, so a driver can still trust it.
+fn arm_the_matrix(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Result<i32> {
+    let outcomes: Vec<save_matrix::CellOutcome> = save_matrix::GRID
+        .iter()
+        .map(|variant| {
+            let cell_args = variant.apply(args);
+            info!(cell = %variant.fixture_suffix(), "arming matrix cell");
+            let result =
+                arm_from_inputs(&cell_args, setup.clone(), roles).map_err(|e| format!("{e:#}"));
+            if let Err(e) = &result {
+                // Loud per-cell, so a failure isn't only visible in the summary
+                // at the very end of a long run.
+                warn!(cell = %variant.fixture_suffix(), error = %e, "matrix cell failed to arm");
+            }
+            save_matrix::CellOutcome {
+                variant: *variant,
+                result,
+            }
+        })
+        .collect();
+
+    println!("\n{}", save_matrix::summarise(&outcomes));
+    // Non-zero when any cell is missing: a partial grid is not a grid, and a
+    // driver that only checks the exit code must not read it as complete.
+    Ok(if outcomes.iter().all(save_matrix::CellOutcome::armed) {
+        0
+    } else {
+        1
+    })
 }
 
 /// Rebuild [`SetupInputs`] from a frozen spec — **no TradingView**.

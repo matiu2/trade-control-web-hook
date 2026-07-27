@@ -108,7 +108,7 @@ pub enum PositionEntry {
 }
 
 /// Arm a reversal setup from the active TradingView chart.
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(version = env!("GIT_VERSION"), about, long_about = None)]
 #[command(group(
     clap::ArgGroup::new("position_entry")
@@ -498,6 +498,22 @@ pub struct Args {
     #[arg(long, value_name = "FILE")]
     pub spec_in: Option<PathBuf>,
 
+    /// Arm the **entry-sensitivity grid** from a single chart read: three entry
+    /// rules (normal / skip-bcr / strategy-v2) × news calendar on/off.
+    ///
+    /// Reads the chart **once** and re-arms six times from that one setup, so
+    /// every cell shares byte-identical geometry and the only difference between
+    /// fixtures is the flag under test. Six separate `tv-arm` invocations would
+    /// each re-read the chart (and the calendar), so they can differ by more
+    /// than the flag — which would make the grid compare setups rather than
+    /// gates.
+    ///
+    /// Pairs with `replay ... --save`: each cell's fixture is named
+    /// `<your-name>-<entry-rule>-<news-on|news-off>`. A cell that fails to arm
+    /// is recorded and the run continues; the summary names it.
+    #[arg(long, conflicts_with_all = ["skip_bcr", "strategy_v2", "skip_all", "quasimodo"])]
+    pub save_matrix: bool,
+
     /// Free-text note stored in a `--spec-out` file (e.g. the journal page this
     /// setup came from). Never read when arming.
     #[arg(long, value_name = "TEXT", requires = "spec_out")]
@@ -591,7 +607,7 @@ pub struct Args {
 /// `--replay`) promoted to **strictly-exclusive** subcommands — you can no
 /// longer arm *and* replay (or arm *and* write JSON) in one invocation. When
 /// no subcommand is given, tv-arm builds + signs the bundle to disk and stops.
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 pub enum Command {
     /// Arm the trade: register it as ONE signed `TradePlan` with the worker's
     /// server-side engine (POSTed directly to the baked webhook). The `*/15`
