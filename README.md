@@ -1826,6 +1826,72 @@ changes don't churn fixtures; after an *intentional* outcome change, re-save the
 fixture. The snapshot freezes today's mid-only fill semantics on purpose — a
 change to the simulator's fill model will (correctly) flag.
 
+**Batch replay.** `--fixtures-glob <glob>` replays every fixture whose directory
+name matches (`*` and `?`), instead of the single `--fixture`. A failing fixture
+is **recorded and the batch continues** — one bad fixture can't hide the other
+290. With `--json`, every fixture produces exactly one object carrying an `ok`
+flag, so a crashed run and a legitimately flat one are never confused (scraping
+`Net R:` off stdout couldn't tell them apart, and a concurrent batch silently
+lost cells because of it). Parallel-safe: `--test-mode` makes no candle-cache
+calls at all.
+
+**Tier 2 — the scored corpus.** The fixture suite above is a *gate*: exact
+equality, any change fails. That's right for ~20 hand-picked cases and wrong for
+a corpus of 291, where a legitimate engine fix moves hundreds of cells and
+"300 failed" is one bit of information. So a second tier **scores** instead:
+
+```sh
+# bless the current corpus
+replay-candles --test-mode --fixtures-glob '*' \
+  --bless-baseline corpus-v113.json --baseline-label v113
+
+# after an engine change — what moved?
+replay-candles --test-mode --fixtures-glob '*' --baseline corpus-v113.json
+```
+
+```
+vs v113 → v114
+  net R:  +42.10 → +47.80  (+5.70)
+  moved:  38 fixture(s)  (29 improved, 9 worse)
+  same:   253
+  of which: 31 reproducible, 7 calendar-sensitive
+    stopped      trade-071-normal-news-off       -1.00 → +0.00
+    requantified trade-118-skip-bcr-news-on      +1.18 → +0.00  [calendar]
+```
+
+This **does not affect the exit code** — a moved number is information, not a
+failure. `--check` remains the gate.
+
+(The `→ v114` side is the engine version recorded *in the fixtures*, not the
+running binary, so a corpus captured before the `arm` block existed reads
+`→ this run`. A corpus spanning an engine change reports **no** version at all
+rather than picking one — a mixed baseline that looks coherent is worse than one
+that admits it isn't.)
+
+Three things it deliberately does:
+
+- **Structural moves are listed before magnitude moves.** A trade that flips
+  between taken and not-taken is a different event from one whose R shifted, and
+  ranking purely by |ΔR| buries it. It matters most when the flip *improves* the
+  aggregate: a setup that stops taking a **loser** shows up as free profit, and
+  that is exactly the kind of "improvement" that needs a human to agree with it.
+  Reported as `stopped`, first, regardless of size.
+- **No noise threshold.** Replay is deterministic — same fixture, same code, same
+  number — so a non-zero delta is never noise. A cutoff would be a way of not
+  looking at small moves, and small moves across 291 trades are how a regression
+  hides.
+- **News-ON rows are tagged `[calendar]`.** `close_on_news` re-reads the calendar
+  at arm time, so those cells can move for calendar reasons rather than engine
+  reasons. They're advisory; the news-OFF rows are fully reproducible and carry
+  the regression signal. If *every* mover is calendar-sensitive, the report says
+  so up front.
+
+A baseline stores each fixture's net R, its exit-shape counters (so a TP becoming
+a reversal-close at the same net R still registers), and whether it traded at
+all. That last one reads the **legs**, not `net_r == 0.0` — a declined setup, a
+break-even exit, and a still-open position all book 0.0 R, and only the first is
+"no trade".
+
 **Replay enforces the news blackout (pause/resume), not just logs it.** A plan's
 `pause`/`resume` control rules fire on their `TimeReached` epochs; the replay
 applies them to its in-memory state store and **gates `05-enter` on them** —

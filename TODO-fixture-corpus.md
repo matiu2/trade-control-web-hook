@@ -71,8 +71,48 @@ Each commit green (tests + clippy + fmt) before the next.
         or refuse when the live chart disagrees. Noted in the `plan_geometry`
         module doc too.
   - [ ] **6f.** `--start` strict-RFC3339 fix (seconds currently mandatory).
-- [ ] **7. Tier-2 scored corpus** (2b) — aggregate Net R, baseline diff, re-bless.
-      Not in `cargo test`.
+- [x] **7. Tier-2 scored corpus** (2b) — DONE (6fae7f2) — `cli/src/bin/replay_candles/baseline.rs`.
+      `--bless-baseline <file>` records a batch; `--baseline <file>` scores a later
+      batch against it. Deliberately **does not affect the exit code** — a moved
+      number is information, not a failure; `--check` stays the gate.
+
+      Three design calls, each with a mutation-verified test:
+
+      1. **Structural moves outrank magnitude moves.** A fixture flipping
+         taken↔not-taken is a different event from one whose R shifted. Proven on
+         the real corpus: a doctored baseline gave a **+0.15 aggregate
+         improvement** that came entirely from gbpaud no longer taking a *loser*
+         — surfaced first as `stopped`, not banked. Under |ΔR| sorting it sat
+         below a −0.85 requantification.
+
+         Hence `taken` reads the **legs**, not `net_r`. Three distinct things book
+         0.0 R — declined, break-even, still-open-at-window-end — and only the
+         first is "no trade". The tracked corpus already has one of each shape.
+         Mutating `took_a_trade` to the tempting `net_r != 0.0` reddens its test.
+      2. **No noise threshold.** Replay is deterministic, so a non-zero delta is
+         never noise — it's always the code. A cutoff is a way of *not looking* at
+         small moves, and small moves across 291 trades are how a regression
+         hides. Sorted by magnitude so the operator can stop reading where they
+         choose.
+      3. **News-ON rows flagged advisory, not frozen** (the constraint recorded
+         under "Decisions" below). `diff.reproducible()` is the set a regression
+         hunt starts from; the render says up front when *no* mover is
+         reproducible.
+
+      Aggregates are summed in **BTreeMap key order on both sides**, so a
+      bless-then-rediff reports exactly `+0.00`, not a last-bit residue. (This
+      gate has lost two digits to summation order before — see the `account`
+      decision below.) A hand-edited baseline is caught by comparing the stored
+      total against a recomputed one.
+
+      The diff prints **before** the failed-batch early return (a partial sweep is
+      exactly when you want to see what moved) and labels itself INCOMPLETE.
+      Blessing a partial batch warns: absent fixtures read as `added` on return.
+
+      22 tests, 8 mutations tried and all 8 reddened a test. Verified end-to-end
+      on the two tracked fixtures: bless → clean re-diff (exactly +0.00) →
+      regression diff → hand-edit warning → `--json` stdout stays one parseable
+      object (diff to stderr) → missing baseline exits 4.
 - [ ] **8. `--save-matrix`** (4.3) — one-pass variants.
 
 ## Decisions made along the way
@@ -246,8 +286,28 @@ valuable: everything it found looked deliberate from the inside.
       machinery gave back what the module extraction took out).
 - **6e** `--spec-in` + `FrozenSpec` + round-trip test.
 - **6f** `--start` strict-RFC3339 fix.
-- **7** tier-2 scored corpus (aggregate Net R + baseline diff). Independent of 6.
 - **8** `--save-matrix`. Independent of 6.
+
+### The corpus is now usable end-to-end
+
+With 7 done, generating and scoring the 291-trade grid needs no further tooling:
+
+```sh
+# one-time, per trade: capture the six variants (live arm, needs TV + broker)
+tv-arm-staging … --save-fixture trade-124-normal-news-on
+# … × 3 entry rules × news on/off
+
+# offline from here — no TV, no broker, no network, parallel-safe
+replay-candles --test-mode --fixtures-glob '*' --bless-baseline corpus-v113.json \
+               --baseline-label v113
+
+# after an engine change
+replay-candles --test-mode --fixtures-glob '*' --baseline corpus-v113.json
+```
+
+**8 (`--save-matrix`) is now a convenience, not a blocker** — it collapses the
+six capture runs into one pass. Worth doing at 291 trades; not on the critical
+path to an answer.
 
 ### Open items for the operator
 - `broker-tradenation-v0.14.0` is pushed as a BRANCH (`feat/testable-account-store`)
