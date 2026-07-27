@@ -57,6 +57,28 @@ Each commit green (tests + clippy + fmt) before the next.
   - [ ] **6d.** Extract `SetupInputs` + `arm_from_inputs`; `run` becomes a two-way
         branch (chart vs frozen). `mcp: Option<TvMcp>` makes "annotation is
         chart-only" structural.
+
+        **Prerequisite done (3b5e116).** The `&Roles` boundary is now closed by
+        type: `register_trade_plan` and the whole M/W chain
+        (`check_mw_required`, `resolve_mw_trade`, `resolve_mw_trade_with_spread`)
+        take `&PlanGeometry`. All three were re-deriving
+        `PlanGeometry::from_roles` internally, so extraction ran **three times**
+        per arm off three borrows of the same drawings. **Only
+        `run_position_entry` still takes `&Roles`** — correctly; position-tool
+        SL/TP are TV drawing properties, so `--spec-in` must reject
+        `--market-entry`/`--stop-entry`/`--limit-entry` anyway (already noted in
+        6e).
+
+        So the split point in `run` is now clean: **lines ~59–246 are chart +
+        calendar read** (TvMcp, `get_state`, `get_range`, `list_drawings`,
+        `classify`, the calendar fetch); everything after builds from `geom` +
+        flags. `SetupInputs` is that first half's output.
+
+        Found doing it: `MwPath` could not represent its own **anchor count** —
+        a 5-anchor path truncated to four and armed as a different pattern than
+        the one on screen, silently. Third instance of the dropped-geometry-field
+        shape (after `runup_start` and `sr_levels`); see the pattern note in the
+        `[[plan_geometry_dropped_field_pattern]]` memory.
   - [ ] **6e.** `--spec-in` itself: `FrozenSpec` file, guards, round-trip test.
         Reject `--market-entry`/`--stop-entry`/`--limit-entry` (position-tool SL/TP
         are TV drawing properties, inherently live-chart).
