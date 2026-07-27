@@ -105,12 +105,18 @@ Each commit green (tests + clippy + fmt) before the next.
         the two unnecessary ones deleted. Clippy clean with two *fewer*
         suppressions than before.
 
-        **Still in `pipeline.rs` (1460):** `run`/`arm_from_inputs`/
-        `read_setup_from_chart` (the flow itself, ~600 lines), instrument +
-        account resolution, key loading, `run_position_entry`, the `--replace`
-        machinery, `register_trade_plan`. The next natural cuts are
-        `register_trade_plan` + `--replace` (a "register" module, ~200 lines)
-        and `run_position_entry` (~96).
+        **Both follow-up cuts are now done too.** `register_trade_plan` +
+        `--replace` → `register.rs` (7328948), and `run_position_entry` →
+        `position_entry.rs` (2c5fce6). `pipeline.rs` body: 1458 → **1134**.
+        In both cases the imports left behind were the useful signal — the
+        pattern-arming flow genuinely stopped depending on `post_intent_blocking`,
+        `broker_to_kind`, `core_direction`/`resolve_levels` and `PositionEntry`,
+        so the extraction removed dependencies rather than relocating text.
+
+        **Still in `pipeline.rs` (1134):** `run`/`arm_from_inputs`/
+        `read_setup_from_chart` (the flow itself), instrument + account
+        resolution, key loading, the as-of/arm-time helpers. Nothing left is an
+        obvious next cut — what remains *is* the pipeline.
 
         **The test block is now split too** (done as its own commit, as
         planned). The `// ===== M / W trade-spec resolution` marker did cover a
