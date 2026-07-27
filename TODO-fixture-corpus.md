@@ -15,8 +15,15 @@ Each commit green (tests + clippy + fmt) before the next.
       Also `--no-annotate` for unattended runs (after reproducing the collision).
 - [x] **5. `PlanGeometry`** (2a) — DONE (3bfcab1). Landed as `tv-arm/src/plan_geometry.rs`
       rather than `HsSpec` on `TradeSpec` (see the decision note below).
-      `build_trade_plan`/`trigger_for` read plain data; proven byte-identical by
-      `a_plan_built_from_frozen_geometry_matches_one_built_from_drawings`.
+      `build_trade_plan`/`trigger_for` read plain data. Guarded by
+      `a_plan_built_from_frozen_geometry_matches_one_built_from_drawings` — but
+      "proven byte-identical" overstated it, and the test says so itself: its
+      headline assertion reduces to `f(x) == f(x)` (both sides build from the same
+      extracted geometry), so it cannot catch a field the extractor drops. That is
+      exactly how `MwPath.runup_start` slipped through until 6a. The real coverage
+      is the field-level assertions added alongside it
+      (`a_fully_drawn_chart_freezes_every_geometry_field`, which asserts the
+      key-set union of an H&S and an M/W chart against an explicit list).
 - [ ] **6. `tv-arm --spec-in`** (2a) — arm from frozen spec, no TV. Bigger than
       one commit; sequenced:
   - [x] **6a.** `MwPath.runup_start` (4713acb) — latent bug: direction + 2 gates
@@ -85,9 +92,36 @@ Each commit green (tests + clippy + fmt) before the next.
   its place as a second opinion on *bracket* physics (fill/sweep/never-trigger).
   It IS blind to reversal/expiry closes — documented, with `outcome` authoritative
   there.
-- **Only 2 of the 5 local fixtures are git-tracked.** `sgdjpy-spread-floor-min-r-block`,
-  `xau-xag-close-on-reversal`, `xau-xag-tp-resistance` are untracked WIP in the
-  primary checkout and were deliberately left alone (not re-blessed).
+  **OVERTURNED 2026-07-27 (`751efa8`) — this reasoning was wrong.** Measured on
+  the uk-100 golden, `fires[].fill` was right on 1 of 5 rows: two were *phantom*
+  (fabricated losing fills, with invented timestamps, for enters the report shows
+  as `SUPERSEDED — resting order cancelled`), two were wrong (reversal-close read
+  as `stopped_out` 0R vs really +0.549R; expiry-close read as unresolved
+  `filled_open` vs really +0.797R). It was not a partial view — it answered in the
+  same vocabulary as the right answer, so nothing flagged it. Deleted. A
+  clean-slate reviewer independently reproduced the table and confirmed no
+  regression coverage was lost (mutating the fire-bar skip in `find_fill` still
+  reddens the gate via `outcome.legs`).
+
+- **Untracked WIP fixtures are UNLOADABLE after this branch merges.** With
+  `deny_unknown_fields` (`751efa8`), a stale `"fill"` key is a hard load error.
+  In the primary checkout that is **four** fixtures: `coffee-sad` (4 keys),
+  `eth-usd-missed`, `xau-xag-close-on-reversal`, `xau-xag-tp-resistance` (1 each).
+  (`sgdjpy-spread-floor-min-r-block` has none and is fine.)
+
+  **The remedy is a re-bless, not a strip.** All four also predate commit 2, so
+  they carry no `outcome` block at all — stripping `fill` would make them load
+  but leave them economically empty, which is useless for the grid and worse than
+  a loud failure. Re-bless each from its own frozen inputs:
+
+  ```sh
+  replay-candles --test-mode --fixture <name> --rebless
+  ```
+
+  Cheap and offline (frozen candles, no broker). Deliberately NOT done for them
+  here: re-blessing is destructive, and these are somebody's in-progress capture.
+  Note the tracked goldens in the *primary checkout* also lack `outcome` — that's
+  just this branch's own new field, not drift.
 
 **All of the journalling side's asks (4.1–4.5) are DELIVERED.** 5–8 below are the
 operator-requested expansion (re-armable spec + scored corpus).
@@ -133,9 +167,10 @@ parallel-safe already.
   Two independent reports raises confidence the `--annotate` one is real despite
   `replay.rs:177-196` asserting the override works. Reproduce before fixing.
 
-**Merge hazard:** this branch's `cli/Cargo.toml` still lacks
-`features = ["postgres-storage"]` (their uncommitted fix is in the primary
-checkout). Take THEIR version of that line when merging.
+**~~Merge hazard:~~ RESOLVED (verified 2026-07-27).** This said the branch's
+`cli/Cargo.toml` lacked `features = ["postgres-storage"]`. It doesn't — the
+worktree, the primary checkout and `origin/main` all carry it on line 21. The
+other agent's fix landed in `aeededb` and is already merged. No merge action.
 
 ---
 
@@ -206,6 +241,12 @@ valuable: everything it found looked deliberate from the inside.
 - `annotate.rs` still has two `unsafe set_var("HOME")`. Deliberately left: that
   one is honest (correct comment, lock genuinely covers both mutators). Separate
   cleanup, not a bug.
-- Reviewer flagged `GIT_VERSION` staleness: `cli/build.rs` only reruns on
-  `.git/HEAD`/`refs/tags`, so `engine_version` can lag the code that produced an
-  outcome. Matters if it gates a blessed baseline.
+- ~~Reviewer flagged `GIT_VERSION` staleness~~ — **NOT REPRODUCIBLE, closed
+  2026-07-27.** The claim was that `cli/build.rs` only reruns on
+  `.git/HEAD`/`refs/tags`, so `engine_version` could lag the code. It can't: any
+  source change recompiles the crate, which reruns `build.rs` and re-reads `git
+  describe`. Verified twice, independently — appended a comment to
+  `economics.rs`, rebuilt, `--version` went `v116-62-g751efa8` →
+  `…-g751efa8-dirty`; removed it and the `-dirty` tracked the remaining real
+  edits. The rerun-if directives are a *lower* bound on when it reruns, not a
+  ceiling. No action.

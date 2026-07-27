@@ -157,15 +157,40 @@ pub struct FailureLine<'a> {
     pub detail: &'a str,
 }
 
+/// Cap on the `detail:` payload, in characters.
+///
+/// A `--check` mismatch embeds BOTH pretty-printed JSON snapshots (expected and
+/// got) in its message — ~900 chars for the small gbpaud fixture and ~9KB for
+/// uk-100 — and the newline-flattening below turns all of it into one terminal
+/// line. Across 291 fixtures that is an unreadable wall that buries the very
+/// tag it exists to surface.
+///
+/// The full text is never lost: `main` prints the whole eyre chain to **stderr**
+/// (multi-line, un-truncated) before this line goes to stdout, and the `--json`
+/// path carries the numbers structurally (`expected_net_r` vs `outcome.net_r`)
+/// rather than as prose. This line's job is to be greppable, not complete.
+const MAX_DETAIL_CHARS: usize = 240;
+
 impl fmt::Display for FailureLine<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Keep it to one line: a driver reads this line-wise, and eyre details
+        // are frequently multi-line.
+        let flat = self.detail.replace('\n', " ");
+        // Truncate on a CHARACTER boundary — slicing a str by byte index panics
+        // mid-UTF-8, and these messages carry `—` / `…` from the doc text.
+        let detail = match flat.char_indices().nth(MAX_DETAIL_CHARS) {
+            Some((byte_idx, _)) => format!(
+                "{}… ({} chars total; full text on stderr)",
+                &flat[..byte_idx],
+                flat.chars().count()
+            ),
+            None => flat,
+        };
         write!(
             f,
             "Done: false  |  error: {}  |  detail: {}  |  Net R: n/a",
             self.kind.tag(),
-            // Keep it to one line: a driver reads this line-wise, and eyre
-            // details are frequently multi-line.
-            self.detail.replace('\n', " ")
+            detail
         )
     }
 }
@@ -292,5 +317,67 @@ mod tests {
         }
         .to_string();
         assert!(!line.contains('\n'), "got: {line}");
+    }
+
+    /// A `--check` mismatch embeds both pretty-printed snapshots (~9KB on the
+    /// uk-100 fixture); flattened onto one line that buries the error tag. The
+    /// payload is capped, and says so rather than truncating silently.
+    #[test]
+    fn a_huge_detail_is_truncated_and_says_it_was() {
+        let huge = "x".repeat(9000);
+        let line = FailureLine {
+            kind: FailureKind::CheckMismatch,
+            detail: &huge,
+        }
+        .to_string();
+
+        assert!(line.len() < 400, "line was {} chars: {line}", line.len());
+        assert!(line.contains("9000 chars total"), "got: {line}");
+        assert!(line.contains("full text on stderr"), "got: {line}");
+        // The tag must survive — it's the reason the line exists.
+        assert!(
+            line.contains(FailureKind::CheckMismatch.tag()),
+            "got: {line}"
+        );
+        // And the shape a driver scrapes is intact.
+        assert!(line.ends_with("Net R: n/a"), "got: {line}");
+    }
+
+    /// Truncation slices on a CHARACTER boundary. These messages carry `—`/`…`
+    /// from the doc text, and byte-slicing mid-UTF-8 panics — which would turn a
+    /// mismatch report into a crash, losing the diff entirely.
+    ///
+    /// The leading `"x"` is load-bearing and the whole reason this test bites.
+    /// With a bare `"—".repeat(n)`, byte offset `MAX_DETAIL_CHARS` (240) divides
+    /// exactly by the 3-byte char width, so even a buggy byte-index slice lands
+    /// on a boundary and the test passes anyway — verified by mutating the impl
+    /// to slice by byte, which stayed GREEN. One ASCII byte in front shifts every
+    /// boundary by one, putting byte 240 mid-character; the same mutation then
+    /// panics with "byte index 240 is not a char boundary".
+    #[test]
+    fn truncation_never_splits_a_multibyte_char() {
+        let multibyte = format!("x{}", "—".repeat(9000));
+        let line = FailureLine {
+            kind: FailureKind::CheckMismatch,
+            detail: &multibyte,
+        }
+        .to_string();
+        assert!(line.contains("9001 chars total"), "got: {line}");
+    }
+
+    /// A short detail is passed through untouched — no ellipsis, no char count.
+    #[test]
+    fn a_short_detail_is_not_annotated() {
+        let line = FailureLine {
+            kind: FailureKind::BadInput,
+            detail: "unsupported granularity \"3h\"",
+        }
+        .to_string();
+        assert!(
+            line.contains("unsupported granularity \"3h\""),
+            "got: {line}"
+        );
+        assert!(!line.contains("chars total"), "got: {line}");
+        assert!(!line.contains('…'), "got: {line}");
     }
 }

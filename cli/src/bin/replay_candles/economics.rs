@@ -437,6 +437,34 @@ mod tests {
         assert!(leg.exit_price.is_none());
     }
 
+    /// An open position books 0R **even when an exit price is present** — the
+    /// `is_realized()` guard, not the absent price, is what makes it flat.
+    ///
+    /// Without this case `is_realized()` is unfalsifiable: the sibling test above
+    /// passes `exit: None`, so `.filter(|_| reason.is_realized())` never receives
+    /// a value and the closure is never called. Replacing the whole function body
+    /// with `true` left all 499 tests green (verified 2026-07-27) — the ledger
+    /// happens to hardcode `exit_price: None` beside `FillKind::Open`
+    /// (`replay_broker.rs`), so the invariant was encoded in two places with only
+    /// one enforced. If that ledger detail ever changes, an open position would
+    /// silently score as a **win**, inflating every grid cell that holds one.
+    #[test]
+    fn an_open_position_books_zero_r_even_with_an_exit_price() {
+        let mut e = ReplayEconomics::new();
+        // 1.12 against entry 1.10 / stop 1.09 would be +2R if it were realized.
+        e.book(&long_fire(FillKind::Open, Some(1.12)));
+
+        assert_eq!(e.open_at_end, 1);
+        assert_eq!(e.net_r, 0.0, "an open position must not be scored");
+        assert_eq!(e.account(), START_ACCOUNT);
+        let leg = &e.legs[0];
+        assert_eq!(leg.r, 0.0);
+        // The exit is dropped, not merely unscored: a leg that carried an exit
+        // price with r == 0.0 would read as a scratch, which it is not.
+        assert!(leg.exit_price.is_none());
+        assert!(leg.exit_time.is_none());
+    }
+
     /// Not-taken outcomes book nothing at all — no leg, no count, no balance move.
     #[test]
     fn not_taken_outcomes_book_nothing() {
