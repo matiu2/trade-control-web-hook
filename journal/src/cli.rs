@@ -36,6 +36,33 @@ fn bin(base: &str) -> String {
     }
 }
 
+/// Explain a failure to launch a sibling CLI. The overwhelmingly common cause
+/// is a **plain `cargo install --path journal`**, which bakes an EMPTY env
+/// suffix, so this binary hunts for a bare `trade-control` / `tv-arm` — and the
+/// unsuffixed CLIs were deliberately removed from this repo (only
+/// `-dev` / `-staging` exist). A bare "No such file or directory" sends the
+/// operator reading `cli.rs` to work that out, so say it here instead.
+fn launch_error(program: &str, e: std::io::Error) -> color_eyre::Report {
+    if ENV_SUFFIX.is_empty() && e.kind() == std::io::ErrorKind::NotFound {
+        return eyre!(
+            "failed to launch `{program}`: not found on PATH.\n\
+             \n\
+             This `journal` was built with NO environment suffix (a plain \
+             `cargo build` / `cargo install --path journal`), so it looks for \
+             the unsuffixed `{program}` — which this repo no longer installs.\n\
+             \n\
+             Run the deployed binary instead:\n    \
+             journal-staging     (demo worker)\n    \
+             journal-dev         (dev worker)\n\
+             \n\
+             Both are installed by ./deploy-staging.sh / ./deploy-dev.sh, which \
+             bake the matching CLI suffix. To build a suffixed one by hand:\n    \
+             TRADE_CONTROL_ENV_SUFFIX=staging cargo install --path journal"
+        );
+    }
+    eyre!("failed to launch `{program}`: {e}")
+}
+
 /// The signing key file. Honours `TRADE_CONTROL_KEY_FILE` (same env var the
 /// stock CLIs read) and otherwise defaults to the conventional location.
 fn key_file() -> PathBuf {
@@ -54,9 +81,7 @@ fn run_trade_control(args: &[&str]) -> Result<String> {
     let program = bin("trade-control");
     let mut cmd = Command::new(&program);
     cmd.args(args).arg("--key-file").arg(&key);
-    let out = cmd
-        .output()
-        .map_err(|e| eyre!("failed to launch `{program}`: {e}"))?;
+    let out = cmd.output().map_err(|e| launch_error(&program, e))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(eyre!(
@@ -130,9 +155,7 @@ pub fn replay_via_tv_arm(armed_at: &str, skip_flags: &[&str]) -> Result<String> 
     if std::env::var_os("RUST_LOG").is_none() {
         cmd.env("RUST_LOG", "warn");
     }
-    let out = cmd
-        .output()
-        .map_err(|e| eyre!("failed to launch `{program}`: {e}"))?;
+    let out = cmd.output().map_err(|e| launch_error(&program, e))?;
     let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
     if !out.status.success() {
         let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
@@ -185,6 +208,34 @@ mod tests {
         assert_eq!(strip_ansi(plain), plain);
         // A lone ESC (not a CSI) is dropped with its follower, not left dangling.
         assert_eq!(strip_ansi("a\u{1b}Zb"), "ab");
+    }
+
+    /// A missing sibling CLI in an UNSUFFIXED build is the `cargo install
+    /// --path journal` mistake — the error must name the fix, not just report
+    /// ENOENT and leave the operator reading this file.
+    #[test]
+    fn launch_error_explains_the_unsuffixed_build() {
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let msg = launch_error("trade-control", e).to_string();
+        if ENV_SUFFIX.is_empty() {
+            assert!(msg.contains("journal-staging"), "names the fix:\n{msg}");
+            assert!(
+                msg.contains("TRADE_CONTROL_ENV_SUFFIX"),
+                "names the build-it-yourself route:\n{msg}"
+            );
+        } else {
+            // A suffixed build has a real missing-binary problem; stay terse.
+            assert!(msg.contains("failed to launch"), "{msg}");
+        }
+    }
+
+    /// Any OTHER launch failure (a permission error, say) is a genuine problem
+    /// and must not be misreported as the suffix mistake.
+    #[test]
+    fn launch_error_does_not_blame_the_suffix_for_other_errors() {
+        let e = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let msg = launch_error("trade-control", e).to_string();
+        assert!(!msg.contains("journal-staging"), "{msg}");
     }
 
     #[test]
