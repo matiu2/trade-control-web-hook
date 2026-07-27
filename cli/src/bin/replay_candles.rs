@@ -353,6 +353,44 @@ async fn run() -> Result<()> {
 /// the report be honest about the shallow ATR rather than loop forever.
 const MAX_WARMUP_BACKOFF_ATTEMPTS: u32 = 6;
 
+/// Verdict on one back-off attempt's live-bar count. Widening the warm-up
+/// look-back moves `pull_from` EARLIER while `pull_end` stays fixed, so the
+/// number of bars at/after `start` — the **live window the engine scores** — must
+/// never change. If it does, the series we just pulled is not a superset of the
+/// previous one and any result computed from it is not comparable.
+///
+/// Split out as a pure fn so the invariant is unit-testable without a broker.
+#[derive(Debug, PartialEq, Eq)]
+enum LiveCountVerdict {
+    /// First attempt (nothing to compare against) or an unchanged count.
+    Ok,
+    /// The live window changed between attempts — a data-source bug, not a
+    /// market gap. Carries both counts for the error message.
+    Changed { previous: usize, current: usize },
+}
+
+/// Compare this attempt's live count against the previous attempt's.
+///
+/// This is the guard for the candle-cache duplicate-bars bug (fixed in
+/// candle-cache v3): overlapping cached/fetched chunks were merged without
+/// dedup and then trimmed by COUNT, so a widened look-back could return a
+/// DIFFERENT live window — and the replay silently scored it. One unchanged
+/// trade plan scored −0.40R or −3.00R depending only on how the look-back
+/// landed against the cached-range boundaries.
+///
+/// Failing loudly here is the point: a silently-different live window produces
+/// a plausible-looking R that is simply wrong, which is far worse than an
+/// aborted replay ([[no_silent_degrade_prefer_loud_failure]]).
+fn check_live_count(previous: Option<usize>, current: usize) -> LiveCountVerdict {
+    match previous {
+        Some(prev) if prev != current => LiveCountVerdict::Changed {
+            previous: prev,
+            current,
+        },
+        _ => LiveCountVerdict::Ok,
+    }
+}
+
 /// Cap on how much a single warm-up back-off may widen the look-back span,
 /// as a multiple of the current span. Guards against a density estimate poisoned
 /// by a gap-dominated first attempt (a `--start` on a Monday sees only the
@@ -384,6 +422,8 @@ async fn pull_with_warmup(
 ) -> Result<Vec<EngineCandle>> {
     let mut pull_from = start - Duration::seconds(bar_secs * want_warmup as i64);
     let mut attempt: u32 = 0;
+    // Live-bar count from the previous attempt, for the invariance guard below.
+    let mut prev_live_count: Option<usize> = None;
     loop {
         tracing::info!(
             instrument = %symbol,
@@ -404,13 +444,32 @@ async fn pull_with_warmup(
             ));
         }
         let warmup_count = candles.iter().filter(|c| c.time < start).count();
+        let live_count = candles.len() - warmup_count;
         tracing::info!(
             count = candles.len(),
             warmup = warmup_count,
-            live = candles.len() - warmup_count,
+            live = live_count,
             attempt,
             "pulled candles"
         );
+
+        // The live window must be invariant across back-off attempts: widening
+        // only moves `pull_from` earlier, and `pull_end` never moves. A change
+        // means the data source handed us a different series, so scoring it
+        // would produce a plausible-looking but wrong result. Abort instead.
+        if let LiveCountVerdict::Changed { previous, current } =
+            check_live_count(prev_live_count, live_count)
+        {
+            return Err(eyre!(
+                "{symbol} {gran_label}: the live-bar count changed between warm-up back-off \
+                 attempts ({previous} -> {current}) while only the look-back was widened. The \
+                 candle source returned a different series for the same [start, end] window, so \
+                 this replay's result would not be comparable. (This was candle-cache's \
+                 merge-without-dedup bug, fixed in v3 — if you are seeing it again, the range \
+                 fetch is duplicating or dropping bars.)"
+            ));
+        }
+        prev_live_count = Some(live_count);
 
         if warmup_count >= want_warmup {
             return Ok(candles);
@@ -1045,6 +1104,51 @@ mod tests {
             extra,
             M15 * 60,
             "healthy extrapolation unchanged by the cap"
+        );
+    }
+
+    /// The first attempt has nothing to compare against.
+    #[test]
+    fn live_count_guard_passes_on_the_first_attempt() {
+        assert_eq!(check_live_count(None, 153), LiveCountVerdict::Ok);
+    }
+
+    /// The normal case: widening the look-back adds warm-up bars and leaves the
+    /// live window untouched.
+    #[test]
+    fn live_count_guard_passes_when_the_live_window_is_stable() {
+        assert_eq!(check_live_count(Some(153), 153), LiveCountVerdict::Ok);
+    }
+
+    /// The regression this guard exists for (candle-cache merge-without-dedup,
+    /// fixed in v3): a widened look-back came back with FEWER live bars, because
+    /// duplicates from an overlapping chunk merge displaced real bars off the
+    /// count-based trim. The replay then scored a different window — one
+    /// unchanged Coffee M15 plan reported −0.40R or −3.00R depending only on the
+    /// cursor. Silently scoring that is the failure mode; abort instead.
+    #[test]
+    fn live_count_guard_catches_a_shrinking_live_window() {
+        assert_eq!(
+            check_live_count(Some(153), 135),
+            LiveCountVerdict::Changed {
+                previous: 153,
+                current: 135
+            },
+            "the exact 153 -> 135 drop observed on Coffee M15"
+        );
+    }
+
+    /// Growth is equally wrong — the live window is bounded by `pull_end`, which
+    /// never moves, so gaining bars means the source changed its answer too.
+    #[test]
+    fn live_count_guard_catches_a_growing_live_window() {
+        assert_eq!(
+            check_live_count(Some(135), 153),
+            LiveCountVerdict::Changed {
+                previous: 135,
+                current: 153
+            },
+            "a GROWING live window is just as much a source inconsistency"
         );
     }
 

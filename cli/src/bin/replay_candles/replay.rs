@@ -592,9 +592,21 @@ pub async fn run(
         // otherwise only called per-enter inside `dispatch_enter`, so without this
         // the lifecycle's `list_pending_orders`/`resolve` would judge pending-ness
         // against the last fire bar, not the current one — a resting order would be
-        // listed (or not) as of stale time. Use the same `now` the lifecycle runs
-        // at so the cancel/restore timing is bar-accurate.
-        replay_broker.set_as_of(now);
+        // listed (or not) as of stale time.
+        //
+        // Bound at the bar's OPEN, NOT `now` (the bar CLOSE). Candle timestamps are
+        // bar-open times, so a bar's close equals the NEXT bar's open: every held
+        // read here (`list_pending_orders` / `list_open_positions` /
+        // `held_attempt_state`) calls `advance(as_of)`, whose `prefix_from_fire` is
+        // inclusive — a close-bounded `as_of` admits the next bar and can fill AND
+        // stop an order placed on THIS bar, a whole bar early
+        // (BUG-same-bar-fill-and-stop: phantom −1R losses whose presence depended
+        // on the replay's `--start` cursor). The tick above already bounds at
+        // `bar_open` for exactly this reason; the lifecycle must match.
+        //
+        // The lifecycle's own spread-hour gating still keys on the bar CLOSE — it
+        // takes `now` as an argument below, independent of the broker's held clock.
+        replay_broker.set_as_of(bar_open);
         let src = super::lifecycle::ReplayVerifiedSource::new(&replay_broker);
         // Replay is the SOLE owner of the record (no System 2 widened stops
         // offline), so it clears the record itself — `ClearRecord`, the default
