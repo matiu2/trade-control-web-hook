@@ -42,7 +42,7 @@ Each commit green (tests + clippy + fmt) before the next.
       `Ok(())` left all 293 green, and the `feaa019` one-point-neckline fix it
       contains was free to revert. Now one case per branch, each mutation-verified
       to redden ≥2 tests.
-- [ ] **6. `tv-arm --spec-in`** (2a) — arm from frozen spec, no TV. Bigger than
+- [x] **6. `tv-arm --spec-in`** DONE — (2a) — arm from frozen spec, no TV. Bigger than
       one commit; sequenced:
   - [x] **6a.** `MwPath.runup_start` (4713acb) — latent bug: direction + 2 gates
         need it, no trigger does.
@@ -54,7 +54,7 @@ Each commit green (tests + clippy + fmt) before the next.
         two untested behaviours: `close_on_news` had **no** test at all, and
         nothing asserted pause/news bundles land in disjoint dirs (both write
         `manifest.yaml`, so a collision silently clobbers one).
-  - [ ] **6d.** Extract `SetupInputs` + `arm_from_inputs`; `run` becomes a two-way
+  - [x] **6d.** DONE (5177d9a) — Extract `SetupInputs` + `arm_from_inputs`; `run` becomes a two-way
         branch (chart vs frozen). `mcp: Option<TvMcp>` makes "annotation is
         chart-only" structural.
 
@@ -79,7 +79,7 @@ Each commit green (tests + clippy + fmt) before the next.
         the one on screen, silently. Third instance of the dropped-geometry-field
         shape (after `runup_start` and `sr_levels`); see the pattern note in the
         `[[plan_geometry_dropped_field_pattern]]` memory.
-  - [ ] **6e.** `--spec-in` itself: `FrozenSpec` file, guards, round-trip test.
+  - [x] **6e.** DONE (d8fdbf5) — `--spec-in` itself: `FrozenSpec` file, guards, round-trip test.
         Reject `--market-entry`/`--stop-entry`/`--limit-entry` (position-tool SL/TP
         are TV drawing properties, inherently live-chart).
         **MUST carry `granularity`** — reviewer-flagged, verified. It feeds
@@ -92,7 +92,7 @@ Each commit green (tests + clippy + fmt) before the next.
         resolution isn't geometry); the frozen spec must carry it and either use it
         or refuse when the live chart disagrees. Noted in the `plan_geometry`
         module doc too.
-  - [ ] **6f.** `--start` strict-RFC3339 fix (seconds currently mandatory).
+  - [x] **6f.** DONE (ed804fb) — `--start` strict-RFC3339 fix (seconds currently mandatory).
 - [x] **7. Tier-2 scored corpus** (2b) — DONE (6fae7f2) — `cli/src/bin/replay_candles/baseline.rs`.
       `--bless-baseline <file>` records a batch; `--baseline <file>` scores a later
       batch against it. Deliberately **does not affect the exit code** — a moved
@@ -135,7 +135,20 @@ Each commit green (tests + clippy + fmt) before the next.
       on the two tracked fixtures: bless → clean re-diff (exactly +0.00) →
       regression diff → hand-edit warning → `--json` stdout stays one parseable
       object (diff to stderr) → missing baseline exits 4.
-- [ ] **8. `--save-matrix`** (4.3) — one-pass variants.
+- [x] **8. `--save-matrix`** (4.3) — DONE (c657290) — three entry rules ×
+      news on/off, armed six times from ONE `SetupInputs`. Six separate
+      invocations would each re-read chart + calendar, so the grid would compare
+      *setups* rather than gates. Works from a frozen spec (`--spec-in
+      --save-matrix`), which is the actual corpus workflow. Verified 6/6 cells
+      from a spec with no TV; columns genuinely differ (normal 7 rules, skip-bcr
+      5, strategy-v2 8 incl. `09-enter-qm`).
+
+      Caught in my own code by the e2e check: `apply` set
+      `skip_break_and_close`/`require_confirmation` for the v2 cell, which
+      `apply_aliases` does **not** do (only `--skip-bcr`/`--quasimodo` expand;
+      `strategy_v2` is read directly and adds the QM leg *alongside* the preps).
+      Plans matched by luck, flags didn't. Two tests now pin `apply` against
+      `apply_aliases`.
 
 ## Decisions made along the way
 
@@ -301,35 +314,42 @@ valuable: everything it found looked deliberate from the inside.
   open position (pre-existing, 0R either way — but the new economics module now
   trusts it as input, so worth a look before tier-2 scoring).
 
-### Next (unstarted)
-- **6d** extract `SetupInputs` + `arm_from_inputs`; `run` becomes chart-vs-frozen.
-      This is also where `pipeline.rs` finally gets under control — 6c left its
-      non-test body at 2269 lines (it only shrank by 6; the generic bundle
-      machinery gave back what the module extraction took out).
-- **6e** `--spec-in` + `FrozenSpec` + round-trip test.
-- **6f** `--start` strict-RFC3339 fix.
-- **8** `--save-matrix`. Independent of 6.
+### ALL EIGHT ITEMS DONE (2026-07-27)
 
-### The corpus is now usable end-to-end
-
-With 7 done, generating and scoring the 291-trade grid needs no further tooling:
+The full workflow, chart-to-answer:
 
 ```sh
-# one-time, per trade: capture the six variants (live arm, needs TV + broker)
-tv-arm-staging … --save-fixture trade-124-normal-news-on
-# … × 3 entry rules × news on/off
+# 1. ONCE per trade, on the chart: confirm the pattern, freeze it,
+#    and arm all six grid cells in one read.
+tv-arm-staging --spec-out setups/trade-124.json --save-matrix \
+  replay --save trade-124 --simulate true
+#    → fixtures trade-124-{normal,skip-bcr,strategy-v2}-{news-on,news-off}
 
-# offline from here — no TV, no broker, no network, parallel-safe
-replay-candles --test-mode --fixtures-glob '*' --bless-baseline corpus-v113.json \
-               --baseline-label v113
+# 2. FOREVER AFTER, offline — no TradingView, no broker, parallel-safe.
+#    Re-generate the grid after any engine change:
+tv-arm-staging --spec-in setups/trade-124.json --save-matrix \
+  replay --save trade-124 --simulate true
 
-# after an engine change
+# 3. Score the corpus and see what moved.
+replay-candles --test-mode --fixtures-glob '*' \
+  --bless-baseline corpus-v113.json --baseline-label v113
 replay-candles --test-mode --fixtures-glob '*' --baseline corpus-v113.json
 ```
 
-**8 (`--save-matrix`) is now a convenience, not a blocker** — it collapses the
-six capture runs into one pass. Worth doing at 291 trades; not on the critical
-path to an answer.
+Step 2 is the prize: the entry-rule / news question stops being a one-shot
+manual survey and becomes a **standing regression surface**. Every future engine
+change gets scored against 291 real historical setups before it ships — not
+"did the tests pass" but "did this earn or cost R across the whole book."
+
+**Known non-reproducibility, by design.** News windows are re-read at arm time,
+so a `--spec-in` re-arm is not bit-identical across days. That's correct (you
+want fresh news), and tier-2 handles it by tagging news-ON rows `[calendar]`;
+news-OFF rows carry the regression signal. Don't "fix" this by freezing the
+calendar — that would make those rows answer a question about a stale week.
+
+**What each of the 291 trades still needs from a human:** one live chart read to
+confirm the pattern is the one intended. That is the irreducible step, and it is
+now the *only* one.
 
 ### Open items for the operator
 - `broker-tradenation-v0.14.0` is pushed as a BRANCH (`feat/testable-account-store`)

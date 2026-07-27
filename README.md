@@ -3248,6 +3248,67 @@ Skipped preps are pre-fired directly to the worker so the entry's
 after the break-and-close / retest already happened, or for stock setups
 where those preps don't apply.
 
+### Re-armable setups: `--spec-out` / `--spec-in`
+
+Confirm a pattern on the chart **once**, freeze it, re-arm forever with no
+TradingView:
+
+```sh
+tv-arm --spec-out setups/trade-124.json plan-out plan.json   # once, on the chart
+tv-arm --spec-in  setups/trade-124.json plan-out plan.json   # forever after
+```
+
+A frozen setup can't drift: a rewound chart or a stale drawing is no longer able
+to hand back a different pattern than the one a human confirmed.
+
+**Frozen** (it *is* the setup): the drawn geometry, the **granularity**, the
+broker-qualified chart symbol, and the arm cursor.
+
+**Re-read every arm** (a frozen copy would be *stale*, not reproducible): the
+broker spread (a frozen one mis-sizes the entry), the live mid (it *is* "price
+at arm time"), the instrument-lookup pip/tick, and the **news calendar**.
+
+That last one has a consequence worth stating: a `--spec-in` arm is **not
+bit-reproducible across days**, because the calendar moves. This is correct
+behaviour — you want fresh news — and the tier-2 diff handles it by tagging
+news-ON rows `[calendar]`.
+
+Granularity is the sharp edge. It isn't geometry and isn't recoverable from the
+anchors, but it feeds `TrendlineCross.bar_seconds`, and trendline prices
+interpolate in *bar-index* space — so the same neckline at H1 vs H4 gives
+different prices at the same instant. Frozen here, a re-arm off a chart left on
+another timeframe can't silently reprice the neckline.
+
+The position-entry tools (`--market-entry` / `--stop-entry` / `--limit-entry`)
+are **refused** with `--spec-in`: their SL/TP are TradingView drawing properties
+with no frozen equivalent.
+
+### The entry-sensitivity grid: `--save-matrix`
+
+Arms three entry rules (`normal` / `skip-bcr` / `strategy-v2`) × news calendar
+on/off — six cells — from a **single** chart read:
+
+```sh
+tv-arm --spec-out setups/trade-124.json --save-matrix \
+  replay --save trade-124 --simulate true
+# → trade-124-{normal,skip-bcr,strategy-v2}-{news-on,news-off}
+```
+
+Reading once matters. Six separate `tv-arm` invocations would each re-classify
+roles against a chart that may have scrolled and re-read a calendar that may
+have moved, so the cells could differ by more than the flag under test — and the
+grid would be comparing *setups* rather than gates. One read means every cell
+shares byte-identical geometry.
+
+It composes with `--spec-in`, which is the actual corpus workflow: confirm once
+on the chart, then regenerate the whole grid offline after any engine change.
+
+Each cell suffixes the replay's `--save` name, so six cells land in six
+directories rather than overwriting each other. A cell that fails to arm is
+recorded and the run continues (a variant can legitimately be rejected); the
+summary names what's missing, and the exit code is non-zero unless all six
+armed — a partial grid must not read as complete.
+
 ### Gotchas worth knowing
 
 - **Trendline alerts need `extend_forward: true` in the payload.** TV's
