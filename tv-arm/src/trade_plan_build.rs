@@ -793,6 +793,11 @@ mod tests {
             trade_expiry: Some(vert(99_000)),
             tp_fib: Some(trend((10, 1.1700), (20, 1.1900))),
             prep_expiries: vec![("retest".to_string(), vert(98_000))],
+            // Two drawn S/R horizontals. Load-bearing for THIS test: `sr_levels`
+            // is `skip_serializing_if = "Vec::is_empty"`, so leaving them off
+            // would omit the key and the field would slip past the key-set
+            // assertion — the exact hole that let `runup_start` through.
+            sr_levels: vec![horz(1.1950), horz(1.1600)],
             ..Roles::default()
         };
         // The M/W half. H&S and M/W are mutually exclusive on a chart (an H&S has
@@ -825,6 +830,11 @@ mod tests {
             "trade_expiry_epoch",
             "prep_expiry_epochs",
             "mw_path",
+            // Decided YES, 2026-07-27: a re-arm must restore the drawn S/R
+            // levels. They gate whether `07-close-on-sr-reversal` is armed, and
+            // the failure without them is silent — the derived TP band keeps the
+            // vec non-empty, so the alert still fires, just off the wrong levels.
+            "sr_levels",
         ]
         .iter()
         .map(|s| s.to_string())

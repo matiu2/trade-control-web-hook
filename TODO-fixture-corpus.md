@@ -24,6 +24,24 @@ Each commit green (tests + clippy + fmt) before the next.
       is the field-level assertions added alongside it
       (`a_fully_drawn_chart_freezes_every_geometry_field`, which asserts the
       key-set union of an H&S and an M/W chart against an explicit list).
+
+      **A SECOND dropped field found 2026-07-27 (clean-slate review): `sr_levels`.**
+      Same class as `runup_start` — drawn geometry no *trigger* reads, so it looked
+      droppable — but `build_sr_ranges` widens each into a band and
+      `!spec.sr_reversal_ranges.is_empty()` gates whether `07-close-on-sr-reversal`
+      is armed at all. Worse than `runup_start` because it fails *quietly*: the
+      default-on `tp_resistance_band` (derived from the fib, which IS in the
+      geometry) keeps the vec non-empty, so a spec-in re-arm still emits the alert,
+      just off the wrong levels. No error, no missing rule — only a different exit
+      price, across 291 trades. Now in `PlanGeometry`; `resolve_hs_trade` and
+      `build_trade_spec` take **no `Roles` at all**, so the seam is closed by the
+      type system rather than by discipline. Two tests catch a regression (the
+      key-set guard + `hs_drawn_sr_plus_auto_band`), both mutation-verified.
+
+      Also closed: `check_required` had **zero** tests — replacing its body with
+      `Ok(())` left all 293 green, and the `feaa019` one-point-neckline fix it
+      contains was free to revert. Now one case per branch, each mutation-verified
+      to redden ≥2 tests.
 - [ ] **6. `tv-arm --spec-in`** (2a) — arm from frozen spec, no TV. Bigger than
       one commit; sequenced:
   - [x] **6a.** `MwPath.runup_start` (4713acb) — latent bug: direction + 2 gates

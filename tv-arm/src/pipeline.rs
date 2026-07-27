@@ -300,7 +300,6 @@ pub fn run(args: Args) -> Result<i32> {
         // prefers live TV; --pip-size / --tick-size override downstream.
         resolve_hs_trade(
             &args,
-            &roles,
             &geom,
             control.has_news(),
             &instrument,
@@ -643,23 +642,29 @@ impl From<color_eyre::eyre::Error> for ResolveError {
 /// the source of a wrong-direction bug when a stale invalidation from
 /// another setup got picked. Reading direction off raw point order was a
 /// *second* wrong-direction bug (AUD/CAD 2026-07: head at `points[1]`).
-/// Takes **both** `geom` and `roles`, which is not redundant: `geom` is the
-/// drawing-derived *geometry* (every level, line, and epoch this function reads),
-/// while `roles` is only forwarded to [`build_trade_spec`] for the one thing that
-/// isn't geometry — the drawn S/R levels (and the prep-expiry steps derived from
-/// them). The news fact arrives separately as `close_on_news`, because news
-/// windows are calendar-derived rather than drawn (see
-/// [`crate::control_windows`]). A spec-driven arm supplies the geometry from a
-/// frozen file and re-reads the calendar, so keeping the three apart is what
-/// makes that possible.
+/// Takes `geom` and **no `Roles`** — no chart drawing is read anywhere below
+/// this line, which is the property `--spec-in` needs. The news fact arrives
+/// separately as `close_on_news`, because news windows are calendar-derived
+/// rather than drawn (see [`crate::control_windows`]): a spec-driven arm supplies
+/// frozen geometry and re-reads the calendar, so those two must stay apart.
 ///
-/// Nine parameters trips clippy; splitting them into a struct would just relocate
-/// the same fields, and the geometry/roles split above is the distinction that
-/// actually matters.
+/// It used to take **both**, and the doc here justified that: `roles` was
+/// forwarded to [`build_trade_spec`] "for the one thing that isn't geometry — the
+/// drawn S/R levels (and the prep-expiry steps derived from them)". That was the
+/// bug, not an exception. Drawn S/R levels *are* geometry; they gate whether
+/// `07-close-on-sr-reversal` is armed at all, so a spec-in re-arm without them
+/// would have silently changed the exit. They now live in
+/// [`PlanGeometry::sr_levels`] (and the prep-expiry steps come from
+/// `prep_expiry_epochs`, which was already there), so the `Roles` parameter is
+/// gone. Caught by a clean-slate review, 2026-07-27 — the same class as
+/// `MwPath.runup_start`: drawn geometry no *trigger* reads, so it looked
+/// droppable.
+///
+/// Eight parameters still trips clippy; splitting them into a struct would just
+/// relocate the same fields.
 #[allow(clippy::too_many_arguments)]
 fn resolve_hs_trade(
     args: &Args,
-    roles: &Roles,
     geom: &PlanGeometry,
     close_on_news: bool,
     instrument: &str,
@@ -724,7 +729,7 @@ fn resolve_hs_trade(
         direction,
         expiry,
         tp,
-        roles,
+        geom,
         close_on_news,
         pip_size,
         tick_size,
@@ -1116,9 +1121,8 @@ fn check_required(geom: &PlanGeometry, args: &Args) -> std::result::Result<(), S
 /// context, not a cutoff to arm. Emitting it anyway would put the same
 /// name in both `skip_preps` and `prep_expiries`, which the CLI validator
 /// rejects (`can't expire a prep that's been dropped`).
-fn prep_expiry_steps(roles: &Roles, skip_preps: &[String]) -> Vec<String> {
-    roles
-        .prep_expiries
+fn prep_expiry_steps(geom: &PlanGeometry, skip_preps: &[String]) -> Vec<String> {
+    geom.prep_expiry_epochs
         .iter()
         .map(|(step, _)| step.clone())
         .filter(|step| !skip_preps.iter().any(|s| s == step))
@@ -1239,7 +1243,7 @@ fn build_trade_spec(
     direction: Direction,
     expiry: DateTime<Utc>,
     tp: f64,
-    roles: &Roles,
+    geom: &PlanGeometry,
     close_on_news: bool,
     pip_size: f64,
     tick_size: f64,
@@ -1258,7 +1262,7 @@ fn build_trade_spec(
         skip_preps.push("retest".to_string());
     }
     // Borrow `skip_preps` before it's moved into the struct literal below.
-    let prep_expiries = prep_expiry_steps(roles, &skip_preps);
+    let prep_expiries = prep_expiry_steps(geom, &skip_preps);
     let mut spec =
         cli::TradeSpec {
             pattern,
@@ -1310,7 +1314,7 @@ fn build_trade_spec(
             // rather than round-tripping to the stop. `07-close-on-sr-reversal`
             // OR-fires across every band. H&S only — see `tp_resistance_band`.
             sr_reversal_ranges: {
-                let mut bands = build_sr_ranges(roles, args.reversal_band_pct);
+                let mut bands = build_sr_ranges(geom, args.reversal_band_pct);
                 if !args.skip_tp_resistance {
                     bands.push(tp_resistance_band(tp, direction, args.tp_resistance_pct));
                 }
@@ -1452,12 +1456,15 @@ fn kind_to_broker(k: cli::BrokerKind) -> Broker {
     }
 }
 
-fn build_sr_ranges(roles: &Roles, band_pct: f64) -> Vec<[f64; 2]> {
+/// Widen each drawn S/R level into a `±band_pct` band.
+///
+/// Reads [`PlanGeometry::sr_levels`], not `roles.sr_levels`, so a spec-in re-arm
+/// gets the operator's drawn levels rather than silently arming with only the
+/// derived TP band — see that field's doc for why the failure is quiet.
+fn build_sr_ranges(geom: &PlanGeometry, band_pct: f64) -> Vec<[f64; 2]> {
     let pct = band_pct / 100.0;
-    roles
-        .sr_levels
+    geom.sr_levels
         .iter()
-        .filter_map(|d| d.points.first().map(|p| p.price))
         .map(|price| [round5(price * (1.0 - pct)), round5(price * (1.0 + pct))])
         .collect()
 }
@@ -2501,7 +2508,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            prep_expiry_steps(&roles, &[]),
+            prep_expiry_steps(&PlanGeometry::from_roles(&roles), &[]),
             vec!["break-and-close", "retest"]
         );
     }
@@ -2520,7 +2527,10 @@ mod tests {
             ..Default::default()
         };
         let skip = vec!["break-and-close".to_string()];
-        assert_eq!(prep_expiry_steps(&roles, &skip), vec!["retest"]);
+        assert_eq!(
+            prep_expiry_steps(&PlanGeometry::from_roles(&roles), &skip),
+            vec!["retest"]
+        );
     }
 
     // ===== calendar news-scope range ====================================
@@ -2779,6 +2789,97 @@ mod tests {
         }
     }
 
+    /// `check_required` is the guard between a malformed chart and an armed
+    /// trade, and it had **zero** tests: replacing its whole body with
+    /// `return Ok(())` left all 293 green (verified 2026-07-27). Worse, the
+    /// commit that changed it to read `geom.neckline` — fixing a bug where a
+    /// ONE-POINT drawing satisfied `roles.break_and_close.is_some()` — shipped
+    /// with no regression test, so reverting that fix was free.
+    ///
+    /// One case per branch, each dropping exactly one role from an otherwise
+    /// complete chart, asserting on the specific message rather than just "is
+    /// Err" (so a branch can't pass by another's error).
+    #[test]
+    fn check_required_names_each_missing_drawing() {
+        let complete = || hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        let args = mw_args(&[]);
+        assert!(
+            check_required(&PlanGeometry::from_roles(&complete()), &args).is_ok(),
+            "the complete chart must pass, or the cases below prove nothing"
+        );
+
+        // One case: the message `check_required` must produce, paired with the
+        // mutation that provokes it. A plain `fn` pointer — none of these capture.
+        type MissingCase = (&'static str, fn(&mut Roles));
+
+        let cases: [MissingCase; 4] = [
+            ("horizontal_line labeled 'too-high' or 'too-low'", |r| {
+                r.invalidation = None
+            }),
+            (
+                "trend_line labeled 'neckline' (or 'break-and-close')",
+                |r| r.break_and_close = None,
+            ),
+            ("fib_retracement (TP)", |r| r.tp_fib = None),
+            ("vertical_line labeled 'trade-expiry'", |r| {
+                r.trade_expiry = None
+            }),
+        ];
+
+        for (want, drop_one) in cases {
+            let mut roles = complete();
+            drop_one(&mut roles);
+            let err = check_required(&PlanGeometry::from_roles(&roles), &args)
+                .expect_err("a chart missing a required drawing must be rejected");
+            assert!(
+                err.contains(want),
+                "expected the error to name {want:?}, got: {err}"
+            );
+        }
+    }
+
+    /// The `feaa019` fix, pinned: a ONE-POINT drawing in the neckline slot is
+    /// **not** a usable neckline. `roles.break_and_close.is_some()` is true for
+    /// it (which is what the guard used to test), but `PlanGeometry` needs two
+    /// anchors to build a `Line`, so `geom.neckline` is `None` — and it is
+    /// `geom` that plan-building actually reads. Reverting the guard to the
+    /// `roles` form makes this test fail.
+    #[test]
+    fn check_required_rejects_a_one_point_neckline() {
+        let mut roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        // Present as a drawing, unusable as a line.
+        roles.break_and_close = Some(hline("neck", "neckline", 1.10));
+        let err = check_required(&PlanGeometry::from_roles(&roles), &mw_args(&[]))
+            .expect_err("a one-point neckline must be rejected");
+        assert!(err.contains("trend_line labeled 'neckline'"), "got: {err}");
+    }
+
+    /// `--skip-break-and-close` waives the neckline requirement — but only when
+    /// the retest is skipped too, since the retest derives from the same drawing.
+    /// Both halves asserted, so neither `args` branch is a free mutation.
+    #[test]
+    fn check_required_waives_the_neckline_only_when_both_preps_are_skipped() {
+        let mut roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        roles.break_and_close = None;
+        roles.retest = None;
+        let geom = PlanGeometry::from_roles(&roles);
+
+        // Skipping only break-and-close still leaves the retest needing a line.
+        let err = check_required(&geom, &mw_args(&["--skip-break-and-close"]))
+            .expect_err("the retest still needs the neckline");
+        assert!(err.contains("needed for the retest"), "got: {err}");
+
+        // Skipping both waives it entirely.
+        assert!(
+            check_required(
+                &geom,
+                &mw_args(&["--skip-break-and-close", "--skip-retest"])
+            )
+            .is_ok(),
+            "with both preps skipped no neckline is required"
+        );
+    }
+
     #[test]
     fn hs_direction_comes_from_fib_not_invalidation_label() {
         // Rule 1: the fib is authoritative. Head at 1.20 (0-reading, clicked
@@ -2791,7 +2892,6 @@ mod tests {
         let args = mw_args(&[]);
         let (dir, spec) = resolve_hs_trade(
             &args,
-            &roles,
             &PlanGeometry::from_roles(&roles),
             false,
             "EUR_USD",
@@ -2815,7 +2915,6 @@ mod tests {
         let args = mw_args(&[]);
         let (dir, _) = resolve_hs_trade(
             &args,
-            &roles,
             &PlanGeometry::from_roles(&roles),
             false,
             "EUR_USD",
@@ -2839,7 +2938,6 @@ mod tests {
         let args = mw_args(&[]);
         match resolve_hs_trade(
             &args,
-            &roles,
             &PlanGeometry::from_roles(&roles),
             false,
             "EUR_USD",
@@ -2864,7 +2962,6 @@ mod tests {
         let args = mw_args(&[]);
         match resolve_hs_trade(
             &args,
-            &roles,
             &PlanGeometry::from_roles(&roles),
             false,
             "EUR_USD",
@@ -2962,7 +3059,6 @@ mod tests {
         let args = mw_args(&[]);
         let (_dir, spec) = resolve_hs_trade(
             &args,
-            &roles,
             &PlanGeometry::from_roles(&roles),
             false,
             "EUR_USD",
@@ -2989,7 +3085,6 @@ mod tests {
         let args = mw_args(&["--skip-tp-resistance"]);
         let (_dir, spec) = resolve_hs_trade(
             &args,
-            &roles,
             &PlanGeometry::from_roles(&roles),
             false,
             "EUR_USD",
@@ -3014,7 +3109,6 @@ mod tests {
         let args = mw_args(&[]);
         let (_dir, spec) = resolve_hs_trade(
             &args,
-            &roles,
             &PlanGeometry::from_roles(&roles),
             false,
             "EUR_USD",
@@ -3134,7 +3228,7 @@ mod tests {
             Direction::Short,
             now() + chrono::Duration::days(1),
             150.0,
-            &Roles::default(),
+            &PlanGeometry::default(),
             false,
             0.01,
             // Distinct tick (finer than pip) to prove it's baked independently.
@@ -3161,7 +3255,7 @@ mod tests {
             Direction::Long,
             now() + chrono::Duration::days(1),
             1.05,
-            &Roles::default(),
+            &PlanGeometry::default(),
             false,
             0.0001,
             0.0001,
@@ -3180,7 +3274,7 @@ mod tests {
             Direction::Long,
             now() + chrono::Duration::days(1),
             1.05,
-            &Roles::default(),
+            &PlanGeometry::default(),
             false,
             0.0001,
             0.0001,
@@ -3211,7 +3305,7 @@ mod tests {
                 Direction::Long,
                 now() + chrono::Duration::days(1),
                 1.05,
-                &Roles::default(),
+                &PlanGeometry::default(),
                 close_on_news,
                 0.0001,
                 0.0001,
@@ -3259,7 +3353,7 @@ mod tests {
             Direction::Short,
             now() + chrono::Duration::days(1),
             1.05,
-            &Roles::default(),
+            &PlanGeometry::default(),
             false,
             0.0001,
             0.0001,
@@ -3474,7 +3568,7 @@ mod tests {
             Direction::Long,
             now() + chrono::Duration::days(1),
             1.05,
-            &Roles::default(),
+            &PlanGeometry::default(),
             false,
             pip_size,
             pip_size,

@@ -151,6 +151,28 @@ pub struct PlanGeometry {
     /// The M/W path anchors, when this is an M/W trade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mw_path: Option<MwPath>,
+    /// Prices of the operator's **drawn** S/R horizontals, in chart order.
+    ///
+    /// **No trigger reads these** — same shape as [`MwPath::runup_start`], and the
+    /// same reason they were nearly left out. They are load-bearing anyway:
+    /// `build_sr_ranges` widens each into a `±reversal_band_pct` band, and
+    /// `!spec.sr_reversal_ranges.is_empty()` decides whether the
+    /// `07-close-on-sr-reversal` alert is emitted **at all**. Drop them and a
+    /// position that would have closed for a partial win round-trips to its stop.
+    ///
+    /// This one fails *quietly*, which is what makes it worse than a plain missing
+    /// field. The band vec is **half**-reconstructible: `tp_resistance_band` is
+    /// derived from `fib_head_neckline` (present here) and is default-on, so a
+    /// spec-in re-arm still produces a non-empty vec and still emits the alert —
+    /// just without the operator's drawn levels. No error, no empty case, no
+    /// missing rule; only a different exit price. Across a 291-trade grid that is
+    /// exactly the "plausible numbers, wrong plan" failure the module doc warns
+    /// about for granularity.
+    ///
+    /// Prices only, not `Anchor`s: `build_sr_ranges` reads `points.first()?.price`
+    /// and ignores the time entirely (a horizontal has no meaningful `t`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sr_levels: Vec<f64>,
 }
 
 impl PlanGeometry {
@@ -196,6 +218,15 @@ impl PlanGeometry {
                     right_shoulder: d.points.get(3).map(|p| p.price),
                 })
             }),
+            // Drawn S/R horizontals — no trigger reads them, but they gate whether
+            // `07-close-on-sr-reversal` is armed. `filter_map` mirrors
+            // `build_sr_ranges`' own `points.first()` exactly: a degenerate
+            // point-less drawing is skipped rather than defaulted.
+            sr_levels: roles
+                .sr_levels
+                .iter()
+                .filter_map(|d| d.points.first().map(|p| p.price))
+                .collect(),
         }
     }
 
@@ -422,6 +453,7 @@ mod tests {
                 neckline: 1.10,
                 right_shoulder: None,
             }),
+            sr_levels: vec![1.0950, 1.1250],
         };
         let back: PlanGeometry =
             serde_json::from_str(&serde_json::to_string_pretty(&g).unwrap()).unwrap();
