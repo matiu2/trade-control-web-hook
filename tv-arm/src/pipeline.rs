@@ -69,8 +69,121 @@ const ARM_OUT_ROOT: &str = "/tmp/trade-control-arm";
 /// consumer still needs the raw drawings (the position-entry tools) and that
 /// path is inherently live-chart. See [`SetupInputs`]' module doc.
 pub fn run(args: Args) -> Result<i32> {
-    let (setup, roles) = read_setup_from_chart(&args)?;
-    arm_from_inputs(&args, setup, Some(&roles))
+    match args.spec_in.as_deref() {
+        // Frozen: no chart, and therefore no `Roles` — the position-entry tools
+        // are refused rather than silently skipped.
+        Some(path) => arm_from_inputs(&args, read_setup_from_spec(&args, path)?, None),
+        None => {
+            let (setup, roles) = read_setup_from_chart(&args)?;
+            if let Some(path) = args.spec_out.as_deref() {
+                let frozen = crate::frozen_setup::FrozenSetup::capture(
+                    setup.geom.clone(),
+                    setup.resolution.clone(),
+                    setup.chart_symbol.clone(),
+                    setup.start,
+                    args.spec_note.clone(),
+                );
+                frozen.write(path)?;
+                info!(
+                    path = %path.display(),
+                    resolution = %frozen.resolution,
+                    chart_symbol = %frozen.chart_symbol,
+                    "froze setup — re-arm with --spec-in"
+                );
+            }
+            arm_from_inputs(&args, setup, Some(&roles))
+        }
+    }
+}
+
+/// Rebuild [`SetupInputs`] from a frozen spec — **no TradingView**.
+///
+/// The frozen half (geometry, granularity, chart symbol, cursor) is read from
+/// the file. Everything else is re-resolved exactly as a live arm would:
+///
+/// - **broker + instrument** from the frozen chart symbol, through the same
+///   `instrument-lookup` catalog. Re-resolved rather than frozen so a catalog
+///   correction reaches old specs.
+/// - **precision** from the catalog. A live arm prefers the TradingView
+///   Symbol-info tick; with no chart there is nothing to prefer, so the catalog
+///   value stands — the same fallback a live arm takes when tv-mcp is
+///   unreachable.
+/// - **news / blackout windows** from the calendar, via the same
+///   [`resolve_control_windows`] the chart path uses. Deliberately re-read: a
+///   frozen calendar answers a question about a stale week.
+///
+/// Note the consequence — a spec-in arm is **not** bit-reproducible across days,
+/// because the calendar moves. That's why the tier-2 baseline diff tags news-ON
+/// rows `[calendar]` rather than treating their movement as a regression.
+fn read_setup_from_spec(args: &Args, path: &Path) -> Result<SetupInputs> {
+    let frozen = crate::frozen_setup::FrozenSetup::load(path)?;
+    // The position tools need drawings this path doesn't have. Refuse up front,
+    // with the reason — arming them off a frozen spec would silently place a
+    // different trade.
+    if args.position_entry_mode().is_some() {
+        return Err(eyre!(
+            "--market-entry / --stop-entry / --limit-entry read the drawn position \
+             tool's SL/TP from the chart, so they cannot be used with --spec-in \
+             (there are no drawings in a frozen setup)"
+        ));
+    }
+
+    let broker = resolve_broker(args, &frozen.chart_symbol)?;
+    let resolved = crate::instrument_resolution::resolve_for_broker(&frozen.chart_symbol, broker)?;
+    let instrument = resolved.broker_symbol.clone();
+    // No live chart, so no TV Symbol-info to prefer — the catalog precision is
+    // the answer, exactly as it is when a live arm can't reach tv-mcp.
+    let effective = crate::precision::EffectivePrecision {
+        pip_size: resolved.precision.pip_size,
+        tick_size: resolved.precision.tick_size,
+        tick_from_tv: false,
+    };
+
+    // `--start` on the command line overrides the frozen cursor, so a single
+    // spec can be re-armed at several cursors (which is what the entry-rule grid
+    // does). Absent, the frozen cursor stands.
+    let start = parse_start(args)?.or(frozen.start);
+    let cursor_unix = start.ok_or_else(|| {
+        eyre!(
+            "frozen setup {} has no cursor and no --start was given; a spec-in arm \
+             needs to know what instant counts as \"now\"",
+            path.display()
+        )
+    })?;
+    let prune_as_of = pick_prune_as_of(args, Utc::now(), cursor_unix, start);
+    let control = resolve_control_windows(
+        args,
+        &frozen.geom,
+        &resolved,
+        &frozen.resolution,
+        cursor_unix,
+        prune_as_of,
+    );
+
+    info!(
+        path = %path.display(),
+        chart_symbol = %frozen.chart_symbol,
+        resolution = %frozen.resolution,
+        instrument = %instrument,
+        broker = broker.as_str(),
+        captured_by = frozen.tv_arm_version.as_deref().unwrap_or("unknown"),
+        "armed from frozen setup (no TradingView)"
+    );
+
+    let raw_symbol = split_symbol(&frozen.chart_symbol).1.to_string();
+    Ok(SetupInputs {
+        geom: frozen.geom,
+        control,
+        instrument,
+        resolved,
+        broker,
+        effective,
+        resolution: frozen.resolution,
+        chart_symbol: frozen.chart_symbol,
+        raw_symbol,
+        start,
+        prune_as_of,
+    })
 }
 
 /// Read TradingView + the economic calendar into a [`SetupInputs`].
@@ -229,37 +342,14 @@ fn read_setup_from_chart(args: &Args) -> Result<(SetupInputs, Roles)> {
     //
     // `ControlWindows::new` prunes already-elapsed windows at construction, so
     // there is no un-pruned set for anything downstream to observe.
-    let control = if !args.skip_calendar_bars {
-        // Scope the news filter to the trade's own lifetime `[cursor, expiry]`,
-        // NOT the chart's visible area:
-        //   - left edge = the cursor (`--start` when given, else the last loaded
-        //     bar `bars_range.to`) — so only news at or after "live now" matters,
-        //     independent of how far left the chart is scrolled;
-        //   - right edge = the trade-expiry vertical, so only news the open trade
-        //     could still run into is considered.
-        // A missing/unparseable expiry collapses the range to empty (no windows)
-        // rather than fetching across all of time; check_required (step 3)
-        // surfaces the absent expiry drawing as a hard error shortly anyway.
-        let expiry_hint = read_trade_expiry(&geom).ok();
-        let calendar_range = calendar_scope_range(cursor_unix, expiry_hint);
-        match calendar_windows(
-            &state.resolution,
-            &resolved,
-            calendar_range,
-            args.news_before_hours,
-            args.news_after_hours,
-        ) {
-            Ok((blackout, news, markers)) => {
-                ControlWindows::new(blackout, news, markers, prune_as_of)
-            }
-            Err(e) => {
-                warn!(error = ?e, "calendar window resolution failed; continuing with no news/blackout windows");
-                ControlWindows::empty()
-            }
-        }
-    } else {
-        ControlWindows::empty()
-    };
+    let control = resolve_control_windows(
+        args,
+        &geom,
+        &resolved,
+        &state.resolution,
+        cursor_unix,
+        prune_as_of,
+    );
 
     // Cosmetic chart annotation (default on): draw a vertical line for exactly
     // the news events tv-arm reacts to — the armed set, post-prune, so drawn ==
@@ -560,6 +650,62 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
     }
 
     Ok(0)
+}
+
+/// Resolve blackout/news windows from the economic calendar.
+///
+/// Shared by the live-chart and frozen-spec paths, so a `--spec-in` arm gets the
+/// **same** window resolution a live arm does. That matters more than it looks:
+/// news is deliberately RE-READ rather than frozen (a frozen calendar answers a
+/// question about a stale week), so this is the one piece of "chart-half" work a
+/// frozen arm still has to do — and doing it differently would be a silent
+/// replay↔live divergence of exactly the kind the fixture corpus exists to find.
+///
+/// Windows come straight from the calendar at real event-minute precision. No
+/// chart lines are drawn and nothing is read back — the old draw + re-classify
+/// round-trip (which snapped every window to a bar boundary and could split a
+/// window straddling `--start` into an orphaned half) is gone.
+/// `--skip-calendar-bars` opts out entirely.
+///
+/// `ControlWindows::new` prunes already-elapsed windows at construction, so
+/// there is no un-pruned set for anything downstream to observe. A calendar
+/// failure warns and yields no windows rather than aborting the arm.
+fn resolve_control_windows(
+    args: &Args,
+    geom: &PlanGeometry,
+    resolved: &ResolvedInstrument,
+    resolution: &str,
+    cursor_unix: i64,
+    prune_as_of: AsOf,
+) -> ControlWindows {
+    if args.skip_calendar_bars {
+        return ControlWindows::empty();
+    }
+    // Scope the news filter to the trade's own lifetime `[cursor, expiry]`, NOT
+    // the chart's visible area:
+    //   - left edge = the cursor (`--start` when given, else the last loaded bar
+    //     `bars_range.to`) — so only news at or after "live now" matters,
+    //     independent of how far left the chart is scrolled;
+    //   - right edge = the trade-expiry vertical, so only news the open trade
+    //     could still run into is considered.
+    // A missing/unparseable expiry collapses the range to empty (no windows)
+    // rather than fetching across all of time; check_required surfaces the
+    // absent expiry drawing as a hard error shortly anyway.
+    let expiry_hint = read_trade_expiry(geom).ok();
+    let calendar_range = calendar_scope_range(cursor_unix, expiry_hint);
+    match calendar_windows(
+        resolution,
+        resolved,
+        calendar_range,
+        args.news_before_hours,
+        args.news_after_hours,
+    ) {
+        Ok((blackout, news, markers)) => ControlWindows::new(blackout, news, markers, prune_as_of),
+        Err(e) => {
+            warn!(error = ?e, "calendar window resolution failed; continuing with no news/blackout windows");
+            ControlWindows::empty()
+        }
+    }
 }
 
 /// Resolve `--broker` > `TRADE_CONTROL_BROKER` env > chart exchange.
@@ -2824,6 +2970,80 @@ mod tests {
     #[test]
     fn gate_neckline_pct_nan_errors() {
         assert!(gate_neckline_pct(f64::NAN, true).is_err());
+    }
+
+    // ===== --spec-in ====================================================
+
+    /// A frozen arm refuses the position tools **at runtime**, not just at the
+    /// clap layer.
+    ///
+    /// The clap `conflicts_with` catches an operator typing both flags, but it
+    /// is not the invariant: anything that builds `Args` directly — which every
+    /// test in this crate does, and which a future caller might — bypasses clap
+    /// entirely. Without this guard a frozen arm would reach
+    /// `run_position_entry` with `roles: None` and arm a *different trade* off
+    /// whatever the pattern path produced.
+    ///
+    /// Found by mutation: replacing the guard's condition with `false` left all
+    /// 314 tests green, so nothing was actually checking it.
+    #[test]
+    fn spec_in_refuses_the_position_tools_even_when_clap_is_bypassed() {
+        let spec = crate::frozen_setup::FrozenSetup::capture(
+            PlanGeometry::default(),
+            "60".into(),
+            "OANDA:EUR_USD".into(),
+            Some(1_700_000_000),
+            None,
+        );
+        let path = std::env::temp_dir().join(format!("spec-refuse-{}.json", std::process::id()));
+        spec.write(&path).expect("write spec");
+
+        // Built directly, exactly as a non-clap caller would — `market_entry`
+        // and `spec_in` both set, which clap would have rejected.
+        let mut args = mw_args(&[]);
+        args.market_entry = true;
+        args.spec_in = Some(path.clone());
+
+        let err = read_setup_from_spec(&args, &path)
+            .expect_err("a frozen arm has no drawn position tool")
+            .to_string();
+        assert!(
+            err.contains("position") && err.contains("--spec-in"),
+            "the error must say WHY, so the operator knows to arm off the chart: {err}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A spec with no cursor and no `--start` is refused rather than silently
+    /// defaulting to wall-clock "now".
+    ///
+    /// Defaulting would be wrong in the one case that matters: re-arming a
+    /// historical setup for the corpus. It'd prune every news window as elapsed
+    /// and score the trade against today's calendar instead of its own.
+    #[test]
+    fn a_cursorless_spec_without_start_is_refused() {
+        let spec = crate::frozen_setup::FrozenSetup::capture(
+            PlanGeometry::default(),
+            "60".into(),
+            "OANDA:EUR_USD".into(),
+            None, // no cursor
+            None,
+        );
+        let path = std::env::temp_dir().join(format!("spec-nocursor-{}.json", std::process::id()));
+        spec.write(&path).expect("write spec");
+
+        let err = read_setup_from_spec(&mw_args(&[]), &path)
+            .expect_err("no cursor anywhere")
+            .to_string();
+        assert!(err.contains("no cursor"), "err = {err}");
+
+        // …and supplying --start resolves it.
+        let args = mw_args(&["--start", "2026-06-20T17:00"]);
+        assert!(
+            read_setup_from_spec(&args, &path).is_ok(),
+            "--start must supply the missing cursor"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     // ===== M / W trade-spec resolution ==================================

@@ -206,19 +206,19 @@ pub struct Args {
     /// entry / SL / TP. Mutually exclusive with `--stop-entry` /
     /// `--limit-entry`. No pattern, preps, or geometry needed — just the
     /// drawn position + a trade-expiry.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "spec_in")]
     pub market_entry: bool,
 
     /// **Position-tool direct entry.** Rest a **stop** order at the
     /// drawn position's entry price. Mutually exclusive with
     /// `--market-entry` / `--limit-entry`.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "spec_in")]
     pub stop_entry: bool,
 
     /// **Position-tool direct entry.** Rest a **limit** order at the
     /// drawn position's entry price. Mutually exclusive with
     /// `--market-entry` / `--stop-entry`.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "spec_in")]
     pub limit_entry: bool,
 
     /// Anchor SL to Pine's `recent_high` (shorts) / `recent_low`
@@ -474,6 +474,34 @@ pub struct Args {
     /// `--register-plan` path it still overrides discovery + cursor if set.
     #[arg(long)]
     pub start: Option<String>,
+
+    /// After reading the chart, write the confirmed setup to this file so it can
+    /// be re-armed later with `--spec-in` — no TradingView needed.
+    ///
+    /// Freezes the drawn geometry, the granularity, the broker-qualified chart
+    /// symbol, and the arm cursor. Spread, live mid, and the news calendar are
+    /// deliberately **not** frozen: they're re-read on every arm, because a
+    /// frozen spread mis-sizes an entry and frozen news answers a question about
+    /// a stale calendar.
+    #[arg(long, value_name = "FILE", conflicts_with = "spec_in")]
+    pub spec_out: Option<PathBuf>,
+
+    /// Arm from a frozen setup written by `--spec-out`, with **no TradingView**.
+    ///
+    /// The pattern was confirmed once, on the chart, by a human. Re-arming from
+    /// the file means a rewound chart or a stale drawing can't hand back a
+    /// different pattern than the one that was confirmed.
+    ///
+    /// Incompatible with the position-entry tools (`--market-entry` /
+    /// `--stop-entry` / `--limit-entry`): their SL/TP are TradingView drawing
+    /// properties with no frozen equivalent.
+    #[arg(long, value_name = "FILE")]
+    pub spec_in: Option<PathBuf>,
+
+    /// Free-text note stored in a `--spec-out` file (e.g. the journal page this
+    /// setup came from). Never read when arming.
+    #[arg(long, value_name = "TEXT", requires = "spec_out")]
+    pub spec_note: Option<String>,
 
     /// Half-width of the price band around each chart-drawn
     /// `support` / `resistance` line, as a percent of the line's
@@ -851,6 +879,53 @@ pub enum PatternEntry {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// The position tools read the drawn position's SL/TP, which are TradingView
+    /// **drawing properties** — there is no frozen equivalent. Combining them
+    /// with `--spec-in` must fail at parse time, not arm some other trade.
+    ///
+    /// Checked at the clap layer *and* guarded again at runtime in
+    /// `read_setup_from_spec`: this catches the operator's typo with a good
+    /// message, that one keeps the invariant true for any future caller that
+    /// builds `Args` directly (every test in this crate does exactly that).
+    #[test]
+    fn position_tools_conflict_with_spec_in() {
+        for flag in ["--market-entry", "--stop-entry", "--limit-entry"] {
+            // Each is fine on its own …
+            Args::try_parse_from(["tv-arm", flag]).expect(flag);
+            // … and fine with --spec-out (that's a live arm that also freezes).
+            Args::try_parse_from(["tv-arm", flag, "--spec-out", "/tmp/s.json"])
+                .unwrap_or_else(|e| panic!("{flag} with --spec-out should parse: {e}"));
+            // … but not with --spec-in.
+            assert!(
+                Args::try_parse_from(["tv-arm", flag, "--spec-in", "/tmp/s.json"]).is_err(),
+                "{flag} must conflict with --spec-in"
+            );
+        }
+    }
+
+    /// `--spec-in` and `--spec-out` are opposite directions of the same file and
+    /// can't both be given; `--spec-note` only means something when writing.
+    #[test]
+    fn spec_flags_are_coherent() {
+        assert!(
+            Args::try_parse_from([
+                "tv-arm",
+                "--spec-in",
+                "/tmp/a.json",
+                "--spec-out",
+                "/tmp/b.json"
+            ])
+            .is_err(),
+            "reading and writing a spec in one run is incoherent"
+        );
+        assert!(
+            Args::try_parse_from(["tv-arm", "--spec-note", "hi"]).is_err(),
+            "--spec-note without --spec-out has nothing to annotate"
+        );
+        Args::try_parse_from(["tv-arm", "--spec-out", "/tmp/b.json", "--spec-note", "hi"])
+            .expect("--spec-note with --spec-out is the intended pairing");
+    }
 
     #[test]
     fn defaults_are_sensible() {

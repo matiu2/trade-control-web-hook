@@ -679,6 +679,90 @@ mod tests {
     /// That equality is what makes a re-armable spec possible: freeze the geometry
     /// once (operator confirms the right pattern), and every later rebuild is
     /// reproducible and can't pick a different drawing off the chart.
+    /// The same parity claim, but through an actual **`--spec-out` file**:
+    /// write, reload from disk, rebuild, compare.
+    ///
+    /// The sibling test below round-trips `PlanGeometry` through a JSON *string*.
+    /// This one goes through `FrozenSetup::write` → `load`, which is the step a
+    /// real `--spec-in` arm performs — a different code path with its own
+    /// `deny_unknown_fields`, its own version gate, and its own set of
+    /// `skip_serializing_if` attributes, any of which could drop a field that an
+    /// in-memory compare never sees.
+    ///
+    /// Same caveat as its sibling, stated so nobody over-trusts it: a field
+    /// `PlanGeometry` never carried is absent on both sides and this still
+    /// passes. The key-set guards are what cover that — and they have caught
+    /// three real dropped fields (`runup_start`, `sr_levels`, `anchors`).
+    #[test]
+    fn a_plan_from_a_spec_written_to_disk_matches_the_live_one() {
+        let alerts = vec![
+            alert("01-veto-too-high", Action::Veto),
+            alert("03-prep-break-and-close", Action::Prep),
+            alert("04-prep-retest", Action::Prep),
+            alert("02-veto-trade-expiry", Action::Invalidate),
+            alert("05-enter", Action::Enter),
+        ];
+        let roles = Roles {
+            invalidation: Some(horz(1.2000)),
+            break_and_close: Some(trend((10, 1.1900), (20, 1.1850))),
+            retest: Some(trend((10, 1.1900), (20, 1.1850))),
+            trade_expiry: Some(vert(99_000)),
+            tp_fib: Some(trend((10, 1.1700), (20, 1.1900))),
+            ..Roles::default()
+        };
+        let live = PlanGeometry::from_roles(&roles);
+
+        // Freeze to a real file and read it back — the `--spec-out` /
+        // `--spec-in` round trip.
+        let path = std::env::temp_dir().join(format!("spec-parity-{}.json", std::process::id()));
+        crate::frozen_setup::FrozenSetup::capture(
+            live.clone(),
+            "60".into(),
+            "OANDA:EUR_USD".into(),
+            Some(1_700_000_000),
+            None,
+        )
+        .write(&path)
+        .expect("write spec");
+        let reloaded = crate::frozen_setup::FrozenSetup::load(&path).expect("load spec");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            reloaded.geom, live,
+            "geometry must survive the file round-trip"
+        );
+        assert_eq!(
+            reloaded.resolution, "60",
+            "the granularity must survive — losing it reprices the whole neckline"
+        );
+
+        let build = |geom: &PlanGeometry| {
+            build_trade_plan(
+                "eurusd-hs-spec",
+                "EUR_USD",
+                &alerts,
+                ConvDirection::Short,
+                geom,
+                Granularity::H1,
+                false,
+                false,
+                None,
+                trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+                trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+                trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+                false,
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid"),
+                None,
+                None,
+            )
+        };
+        assert_eq!(
+            serde_json::to_value(build(&live)).expect("live"),
+            serde_json::to_value(build(&reloaded.geom)).expect("reloaded"),
+            "a plan armed from a spec file must be identical to the live one"
+        );
+    }
+
     #[test]
     fn a_plan_built_from_frozen_geometry_matches_one_built_from_drawings() {
         let alerts = vec![

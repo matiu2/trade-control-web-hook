@@ -23,6 +23,7 @@ use color_eyre::eyre::Result;
 
 mod args;
 mod control_windows;
+mod frozen_setup;
 mod geometry;
 mod instrument_recovery;
 mod instrument_resolution;
