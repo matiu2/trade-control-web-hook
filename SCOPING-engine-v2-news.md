@@ -1,5 +1,9 @@
 # SCOPING — engine-v2 economic-news systems
 
+> **engine-v2 is PARKED (2026-07-27)** — see `engine-v2/PARKED.md` for why,
+> what's built, and the resume signal. The news-reversal-close slice below is
+> the designated **resume point** if development restarts.
+
 Status: **pause slice DONE; news-reversal-close slice PENDING (design below).**
 
 ## Two separate systems (from the v1 map)

@@ -2,6 +2,10 @@
 //! system, built alongside the untouched live v1 engine (`trade-control-engine`)
 //! and judged by trade profitability, **not** byte-parity with v1.
 //!
+//! **STATUS: PARKED (2026-07-27)** — development is deliberately paused at a
+//! green, tested stopping point. See `PARKED.md` (crate root) for why, what's
+//! built, the resume point (news-reversal-close), and the resume signal.
+//!
 //! See `SCOPING-rule-based-engine.md`. The design in one line: **rules
 //! communicate through facts in a shared blackboard, not through a central
 //! `Phase` state machine.** Facts are keyed by `(line, kind)` and one rule
