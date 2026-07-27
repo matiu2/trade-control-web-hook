@@ -190,7 +190,7 @@ impl App {
     pub fn select_next(&mut self) {
         let n = self.visible().len();
         if n > 0 {
-            self.selected = (self.selected + 1) % n;
+            self.select((self.selected + 1) % n);
         }
     }
 
@@ -198,7 +198,29 @@ impl App {
     pub fn select_prev(&mut self) {
         let n = self.visible().len();
         if n > 0 {
-            self.selected = (self.selected + n - 1) % n;
+            self.select((self.selected + n - 1) % n);
+        }
+    }
+
+    /// Move the selection and fetch whatever the CURRENT screen needs for the
+    /// newly-selected plan. Changing rows on a deep screen switches which plan
+    /// that screen is showing, so it needs the same fetch a push would do —
+    /// without this the renderer sits on "loading timeline…" forever, since
+    /// nothing is actually loading (only `push_deeper` used to kick the jobs,
+    /// so `←` then `→` was the workaround). No-op on the list, which fetches
+    /// nothing.
+    fn select(&mut self, index: usize) {
+        if index == self.selected {
+            return;
+        }
+        self.selected = index;
+        // A deep screen is now showing a different plan — reset the per-plan
+        // view state so we don't keep the previous plan's scroll position.
+        self.replay_scroll = 0;
+        self.popup_scroll = 0;
+        if self.screen != Screen::List {
+            self.record_depth(self.screen.depth());
+            self.start_screen_jobs(self.screen);
         }
     }
 
@@ -1028,6 +1050,45 @@ mod tests {
         assert!(!app.search.active, "no search prompt off the list screen");
     }
 
+    /// Moving the selection on a DEEP screen must fetch the newly-selected
+    /// plan. Without this the timeline view sits on "loading timeline…" forever
+    /// — nothing was loading, and `←` then `→` was the only way to trigger it.
+    #[test]
+    fn selecting_another_plan_on_a_deep_screen_fetches_it() {
+        let mut app = App::from_rows(vec![row("t1"), row("t2")]);
+        app.set_screen(Screen::Timeline);
+        assert_eq!(app.in_flight_len(), 0);
+
+        app.select_next(); // now showing t2, which has nothing cached
+        assert_eq!(app.current_plan().map(|p| p.trade_id.as_str()), Some("t2"));
+        assert!(
+            app.in_flight.contains(&("t2".into(), JobKind::Timeline)),
+            "the newly-selected plan's timeline must actually be fetched"
+        );
+    }
+
+    /// The same move on the LIST fetches nothing — the list shows no per-plan
+    /// data, so arrowing through the backlog must stay free.
+    #[test]
+    fn selecting_on_the_list_fetches_nothing() {
+        let mut app = App::from_rows(vec![row("t1"), row("t2")]);
+        app.select_next();
+        assert_eq!(app.in_flight_len(), 0, "list navigation spawns no jobs");
+    }
+
+    /// Switching plans on a deep screen resets the per-plan scroll positions,
+    /// so the new plan's report doesn't open scrolled to the old one's offset.
+    #[test]
+    fn switching_plans_resets_scroll() {
+        let mut app = App::from_rows(vec![row("t1"), row("t2")]);
+        app.set_screen(Screen::Timeline);
+        app.scroll_replay(40);
+        app.scroll_popup(15);
+        app.select_next();
+        assert_eq!(app.replay_scroll, 0);
+        assert_eq!(app.popup_scroll, 0);
+    }
+
     /// Walking into a plan must NOT touch the live TradingView chart — the
     /// operator drives that with `l`. Only the timeline job is spawned.
     #[test]
@@ -1146,5 +1207,42 @@ mod tests {
                 .contains(&("hs-aud-cad-a07622da".into(), JobKind::Replay)),
             "with the chart loaded, replay fires"
         );
+    }
+}
+
+#[cfg(test)]
+mod e2e {
+    //! End-to-end against the LIVE worker (ignored by default; run with
+    //! `cargo test -p journal -- --ignored --nocapture`). Reproduces the
+    //! operator's report: on the Timeline screen, `↓` used to sit on
+    //! "loading timeline…" forever.
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn down_on_timeline_actually_loads_the_next_plan() {
+        let mut app = App::new().expect("fetch plan list from the live worker");
+        assert!(app.plans.len() > 1, "need 2+ plans to move between");
+
+        app.push_deeper(); // List -> Timeline, fetches plan #1
+        let first = app.current_plan().expect("plan 1").trade_id.clone();
+
+        app.select_next(); // the reported keypress
+        let second = app.current_plan().expect("plan 2").trade_id.clone();
+        assert_ne!(first, second);
+
+        // Drain until the newly-selected plan's timeline lands (or time out).
+        let mut waited = 0;
+        while app
+            .current_data()
+            .and_then(|d| d.timeline_json.as_ref())
+            .is_none()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            app.drain_jobs();
+            waited += 1;
+            assert!(waited < 100, "timeline for {second} never loaded (the bug)");
+        }
+        println!("OK: {second} loaded after ~{}ms of `↓` alone", waited * 200);
     }
 }
