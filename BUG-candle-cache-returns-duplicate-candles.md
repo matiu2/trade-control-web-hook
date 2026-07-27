@@ -1,12 +1,18 @@
-# Bug: the warm-up back-off loop silently SHRINKS the live window
+# Bug: candle-cache returns DUPLICATE candles, so replays score differently
 
 **Severity:** high — replays of the same plan on the same candles score
-differently depending on `--start` / `--warmup-bars`, because the two runs
-evaluate **different live windows**.
+-0.40R or -3.00R depending on `--start` / `--warmup-bars`, because some
+range fetches feed the engine **duplicated bars**.
 
-**One line:** widening the warm-up look-back (`pull_from` moves earlier,
-`pull_end` unchanged) sometimes returns **fewer live candles**, and
-`pull_with_warmup` accepts that silently.
+**One line:** `candle-cache` merges cached + freshly-fetched chunks with
+`sort_by_key` and **no dedup**, then truncates by COUNT — so duplicates both
+corrupt the series and push real bars off the end. `pull_with_warmup`
+accepts the result silently.
+
+> **Reading note:** the investigation reversed itself twice. Sections below
+> are in discovery order; the CONFIRMED section is authoritative. Early
+> framing ("widening loses tail bars") is **wrong** — it was a duplicate
+> count, not a loss.
 
 ---
 
@@ -31,8 +37,9 @@ Coffee M15, plan `ihs-coffee-a40c79a7`, `--end 2026-07-23T23:59`,
 
 `live` is `candles.len() - warmup_count` where `warmup_count` counts
 `c.time < start`. The back-off only ever moves `pull_from` **earlier**;
-`pull_end` is fixed. So the live half of the window MUST be invariant —
-losing 18 tail bars between attempt 1 and attempt 2 is the bug.
+`pull_end` is fixed, so the live half MUST be invariant. (Superseded
+framing: the 153 is the *inflated* number — 135 is the true bar count. See
+CONFIRMED below.)
 
 Because the live window differs, the detector sees different bars, so the
 golden count and every downstream entry differ. That is the whole
@@ -114,11 +121,9 @@ against the cached-range boundaries, which is why alignment (not distance)
 is the discriminator.
 
 Ragged `from` values come from `next_pull_from`'s density extrapolation
-(`cli/src/bin/replay_candles.rs`), which computes an instant from a
-bars-per-second estimate and never snaps it to the granularity grid. So the
-back-off loop's attempt 0/1 (naive `start - bar_secs * want`) are aligned
-and safe, while attempt 2+ (extrapolated) are ragged and lossy — exactly
-matching the observed `live=153, 153, 135, 135`.
+(`cli/src/bin/replay_candles.rs`), which never snaps to the granularity
+grid — which is why attempts 0/1 (aligned, duplicated) and attempt 2+
+(ragged, clean) differ, matching `live=153, 153, 135, 135`.
 
 Fix, in order:
 1. **candle-cache (the real defect)**: dedup by timestamp after every merge,
@@ -134,15 +139,11 @@ Fix, in order:
    which `from` values occur but does NOT fix the dedup bug — do not treat
    it as a fix.
 
-## Fixes (independent, do both)
+## Regression tests
 
-1. **candle-cache**: find why a widened range drops tail candles.
-2. **replay guard (defence in depth)**: `pull_with_warmup` must assert the
-   live count never decreases across attempts — keep the best-live result,
-   or fail loudly. Silently accepting a shrunken live window is what turned
-   a cache bug into a scoring bug. Matches the no-silent-degrade rule.
-
-## Regression test
-
-Replay one plan from two cursors that differ only in back-off attempt count
-and assert identical Net R (and identical live-bar count).
+- **candle-cache**: a range fetch must return strictly-increasing distinct
+  timestamps for any `from`, aligned or ragged. `cli/examples/
+  cache_range_tail_probe.rs` is the manual version; port it to a unit test
+  in the crate.
+- **replay**: replay one plan from two cursors that differ only in back-off
+  attempt count and assert identical Net R and identical live-bar count.
