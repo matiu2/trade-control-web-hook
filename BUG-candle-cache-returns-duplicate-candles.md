@@ -120,6 +120,31 @@ Whether a given `from` produces overlapping chunks depends on how it lands
 against the cached-range boundaries, which is why alignment (not distance)
 is the discriminator.
 
+### Checked and NOT the cause: TN synthetic/aggregated candles
+
+Worth ruling out explicitly, because TradeNation *does* synthesise some TFs
+and chunked fetches *do* deliberately overlap:
+
+- **Coffee M15 is TN-NATIVE**, not synthesised. `to_cm_granularity`
+  (`broker-tradenation-adapter/src/lib.rs:579`) maps M1/M15/H1/D1 to native
+  endpoints; only **H4 (=4xH1) and M5 (=5xM1)** are adapter-aggregated. So
+  no aggregation runs on this path at all.
+- **Chunked count-back requests overlap on purpose.** `chunk_windows`
+  (~620) gives each chunk `+1+SLACK` bars so adjacent chunks overlap rather
+  than leave a seam gap — a deliberate duplicate source. But the adapter
+  **dedups it correctly**: `get_bidask_candles` unions chunks through a
+  `HashMap<DateTime<Utc>, BidAskCandle>` (~322) so the seam collapses to one
+  bar.
+- `candle-cache`'s own `aggregation.rs` groups via a `HashMap` keyed on the
+  aligned bucket, so it cannot duplicate a bucket within one call — though
+  note it would happily aggregate *duplicated inputs* into a wrong OHLC
+  (`group_candles.len() >= multiplier` would pass spuriously). Not triggered
+  here, but a real hazard for H4/M5 once duplicates exist upstream.
+
+So the duplicates are introduced **downstream of the adapter, in
+candle-cache's merge** — the sites named above. The adapter shows the right
+pattern to copy.
+
 Ragged `from` values come from `next_pull_from`'s density extrapolation
 (`cli/src/bin/replay_candles.rs`), which never snaps to the granularity
 grid — which is why attempts 0/1 (aligned, duplicated) and attempt 2+
