@@ -11,6 +11,7 @@ use crate::cli;
 use crate::jobs::{self, JobKind, JobOutcome, JobResult};
 use crate::plan::{PlanDetail, PlanRow, parse_plan_export, parse_plan_list};
 use crate::screen::Screen;
+use crate::search::{self, SearchState};
 
 /// A transient status/error message shown in the footer.
 #[derive(Debug, Clone, Default)]
@@ -63,6 +64,10 @@ pub struct Confirm {
 
 pub struct App {
     pub plans: Vec<PlanRow>,
+    /// Index into the **visible** (search-filtered) rows, not into `plans` —
+    /// see [`App::visible`]. Keeping the selection in visible-space means the
+    /// highlight, `↑`/`↓`, and `current_plan()` all agree with what's drawn
+    /// while a `/` filter is applied.
     pub selected: usize,
     pub screen: Screen,
     /// Per-plan loaded data, keyed by trade_id.
@@ -90,6 +95,8 @@ pub struct App {
     /// The journal DB connection, opened lazily on the first `s` record and
     /// cached for the session (see [`App::record_db`]).
     record_db: Option<rusqlite::Connection>,
+    /// The `/` search prompt + live query. Filters the list screen.
+    pub search: SearchState,
 }
 
 /// Braille spinner frames for the "loading…" indicator.
@@ -117,6 +124,7 @@ impl App {
             replay_scroll: 0,
             needs_clear: false,
             record_db: None,
+            search: SearchState::default(),
         })
     }
 
@@ -141,9 +149,27 @@ impl App {
         SPINNER[(self.tick as usize) % SPINNER.len()]
     }
 
+    /// Indices into `plans` of the rows the `/` filter lets through, in list
+    /// order. No filter → every row. This is the list the UI draws and the one
+    /// `selected` indexes, so filtering can never desync the highlight from the
+    /// drawn rows.
+    pub fn visible(&self) -> Vec<usize> {
+        search::matching(&self.plans, &self.search.query)
+    }
+
+    /// The visible rows themselves, for the renderer.
+    pub fn visible_plans(&self) -> Vec<&PlanRow> {
+        self.visible()
+            .into_iter()
+            .filter_map(|i| self.plans.get(i))
+            .collect()
+    }
+
     /// The currently-highlighted plan (list) or the open plan (deeper screens).
+    /// `selected` is an index into the **visible** rows.
     pub fn current_plan(&self) -> Option<&PlanRow> {
-        self.plans.get(self.selected)
+        let idx = *self.visible().get(self.selected)?;
+        self.plans.get(idx)
     }
 
     /// Loaded data for the current plan, if any.
@@ -153,15 +179,81 @@ impl App {
 
     // -- list navigation ---------------------------------------------------
 
+    /// Move down one **visible** row, wrapping.
     pub fn select_next(&mut self) {
-        if !self.plans.is_empty() {
-            self.selected = (self.selected + 1) % self.plans.len();
+        let n = self.visible().len();
+        if n > 0 {
+            self.selected = (self.selected + 1) % n;
         }
     }
 
+    /// Move up one **visible** row, wrapping.
     pub fn select_prev(&mut self) {
-        if !self.plans.is_empty() {
-            self.selected = (self.selected + self.plans.len() - 1) % self.plans.len();
+        let n = self.visible().len();
+        if n > 0 {
+            self.selected = (self.selected + n - 1) % n;
+        }
+    }
+
+    // -- search ------------------------------------------------------------
+
+    /// Open the `/` prompt (list screen only). Filtering only makes sense over
+    /// the picker; deeper screens are about one already-chosen plan.
+    pub fn open_search(&mut self) {
+        if self.screen != Screen::List {
+            return;
+        }
+        self.search.open();
+        self.status = Status::info("search: type to filter, Enter to keep, Esc to clear");
+    }
+
+    /// Type a character into the query and re-clamp the selection — the match
+    /// set shrinks as you type, so the old index can fall off the end.
+    pub fn search_push(&mut self, c: char) {
+        self.search.push(c);
+        self.clamp_selection();
+    }
+
+    /// Backspace one character (the match set grows; still re-clamp for safety).
+    pub fn search_pop(&mut self) {
+        self.search.pop();
+        self.clamp_selection();
+    }
+
+    /// Close the prompt but keep the filter applied (Enter).
+    pub fn search_accept(&mut self) {
+        self.search.accept();
+        self.clamp_selection();
+        let n = self.visible().len();
+        self.status = if self.search.is_filtering() {
+            Status::info(format!(
+                "filter '{}' — {n} plan(s); Esc or / to change",
+                self.search.query
+            ))
+        } else {
+            Status::info("search cleared")
+        };
+    }
+
+    /// Close the prompt and drop the filter (Esc). The selection follows the
+    /// currently-highlighted plan back into the unfiltered list, so clearing the
+    /// filter doesn't jump you somewhere unrelated.
+    pub fn search_clear(&mut self) {
+        let keep = self.current_plan().map(|p| p.trade_id.clone());
+        self.search.clear();
+        self.selected = keep
+            .and_then(|id| self.plans.iter().position(|p| p.trade_id == id))
+            .unwrap_or(0);
+        self.status = Status::info("search cleared");
+    }
+
+    /// Keep `selected` inside the visible range after the match set changes.
+    fn clamp_selection(&mut self) {
+        let n = self.visible().len();
+        if n == 0 {
+            self.selected = 0;
+        } else if self.selected >= n {
+            self.selected = n - 1;
         }
     }
 
@@ -192,8 +284,8 @@ impl App {
 
     /// Record that the current plan reached at least `depth`.
     fn record_depth(&mut self, depth: u8) {
-        if let Some(p) = self.plans.get(self.selected) {
-            let entry = self.data.entry(p.trade_id.clone()).or_default();
+        if let Some(trade_id) = self.current_plan().map(|p| p.trade_id.clone()) {
+            let entry = self.data.entry(trade_id).or_default();
             entry.max_depth = entry.max_depth.max(depth);
         }
     }
@@ -526,9 +618,9 @@ impl App {
                 match fetch_plans() {
                     Ok(plans) => {
                         self.plans = plans;
-                        if self.selected >= self.plans.len() {
-                            self.selected = self.plans.len().saturating_sub(1);
-                        }
+                        // The deleted row leaves the (possibly filtered) list, so
+                        // re-clamp against the VISIBLE count, not `plans.len()`.
+                        self.clamp_selection();
                         self.status = Status::info(format!("deleted {}", confirm.trade_id));
                     }
                     Err(e) => self.status = Status::error(format!("refresh after delete: {e}")),
@@ -633,14 +725,15 @@ impl App {
             replay_scroll: 0,
             needs_clear: false,
             record_db: None,
+            search: SearchState::default(),
         }
     }
 
     /// Seed the current plan's cached data (detail + timeline) so deeper-screen
     /// render tests have something to draw.
     pub fn seed_current(&mut self, data: PlanData) {
-        if let Some(p) = self.plans.get(self.selected) {
-            self.data.insert(p.trade_id.clone(), data);
+        if let Some(trade_id) = self.current_plan().map(|p| p.trade_id.clone()) {
+            self.data.insert(trade_id, data);
         }
     }
 
@@ -650,8 +743,13 @@ impl App {
     }
 
     /// Move the selection to the plan with the given trade_id (test helper).
+    /// `selected` is in visible-space, so the position is looked up there.
     pub fn select_to(&mut self, trade_id: &str) {
-        if let Some(i) = self.plans.iter().position(|p| p.trade_id == trade_id) {
+        let pos = self
+            .visible()
+            .into_iter()
+            .position(|i| self.plans.get(i).map(|p| p.trade_id.as_str()) == Some(trade_id));
+        if let Some(i) = pos {
             self.selected = i;
         }
     }
@@ -798,6 +896,118 @@ mod tests {
         // Recording again upserts — still one row.
         app.record_current();
         assert_eq!(app.recorded_count(), 1, "re-record upserts, no duplicate");
+    }
+
+    /// Filtering must move the SELECTION with the rows, not just hide rows: the
+    /// highlight is an index into the visible list, so after a filter the
+    /// selected plan must be one that actually matches.
+    #[test]
+    fn filter_keeps_selection_on_a_visible_plan() {
+        let mut app = App::from_rows(vec![row("hs-eur-usd-1"), row("hs-aud-cad-2")]);
+        // Make the two rows distinguishable by instrument.
+        app.plans[0].instrument = "EUR_USD".into();
+        app.plans[1].instrument = "AUD_CAD".into();
+
+        app.selected = 1; // AUD_CAD
+        assert_eq!(
+            app.current_plan().map(|p| p.trade_id.as_str()),
+            Some("hs-aud-cad-2")
+        );
+
+        // Filter to EUR: only one row is visible, and the out-of-range selection
+        // clamps onto it rather than dangling past the end.
+        app.open_search();
+        for c in "eur".chars() {
+            app.search_push(c);
+        }
+        assert_eq!(app.visible().len(), 1);
+        assert_eq!(
+            app.current_plan().map(|p| p.trade_id.as_str()),
+            Some("hs-eur-usd-1"),
+            "selection follows the filter"
+        );
+    }
+
+    /// Navigation wraps over the VISIBLE rows, not the full list — otherwise
+    /// `↓` would walk into filtered-out plans.
+    #[test]
+    fn navigation_wraps_within_the_filtered_set() {
+        let mut app = App::from_rows(vec![row("a"), row("b"), row("c")]);
+        app.plans[0].instrument = "EUR_USD".into();
+        app.plans[1].instrument = "AUD_CAD".into();
+        app.plans[2].instrument = "EUR_GBP".into();
+
+        app.open_search();
+        for c in "eur".chars() {
+            app.search_push(c);
+        }
+        assert_eq!(app.visible().len(), 2, "two EUR plans match");
+
+        assert_eq!(app.current_plan().map(|p| p.trade_id.as_str()), Some("a"));
+        app.select_next();
+        assert_eq!(
+            app.current_plan().map(|p| p.trade_id.as_str()),
+            Some("c"),
+            "skips the filtered-out AUD_CAD"
+        );
+        app.select_next();
+        assert_eq!(
+            app.current_plan().map(|p| p.trade_id.as_str()),
+            Some("a"),
+            "wraps at the end of the FILTERED set"
+        );
+    }
+
+    /// Clearing the filter (Esc) keeps you on the plan you had highlighted,
+    /// rather than jumping to whatever now sits at that index.
+    #[test]
+    fn clearing_the_filter_keeps_the_same_plan_selected() {
+        let mut app = App::from_rows(vec![row("a"), row("b"), row("c")]);
+        app.plans[0].instrument = "EUR_USD".into();
+        app.plans[1].instrument = "AUD_CAD".into();
+        app.plans[2].instrument = "EUR_GBP".into();
+
+        app.open_search();
+        for c in "eur".chars() {
+            app.search_push(c);
+        }
+        app.select_next(); // the second EUR plan, "c"
+        assert_eq!(app.current_plan().map(|p| p.trade_id.as_str()), Some("c"));
+
+        app.search_clear();
+        assert_eq!(app.visible().len(), 3, "filter dropped");
+        assert_eq!(
+            app.current_plan().map(|p| p.trade_id.as_str()),
+            Some("c"),
+            "still on the same plan after clearing"
+        );
+    }
+
+    /// A query matching nothing shows nothing and has no current plan — the
+    /// actions that need one must no-op rather than panic or act on a stale row.
+    #[test]
+    fn no_match_leaves_no_current_plan() {
+        let mut app = App::from_rows(vec![row("a")]);
+        app.open_search();
+        for c in "zzz".chars() {
+            app.search_push(c);
+        }
+        assert!(app.visible().is_empty());
+        assert!(app.current_plan().is_none());
+        // Actions that read the current plan are safe no-ops.
+        app.push_deeper();
+        assert_eq!(app.screen, Screen::List, "cannot drill into nothing");
+        app.request_delete();
+        assert!(app.confirm.is_none(), "no delete confirm without a plan");
+    }
+
+    /// The prompt only opens on the list — deeper screens are about one plan.
+    #[test]
+    fn search_does_not_open_on_deeper_screens() {
+        let mut app = App::from_rows(vec![row("a")]);
+        app.set_screen(Screen::Replay);
+        app.open_search();
+        assert!(!app.search.active, "no search prompt off the list screen");
     }
 
     /// Replay must not fire until the chart is loaded (it re-arms from the live

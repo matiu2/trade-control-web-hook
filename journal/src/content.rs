@@ -36,10 +36,22 @@ fn detail(app: &App) -> String {
         .unwrap_or_else(|| "(no plan detail loaded)".to_string())
 }
 
-/// The plan list: every row (not just the on-screen ones), tab-aligned.
+/// The plan list: every row (not just the on-screen ones), tab-aligned. With a
+/// `/` filter applied this copies the **matching** rows — the copy mirrors what
+/// the operator is looking at, which is the point of having filtered.
 fn list(app: &App) -> String {
-    let mut out = format!("Plans ({}) — oldest event first\n", app.plans.len());
-    for p in &app.plans {
+    let rows = app.visible_plans();
+    let mut out = if app.search.is_filtering() {
+        format!(
+            "Plans ({}/{} matching '{}') — oldest event first\n",
+            rows.len(),
+            app.plans.len(),
+            app.search.query.trim(),
+        )
+    } else {
+        format!("Plans ({}) — oldest event first\n", app.plans.len())
+    };
+    for p in rows {
         out.push_str(&list_row(p));
         out.push('\n');
     }

@@ -1,14 +1,26 @@
 //! The plan-picker list (depth 0).
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use crate::app::App;
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
+    // While the `/` prompt is open (or a filter is applied), a one-line search
+    // bar sits under the list so the operator can see what they're typing.
+    let (list_area, search_area) = if app.search.active || app.search.is_filtering() {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
+
     // A visited plan (max_depth ≥ 1) gets a subtle marker so you can see what
     // you've already worked through.
     let visited = |trade_id: &str| {
@@ -18,8 +30,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             .unwrap_or(false)
     };
 
-    let items: Vec<ListItem> = app
-        .plans
+    // Only the rows the `/` filter lets through; `app.selected` indexes these.
+    let rows = app.visible_plans();
+    let items: Vec<ListItem> = rows
         .iter()
         .map(|p| {
             let marker = if visited(&p.trade_id) { "· " } else { "  " };
@@ -53,7 +66,17 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let title = format!("Plans ({}) — oldest event first", app.plans.len());
+    // With a filter on, the title shows matched-of-total so it's obvious the
+    // list is a subset (and not that plans went missing).
+    let title = if app.search.is_filtering() {
+        format!(
+            "Plans ({}/{} matching) — oldest event first",
+            rows.len(),
+            app.plans.len()
+        )
+    } else {
+        format!("Plans ({}) — oldest event first", app.plans.len())
+    };
     let list = List::new(items)
         .block(crate::ui::titled_block(&title))
         .highlight_style(
@@ -64,10 +87,61 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .highlight_symbol("▶ ");
 
     let mut state = ListState::default();
-    if !app.plans.is_empty() {
+    if !rows.is_empty() {
         state.select(Some(app.selected));
     }
-    f.render_stateful_widget(list, area, &mut state);
+    f.render_stateful_widget(list, list_area, &mut state);
+
+    if let Some(search_area) = search_area {
+        render_search_bar(f, app, search_area, rows.is_empty());
+    }
+}
+
+/// The `/` search bar: a live-editing prompt while open, a dimmed reminder of
+/// the applied filter once closed. A query matching nothing says so explicitly
+/// rather than leaving an unexplained empty list.
+fn render_search_bar(f: &mut Frame, app: &App, area: Rect, no_matches: bool) {
+    let line = if app.search.active {
+        // A block cursor marks the insertion point — there's no real terminal
+        // cursor in the alternate screen here.
+        let style = if no_matches {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        Line::from(vec![
+            Span::styled("/", style.add_modifier(Modifier::BOLD)),
+            Span::styled(app.search.query.clone(), style),
+            Span::styled("█", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if no_matches {
+                    "  no matches".to_string()
+                } else {
+                    String::new()
+                },
+                Style::default().fg(Color::Red),
+            ),
+            Span::styled(
+                "   Enter keep · Esc clear",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("filter: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.search.query.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "   / edit · Esc clear",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    };
+    f.render_widget(Paragraph::new(line), area);
 }
 
 /// A compact Brisbane `MM-DD HH:MM` for the last-event column. Echoes the raw
