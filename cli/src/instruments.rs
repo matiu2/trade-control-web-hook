@@ -9,7 +9,7 @@
 //! `tv_arm_hs.py`'s `instrument_for()`. The broker dispatch stays in place
 //! so a future OANDA implementation slots in without touching callers.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use color_eyre::eyre::{Result, eyre};
@@ -75,8 +75,26 @@ pub fn load_cache(
 /// public so `account add` can run the same check before touching
 /// Cloudflare.
 pub fn require_local_tn_account(name: &str) -> Result<()> {
-    let names = tradenation_api::accounts::list_accounts()
-        .map_err(|e| eyre!("reading local TradeNation account store: {e}"))?;
+    require_local_tn_account_in(name, None)
+}
+
+/// [`require_local_tn_account`] against an explicit store path.
+///
+/// `store` lets tests pin the lookup to a tempdir — mirroring
+/// [`load_cache`]'s `path` parameter. `None` uses the operator's real store.
+///
+/// This exists because the default path is **not** side-effect free: the
+/// env-resolving `accounts::list_accounts` routes through `load_store`, which
+/// runs legacy migration *before* checking the store exists, and that migration
+/// can `remove_file` / `save_to` the real `~/.config/tradenation/accounts.enc`.
+/// A unit test must never be able to reach that, and the `_in` variant skips
+/// migration entirely (see `broker-tradenation-v0.14.0`).
+pub fn require_local_tn_account_in(name: &str, store: Option<&Path>) -> Result<()> {
+    let names = match store {
+        Some(path) => tradenation_api::accounts::list_accounts_in(path),
+        None => tradenation_api::accounts::list_accounts(),
+    }
+    .map_err(|e| eyre!("reading local TradeNation account store: {e}"))?;
     if names.iter().any(|(n, _)| n == name) {
         return Ok(());
     }
@@ -204,18 +222,57 @@ mod tests {
         );
     }
 
+    /// Pinned to a temp store, NOT the operator's real one.
+    ///
+    /// This used to call `require_local_tn_account`, which resolves
+    /// `dirs::config_dir()` and therefore read the real
+    /// `~/.config/tradenation/accounts.enc` — and reached `load_store`'s legacy
+    /// migration, which can `remove_file` / `save_to` that file. The test passed
+    /// either way (a bogus name is absent from any store), which is exactly why
+    /// nobody noticed a unit test was touching a live credential store.
+    ///
+    /// It was also a race: `expiry.rs`'s tests `set_var("XDG_CONFIG_HOME")`
+    /// process-wide, so which store this read depended on scheduling.
     #[test]
     fn require_local_tn_account_errors_for_unknown() {
-        // Pick a name with random suffix to keep the test stable
-        // even if the user happens to have other named demos locally.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("accounts.enc");
         let bogus = "nonexistent-tv-arm-test-account-zzz12345";
-        let err = require_local_tn_account(bogus).unwrap_err();
+
+        let err = require_local_tn_account_in(bogus, Some(&store)).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains(bogus), "got: {msg}");
         assert!(
             msg.contains("tradenation account create"),
             "expected fix-it hint; got: {msg}",
         );
+        // A read must not create the store, nor migrate anything into the sandbox.
+        assert!(!store.exists(), "the lookup must not create a store");
+    }
+
+    /// The positive case, now that a store can be seeded: a name that IS present
+    /// resolves. Previously untestable without the operator's real store.
+    #[test]
+    fn require_local_tn_account_accepts_a_seeded_name() {
+        use tradenation_api::accounts::{Account, AccountKind, AccountStore, save_store_in};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("accounts.enc");
+
+        let mut s = AccountStore::default();
+        s.accounts.insert(
+            "reversals".to_owned(),
+            Account {
+                username: "demo".into(),
+                password: "pw".into(),
+                kind: AccountKind::Demo,
+                created_at: chrono::Utc::now(),
+            },
+        );
+        save_store_in(&s, &store).unwrap();
+
+        require_local_tn_account_in("reversals", Some(&store)).unwrap();
+        // And a different name in the same store still errors.
+        assert!(require_local_tn_account_in("other", Some(&store)).is_err());
     }
 
     #[test]

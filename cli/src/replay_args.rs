@@ -167,6 +167,7 @@ So does a successful run with `--simulate false` (nothing was simulated).";
 /// binary and `tv-arm ... replay`.
 #[derive(Parser, Debug)]
 #[command(name = "replay-candles")]
+#[command(version = env!("GIT_VERSION"))]
 #[command(about = "Replay a candle window through the engine's decision logic, offline")]
 #[command(after_long_help = EXIT_CODE_HELP)]
 pub struct ReplayArgs {
@@ -306,6 +307,50 @@ pub struct ReplayArgs {
     #[arg(long, value_name = "TEXT", requires = "save")]
     pub message: Option<String>,
 
+    /// Which entry rule the plan was armed with, recorded into the saved fixture's
+    /// `meta.json` as the grid's **column** axis: `normal` / `skip-bcr` /
+    /// `strategy-v2` (any other value is stored verbatim). Passed through by
+    /// `tv-arm … replay --save`, which knows its own flags; a fixture saved
+    /// without it reads as `normal`.
+    #[arg(long, value_name = "RULE", requires = "save")]
+    pub arm_entry_rule: Option<String>,
+
+    /// Record that the plan was armed with `--skip-calendar-bars` (news windows
+    /// suppressed) — the grid's **row** axis.
+    ///
+    /// Must be passed explicitly because it is **not inferable** from the saved
+    /// plan: a plan with no pause rules could equally mean "the calendar ran and
+    /// found no events in the window" or "the calendar was skipped".
+    #[arg(long, requires = "save")]
+    pub arm_skip_calendar_bars: bool,
+
+    /// Record that the plan was armed with `--skip-golden`.
+    #[arg(long, requires = "save")]
+    pub arm_skip_golden: bool,
+
+    /// The `--start` cursor as typed at arm time, stored verbatim so the exact
+    /// spelling round-trips for a later re-arm.
+    #[arg(long, value_name = "TS", requires = "save")]
+    pub arm_start: Option<String>,
+
+    /// The **broker-qualified** TradingView symbol the geometry was read from,
+    /// e.g. `TRADENATION:EURUSD`. Record it qualified: a bare `EURUSD` silently
+    /// resolves to the OANDA feed, so an unqualified capture can be off the wrong
+    /// price data and produce a plausible-but-wrong number.
+    #[arg(long, value_name = "SYMBOL", requires = "save")]
+    pub arm_chart_symbol: Option<String>,
+
+    /// `git describe` of the tv-arm build that armed the plan. (The engine version
+    /// is stamped automatically from this binary's own build.)
+    #[arg(long, value_name = "VERSION", requires = "save")]
+    pub arm_tv_arm_version: Option<String>,
+
+    /// A pointer back to the journal page this fixture documents, e.g.
+    /// `trade-124`. Makes the corpus cross-referenceable with the journal in both
+    /// directions — and "which pages still lack a fixture?" answerable.
+    #[arg(long, value_name = "REF", requires = "save")]
+    pub trade_ref: Option<String>,
+
     /// Replay a saved fixture **offline**: load plan + candles + meta from
     /// `<fixtures-dir>/<--fixture>/` instead of pulling from the broker (no
     /// network, no env vars, no TradingView). Requires `--fixture`.
@@ -315,6 +360,42 @@ pub struct ReplayArgs {
     /// Name of the fixture under `<fixtures-dir>/` to replay with `--test-mode`.
     #[arg(long, value_name = "NAME")]
     pub fixture: Option<String>,
+
+    /// Replay **every** fixture whose directory name matches this glob (`*` and
+    /// `?`), instead of the single `--fixture`. Turns grid generation into a pure
+    /// offline transform: `--test-mode --fixtures-glob 'trade-124-*' --json`.
+    ///
+    /// A failing fixture is **recorded and the batch continues** — one bad fixture
+    /// can't hide the rest. Combines with `--check` (gate the whole set) and
+    /// `--rebless` (re-bless the whole set).
+    #[arg(
+        long,
+        value_name = "GLOB",
+        requires = "test_mode",
+        conflicts_with = "fixture"
+    )]
+    pub fixtures_glob: Option<String>,
+
+    /// Emit the result as JSON on stdout instead of the human report.
+    ///
+    /// **Always emits an object, even when the replay fails** — a failure is a row
+    /// with `ok: false`, an `error`, and a null `outcome`, never a missing row. So
+    /// absence of output can only mean the process died unhandled, and a
+    /// legitimately flat run (`ok: true`, `net_r: 0.0`) is never confused with a
+    /// crash. That distinction is why this exists: scraping `Net R:` off stdout
+    /// couldn't make it, and a concurrent batch silently lost cells because of it.
+    ///
+    /// **`--test-mode` only**, and enforced by clap rather than trusted. The
+    /// guarantee above is a property of the fixture path, which owns a row schema
+    /// (`BatchResult`) and can therefore describe its own failure. The live
+    /// `--plan` path has no such schema: it emitted *zero bytes* under `--json` on
+    /// failure (the terminal `FailureLine` is suppressed to keep stdout pure, and
+    /// nothing replaced it), and the human report on success — the exact ambiguity
+    /// this flag exists to remove, on the path an operator would use to *build* a
+    /// corpus. A `requires` is the honest fix: better to refuse the flag than to
+    /// invent a second, half-specified schema a driver would have to sniff.
+    #[arg(long, requires = "test_mode")]
+    pub json: bool,
 
     /// Under `--test-mode`, also compare the replay's outcome against the
     /// fixture's `expected.json` and exit non-zero on any mismatch (printing the
@@ -333,6 +414,36 @@ pub struct ReplayArgs {
     /// repo root (relative to the cli crate's manifest).
     #[arg(long)]
     pub fixtures_dir: Option<PathBuf>,
+
+    /// Score this batch against a blessed baseline file and report what moved:
+    /// aggregate Net R, which fixtures changed, and by how much.
+    ///
+    /// This is **tier 2** — the scored corpus, not the pass/fail gate. It does
+    /// *not* affect the exit code on its own: a moved number is information, not
+    /// a failure. At 291 trades a legitimate engine fix moves hundreds of cells,
+    /// and if a bug fix moves nothing it either didn't matter or isn't fixed. Use
+    /// `--check` when you want a gate.
+    ///
+    /// Batch only — a one-fixture diff is just the fixture's own number.
+    #[arg(long, value_name = "FILE", requires = "fixtures_glob")]
+    pub baseline: Option<PathBuf>,
+
+    /// Write this batch's results to a baseline file, to be diffed against later
+    /// with `--baseline`.
+    ///
+    /// Only **successful** fixtures are blessed. A failed one is simply absent —
+    /// we don't know what it earns, and recording a `0.0` for it would bake an
+    /// infrastructure blip into the corpus as a real flat trade.
+    ///
+    /// Overwrites without asking, like `--rebless`. Keep baselines in git; the
+    /// review of a re-bless is the diff.
+    #[arg(long, value_name = "FILE", requires = "fixtures_glob")]
+    pub bless_baseline: Option<PathBuf>,
+
+    /// Label recorded in a blessed baseline (e.g. `v113`), shown in later diffs
+    /// as the "from" side. Defaults to the engine version the fixtures carry.
+    #[arg(long, value_name = "LABEL", requires = "bless_baseline")]
+    pub baseline_label: Option<String>,
 }
 
 #[cfg(test)]

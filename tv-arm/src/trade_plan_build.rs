@@ -26,13 +26,12 @@ use trade_control_conventions::{AlertBasename, Direction as ConvDirection, RuleK
 use trade_control_core::broker::Granularity;
 use trade_control_core::intent::{Direction, Intent};
 use trade_control_core::trade_plan::{
-    BarEvent, ConditionRule, CrossDir, FireMode, LinePoint, TradePlan, Trigger,
+    BarEvent, ConditionRule, CrossDir, FireMode, TradePlan, Trigger,
 };
 
 use crate::geometry::pcl_exhausted_price;
 use crate::mw_geometry::{abort_level, cancel_level, highest_shoulder, overshoot_level};
-use crate::roles::Roles;
-use trading_view::drawings::Drawing;
+use crate::plan_geometry::{Line, PlanGeometry};
 
 /// Arm-time inputs for the pullback prep, captured by the pipeline and threaded
 /// into the plan build. `anchor_open` is the live mid at arm time (baked onto the
@@ -106,7 +105,7 @@ pub fn build_trade_plan(
     instrument: &str,
     alerts: &[BuiltAlert],
     direction: ConvDirection,
-    roles: &Roles,
+    geom: &PlanGeometry,
     granularity: Granularity,
     is_mw: bool,
     shadow: bool,
@@ -121,7 +120,7 @@ pub fn build_trade_plan(
 ) -> TradePlan {
     let rules = alerts
         .iter()
-        .filter_map(|alert| build_rule(alert, direction, roles, granularity, is_mw, pullback_arm))
+        .filter_map(|alert| build_rule(alert, direction, geom, granularity, is_mw, pullback_arm))
         .collect();
 
     TradePlan {
@@ -233,20 +232,13 @@ impl WindowAlert for trade_control_cli::BuiltNewsAlert {
 fn build_rule(
     alert: &BuiltAlert,
     direction: ConvDirection,
-    roles: &Roles,
+    geom: &PlanGeometry,
     granularity: Granularity,
     is_mw: bool,
     pullback_arm: Option<PullbackArm>,
 ) -> Option<ConditionRule> {
     let basename = AlertBasename::parse(&alert.basename)?;
-    let trigger = trigger_for(
-        &basename,
-        direction,
-        roles,
-        granularity,
-        is_mw,
-        pullback_arm,
-    )?;
+    let trigger = trigger_for(&basename, direction, geom, granularity, is_mw, pullback_arm)?;
     let fire_mode = fire_mode_for(&trigger);
     let kind = RuleKind::from(&basename);
     Some(ConditionRule {
@@ -264,25 +256,19 @@ fn build_rule(
 fn trigger_for(
     basename: &AlertBasename,
     direction: ConvDirection,
-    roles: &Roles,
+    geom: &PlanGeometry,
     granularity: Granularity,
     is_mw: bool,
     pullback_arm: Option<PullbackArm>,
 ) -> Option<Trigger> {
     match basename {
         AlertBasename::VetoTooHigh | AlertBasename::VetoTooLow => {
-            invalidation_or_pcl_trigger(basename, direction, roles)
+            invalidation_or_pcl_trigger(basename, direction, geom)
         }
         // Trade-expiry / prep-expiry are vertical-line time triggers. The veto
         // fires when wall-clock reaches the line.
-        AlertBasename::VetoTradeExpiry => time_trigger(roles.trade_expiry.as_ref()),
-        AlertBasename::PrepExpire(step) => time_trigger(
-            roles
-                .prep_expiries
-                .iter()
-                .find(|(s, _)| s == step)
-                .map(|(_, d)| d),
-        ),
+        AlertBasename::VetoTradeExpiry => time_trigger(geom.trade_expiry_epoch),
+        AlertBasename::PrepExpire(step) => time_trigger(geom.prep_expiry(step)),
         // Pause / news are control bars: they're folded into the plan from the
         // built pause/news/calendar bundles by [`append_control_rules`], not
         // from `built_trade.alerts` (these basenames never appear there), so
@@ -295,14 +281,19 @@ fn trigger_for(
         // Break-and-close: neckline trendline, closes through it. Short closes
         // down, long closes up — same as the TV `CrossDown`/`CrossUp`.
         AlertBasename::PrepBreakAndClose => trendline_trigger(
-            roles.break_and_close.as_ref(),
+            geom.neckline,
             close_dir(direction),
             BarEvent::OnClose,
             granularity,
         ),
-        // Retest: opposite cross of the neckline trendline, intrabar.
+        // Retest: opposite cross of the SAME neckline trendline, intrabar. Reading
+        // one `geom.neckline` for both is not a simplification — `roles::classify`
+        // assigns `roles.retest = break_and_close.clone()` unconditionally (a
+        // separately-drawn retest line is deliberately ignored, since an old
+        // extrapolated anchor could make the retest uncrossable). So the two reads
+        // were already the same drawing.
         AlertBasename::PrepRetest => trendline_trigger(
-            roles.retest.as_ref(),
+            geom.neckline,
             retest_dir(direction),
             BarEvent::Intrabar,
             granularity,
@@ -336,9 +327,9 @@ fn trigger_for(
             })
         }
         // M/W price-level vetos from the path anchors [A, B, C].
-        AlertBasename::VetoMwCancel => mw_price_trigger(roles, MwVeto::Cancel),
-        AlertBasename::VetoMwAbort => mw_price_trigger(roles, MwVeto::Abort),
-        AlertBasename::VetoMwOvershoot => mw_price_trigger(roles, MwVeto::Overshoot),
+        AlertBasename::VetoMwCancel => mw_price_trigger(geom, MwVeto::Cancel),
+        AlertBasename::VetoMwAbort => mw_price_trigger(geom, MwVeto::Abort),
+        AlertBasename::VetoMwOvershoot => mw_price_trigger(geom, MwVeto::Overshoot),
     }
 }
 
@@ -356,7 +347,7 @@ enum MwVeto {
 fn invalidation_or_pcl_trigger(
     basename: &AlertBasename,
     direction: ConvDirection,
-    roles: &Roles,
+    geom: &PlanGeometry,
 ) -> Option<Trigger> {
     let basename_dir = match basename {
         AlertBasename::VetoTooHigh => ConvDirection::Short,
@@ -374,13 +365,12 @@ fn invalidation_or_pcl_trigger(
         // distinction (operator 2026-07-01): the drawn line is close-confirm;
         // the fib level (the `else` branch) is a wick-through. Direction only
         // decides which *way* the line is crossed, not the confirm mode.
-        let d = roles.invalidation.as_ref()?;
         let dir = match direction {
             ConvDirection::Short => CrossDir::Up,  // close above the cap
             ConvDirection::Long => CrossDir::Down, // close below the floor
         };
         Some(Trigger::HorizontalCross {
-            level: horizontal_level(d)?,
+            level: geom.invalidation?,
             dir,
             bar: BarEvent::OnClose,
         })
@@ -389,9 +379,9 @@ fn invalidation_or_pcl_trigger(
         // power of the setup has been consumed"). A fib level is a
         // **wick-through** (`Intrabar`, `Either`): any straddle aborts — if the
         // move ran ~80% to TP without us, a wick alone is reason enough.
-        let fib = roles.tp_fib.as_ref()?;
-        // Resolve head/neckline via the fib's `reverse` flag (not point order).
-        let (head, neckline) = fib.fib_head_neckline()?;
+        // Head/neckline were already resolved via the fib's `reverse` flag (not
+        // point order) when the geometry was extracted.
+        let (head, neckline) = geom.fib_head_neckline?;
         Some(Trigger::PriceValueCross {
             level: pcl_exhausted_price(head, neckline),
             dir: CrossDir::Either,
@@ -402,16 +392,14 @@ fn invalidation_or_pcl_trigger(
 
 /// Build an M/W cancel / abort / overshoot price-value trigger from the path
 /// anchors. Verbatim port of `alert_spec::mw_price_veto`.
-fn mw_price_trigger(roles: &Roles, which: MwVeto) -> Option<Trigger> {
-    let path = roles.mw_path.as_ref()?;
-    let first_point = path.points.get(1)?.price;
-    let neckline = path.points.get(2)?.price;
+fn mw_price_trigger(geom: &PlanGeometry, which: MwVeto) -> Option<Trigger> {
+    let path = geom.mw_path?;
     // 4-point path: anchor the cancel / overshoot levels to the **higher** of
     // the two drawn shoulders, so a drawn right shoulder above the left widens
     // the 1.3 cancel ceiling and pushes the overshoot level out to match the
     // real geometry. The abort (neckline close) is shoulder-independent.
-    let right_shoulder = path.points.get(3).map(|p| p.price);
-    let shoulder = highest_shoulder(first_point, neckline, right_shoulder);
+    let (first_point, neckline) = (path.first_point, path.neckline);
+    let shoulder = highest_shoulder(first_point, neckline, path.right_shoulder);
     let (level, bar) = match which {
         MwVeto::Cancel => (cancel_level(shoulder, neckline), BarEvent::Intrabar),
         // Abort is the only M/W veto that's a candle *close* back through the
@@ -426,36 +414,27 @@ fn mw_price_trigger(roles: &Roles, which: MwVeto) -> Option<Trigger> {
     })
 }
 
-/// A vertical-line time trigger from a drawing's anchor, or `None` if the
-/// drawing is absent.
-fn time_trigger(drawing: Option<&Drawing>) -> Option<Trigger> {
-    let d = drawing?;
+/// A vertical-line time trigger from an epoch, or `None` if the geometry has no
+/// such marker (an undrawn expiry → no rule, as before).
+fn time_trigger(at_epoch: Option<i64>) -> Option<Trigger> {
     Some(Trigger::TimeReached {
-        at_epoch: d.points.first()?.time,
+        at_epoch: at_epoch?,
     })
 }
 
-/// A trendline cross trigger from a two-anchor drawing. Necklines are
+/// A trendline cross trigger from a two-anchor line. Necklines are
 /// extended forward so a cross past the right anchor still fires (the engine
 /// analogue of the TV `extend_forward` flag — see the README trendline note).
 fn trendline_trigger(
-    drawing: Option<&Drawing>,
+    line: Option<Line>,
     dir: CrossDir,
     bar: BarEvent,
     granularity: Granularity,
 ) -> Option<Trigger> {
-    let d = drawing?;
-    let a = d.points.first()?;
-    let b = d.points.get(1)?;
+    let line = line?;
     Some(Trigger::TrendlineCross {
-        a: LinePoint {
-            at_epoch: a.time,
-            price: a.price,
-        },
-        b: LinePoint {
-            at_epoch: b.time,
-            price: b.price,
-        },
+        a: line.a.to_line_point(),
+        b: line.b.to_line_point(),
         extend_forward: true,
         // The engine interpolates the line in bar-index space; this is the
         // nominal bar duration it falls back to when an anchor predates the
@@ -481,11 +460,6 @@ fn retest_dir(direction: ConvDirection) -> CrossDir {
         ConvDirection::Short => CrossDir::Up,
         ConvDirection::Long => CrossDir::Down,
     }
-}
-
-/// The horizontal line's price level — the first (only) anchor's price.
-fn horizontal_level(d: &Drawing) -> Option<f64> {
-    Some(d.points.first()?.price)
 }
 
 /// Fire-once for everything except the M/W per-bar heartbeat, which
@@ -523,6 +497,18 @@ fn to_core_direction(d: ConvDirection) -> Direction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The tests deliberately still build `Roles` (i.e. real chart drawings) and
+    // pass them through `PlanGeometry::from_roles`. That keeps them a test of the
+    // WHOLE drawings -> geometry -> plan path, so the extraction can't silently
+    // change what a chart produces. Testing `PlanGeometry` directly would only
+    // prove the second half.
+    use crate::roles::Roles;
+
+    /// Build the plan the way the pipeline does: extract geometry from the chart
+    /// roles, then build. Keeps every test's call site honest about the seam.
+    fn geom_of(roles: &Roles) -> PlanGeometry {
+        PlanGeometry::from_roles(roles)
+    }
 
     #[test]
     fn resolution_maps_known_timeframes() {
@@ -672,6 +658,306 @@ mod tests {
         }
     }
 
+    /// A multi-anchor `path` drawing — the M/W form (3 anchors, or 4 with a drawn
+    /// right shoulder).
+    fn path(points: &[(i64, f64)]) -> Drawing {
+        Drawing {
+            id: "p".into(),
+            points: points
+                .iter()
+                .map(|&(time, price)| Point { time, price })
+                .collect(),
+            properties: Properties::default(),
+        }
+    }
+
+    /// **The point of the `PlanGeometry` seam.** A plan built from geometry that
+    /// has been through a JSON round-trip — i.e. frozen to disk and reloaded, with
+    /// no `Drawing` and no TradingView anywhere — is **identical** to one built
+    /// from the live chart drawings.
+    ///
+    /// That equality is what makes a re-armable spec possible: freeze the geometry
+    /// once (operator confirms the right pattern), and every later rebuild is
+    /// reproducible and can't pick a different drawing off the chart.
+    /// The same parity claim, but through an actual **`--spec-out` file**:
+    /// write, reload from disk, rebuild, compare.
+    ///
+    /// The sibling test below round-trips `PlanGeometry` through a JSON *string*.
+    /// This one goes through `FrozenSetup::write` → `load`, which is the step a
+    /// real `--spec-in` arm performs — a different code path with its own
+    /// `deny_unknown_fields`, its own version gate, and its own set of
+    /// `skip_serializing_if` attributes, any of which could drop a field that an
+    /// in-memory compare never sees.
+    ///
+    /// Same caveat as its sibling, stated so nobody over-trusts it: a field
+    /// `PlanGeometry` never carried is absent on both sides and this still
+    /// passes. The key-set guards are what cover that — and they have caught
+    /// three real dropped fields (`runup_start`, `sr_levels`, `anchors`).
+    #[test]
+    fn a_plan_from_a_spec_written_to_disk_matches_the_live_one() {
+        let alerts = vec![
+            alert("01-veto-too-high", Action::Veto),
+            alert("03-prep-break-and-close", Action::Prep),
+            alert("04-prep-retest", Action::Prep),
+            alert("02-veto-trade-expiry", Action::Invalidate),
+            alert("05-enter", Action::Enter),
+        ];
+        let roles = Roles {
+            invalidation: Some(horz(1.2000)),
+            break_and_close: Some(trend((10, 1.1900), (20, 1.1850))),
+            retest: Some(trend((10, 1.1900), (20, 1.1850))),
+            trade_expiry: Some(vert(99_000)),
+            tp_fib: Some(trend((10, 1.1700), (20, 1.1900))),
+            ..Roles::default()
+        };
+        let live = PlanGeometry::from_roles(&roles);
+
+        // Freeze to a real file and read it back — the `--spec-out` /
+        // `--spec-in` round trip.
+        let path = std::env::temp_dir().join(format!("spec-parity-{}.json", std::process::id()));
+        crate::frozen_setup::FrozenSetup::capture(
+            live.clone(),
+            "60".into(),
+            "OANDA:EUR_USD".into(),
+            Some(1_700_000_000),
+            None,
+        )
+        .write(&path)
+        .expect("write spec");
+        let reloaded = crate::frozen_setup::FrozenSetup::load(&path).expect("load spec");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            reloaded.geom, live,
+            "geometry must survive the file round-trip"
+        );
+        assert_eq!(
+            reloaded.resolution, "60",
+            "the granularity must survive — losing it reprices the whole neckline"
+        );
+
+        let build = |geom: &PlanGeometry| {
+            build_trade_plan(
+                "eurusd-hs-spec",
+                "EUR_USD",
+                &alerts,
+                ConvDirection::Short,
+                geom,
+                Granularity::H1,
+                false,
+                false,
+                None,
+                trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+                trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+                trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+                false,
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid"),
+                None,
+                None,
+            )
+        };
+        assert_eq!(
+            serde_json::to_value(build(&live)).expect("live"),
+            serde_json::to_value(build(&reloaded.geom)).expect("reloaded"),
+            "a plan armed from a spec file must be identical to the live one"
+        );
+    }
+
+    #[test]
+    fn a_plan_built_from_frozen_geometry_matches_one_built_from_drawings() {
+        let alerts = vec![
+            alert("01-veto-too-high", Action::Veto),
+            alert("01-veto-too-low", Action::Veto),
+            alert("03-prep-break-and-close", Action::Prep),
+            alert("04-prep-retest", Action::Prep),
+            alert("02-veto-trade-expiry", Action::Invalidate),
+            alert("05-enter", Action::Enter),
+        ];
+        let roles = Roles {
+            invalidation: Some(horz(1.2000)),
+            break_and_close: Some(trend((10, 1.1900), (20, 1.1850))),
+            retest: Some(trend((10, 1.1900), (20, 1.1850))),
+            trade_expiry: Some(vert(99_000)),
+            // A fib is read as two anchor prices resolved through its `reverse`
+            // flag; `trend` gives the same two-point shape (reverse unset =>
+            // false => head is points[1]).
+            tp_fib: Some(trend((10, 1.1700), (20, 1.1900))),
+            ..Roles::default()
+        };
+
+        let build = |geom: &PlanGeometry| {
+            build_trade_plan(
+                "eurusd-hs-frozen",
+                "EUR_USD",
+                &alerts,
+                ConvDirection::Short,
+                geom,
+                Granularity::H1,
+                false,
+                false,
+                None,
+                trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+                trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+                trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+                false,
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                None,
+                None,
+            )
+        };
+
+        let live = PlanGeometry::from_roles(&roles);
+        // Freeze -> reload. This is the step a `--spec-in` re-arm performs.
+        let frozen: PlanGeometry =
+            serde_json::from_str(&serde_json::to_string(&live).unwrap()).unwrap();
+        assert_eq!(live, frozen, "geometry must survive the round-trip");
+
+        // `TradePlan` has no `PartialEq`, so compare the serialized form — the same
+        // equality the fixture goldens use.
+        assert_eq!(
+            serde_json::to_value(build(&live)).unwrap(),
+            serde_json::to_value(build(&frozen)).unwrap(),
+            "a plan rebuilt from frozen geometry must be byte-identical"
+        );
+
+        // ⚠ The two assertions above are NECESSARY BUT NOT SUFFICIENT, and it's
+        // worth being explicit about why: both sides call the same `build` on
+        // values already asserted equal, so it is `f(x) == f(x)`. A field that
+        // `from_roles` silently drops disappears from BOTH sides and the test
+        // still passes — which is exactly what happened with `MwPath.runup_start`
+        // (fixed in 4713acb; this test would not have caught it).
+        //
+        // So the real check is below: every role the chart supplied must be
+        // PRESENT, with the right VALUE, in the extracted geometry.
+        assert_eq!(
+            live.invalidation,
+            Some(1.2000),
+            "invalidation lost/mis-wired"
+        );
+        assert_eq!(
+            live.trade_expiry_epoch,
+            Some(99_000),
+            "trade-expiry epoch lost/mis-wired"
+        );
+        let (head, neck) = live.fib_head_neckline.expect("fib anchors lost");
+        assert_eq!(
+            (head, neck),
+            (1.1900, 1.1700),
+            "fib head/neckline must resolve through the `reverse` flag: head is \
+             points[1] when reverse is unset"
+        );
+        let neckline = live.neckline.expect("neckline lost");
+        assert_eq!(
+            (neckline.a.price, neckline.b.price),
+            (1.1900, 1.1850),
+            "neckline anchors must carry the drawn prices in order"
+        );
+        assert_eq!(
+            (neckline.a.at_epoch, neckline.b.at_epoch),
+            (10, 20),
+            "…and their epochs, which is what bar-index interpolation needs"
+        );
+    }
+
+    /// The complement to the test above, and the one that actually guards the
+    /// `--spec-in` promise: a geometry extracted from a chart with **every** role
+    /// present must serialize **every** field.
+    ///
+    /// Asserted against the serialized key set rather than field-by-field, so a
+    /// NEWLY ADDED field is caught too — it'll be absent from the expected list
+    /// and force whoever adds it to decide whether it belongs in the frozen
+    /// contract. That's the check `runup_start` needed.
+    #[test]
+    fn a_fully_drawn_chart_freezes_every_geometry_field() {
+        let roles = Roles {
+            invalidation: Some(horz(1.2000)),
+            invalidation_label: Some("too-high".into()),
+            break_and_close: Some(trend((10, 1.1900), (20, 1.1850))),
+            retest: Some(trend((10, 1.1900), (20, 1.1850))),
+            trade_expiry: Some(vert(99_000)),
+            tp_fib: Some(trend((10, 1.1700), (20, 1.1900))),
+            prep_expiries: vec![("retest".to_string(), vert(98_000))],
+            // Two drawn S/R horizontals. Load-bearing for THIS test: `sr_levels`
+            // is `skip_serializing_if = "Vec::is_empty"`, so leaving them off
+            // would omit the key and the field would slip past the key-set
+            // assertion — the exact hole that let `runup_start` through.
+            sr_levels: vec![horz(1.1950), horz(1.1600)],
+            ..Roles::default()
+        };
+        // The M/W half. H&S and M/W are mutually exclusive on a chart (an H&S has
+        // no path drawing, an M/W has no fib/invalidation), so no SINGLE chart
+        // populates every field — the contract is covered by their union.
+        let mw_roles = Roles {
+            mw_path: Some(path(&[(10, 1.1000), (20, 1.2000), (30, 1.1500)])),
+            trade_expiry: Some(vert(99_000)),
+            ..Roles::default()
+        };
+
+        let keys_of = |r: &Roles| -> std::collections::BTreeSet<String> {
+            serde_json::to_value(PlanGeometry::from_roles(r))
+                .expect("serialize")
+                .as_object()
+                .expect("an object")
+                .keys()
+                .cloned()
+                .collect()
+        };
+        let mut reachable = keys_of(&roles);
+        reachable.extend(keys_of(&mw_roles));
+
+        // Every field of the frozen contract. Update ONLY when you have decided
+        // whether a new field is part of what a `--spec-in` re-arm must restore.
+        let expected: std::collections::BTreeSet<String> = [
+            "neckline",
+            "invalidation",
+            "fib_head_neckline",
+            "trade_expiry_epoch",
+            "prep_expiry_epochs",
+            "mw_path",
+            // Decided YES, 2026-07-27: a re-arm must restore the drawn S/R
+            // levels. They gate whether `07-close-on-sr-reversal` is armed, and
+            // the failure without them is silent — the derived TP band keeps the
+            // vec non-empty, so the alert still fires, just off the wrong levels.
+            "sr_levels",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        assert_eq!(
+            reachable, expected,
+            "PlanGeometry's frozen field set changed. If you ADDED a field, decide \
+             whether a re-arm must restore it, then update this list. If a field \
+             VANISHED (unreachable from BOTH an H&S and an M/W chart), `from_roles` \
+             stopped reading a role — that's the `runup_start` bug class."
+        );
+
+        // And the fields really are populated, so the key set above isn't passing
+        // on the strength of serialized `None`s.
+        let hs = PlanGeometry::from_roles(&roles);
+        assert!(hs.neckline.is_some());
+        assert!(hs.invalidation.is_some());
+        assert!(hs.fib_head_neckline.is_some());
+        assert!(hs.trade_expiry_epoch.is_some());
+        assert_eq!(hs.prep_expiry_epochs.len(), 1);
+        assert!(
+            hs.mw_path.is_none(),
+            "an H&S chart has no path drawing — the M/W key is legitimately absent"
+        );
+
+        let mw = PlanGeometry::from_roles(&mw_roles);
+        let mw_path = mw.mw_path.expect("M/W path extracted");
+        // `runup_start` specifically: the field whose loss this whole test class
+        // exists to catch. Direction and two gates read it.
+        assert_eq!(mw_path.runup_start, 1.1000);
+        assert_eq!(mw_path.first_point, 1.2000);
+        assert_eq!(mw_path.neckline, 1.1500);
+        assert!(
+            mw_path.right_shoulder.is_none(),
+            "a 3-anchor path has no drawn right shoulder"
+        );
+    }
+
     /// A short H&S trade folds its invalidation / break-and-close / retest /
     /// trade-expiry / enter alerts into the matching triggers, carrying each
     /// embedded intent verbatim and latching every rule but (here) none being
@@ -698,7 +984,7 @@ mod tests {
             "EUR_USD",
             &alerts,
             ConvDirection::Short,
-            &roles,
+            &geom_of(&roles),
             Granularity::H1,
             false,
             false,
@@ -783,7 +1069,7 @@ mod tests {
             "EUR_USD",
             &alerts,
             ConvDirection::Short,
-            &roles,
+            &geom_of(&roles),
             Granularity::H1,
             false,
             false,
@@ -820,7 +1106,7 @@ mod tests {
             "EUR_USD",
             &alerts,
             ConvDirection::Short,
-            &Roles::default(),
+            &PlanGeometry::from_roles(&Roles::default()),
             Granularity::H1,
             false,
             false,
@@ -865,7 +1151,7 @@ mod tests {
             "EUR_USD",
             &alerts,
             ConvDirection::Long,
-            &roles,
+            &geom_of(&roles),
             Granularity::H1,
             false,
             false,
@@ -918,7 +1204,7 @@ mod tests {
             "EUR_USD",
             &alerts,
             ConvDirection::Short,
-            &roles,
+            &geom_of(&roles),
             Granularity::H1,
             false,
             false,
@@ -990,7 +1276,7 @@ mod tests {
             "EUR_USD",
             &alerts,
             ConvDirection::Short,
-            &roles,
+            &geom_of(&roles),
             Granularity::H1,
             true,
             false,
@@ -1043,7 +1329,7 @@ mod tests {
             "EUR_USD",
             &alerts,
             ConvDirection::Short,
-            &Roles::default(),
+            &PlanGeometry::from_roles(&Roles::default()),
             Granularity::H1,
             false,
             false,
@@ -1069,7 +1355,7 @@ mod tests {
             "EUR_USD",
             &alerts,
             ConvDirection::Short,
-            &Roles::default(),
+            &PlanGeometry::from_roles(&Roles::default()),
             Granularity::H1,
             true,
             true,
@@ -1094,7 +1380,7 @@ mod tests {
             "EUR_USD",
             &alerts,
             ConvDirection::Short,
-            &Roles::default(),
+            &PlanGeometry::from_roles(&Roles::default()),
             Granularity::H1,
             false,
             false,
@@ -1118,7 +1404,7 @@ mod tests {
             "EUR_USD",
             &alerts,
             ConvDirection::Short,
-            &Roles::default(),
+            &PlanGeometry::from_roles(&Roles::default()),
             Granularity::H1,
             false,
             false,
@@ -1147,7 +1433,7 @@ mod tests {
             "EUR_USD",
             &alerts,
             ConvDirection::Short,
-            &Roles::default(),
+            &PlanGeometry::from_roles(&Roles::default()),
             Granularity::H1,
             false,
             false,
@@ -1171,7 +1457,7 @@ mod tests {
             "EUR_USD",
             &alerts,
             ConvDirection::Short,
-            &Roles::default(),
+            &PlanGeometry::from_roles(&Roles::default()),
             Granularity::H1,
             false,
             false,
@@ -1203,7 +1489,7 @@ mod tests {
             "EUR_USD",
             &alerts,
             ConvDirection::Short,
-            &Roles::default(),
+            &PlanGeometry::from_roles(&Roles::default()),
             Granularity::H1,
             false,
             false,
@@ -1227,7 +1513,7 @@ mod tests {
             "EUR_USD",
             &alerts,
             ConvDirection::Short,
-            &Roles::default(),
+            &PlanGeometry::from_roles(&Roles::default()),
             Granularity::H1,
             false,
             false,
@@ -1300,7 +1586,7 @@ mod tests {
             "EUR_USD",
             &[alert("05-enter", Action::Enter)],
             ConvDirection::Short,
-            &Roles::default(),
+            &PlanGeometry::from_roles(&Roles::default()),
             Granularity::H1,
             false,
             false,

@@ -15,6 +15,7 @@ mod pause_pattern;
 mod prompts;
 pub mod replay_args;
 mod script_validator;
+pub mod start_time;
 mod templates;
 mod trade_patterns;
 

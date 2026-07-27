@@ -1271,7 +1271,8 @@ mod tests {
             false,
             None,
             &no_marks(),
-        );
+        )
+        .text;
         assert!(
             report.contains("SUPPRESSED") && report.contains("NO FILL"),
             "report must show the paused enter as a 0R skip:\n{report}"
@@ -1638,7 +1639,8 @@ mod tests {
             false,
             None,
             &no_marks(),
-        );
+        )
+        .text;
         assert!(
             report.contains("TP: 1"),
             "without an active blackout the enter fills and takes profit:\n{report}"
@@ -1895,7 +1897,7 @@ mod tests {
         // fabricated fill), and exactly one trade is tallied (the limit's TP) —
         // not two overlapping positions.
         let report =
-            crate::report::render(&two_enter_v2_plan(), &r, true, false, None, &no_marks());
+            crate::report::render(&two_enter_v2_plan(), &r, true, false, None, &no_marks()).text;
         assert!(
             report.contains("SUPERSEDED"),
             "report must show the cancelled stop as SUPERSEDED:\n{report}"
@@ -2018,7 +2020,7 @@ mod tests {
         );
 
         // The replay report shows the short CLOSED ON REVERSAL, not held open.
-        let report = crate::report::render(&plan, &r, true, false, None, &no_marks());
+        let report = crate::report::render(&plan, &r, true, false, None, &no_marks()).text;
         assert!(
             report.contains("CLOSED ON REVERSAL"),
             "the open short must close on the reversal candle:\n{report}"
@@ -2117,7 +2119,8 @@ mod tests {
         assert_eq!(m[0].direction, Direction::Long, "bullish → Long");
 
         // And the always-on summary counts it.
-        let report = crate::report::render(&never_firing_long_plan(), &r, true, false, None, &cfg);
+        let report =
+            crate::report::render(&never_firing_long_plan(), &r, true, false, None, &cfg).text;
         assert!(
             report.contains("1 golden"),
             "summary reports the golden mark:\n{report}"
@@ -2163,7 +2166,7 @@ mod tests {
         .await;
         assert!(marks(&r_off).is_empty(), "none disables marking");
         let report =
-            crate::report::render(&never_firing_long_plan(), &r_off, true, false, None, &off);
+            crate::report::render(&never_firing_long_plan(), &r_off, true, false, None, &off).text;
         assert!(
             !report.contains("Candle detector"),
             "summary omitted when off:\n{report}"
@@ -2230,12 +2233,12 @@ mod tests {
 
         // The always-on report surfaces it (no --verbose needed), and --verbose
         // shows the ✗ line right under the ◆ GOLDEN mark on the same bar.
-        let plain = crate::report::render(&plan, &r, true, false, None, &cfg);
+        let plain = crate::report::render(&plan, &r, true, false, None, &cfg).text;
         assert!(
             plain.contains("Entry declines:"),
             "always-on decline rollup present:\n{plain}"
         );
-        let verbose = crate::report::render(&plan, &r, true, true, None, &cfg);
+        let verbose = crate::report::render(&plan, &r, true, true, None, &cfg).text;
         assert!(
             verbose.contains("◆ GOLDEN") && verbose.contains("✗ not entered:"),
             "verbose joins the golden mark and the decline on the bar:\n{verbose}"
@@ -2342,7 +2345,7 @@ mod tests {
             "not-golden decline suppressed from traces under golden-only"
         );
         // …and from the always-on rollup + verbose bar lines.
-        let report = crate::report::render(&plan, &r, true, true, None, &golden_only);
+        let report = crate::report::render(&plan, &r, true, true, None, &golden_only).text;
         assert!(
             !report.contains("needs golden but signal is not golden"),
             "not-golden decline absent from the report under golden-only:\n{report}"
@@ -2442,7 +2445,7 @@ mod tests {
         );
 
         // And it renders under --verbose right beneath the ◆ mark.
-        let verbose = crate::report::render(&plan, &r, true, true, None, &cfg);
+        let verbose = crate::report::render(&plan, &r, true, true, None, &cfg).text;
         assert!(
             verbose.contains("◆ GOLDEN") && verbose.contains("✗ not taken:"),
             "verbose joins the golden mark and the not-taken reason:\n{verbose}"
@@ -2680,7 +2683,8 @@ mod tests {
             false,
             None,
             &no_marks(),
-        );
+        )
+        .text;
         assert!(
             report.contains("TOOK PROFIT"),
             "the restored order must show its TP fill:\n{report}"
@@ -2946,7 +2950,8 @@ mod tests {
             false,
             None,
             &no_marks(),
-        );
+        )
+        .text;
         assert!(
             report.contains("TOOK PROFIT"),
             "the restored order must show its TP fill in the journal:\n{report}"
@@ -3134,7 +3139,8 @@ mod tests {
             false,
             None,
             &no_marks(),
-        );
+        )
+        .text;
         assert!(
             !report.contains("NO FILL"),
             "the deferred order fills after the block — NOT a NO FILL / 0R:\n{report}"

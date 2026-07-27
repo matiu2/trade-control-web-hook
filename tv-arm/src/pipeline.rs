@@ -25,25 +25,28 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use color_eyre::eyre::{Context, Result, eyre};
 use tracing::{info, warn};
 use trade_control_cli as cli;
-use trade_control_conventions::{Broker, Direction, split_symbol};
+use trade_control_conventions::{Broker, split_symbol};
 use trade_control_core::sig::KEY_LEN;
 
 use crate::args::Args;
-use crate::args::PositionEntry;
-use crate::geometry::{horizontal_price, pcl_exhausted_price};
+use crate::calendar::{calendar_scope_range, calendar_windows, read_trade_expiry};
+use crate::control_bundle::{BundleContext, NewsKind, PauseKind};
+use crate::control_windows::{AsOf, ControlWindows};
+use crate::hs_resolve::resolve_hs_trade;
 use crate::instrument_resolution::ResolvedInstrument;
-use crate::mw_geometry;
+use crate::mw_resolve::resolve_mw_trade;
 use crate::news_marker::{NewsMarker, news_marker_lines};
-use crate::news_window::NewsWindow;
-use crate::position_trade::{core_direction, resolve_levels};
-use crate::register_post::{post_intent_blocking, post_register_blocking};
+use crate::plan_geometry::PlanGeometry;
+use crate::position_entry::run_position_entry;
+use crate::register::{register_trade_plan, replace_existing_plan};
+use crate::resolve_error::ResolveError;
 use crate::roles::{Roles, SlotPref, classify};
-use crate::timeframe::infer_calendar_timeframe;
-use crate::trade_plan_build::{append_control_rules, build_trade_plan, resolution_to_granularity};
+use crate::save_matrix;
+use crate::setup_inputs::SetupInputs;
 use trading_view::drawings::Drawing;
 use trading_view::mcp::TvMcp;
 
@@ -54,7 +57,199 @@ const ARM_OUT_ROOT: &str = "/tmp/trade-control-arm";
 /// Drive the full flow. Returns process exit code; non-zero means a
 /// step failed (chart classification, build-trade, etc.). All errors
 /// are logged before the function returns.
+///
+/// Two steps, deliberately: [`read_setup_from_chart`] does **all** the
+/// TradingView and calendar I/O and returns a [`SetupInputs`]; [`arm_from_inputs`]
+/// builds, signs, and registers from that value alone. Nothing below the seam
+/// touches a chart, which is the property a frozen-spec arm (`--spec-in`) needs
+/// — and it is enforced by the types, not by a comment: `arm_from_inputs` has no
+/// `TvMcp` to call.
+///
+/// `Roles` is returned alongside rather than folded in, because exactly one
+/// consumer still needs the raw drawings (the position-entry tools) and that
+/// path is inherently live-chart. See [`SetupInputs`]' module doc.
 pub fn run(args: Args) -> Result<i32> {
+    // Source the setup: a frozen spec, or the live chart. `Roles` only exists on
+    // the chart path — the position-entry tools need raw drawings, so a frozen
+    // arm refuses them rather than silently arming something else.
+    let (setup, roles) = match args.spec_in.as_deref() {
+        Some(path) => (read_setup_from_spec(&args, path)?, None),
+        None => {
+            let (setup, roles) = read_setup_from_chart(&args)?;
+            if let Some(path) = args.spec_out.as_deref() {
+                freeze_setup(&args, &setup, path)?;
+            }
+            (setup, Some(roles))
+        }
+    };
+
+    // Both sources feed the same two exits. The matrix in particular has to work
+    // off a FROZEN setup: "confirm once on the chart, then generate the grid
+    // offline" is the whole corpus workflow, and wiring it to the chart path
+    // alone made `--spec-in --save-matrix` silently arm a single cell.
+    if args.save_matrix {
+        return arm_the_matrix(&args, setup, roles.as_ref());
+    }
+    arm_from_inputs(&args, setup, roles.as_ref())
+}
+
+/// Write the chart-derived setup to a `--spec-out` file for later `--spec-in`.
+fn freeze_setup(args: &Args, setup: &SetupInputs, path: &Path) -> Result<()> {
+    let frozen = crate::frozen_setup::FrozenSetup::capture(
+        setup.geom.clone(),
+        setup.resolution.clone(),
+        setup.chart_symbol.clone(),
+        setup.start,
+        args.spec_note.clone(),
+    );
+    frozen.write(path)?;
+    info!(
+        path = %path.display(),
+        resolution = %frozen.resolution,
+        chart_symbol = %frozen.chart_symbol,
+        "froze setup — re-arm with --spec-in"
+    );
+    Ok(())
+}
+
+/// Arm every cell of the entry-sensitivity grid from ONE chart read.
+///
+/// The setup is cloned per cell, so all six share byte-identical geometry — the
+/// only difference between the resulting fixtures is the flag under test. Six
+/// separate `tv-arm` runs could not promise that: each would re-classify roles
+/// against a chart that may have scrolled and re-read a calendar that may have
+/// moved, so the grid would be comparing setups rather than gates.
+///
+/// A cell that fails is **recorded and the run continues**. A variant can
+/// legitimately be rejected (a Quasimodo leg the drawing doesn't support, a
+/// validation gate that objects to one entry rule), and aborting on the first
+/// would throw away the cells that did work. Exit code is 0 only if every cell
+/// armed, so a driver can still trust it.
+fn arm_the_matrix(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Result<i32> {
+    let outcomes: Vec<save_matrix::CellOutcome> = save_matrix::GRID
+        .iter()
+        .map(|variant| {
+            let cell_args = variant.apply(args);
+            info!(cell = %variant.fixture_suffix(), "arming matrix cell");
+            let result =
+                arm_from_inputs(&cell_args, setup.clone(), roles).map_err(|e| format!("{e:#}"));
+            if let Err(e) = &result {
+                // Loud per-cell, so a failure isn't only visible in the summary
+                // at the very end of a long run.
+                warn!(cell = %variant.fixture_suffix(), error = %e, "matrix cell failed to arm");
+            }
+            save_matrix::CellOutcome {
+                variant: *variant,
+                result,
+            }
+        })
+        .collect();
+
+    println!("\n{}", save_matrix::summarise(&outcomes));
+    // Non-zero when any cell is missing: a partial grid is not a grid, and a
+    // driver that only checks the exit code must not read it as complete.
+    Ok(if outcomes.iter().all(save_matrix::CellOutcome::armed) {
+        0
+    } else {
+        1
+    })
+}
+
+/// Rebuild [`SetupInputs`] from a frozen spec — **no TradingView**.
+///
+/// The frozen half (geometry, granularity, chart symbol, cursor) is read from
+/// the file. Everything else is re-resolved exactly as a live arm would:
+///
+/// - **broker + instrument** from the frozen chart symbol, through the same
+///   `instrument-lookup` catalog. Re-resolved rather than frozen so a catalog
+///   correction reaches old specs.
+/// - **precision** from the catalog. A live arm prefers the TradingView
+///   Symbol-info tick; with no chart there is nothing to prefer, so the catalog
+///   value stands — the same fallback a live arm takes when tv-mcp is
+///   unreachable.
+/// - **news / blackout windows** from the calendar, via the same
+///   [`resolve_control_windows`] the chart path uses. Deliberately re-read: a
+///   frozen calendar answers a question about a stale week.
+///
+/// Note the consequence — a spec-in arm is **not** bit-reproducible across days,
+/// because the calendar moves. That's why the tier-2 baseline diff tags news-ON
+/// rows `[calendar]` rather than treating their movement as a regression.
+fn read_setup_from_spec(args: &Args, path: &Path) -> Result<SetupInputs> {
+    let frozen = crate::frozen_setup::FrozenSetup::load(path)?;
+    // The position tools need drawings this path doesn't have. Refuse up front,
+    // with the reason — arming them off a frozen spec would silently place a
+    // different trade.
+    if args.position_entry_mode().is_some() {
+        return Err(eyre!(
+            "--market-entry / --stop-entry / --limit-entry read the drawn position \
+             tool's SL/TP from the chart, so they cannot be used with --spec-in \
+             (there are no drawings in a frozen setup)"
+        ));
+    }
+
+    let broker = resolve_broker(args, &frozen.chart_symbol)?;
+    let resolved = crate::instrument_resolution::resolve_for_broker(&frozen.chart_symbol, broker)?;
+    let instrument = resolved.broker_symbol.clone();
+    // No live chart, so no TV Symbol-info to prefer — the catalog precision is
+    // the answer, exactly as it is when a live arm can't reach tv-mcp.
+    let effective = crate::precision::EffectivePrecision {
+        pip_size: resolved.precision.pip_size,
+        tick_size: resolved.precision.tick_size,
+        tick_from_tv: false,
+    };
+
+    // `--start` on the command line overrides the frozen cursor, so a single
+    // spec can be re-armed at several cursors (which is what the entry-rule grid
+    // does). Absent, the frozen cursor stands.
+    let start = parse_start(args)?.or(frozen.start);
+    let cursor_unix = start.ok_or_else(|| {
+        eyre!(
+            "frozen setup {} has no cursor and no --start was given; a spec-in arm \
+             needs to know what instant counts as \"now\"",
+            path.display()
+        )
+    })?;
+    let prune_as_of = pick_prune_as_of(args, Utc::now(), cursor_unix, start);
+    let control = resolve_control_windows(
+        args,
+        &frozen.geom,
+        &resolved,
+        &frozen.resolution,
+        cursor_unix,
+        prune_as_of,
+    );
+
+    info!(
+        path = %path.display(),
+        chart_symbol = %frozen.chart_symbol,
+        resolution = %frozen.resolution,
+        instrument = %instrument,
+        broker = broker.as_str(),
+        captured_by = frozen.tv_arm_version.as_deref().unwrap_or("unknown"),
+        "armed from frozen setup (no TradingView)"
+    );
+
+    let raw_symbol = split_symbol(&frozen.chart_symbol).1.to_string();
+    Ok(SetupInputs {
+        geom: frozen.geom,
+        control,
+        instrument,
+        resolved,
+        broker,
+        effective,
+        resolution: frozen.resolution,
+        chart_symbol: frozen.chart_symbol,
+        raw_symbol,
+        start,
+        prune_as_of,
+    })
+}
+
+/// Read TradingView + the economic calendar into a [`SetupInputs`].
+///
+/// **Every** network / tv-mcp call in the arm flow lives in here. It also
+/// performs the cosmetic news-marker draw, which is chart-only by definition.
+fn read_setup_from_chart(args: &Args) -> Result<(SetupInputs, Roles)> {
     // 1. Read chart state + decide broker / instrument.
     let mcp = TvMcp::new(
         args.tv_mcp_root
@@ -64,7 +259,7 @@ pub fn run(args: Args) -> Result<i32> {
     let state = mcp.get_state().wrap_err("read TV chart state")?;
     let (_exchange, raw_sym) = split_symbol(&state.symbol);
     let raw_sym = raw_sym.to_string();
-    let broker = resolve_broker(&args, &state.symbol)?;
+    let broker = resolve_broker(args, &state.symbol)?;
     // Resolve through the instrument-lookup catalog: this both
     // validates that the asset is listed on the chosen broker and
     // gives us the broker-canonical symbol (`EUR/USD` for TN,
@@ -135,7 +330,7 @@ pub fn run(args: Args) -> Result<i32> {
     // `--replay` with no explicit `--start`: fall back to a chart Note saying
     // `start` — its first anchor's time becomes the journaling cursor. Lets an
     // operator mark live-now with a note instead of typing an RFC3339 stamp.
-    let start = match (parse_start(&args)?, args.replay()) {
+    let start = match (parse_start(args)?, args.replay()) {
         (Some(s), _) => Some(s),
         (None, true) => crate::start_note::resolve_start_from_note(&mcp, &drawings)
             .wrap_err("resolve --replay start from chart Note")?
@@ -175,65 +370,102 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         SlotPref::WindowAware(view)
     };
-    let mut roles = classify(&mcp, &drawings, view, slot_pref)?;
+    // Immutable from here on: `Roles` is what the operator drew, resolved once.
+    // The calendar-derived control windows that used to be mutated onto it now
+    // live in their own type — see [`crate::control_windows`].
+    let roles = classify(&mcp, &drawings, view, slot_pref)?;
+
+    // Extract the chart geometry to plain data ONCE, here — immediately after role
+    // resolution and BEFORE any validation. Two reasons this belongs at the top:
+    //   * the wrong-drawing risk is resolved exactly once, so the same bytes that
+    //     get validated are the bytes that get planned;
+    //   * everything downstream (validation, TP/direction, entry-level vetos, the
+    //     plan build) reads `PlanGeometry`, which is what lets a frozen spec drive
+    //     an identical arm with no TradingView.
+    // `roles` is still needed below for the things that AREN'T geometry: the
+    // calendar windows it carries, the drawn S/R levels, and the position tool.
+    let geom = PlanGeometry::from_roles(&roles);
+
+    // The as-of instant elapsed control windows are pruned against. Live
+    // (`--register-plan`) prunes against wall-clock now; an offline replay
+    // (`--plan-out`) prunes against the chart's replay cursor so a blackout
+    // still upcoming relative to the cursor survives a historical replay.
+    // See `pick_prune_as_of`.
+    let prune_as_of = pick_prune_as_of(args, Utc::now(), cursor_unix, start);
 
     // Resolve blackout/news windows straight from the economic calendar at real
-    // event-minute precision and push them into `roles`. No chart lines are
-    // drawn and nothing is read back — the old draw + re-classify round-trip
-    // (which snapped every window to a bar boundary and could split a window
-    // straddling `--start` into an orphaned half) is gone. `--skip-calendar-bars`
-    // opts out entirely.
-    if !args.skip_calendar_bars {
-        // Scope the news filter to the trade's own lifetime `[cursor, expiry]`,
-        // NOT the chart's visible area:
-        //   - left edge = the cursor (`--start` when given, else the last loaded
-        //     bar `bars_range.to`) — so only news at or after "live now" matters,
-        //     independent of how far left the chart is scrolled;
-        //   - right edge = the trade-expiry vertical, so only news the open trade
-        //     could still run into is considered.
-        // A missing/unparseable expiry collapses the range to empty (no windows)
-        // rather than fetching across all of time; check_required (step 3)
-        // surfaces the absent expiry drawing as a hard error shortly anyway.
-        let expiry_hint = read_trade_expiry(&roles).ok();
-        let calendar_range = calendar_scope_range(cursor_unix, expiry_hint);
-        match calendar_windows(
-            &state.resolution,
-            &resolved,
-            calendar_range,
-            args.news_before_hours,
-            args.news_after_hours,
-        ) {
-            Ok((blackout, news, markers)) => {
-                roles.blackout_pairs = blackout;
-                roles.news_pairs = news;
-                roles.news_markers = markers;
-            }
-            Err(e) => {
-                warn!(error = ?e, "calendar window resolution failed; continuing with no news/blackout windows");
-            }
-        }
-    }
-
-    let key = read_key()?;
-    let account = resolve_account(&args, broker);
-    let out_dir = arm_out_dir(&raw_sym)?;
-    let now = Utc::now();
-
-    // Drop blackout/news windows that have already fully elapsed as of the
-    // arm's reference time. Live (`--register-plan`) prunes against wall-clock
-    // now; an offline replay (`--plan-out`) prunes against the chart's replay
-    // cursor so a blackout still upcoming relative to the cursor survives a
-    // historical replay. See `drop_past_control_pairs` / `pick_prune_as_of`.
-    let prune_as_of = pick_prune_as_of(&args, now, cursor_unix, start);
-    drop_past_control_pairs(&mut roles, prune_as_of);
+    // event-minute precision. No chart lines are drawn and nothing is read back
+    // — the old draw + re-classify round-trip (which snapped every window to a
+    // bar boundary and could split a window straddling `--start` into an
+    // orphaned half) is gone. `--skip-calendar-bars` opts out entirely.
+    //
+    // `ControlWindows::new` prunes already-elapsed windows at construction, so
+    // there is no un-pruned set for anything downstream to observe.
+    let control = resolve_control_windows(
+        args,
+        &geom,
+        &resolved,
+        &state.resolution,
+        cursor_unix,
+        prune_as_of,
+    );
 
     // Cosmetic chart annotation (default on): draw a vertical line for exactly
     // the news events tv-arm reacts to — the armed set, post-prune, so drawn ==
     // armed. Never touches the plan; a draw failure warns and continues.
     // `--skip-calendar-bars` opts out of the whole calendar step above, leaving
-    // `news_markers` empty, so this then draws nothing (that flag skips both the
+    // the marker set empty, so this then draws nothing (that flag skips both the
     // news windows and their markers).
-    draw_news_markers(&mcp, &roles, &state.resolution);
+    draw_news_markers(&mcp, control.markers(), &state.resolution);
+
+    Ok((
+        SetupInputs {
+            geom,
+            control,
+            instrument,
+            resolved,
+            broker,
+            effective,
+            resolution: state.resolution,
+            chart_symbol: state.symbol,
+            raw_symbol: raw_sym,
+            start,
+            prune_as_of,
+        },
+        roles,
+    ))
+}
+
+/// Build, sign, and register a trade from chart-independent inputs.
+///
+/// Takes **no `TvMcp`** — that is the whole point of the split. Everything below
+/// this line works identically whether `setup` was read from a live chart or
+/// loaded from a frozen spec.
+///
+/// `roles` is `Some` only on the live-chart path, and is used for exactly one
+/// thing: the position-entry tools (`--market-entry` / `--stop-entry` /
+/// `--limit-entry`), whose SL/TP are TradingView **drawing properties** with no
+/// frozen equivalent. A frozen arm passes `None`, and asking for a position
+/// entry there is a clean rejection rather than a silent wrong trade.
+fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Result<i32> {
+    let SetupInputs {
+        geom,
+        control,
+        instrument,
+        resolved,
+        broker,
+        effective,
+        resolution,
+        chart_symbol,
+        raw_symbol,
+        start,
+        prune_as_of,
+    } = setup;
+
+    let key = read_key()?;
+    let account = resolve_account(args, broker);
+    let out_dir = arm_out_dir(&raw_symbol)?;
+    let now = Utc::now();
 
     // 2c. Position-tool direct entry. When one of --market-entry /
     //     --stop-entry / --limit-entry is set, ignore the pattern
@@ -242,11 +474,22 @@ pub fn run(args: Args) -> Result<i32> {
     //     signed enter straight to the worker (placed on receipt). This
     //     short-circuits the whole pattern flow below.
     if let Some(mode) = args.position_entry_mode() {
+        // The position tools read raw TradingView drawings (their SL/TP are
+        // drawing properties), so they exist only on the live-chart path. A
+        // frozen-spec arm has no `Roles` and must say so plainly rather than
+        // silently arming some other trade.
+        let roles = roles.ok_or_else(|| {
+            eyre!(
+                "--market-entry / --stop-entry / --limit-entry read the drawn position \
+                 tool from the chart, so they need a live TradingView session; they \
+                 cannot be used with a frozen setup"
+            )
+        })?;
         return run_position_entry(
-            &args,
+            args,
             mode,
             broker,
-            &roles,
+            roles,
             &resolved,
             &instrument,
             &account,
@@ -262,13 +505,13 @@ pub fn run(args: Args) -> Result<i32> {
     //    and the worker computes entry/SL/TP from baked params. The
     //    `?`-returning resolver hard-errors on a bad setup; a clean
     //    operator-facing rejection returns Ok(1).
-    let resolved_spec = if roles.mw_path.is_some() {
+    let resolved_spec = if geom.mw_path.is_some() {
         // Pip/tick for the baked MwSpec come from `effective` — live
         // TradingView precision when available, else the instrument-lookup
         // catalog. --pip-size / --tick-size override downstream.
         resolve_mw_trade(
-            &args,
-            &roles,
+            args,
+            &geom,
             &instrument,
             &account,
             broker,
@@ -281,8 +524,9 @@ pub fn run(args: Args) -> Result<i32> {
         // broker's grid so it isn't rejected as over-precise. `effective`
         // prefers live TV; --pip-size / --tick-size override downstream.
         resolve_hs_trade(
-            &args,
-            &roles,
+            args,
+            &geom,
+            control.has_news(),
             &instrument,
             &account,
             broker,
@@ -304,8 +548,8 @@ pub fn run(args: Args) -> Result<i32> {
         pattern = ?trade_spec.pattern,
         trade_expiry = %trade_spec.trade_expiry.to_rfc3339(),
         sr_reversal_ranges = trade_spec.sr_reversal_ranges.len(),
-        news_pairs = roles.news_pairs.len(),
-        blackout_pairs = roles.blackout_pairs.len(),
+        news_windows = control.news().len(),
+        blackout_windows = control.blackout().len(),
         "trade spec built",
     );
     // `--plan-out` without `--register-plan` is an offline build (no worker
@@ -341,37 +585,27 @@ pub fn run(args: Args) -> Result<i32> {
         "trade bundle written"
     );
 
-    // 6. Pause bundles per blackout pair. Built against the prune as-of (replay
-    //    cursor offline, wall-clock now live) so a blackout that survived the
-    //    prune as still-upcoming-vs-cursor isn't then rejected as "stale" by
-    //    `build_pause_from_spec`'s own past-window guard.
-    let pause_bundles = build_pause_bundles(
-        &roles,
-        &trade_id,
-        &instrument,
-        &account,
+    // 6/7. One pause bundle per blackout window, one news bundle per news
+    //      window. Built against the prune as-of (replay cursor offline,
+    //      wall-clock now live) so a window that survived the prune as
+    //      still-upcoming-vs-cursor isn't then rejected as "stale" by
+    //      `build_pause_from_spec`'s own past-window guard.
+    let bundle_ctx = BundleContext {
+        trade_id: &trade_id,
+        instrument: &instrument,
+        account: &account,
         broker,
-        &out_dir,
-        &key,
-        prune_as_of.at,
-    )?;
-
-    // 7. News bundles per news pair (same as-of reasoning as pause bundles).
-    let news_bundles = build_news_bundles(
-        &roles,
-        &trade_id,
-        &instrument,
-        &account,
-        broker,
-        &out_dir,
-        &key,
-        prune_as_of.at,
-    )?;
+        out_dir: &out_dir,
+        key: &key,
+        now: prune_as_of.at,
+    };
+    let pause_bundles = bundle_ctx.build_all::<PauseKind>(control.blackout())?;
+    let news_bundles = bundle_ctx.build_all::<NewsKind>(control.news())?;
 
     // 8. Calendar control bars now come from the calendar directly, resolved in
-    //    step 2 into `roles.blackout_pairs` / `news_pairs` and built into
-    //    `pause_bundles` / `news_bundles` above. The old drawn-line-era
-    //    supplemental `built_calendar` path was retired in PR1b.
+    //    step 2 into the `ControlWindows` above and built into `pause_bundles` /
+    //    `news_bundles`. The old drawn-line-era supplemental `built_calendar`
+    //    path was retired in PR1b.
 
     // 8b. (`register`) Fold the whole trade — main alert conditions PLUS the
     //     pause/news/calendar control bars built above — into ONE signed
@@ -418,8 +652,8 @@ pub fn run(args: Args) -> Result<i32> {
         register_trade_plan(
             &built_trade,
             direction,
-            &roles,
-            &state.resolution,
+            &geom,
+            &resolution,
             &pause_bundles,
             &news_bundles,
             &key,
@@ -451,16 +685,86 @@ pub fn run(args: Args) -> Result<i32> {
     //    path for the `replay` subcommand). The replay is a post-build
     //    convenience: a failure here surfaces as an error.
     if args.replay() {
+        // Forward what this arm knew about itself, so a chained `--save` records
+        // WHICH variant the fixture froze. `state.symbol` is the broker-qualified
+        // chart symbol (`TRADENATION:EURUSD`) — recorded qualified on purpose: a
+        // bare symbol silently resolves to the OANDA feed, so an unqualified
+        // capture can be off the wrong price data and look perfectly plausible.
+        let arm = crate::replay::ArmContext {
+            skip_bcr: args.skip_bcr,
+            strategy_v2: args.strategy_v2,
+            skip_calendar_bars: args.skip_calendar_bars,
+            skip_golden: args.skip_golden,
+            start: args.start.as_deref(),
+            chart_symbol: Some(&chart_symbol),
+        };
         crate::replay::run_replay(
             effective_plan_out.as_deref(),
             &trade_id,
             broker,
             args.replay_args(),
+            arm,
         )
         .wrap_err("replay after arm (--replay)")?;
     }
 
     Ok(0)
+}
+
+/// Resolve blackout/news windows from the economic calendar.
+///
+/// Shared by the live-chart and frozen-spec paths, so a `--spec-in` arm gets the
+/// **same** window resolution a live arm does. That matters more than it looks:
+/// news is deliberately RE-READ rather than frozen (a frozen calendar answers a
+/// question about a stale week), so this is the one piece of "chart-half" work a
+/// frozen arm still has to do — and doing it differently would be a silent
+/// replay↔live divergence of exactly the kind the fixture corpus exists to find.
+///
+/// Windows come straight from the calendar at real event-minute precision. No
+/// chart lines are drawn and nothing is read back — the old draw + re-classify
+/// round-trip (which snapped every window to a bar boundary and could split a
+/// window straddling `--start` into an orphaned half) is gone.
+/// `--skip-calendar-bars` opts out entirely.
+///
+/// `ControlWindows::new` prunes already-elapsed windows at construction, so
+/// there is no un-pruned set for anything downstream to observe. A calendar
+/// failure warns and yields no windows rather than aborting the arm.
+fn resolve_control_windows(
+    args: &Args,
+    geom: &PlanGeometry,
+    resolved: &ResolvedInstrument,
+    resolution: &str,
+    cursor_unix: i64,
+    prune_as_of: AsOf,
+) -> ControlWindows {
+    if args.skip_calendar_bars {
+        return ControlWindows::empty();
+    }
+    // Scope the news filter to the trade's own lifetime `[cursor, expiry]`, NOT
+    // the chart's visible area:
+    //   - left edge = the cursor (`--start` when given, else the last loaded bar
+    //     `bars_range.to`) — so only news at or after "live now" matters,
+    //     independent of how far left the chart is scrolled;
+    //   - right edge = the trade-expiry vertical, so only news the open trade
+    //     could still run into is considered.
+    // A missing/unparseable expiry collapses the range to empty (no windows)
+    // rather than fetching across all of time; check_required surfaces the
+    // absent expiry drawing as a hard error shortly anyway.
+    let expiry_hint = read_trade_expiry(geom).ok();
+    let calendar_range = calendar_scope_range(cursor_unix, expiry_hint);
+    match calendar_windows(
+        resolution,
+        resolved,
+        calendar_range,
+        args.news_before_hours,
+        args.news_after_hours,
+    ) {
+        Ok((blackout, news, markers)) => ControlWindows::new(blackout, news, markers, prune_as_of),
+        Err(e) => {
+            warn!(error = ?e, "calendar window resolution failed; continuing with no news/blackout windows");
+            ControlWindows::empty()
+        }
+    }
 }
 
 /// Resolve `--broker` > `TRADE_CONTROL_BROKER` env > chart exchange.
@@ -594,21 +898,6 @@ fn resolve_account(args: &Args, broker: Broker) -> String {
     broker.default_account_index().to_string()
 }
 
-/// Outcome of trade-spec resolution. `Reject` is an operator-facing
-/// "fix your chart / flags" message (printed, process exits 1); `Fatal`
-/// is an internal failure that propagates as an error.
-#[derive(Debug)]
-enum ResolveError {
-    Reject(String),
-    Fatal(color_eyre::eyre::Error),
-}
-
-impl From<color_eyre::eyre::Error> for ResolveError {
-    fn from(e: color_eyre::eyre::Error) -> Self {
-        ResolveError::Fatal(e)
-    }
-}
-
 /// H&S / IH&S path: validate the constellation of drawings, read
 /// direction from the **fib** (its head↔neckline, where the head is the
 /// `0`-reading resolved via TradingView's `reverse` flag — *not* raw point
@@ -619,519 +908,26 @@ impl From<color_eyre::eyre::Error> for ResolveError {
 /// the source of a wrong-direction bug when a stale invalidation from
 /// another setup got picked. Reading direction off raw point order was a
 /// *second* wrong-direction bug (AUD/CAD 2026-07: head at `points[1]`).
-fn resolve_hs_trade(
-    args: &Args,
-    roles: &Roles,
-    instrument: &str,
-    account: &str,
-    broker: Broker,
-    catalog_pip: f64,
-    catalog_tick: f64,
-) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
-    if let Err(msg) = check_required(roles, args) {
-        return Err(ResolveError::Reject(msg));
-    }
-    // A future prep-expiry cutoff with no matching prep drawing would
-    // arm a setup that can never enter; a past cutoff is just a re-arm.
-    if let Err(msg) = check_prep_expiries(roles, Utc::now()) {
-        return Err(ResolveError::Reject(msg));
-    }
-    let tp_fib = roles
-        .tp_fib
-        .as_ref()
-        .ok_or_else(|| eyre!("missing tp_fib (already checked by check_required)"))?;
-    // Rule 1: the FIB gives us the trade direction. Resolve which end is the
-    // head (the fib's `0`-reading) via TradingView's `reverse` flag — NOT the
-    // raw point order, which is unreliable (AUD/CAD 2026-07 had its head at
-    // `points[1]`, so point-order armed a long instead of the correct short).
-    // Head above neckline → short (H&S); below → long (iH&S). We no longer read
-    // direction off the `too-high`/`too-low` invalidation label either, which
-    // could be a stale line from a *different* trade and silently flip it.
-    let (head, neckline) = tp_fib.fib_head_neckline().ok_or_else(|| {
-        eyre!("cannot read the fib's two anchors (need two finite prices to set direction)")
-    })?;
-    let direction =
-        crate::geometry::direction_from_head_neckline(head, neckline).ok_or_else(|| {
-            eyre!(
-                "cannot read trade direction from the fib — its head and neckline are equal \
-                 (draw the fib spanning head→neckline)"
-            )
-        })?;
-    // Rule 2: the invalidation (`too-low`/`too-high`) horizontal must sit
-    // inside the fib's head↔neckline range. A line outside that band belongs
-    // to a different, larger pattern — reject it rather than bake a poison
-    // level / mismatched setup.
-    if let Some(inv) = roles.invalidation.as_ref() {
-        let inv_price = horizontal_price(&inv.prices());
-        if !crate::geometry::price_within_fib_range(inv_price, head, neckline) {
-            let (lo, hi) = (head.min(neckline), head.max(neckline));
-            return Err(ResolveError::Reject(format!(
-                "invalidation line at {inv_price} is outside the fib range [{lo}, {hi}] — it \
-                 looks like a stale `too-high`/`too-low` from a different trade; redraw or \
-                 remove it"
-            )));
-        }
-    }
-    let tp = crate::geometry::tp_price(head, neckline);
-    // Continuous at-entry level vetos (Bug #12): the pcl-exhausted (`too-low`)
-    // and invalidation (`too-high`) levels, baked onto the enter so the worker
-    // rejects an entry already past either — independent of the cross-guard.
-    let entry_level_vetos = hs_entry_level_vetos(roles, direction);
-    let expiry = read_trade_expiry(roles)?;
-    // --pip-size / --tick-size override the canonical catalog values when set.
-    let pip_size = args.pip_size.unwrap_or(catalog_pip);
-    let tick_size = args.tick_size.unwrap_or(catalog_tick);
-    let spec = build_trade_spec(
-        args,
-        instrument,
-        account,
-        broker,
-        direction,
-        expiry,
-        tp,
-        roles,
-        pip_size,
-        tick_size,
-        entry_level_vetos,
-    );
-    Ok((direction, spec))
-}
-
-/// M/W path: direction and geometry come from the 3-anchor path drawing
-/// (`mw_path`), not from the H&S drawing constellation. Required
-/// drawings are just the path + the trade-expiry line.
+/// Takes `geom` and **no `Roles`** — no chart drawing is read anywhere below
+/// this line, which is the property `--spec-in` needs. The news fact arrives
+/// separately as `close_on_news`, because news windows are calendar-derived
+/// rather than drawn (see [`crate::control_windows`]): a spec-driven arm supplies
+/// frozen geometry and re-reads the calendar, so those two must stay apart.
 ///
-/// This is the live wrapper: it runs the cheap chart guards first (so an
-/// operator chart mistake fails fast without a network round-trip), then
-/// reads the broker spread live and delegates to
-/// [`resolve_mw_trade_with_spread`] for the geometry gates + baking. The
-/// pure inner fn is what the unit tests drive.
-fn resolve_mw_trade(
-    args: &Args,
-    roles: &Roles,
-    instrument: &str,
-    account: &str,
-    broker: Broker,
-    catalog_pip: f64,
-    catalog_tick: f64,
-) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
-    // --pip-size / --tick-size override the canonical catalog values when set.
-    let pip_size = args.pip_size.unwrap_or(catalog_pip);
-    let tick_size = args.tick_size.unwrap_or(catalog_tick);
-    check_mw_required(roles)?;
-    // The arm-time broker spread is read live (OANDA /pricing or the
-    // TradeNation chart endpoint) and baked into the enter intent so the
-    // worker can mid→bid/ask correct entry/SL/TP at fill time. There is
-    // no operator override — a failed read hard-errors rather than bake a
-    // guessed spread.
-    let spread_pips = read_spread_blocking(broker, instrument, pip_size)?;
-    resolve_mw_trade_with_spread(
-        args,
-        roles,
-        instrument,
-        account,
-        broker,
-        pip_size,
-        tick_size,
-        spread_pips,
-    )
-}
-
-/// Cheap, offline guards every M/W arm needs before the live spread
-/// read: exactly 3 path anchors and a trade-expiry line. Run first so a
-/// fat-fingered chart fails without a network round-trip.
-fn check_mw_required(roles: &Roles) -> std::result::Result<(), ResolveError> {
-    let path = roles
-        .mw_path
-        .as_ref()
-        .ok_or_else(|| eyre!("resolve_mw_trade called without an mw_path"))?;
-    if !matches!(path.points.len(), 3 | 4) {
-        return Err(ResolveError::Reject(format!(
-            "M/W path must have 3 anchors [A runup-start, B first-point, C neckline] or 4 \
-             [+ D right-shoulder]; found {}",
-            path.points.len()
-        )));
-    }
-    if roles.trade_expiry.is_none() {
-        return Err(ResolveError::Reject(
-            "missing required drawing for M/W:\n  - vertical_line labeled 'trade-expiry'\n".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Pure M/W resolution given an already-read `spread_pips`: direction
-/// from the anchors, structure + neckline-depth gates, then bakes the
-/// static `MwSpec`. No I/O — the live spread read happens in the
-/// [`resolve_mw_trade`] wrapper. Unit-tested directly.
-#[allow(clippy::too_many_arguments)]
-fn resolve_mw_trade_with_spread(
-    args: &Args,
-    roles: &Roles,
-    instrument: &str,
-    account: &str,
-    broker: Broker,
-    pip_size: f64,
-    tick_size: f64,
-    spread_pips: f64,
-) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
-    check_mw_required(roles)?;
-    let path = roles
-        .mw_path
-        .as_ref()
-        .ok_or_else(|| eyre!("resolve_mw_trade_with_spread called without an mw_path"))?;
-    let runup_start = path.points[0].price;
-    let first_point = path.points[1].price;
-    let neckline = path.points[2].price;
-    // Optional 4th anchor: the drawn right shoulder (arms immediately).
-    let right_shoulder = path.points.get(3).map(|p| p.price);
-
-    let direction = mw_geometry::mw_direction_from_anchors(runup_start, first_point)
-        .ok_or_else(|| ResolveError::Reject(mw_flat_first_leg_msg(runup_start, first_point)))?;
-    // Coarse "is this even an M/W shape" gate (runup leg > retrace leg).
-    if let Err(e) = mw_geometry::check_mw_structure(runup_start, first_point, neckline) {
-        return Err(ResolveError::Reject(format!("{e}\n")));
-    }
-    // Neckline-retracement depth gate.
-    let pct = mw_geometry::neckline_retrace_pct(runup_start, first_point, neckline);
-    if let Err(msg) = gate_neckline_pct(pct, args.allow_50_pct_m_trades) {
-        return Err(ResolveError::Reject(msg));
-    }
-    // 4-point path: reject a drawing whose right shoulder is on the wrong
-    // side of the neckline or breaks the 1.3 alignment of the shorter
-    // shoulder. Drawing-level validity, so it fails arm here rather than
-    // silently baking a bad geometry.
-    if let Some(rs) = right_shoulder
-        && let Err(e) = mw_geometry::validate_right_shoulder(first_point, neckline, rs)
-    {
-        return Err(ResolveError::Reject(format!("{e}\n")));
-    }
-
-    // The SL-vs-spread floor (hard limit) is enforced at build time in the
-    // shared `cli::build_mw_pattern` chokepoint that this resolve feeds into,
-    // and again at fire time in the worker against the live spread. Not
-    // duplicated here — see `cli/src/trade_patterns.rs::build_mw_pattern`.
-
-    let expiry = read_trade_expiry(roles)?;
-    let pattern = match direction {
-        Direction::Short => cli::TradePattern::M,
-        Direction::Long => cli::TradePattern::W,
-    };
-    info!(
-        direction = direction.as_str(),
-        pattern = ?pattern,
-        runup_start, first_point, neckline,
-        right_shoulder = ?right_shoulder,
-        retrace_pct = %format!("{:.1}%", pct * 100.0),
-        spread_pips,
-        pip_size,
-        "M/W path resolved",
-    );
-    let spec = build_mw_trade_spec(
-        args,
-        instrument,
-        account,
-        broker,
-        pattern,
-        expiry,
-        MwSpecAnchors {
-            runup_start,
-            first_point,
-            neckline,
-            right_shoulder,
-            spread_pips,
-            pip_size,
-            tick_size,
-        },
-    );
-    Ok((direction, spec))
-}
-
-/// Read the live broker spread (in pips) on a short-lived runtime.
+/// It used to take **both**, and the doc here justified that: `roles` was
+/// forwarded to [`build_trade_spec`] "for the one thing that isn't geometry — the
+/// drawn S/R levels (and the prep-expiry steps derived from them)". That was the
+/// bug, not an exception. Drawn S/R levels *are* geometry; they gate whether
+/// `07-close-on-sr-reversal` is armed at all, so a spec-in re-arm without them
+/// would have silently changed the exit. They now live in
+/// [`PlanGeometry::sr_levels`] (and the prep-expiry steps come from
+/// `prep_expiry_epochs`, which was already there), so the `Roles` parameter is
+/// gone. Caught by a clean-slate review, 2026-07-27 — the same class as
+/// `MwPath.runup_start`: drawn geometry no *trigger* reads, so it looked
+/// droppable.
 ///
-/// `resolve_mw_trade` is sync (it's called from the sync `run`), but the
-/// broker reads are async — so we spin a throwaway tokio runtime here,
-/// the same bridge `auto_draw_calendar_lines` uses for its calendar
-/// fetch. Any read failure (no token, network error, market closed,
-/// degenerate spread) surfaces as a `Fatal` resolve error carrying the
-/// actionable message from `spread::read_spread_pips`.
-fn read_spread_blocking(
-    broker: Broker,
-    instrument: &str,
-    pip_size: f64,
-) -> std::result::Result<f64, ResolveError> {
-    let runtime = tokio::runtime::Runtime::new()
-        .context("starting tokio runtime for live spread read")
-        .map_err(ResolveError::Fatal)?;
-    runtime
-        .block_on(crate::spread::read_spread_pips(
-            broker, instrument, pip_size,
-        ))
-        .map_err(ResolveError::Fatal)
-}
-
-/// Blocking live **mid** read — the pullback prep's arm-time anchor. Same
-/// runtime-bridge shape as [`read_spread_blocking`]; hard-errors on a
-/// stale/degenerate quote so a bad anchor can't silently mis-fire the pullback.
-fn read_mid_blocking(broker: Broker, instrument: &str) -> Result<f64> {
-    let runtime =
-        tokio::runtime::Runtime::new().context("starting tokio runtime for live mid read")?;
-    runtime.block_on(crate::spread::read_mid(broker, instrument))
-}
-
-/// The static M/W geometry baked into the signed enter intent — a
-/// complete mirror of `cli::MwSpec`. `pip_size` is the canonical catalog
-/// value (or the `--pip-size` override); `spread_pips` the arm-time
-/// broker spread.
-struct MwSpecAnchors {
-    runup_start: f64,
-    first_point: f64,
-    neckline: f64,
-    /// `D` — the optional drawn right shoulder (4-point path).
-    right_shoulder: Option<f64>,
-    spread_pips: f64,
-    pip_size: f64,
-    /// Canonical instrument tick size (or `--tick-size`), baked onto the enter
-    /// so the worker snaps the mid-correct M/W prices onto the broker's grid.
-    tick_size: f64,
-}
-
-/// Gate the neckline-retracement percentage. Default ceiling is
-/// `< 40%`; `--allow-50-pct-m-trades` raises it to `<= 50%`; `> 50%` is
-/// always rejected. A `NaN` pct (degenerate zero-runup path) is
-/// rejected too.
-fn gate_neckline_pct(pct: f64, allow_50: bool) -> std::result::Result<(), String> {
-    if pct.is_nan() {
-        return Err("M/W neckline retracement is undefined (zero-length runup leg)\n".into());
-    }
-    if pct > 0.50 {
-        return Err(format!(
-            "M/W neckline retracement {:.1}% exceeds the hard 50% ceiling — not a valid \
-             reversal\n",
-            pct * 100.0
-        ));
-    }
-    if pct >= 0.40 && !allow_50 {
-        return Err(format!(
-            "M/W neckline retracement {:.1}% is >= 40% — pass --allow-50-pct-m-trades to arm a \
-             marginal setup up to 50%\n",
-            pct * 100.0
-        ));
-    }
-    Ok(())
-}
-
-fn mw_flat_first_leg_msg(runup_start: f64, first_point: f64) -> String {
-    format!(
-        "M/W path has a flat first leg (A == B): runup_start={runup_start}, \
-         first_point={first_point} — cannot infer direction\n"
-    )
-}
-
-/// Build the M/W trade spec: no preps, single-shot, baked `MwSpec`. The
-/// worker derives entry/SL/TP from the path geometry, so `tp_price` is a
-/// placeholder the M/W build path ignores (it's `None` on the enter
-/// intent).
-fn build_mw_trade_spec(
-    args: &Args,
-    instrument: &str,
-    account: &str,
-    broker: Broker,
-    pattern: cli::TradePattern,
-    expiry: DateTime<Utc>,
-    anchors: MwSpecAnchors,
-) -> cli::TradeSpec {
-    cli::TradeSpec {
-        pattern,
-        instrument: instrument.to_string(),
-        account: account.to_string(),
-        broker: broker_to_kind(broker),
-        trade_expiry: expiry,
-        risk_pct: args.risk_pct.unwrap_or(1.0),
-        risk_amount: args.risk_amount,
-        dry_run: args.broker_dry_run,
-        // M/W is single-shot: a broker rejection of a placed order is
-        // terminal (no re-entry).
-        max_retries: 0,
-        // Order expiry is governed by trade_expiry + the cancel/abort
-        // vetos; the bar-count menu is an H&S feature.
-        expiry_bars: None,
-        skip_preps: Vec::new(),
-        // Pullback is an H&S retest alternative; the M/W path has its own
-        // geometry (cancel/abort/overshoot) and no retest, so no pullback.
-        pull_back: None,
-        entry_offset_pips: None,
-        sl_offset_pips: None,
-        // Both offset forms None → the shared builder applies the ATR-pct
-        // default (DEFAULT_BUFFER_ATR_PCT). Unused on the M/W path (worker
-        // computes geometry); the H&S enter inherits the volatility-scaled buffer.
-        entry_offset_atr_pct: None,
-        sl_offset_atr_pct: None,
-        sl_anchor: None,
-        // Worker computes the real TP (hard 1R); this field is unused on
-        // the M/W build path. Set to the neckline as a harmless,
-        // non-zero placeholder so any accidental serialization is sane.
-        tp_price: round5(anchors.neckline),
-        // M/W anchors SL via the worker-computed geometry, not an
-        // absolute drawn stop.
-        sl_price: None,
-        entry_deadline_pct: 80,
-        allow_entry: args.entry_filter_script.clone(),
-        // M/W entry is always a stop order at the worker-computed level;
-        // --entry-market is an H&S flag and is ignored here.
-        entry_mode: cli::EntryMode::Stop,
-        // Golden is a Head-and-Shoulders signal-candle concept; M/W entry is a
-        // geometry-driven stop the worker resolves, so it never gates on golden.
-        // (`--skip-golden` is an H&S-only lever and is irrelevant here.)
-        needs_golden: false,
-        needs_confirmed: args.require_confirmation,
-        // No close-on-reversal for M/W (TP is a hard 1R), so news/SR
-        // close coverage is not wired.
-        close_on_news: false,
-        sr_reversal_ranges: Vec::new(),
-        veto_on_reversal: false,
-        needs_confirmed_close: false,
-        prep_expiries: Vec::new(),
-        mw: Some(cli::MwSpec {
-            neckline: anchors.neckline,
-            first_point: anchors.first_point,
-            runup_start: anchors.runup_start,
-            right_shoulder: anchors.right_shoulder,
-            spread_pips: anchors.spread_pips,
-            pip_size: anchors.pip_size,
-            tick_size: Some(anchors.tick_size),
-        }),
-        // Mirror the M/W pip onto the top-level field (the cli M/W builder
-        // also does this); keeps the worker's sizing tail on the baked pip.
-        pip_size: Some(anchors.pip_size),
-        // Baked tick so the worker snaps the mid-correct M/W prices onto grid.
-        tick_size: Some(anchors.tick_size),
-        blackout_close: args.blackout_close.into_core(),
-        // M/W has no fib / invalidation drawing — its abort/cancel/overshoot
-        // vetos cover the level guards, so no continuous entry-level vetos.
-        entry_level_vetos: Vec::new(),
-        // M/W is out of scope for wrong-side stop recovery (it has no
-        // EntrySpec — resolves via intent.mw). Keep today's behaviour.
-        recover_entry: trade_control_core::intent::RecoverEntryAction::Skip,
-        // strategy-v2 (dual stop + QM enter) is H&S-only.
-        strategy_v2: false,
-        // No QM leg on this path; default keeps the spec yaml byte-identical.
-        qm_entry_mode: cli::EntryMode::Stop,
-        // Break-even on at 50% by default; `--no-breakeven` opts out,
-        // `--breakeven-pct` overrides. M/W honours it exactly like H&S — the
-        // worker resolves the M/W geometry at fill, so the cron's snapshot has
-        // a concrete entry/TP for the 50% level.
-        breakeven_pct: if args.no_breakeven {
-            None
-        } else {
-            Some(args.breakeven_pct.unwrap_or(0.5))
-        },
-        // Entry SL-spread floor window baked onto the enter; `None` → worker default (5).
-        spread_window: args.spread_window,
-    }
-}
-
-/// Validate the chart has every drawing the bundle will need.
-/// Mirrors `tv_arm_hs.py:1614-1629`.
-fn check_required(roles: &Roles, args: &Args) -> std::result::Result<(), String> {
-    let mut missing = Vec::new();
-    if roles.invalidation.is_none() {
-        missing.push("horizontal_line labeled 'too-high' or 'too-low'");
-    }
-    if roles.break_and_close.is_none() && !args.skip_break_and_close {
-        missing.push("trend_line labeled 'neckline' (or 'break-and-close')");
-    }
-    // The retest reuses the neckline drawing (`resolve_retest`), so it's only
-    // *independently* missing when the retest is wanted but there's no neckline
-    // to derive it from — i.e. the neckline is skipped. A plain neckline setup
-    // satisfies both roles with one drawing.
-    if roles.retest.is_none() && !args.skip_retest && args.skip_break_and_close {
-        missing.push("trend_line labeled 'neckline' (needed for the retest)");
-    }
-    if roles.tp_fib.is_none() {
-        missing.push("fib_retracement (TP)");
-    }
-    if roles.trade_expiry.is_none() {
-        missing.push("vertical_line labeled 'trade-expiry'");
-    }
-    if missing.is_empty() {
-        return Ok(());
-    }
-    let mut msg = String::from("missing required drawings:\n");
-    for m in missing {
-        msg.push_str("  - ");
-        msg.push_str(m);
-        msg.push('\n');
-    }
-    Err(msg)
-}
-
-/// Canonical prep-step names that have a `<prep>-expiry` cutoff line on
-/// the chart — fed into `cli::TradeSpec.prep_expiries` so the CLI emits
-/// one `08-prep-expire-<step>` alert per line.
-///
-/// A step that is *also* being skipped (`skip_preps`, e.g. `--quasimodo`
-/// drops `break-and-close`) is filtered out: there is no prep left to
-/// expire, so a stale drawn `<step>-expiry` line on the chart is just
-/// context, not a cutoff to arm. Emitting it anyway would put the same
-/// name in both `skip_preps` and `prep_expiries`, which the CLI validator
-/// rejects (`can't expire a prep that's been dropped`).
-fn prep_expiry_steps(roles: &Roles, skip_preps: &[String]) -> Vec<String> {
-    roles
-        .prep_expiries
-        .iter()
-        .map(|(step, _)| step.clone())
-        .filter(|step| !skip_preps.iter().any(|s| s == step))
-        .collect()
-}
-
-/// Validate each `<prep>-expiry` cutoff line against the prep it guards.
-///
-/// - **Future cutoff, no matching prep drawing** → hard error. The line
-///   would block the prep before it could ever land, so the setup could
-///   never enter — almost certainly the operator drew the cutoff but
-///   forgot the neckline / retest trend line.
-/// - **Past cutoff** → warn only. We're re-arming a setup later in time
-///   (the cutoff already lapsed); the line is harmless context, not a
-///   reason to abort.
-///
-/// `now` is injected so the rule is unit-testable without a clock.
-fn check_prep_expiries(roles: &Roles, now: DateTime<Utc>) -> std::result::Result<(), String> {
-    let now_unix = now.timestamp();
-    let mut errors = Vec::new();
-    for (step, drawing) in &roles.prep_expiries {
-        let line_unix = drawing.anchor_time_seconds();
-        let prep_present = match step.as_str() {
-            trade_control_conventions::PREP_BREAK_AND_CLOSE => roles.break_and_close.is_some(),
-            trade_control_conventions::PREP_RETEST => roles.retest.is_some(),
-            // Unknown step shouldn't occur (classify only emits known
-            // prep names), but treat it as "prep absent" defensively.
-            _ => false,
-        };
-        if line_unix > now_unix {
-            if !prep_present {
-                errors.push(format!(
-                    "  - '{step}-expiry' cutoff line is in the future but no '{step}' \
-                     trend line is on the chart — this setup could never enter \
-                     (draw the '{step}' line, or remove the expiry cutoff)"
-                ));
-            }
-        } else {
-            warn!(
-                step = %step,
-                "'{step}-expiry' cutoff line is in the past — assuming a re-arm later in time"
-            );
-        }
-    }
-    if errors.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "prep-expiry validation failed:\n{}\n",
-        errors.join("\n")
-    ))
-}
-
+/// Eight parameters still trips clippy; splitting them into a struct would just
+/// relocate the same fields.
 /// Load the signing key from `TRADE_CONTROL_KEY_FILE` env or the
 /// default `~/.config/trade-control/key.hex`.
 fn read_key() -> Result<[u8; KEY_LEN]> {
@@ -1173,7 +969,7 @@ fn key_path_resolved() -> Result<PathBuf> {
     default_key_path()
 }
 
-fn arm_out_dir(raw_sym: &str) -> Result<PathBuf> {
+pub(crate) fn arm_out_dir(raw_sym: &str) -> Result<PathBuf> {
     let today = Utc::now().format("%Y-%m-%d").to_string();
     let dir = PathBuf::from(ARM_OUT_ROOT).join(format!("{raw_sym}-{today}"));
     fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
@@ -1181,360 +977,30 @@ fn arm_out_dir(raw_sym: &str) -> Result<PathBuf> {
 }
 
 /// Assemble the `TradeSpec` from CLI args + classified roles.
-#[allow(clippy::too_many_arguments)]
-fn build_trade_spec(
-    args: &Args,
-    instrument: &str,
-    account: &str,
-    broker: Broker,
-    direction: Direction,
-    expiry: DateTime<Utc>,
-    tp: f64,
-    roles: &Roles,
-    pip_size: f64,
-    tick_size: f64,
-    entry_level_vetos: Vec<trade_control_core::intent::EntryLevelVeto>,
-) -> cli::TradeSpec {
-    use cli::TradePattern;
-    let pattern = match direction {
-        Direction::Short => TradePattern::Hs,
-        Direction::Long => TradePattern::Ihs,
-    };
-    let mut skip_preps = Vec::new();
-    if args.skip_break_and_close {
-        skip_preps.push("break-and-close".to_string());
-    }
-    if args.skip_retest {
-        skip_preps.push("retest".to_string());
-    }
-    // Borrow `skip_preps` before it's moved into the struct literal below.
-    let prep_expiries = prep_expiry_steps(roles, &skip_preps);
-    let mut spec =
-        cli::TradeSpec {
-            pattern,
-            instrument: instrument.to_string(),
-            account: account.to_string(),
-            broker: broker_to_kind(broker),
-            trade_expiry: expiry,
-            risk_pct: args.risk_pct.unwrap_or(1.0),
-            risk_amount: args.risk_amount,
-            dry_run: args.broker_dry_run,
-            // strategy-v2 needs a non-zero max_retries on both enters: it's the
-            // multi_shot flag that keeps the engine plan alive after the first
-            // enter fires, so the worker retry gate can cancel the sibling's
-            // resting order. Floor to 1 (a `--max-retries 0` with `--strategy-v2`
-            // is rejected by validate_args, so this floor is just belt-and-braces).
-            max_retries: if args.strategy_v2 {
-                args.max_retries.unwrap_or(5).max(1)
-            } else {
-                args.max_retries.unwrap_or(5)
-            },
-            expiry_bars: args.expiry_bars,
-            skip_preps,
-            pull_back: args.pull_back,
-            entry_offset_pips: None,
-            sl_offset_pips: None,
-            // Both offset forms None → the shared builder applies the ATR-pct
-            // default (DEFAULT_BUFFER_ATR_PCT). Unused on the M/W path (worker
-            // computes geometry); the H&S enter inherits the volatility-scaled buffer.
-            entry_offset_atr_pct: None,
-            sl_offset_atr_pct: None,
-            sl_anchor: None,
-            tp_price: round5(tp),
-            // H&S anchors SL to the pattern extreme, not an absolute price.
-            sl_price: None,
-            entry_deadline_pct: 80,
-            allow_entry: args.entry_filter_script.clone(),
-            // Pattern-path entry order type: explicit `--entry-{market,stop,limit}`
-            // wins; default is stop.
-            entry_mode: match args.pattern_entry_mode() {
-                Some(crate::args::PatternEntry::Market) => cli::EntryMode::Market,
-                Some(crate::args::PatternEntry::Limit) => cli::EntryMode::Limit,
-                Some(crate::args::PatternEntry::Stop) | None => cli::EntryMode::Stop,
-            },
-            needs_golden: !args.skip_golden,
-            needs_confirmed: args.require_confirmation,
-            close_on_news: !roles.news_pairs.is_empty(),
-            // Chart-drawn S/R bands, plus (default-on) a one-sided band pinned
-            // to the take-profit so a reversal near TP flattens for a partial win
-            // rather than round-tripping to the stop. `07-close-on-sr-reversal`
-            // OR-fires across every band. H&S only — see `tp_resistance_band`.
-            sr_reversal_ranges: {
-                let mut bands = build_sr_ranges(roles, args.reversal_band_pct);
-                if !args.skip_tp_resistance {
-                    bands.push(tp_resistance_band(tp, direction, args.tp_resistance_pct));
-                }
-                bands
-            },
-            veto_on_reversal: args.veto_on_reversal,
-            needs_confirmed_close: false,
-            // Populated from the chart's `<prep>-expiry` vertical lines —
-            // see `prep_expiry_steps`. Skipped preps (e.g. `--quasimodo`
-            // drops break-and-close) are filtered out so a stale expiry line
-            // doesn't collide with `skip_preps`.
-            prep_expiries,
-            // H&S path: no M/W static geometry. The M/W branch (commit 9)
-            // builds its spec separately, keyed on `roles.mw_path`.
-            mw: None,
-            // Baked from instrument-lookup (or --pip-size) so the worker scales
-            // the entry/SL offset_pips with the right pip, not its forex default.
-            pip_size: Some(pip_size),
-            // Baked from instrument-lookup (or --tick-size) so the worker snaps
-            // entry/SL/TP onto the broker's price grid before placement.
-            tick_size: Some(tick_size),
-            blackout_close: args.blackout_close.into_core(),
-            entry_level_vetos,
-            // Wrong-side recovery (H&S / iH&S). Explicit `--recover-entry` wins.
-            // Otherwise the default depends on the entry mode:
-            //  - `--entry-limit`: a wrong-side limit recovers to a **stop** at the
-            //    same level (the operator's rule; `limit_recover_action`).
-            //  - stop entry + `--require-confirmation`: defaults to `limit` (the
-            //    confirmation lag is what strands the stop).
-            //  - everything else: today's drop (`skip`).
-            recover_entry: match args.pattern_entry_mode() {
-                Some(crate::args::PatternEntry::Limit) => args.limit_recover_action(),
-                _ => args.recover_entry.map(|r| r.into_core()).unwrap_or(
-                    if args.require_confirmation {
-                        trade_control_core::intent::RecoverEntryAction::Limit
-                    } else {
-                        trade_control_core::intent::RecoverEntryAction::Skip
-                    },
-                ),
-            },
-            strategy_v2: args.strategy_v2,
-            // QM leg (`09-enter-qm`) entry order type — `--qm-entry`, default
-            // Limit (rest at the signal level, recover to a stop when price has
-            // already crossed it). Independent of the BCR leg's `entry_mode`.
-            qm_entry_mode: match args.qm_entry {
-                Some(crate::args::QmEntry::Market) => cli::EntryMode::Market,
-                Some(crate::args::QmEntry::Stop) => cli::EntryMode::Stop,
-                Some(crate::args::QmEntry::Limit) | None => cli::EntryMode::Limit,
-            },
-            // Break-even on at 50% by default; `--no-breakeven` opts out,
-            // `--breakeven-pct` overrides the threshold.
-            breakeven_pct: if args.no_breakeven {
-                None
-            } else {
-                Some(args.breakeven_pct.unwrap_or(0.5))
-            },
-            // Entry SL-spread floor window baked onto the enter; `None` → worker default (5).
-            spread_window: args.spread_window,
-        };
-    if args.sl_from_recent {
-        spec.sl_anchor = Some(match direction {
-            Direction::Short => cli::PriceAnchor::RecentHigh,
-            Direction::Long => cli::PriceAnchor::RecentLow,
-        });
-    }
-    spec
-}
-
-/// The continuous at-entry level vetos for an H&S/IH&S setup (Bug #12).
 ///
-/// Two levels, mirroring the `intent.vetos` name-list the enter already
-/// carries:
-/// - **pcl-exhausted** — `midpoint + 0.8 × (TP − midpoint)` from the fib;
-///   the move is mostly done, a late entry's R:R no longer justifies opening.
-///   For a short the entry is "past" when **at or below** it (`Below`); a long
-///   mirrors (`Above`). Named `too-low` (short) / `too-high` (long).
-/// - **invalidation** — the operator's horizontal at the right shoulder; the
-///   thesis is dead once price runs back past it. For a short "past" is **at
-///   or above** (`Above`); a long mirrors (`Below`). Named `too-high` (short)
-///   / `too-low` (long).
-///
-/// A level that comes back `NaN` (drawing absent or malformed) is skipped so a
-/// missing fib / invalidation can't bake a poison level. Direction picks both
-/// the name and the side.
-fn hs_entry_level_vetos(
-    roles: &Roles,
-    direction: Direction,
-) -> Vec<trade_control_core::intent::EntryLevelVeto> {
-    use trade_control_core::intent::{EntryLevelVeto, VetoSide};
-    let mut out = Vec::new();
-
-    // pcl-exhausted (the "ran most of the way to TP" gate). Resolve head/
-    // neckline via the fib's `reverse` flag (not point order) so the level
-    // lands on the correct side even when the operator drew it neckline-first.
-    if let Some(fib) = roles.tp_fib.as_ref() {
-        let level = fib
-            .fib_head_neckline()
-            .map(|(head, neckline)| pcl_exhausted_price(head, neckline))
-            .unwrap_or(f64::NAN);
-        if level.is_finite() {
-            let (name, past) = match direction {
-                Direction::Short => ("too-low", VetoSide::Below),
-                Direction::Long => ("too-high", VetoSide::Above),
-            };
-            out.push(EntryLevelVeto {
-                name: name.into(),
-                level,
-                past,
-            });
-        }
-    }
-
-    // invalidation (the right-shoulder horizontal; thesis dead past it).
-    if let Some(inv) = roles.invalidation.as_ref() {
-        let level = horizontal_price(&inv.prices());
-        if level.is_finite() {
-            let (name, past) = match direction {
-                Direction::Short => ("too-high", VetoSide::Above),
-                Direction::Long => ("too-low", VetoSide::Below),
-            };
-            out.push(EntryLevelVeto {
-                name: name.into(),
-                level,
-                past,
-            });
-        }
-    }
-
-    out
-}
-
-fn broker_to_kind(b: Broker) -> cli::BrokerKind {
-    match b {
-        Broker::Oanda => cli::BrokerKind::Oanda,
-        Broker::TradeNation => cli::BrokerKind::TradeNation,
-    }
-}
-
-fn kind_to_broker(k: cli::BrokerKind) -> Broker {
-    match k {
-        cli::BrokerKind::Oanda => Broker::Oanda,
-        cli::BrokerKind::TradeNation => Broker::TradeNation,
-    }
-}
-
-fn build_sr_ranges(roles: &Roles, band_pct: f64) -> Vec<[f64; 2]> {
-    let pct = band_pct / 100.0;
-    roles
-        .sr_levels
-        .iter()
-        .filter_map(|d| d.points.first().map(|p| p.price))
-        .map(|price| [round5(price * (1.0 - pct)), round5(price * (1.0 + pct))])
-        .collect()
-}
-
-/// S/R band pinned so its **far edge is the take-profit**, sitting on the
-/// approach side (toward entry). A golden reversal candle whose band-anchor lands
-/// inside it fires `07-close-on-sr-reversal`, closing the position for a partial
-/// win instead of round-tripping to the stop. H&S / iH&S only — the M/W path
-/// recomputes TP live and gets no auto band.
-///
-/// **Width matches a drawn S/R line** ([`build_sr_ranges`]). A drawn line is a
-/// full `±pct` band (`2·pct` total) centred on the line; this band is the same
-/// total width, but placed so its far edge is TP: the "line" (centre) sits one
-/// `pct` step onto the approach side (`TP·(1+pct)` for a short, `TP·(1-pct)` for
-/// a long) and the normal `±pct` band around it lands the near edge exactly on
-/// TP. So the band never extends *past* TP (a clean run to TP is unaffected) yet
-/// reaches a full drawn-band width up the approach side — twice the old
-/// one-sided `[TP, TP+pct]`, which was accidentally half a drawn line's width.
-/// Catching a reversal that turns further short of TP is a separate lever
-/// (`--tp-resistance-pct`).
-///
-/// `pct` is a percent of the TP price (e.g. `0.1` = 0.1%). Returns `[lo, hi]`
-/// with `lo <= hi` as required by the `sr_bands` validator.
-fn tp_resistance_band(tp: f64, direction: Direction, pct: f64) -> [f64; 2] {
-    let pct = pct / 100.0;
-    // The S/R "line" (band centre) is one pct step onto the approach side of TP,
-    // so the ±pct band's far edge lands back on TP.
-    let center = match direction {
-        // Long: price rises into TP from below → approach side (and the band) is
-        // below TP, top edge = TP.
-        Direction::Long => tp * (1.0 - pct),
-        // Short: price falls into TP from above → approach side (and the band) is
-        // above TP, bottom edge = TP.
-        Direction::Short => tp * (1.0 + pct),
-    };
-    [round5(center * (1.0 - pct)), round5(center * (1.0 + pct))]
-}
-
-fn round5(v: f64) -> f64 {
-    (v * 1e5).round() / 1e5
-}
-
-/// In-memory representation of one built pause / news bundle so the
-/// payload loop downstream can iterate without re-reading disk.
-struct PauseBundle {
-    built: cli::BuiltPause,
-    out_dir: PathBuf,
-}
-
-struct NewsBundle {
-    built: cli::BuiltNews,
-    out_dir: PathBuf,
-}
-
-/// Drop blackout/news pairs whose window has already fully closed
-/// (`end_time <= now`). The visible-window filter in [`classify`] only
-/// removes lines that are *off-screen*; when the operator arms off a chart
-/// that is showing historical bars (an old H&S whose trade-expiry is in the
-/// past), the news/blackout vertical lines are genuinely on-screen yet their
-/// window has elapsed in wall-clock terms. A past window has nothing left to
-/// pause / close-on-news for, so arming it is meaningless — and feeding it to
-/// `build_pause_from_spec` would hard-fail with "refusing to arm a stale
-/// blackout". Drop it here, once, so the log line, `close_on_news`, and both
-/// bundle builders all see a consistent live-only view.
-fn drop_past_control_pairs(roles: &mut Roles, as_of: AsOf) {
-    for (kind, pairs) in [
-        ("blackout", &mut roles.blackout_pairs),
-        ("news", &mut roles.news_pairs),
-    ] {
-        let before = pairs.len();
-        pairs.retain(|w| !w.is_past(as_of.at));
-        let dropped = before - pairs.len();
-        if dropped > 0 {
-            info!(
-                kind,
-                dropped,
-                as_of = %as_of.at.to_rfc3339(),
-                source = as_of.source,
-                "dropping control pair(s) whose window already closed (end_time <= as_of)"
-            );
-        }
-    }
-    // Keep the cosmetic markers exactly in lock-step with the surviving news
-    // windows, so a drawn marker always corresponds to an armed window. A news
-    // window is `[event_time, event_time + after]`, so a marker survives iff a
-    // surviving news window opens at its event minute — this correctly keeps a
-    // marker whose event minute has passed but whose post-release window is
-    // still open (drawn == armed, not drawn == future).
-    let live_event_secs: std::collections::HashSet<i64> = roles
-        .news_pairs
-        .iter()
-        .map(|w| w.start().timestamp())
-        .collect();
-    let before = roles.news_markers.len();
-    roles
-        .news_markers
-        .retain(|m| live_event_secs.contains(&m.event_time.timestamp()));
-    let dropped = before - roles.news_markers.len();
-    if dropped > 0 {
-        info!(
-            dropped,
-            as_of = %as_of.at.to_rfc3339(),
-            source = as_of.source,
-            "dropping news marker(s) whose news window already closed",
-        );
-    }
-}
-
-/// Draw one cosmetic vertical line per news event tv-arm reacts to (`roles.news_markers`),
-/// grouped so events sharing a chart bar collapse to a single line. Purely a chart
+/// `close_on_news` is passed in rather than derived here: the news windows are
+/// calendar-derived, not drawn, so they live in `ControlWindows` rather than
+/// `Roles` — see [`crate::control_windows`]. All this needs is the one fact
+/// "does this trade have a news window", so that's what it takes.
+/// Draw one cosmetic vertical line per news event tv-arm reacts to, grouped so
+/// events sharing a chart bar collapse to a single line. Purely a chart
 /// annotation for debugging / replay — it never affects the signed plan.
+///
+/// `markers` is the *armed* set (post-prune, via
+/// [`ControlWindows::markers`][crate::control_windows::ControlWindows::markers]),
+/// so drawn == armed.
 ///
 /// Failure is non-fatal: a tv-mcp draw error (or an empty marker set) logs a warning
 /// and returns. Unlike tv-news — which hard-errors on a half-drawn chart — a flaky
 /// tv-mcp must never block a live `--register-plan`, so every line is attempted and
 /// per-line failures are counted, not propagated.
-fn draw_news_markers(mcp: &TvMcp, roles: &Roles, resolution: &str) {
-    if roles.news_markers.is_empty() {
+fn draw_news_markers(mcp: &TvMcp, markers: &[NewsMarker], resolution: &str) {
+    if markers.is_empty() {
         info!("news markers: no armed news events to draw");
         return;
     }
     let bar_secs = news_marker_lines_bar_secs(resolution);
-    let lines = news_marker_lines(&roles.news_markers, bar_secs);
+    let lines = news_marker_lines(markers, bar_secs);
     let mut drawn = 0usize;
     let mut failed = 0usize;
     for line in &lines {
@@ -1556,7 +1022,7 @@ fn draw_news_markers(mcp: &TvMcp, roles: &Roles, resolution: &str) {
         }
     }
     info!(
-        events = roles.news_markers.len(),
+        events = markers.len(),
         lines = lines.len(),
         drawn,
         failed,
@@ -1571,17 +1037,6 @@ fn news_marker_lines_bar_secs(resolution: &str) -> i64 {
         .unwrap_or(crate::news_marker::DEFAULT_BAR_SECS)
 }
 
-/// The "as-of" time control pairs are pruned against, plus where it came from
-/// (for the drop log line). In a live `--register-plan` arm this is wall-clock
-/// `now`; in an offline / replay `--plan-out` build it's the chart's replay
-/// cursor (visible range right edge), so blackouts still *upcoming* relative to
-/// the cursor survive a historical replay. See `BUG-tv-arm-stale-blackout-*`.
-#[derive(Clone, Copy)]
-struct AsOf {
-    at: DateTime<Utc>,
-    source: &'static str,
-}
-
 /// Parse `--start` to a unix second, or `None` if the flag is absent. A
 /// malformed value is a hard error — unlike `--as-of` (which falls back to the
 /// cursor), `--start` fundamentally changes discovery, so a typo must not
@@ -1590,9 +1045,14 @@ fn parse_start(args: &Args) -> Result<Option<i64>> {
     let Some(raw) = args.start.as_deref() else {
         return Ok(None);
     };
-    let ts = DateTime::parse_from_rfc3339(raw)
-        .wrap_err_with(|| format!("--start is not valid RFC3339: {raw:?}"))?;
-    Ok(Some(ts.with_timezone(&Utc).timestamp()))
+    // Shared with `replay-candles --start` — see `cli::start_time`. Using
+    // `DateTime::parse_from_rfc3339` directly here was a real trap: it demands
+    // SECONDS and rejects a bare local time, so `--start 2026-06-19T17:00+10:00`
+    // failed on tv-arm while working on replay-candles, even though
+    // `tv-arm ... replay` forwards the very same string to it.
+    let ts = cli::start_time::parse_start_end(raw)
+        .wrap_err_with(|| format!("--start is not a valid datetime: {raw:?}"))?;
+    Ok(Some(ts.timestamp()))
 }
 
 /// The instant a plan should be recorded as armed at.
@@ -1603,7 +1063,7 @@ fn parse_start(args: &Args) -> Result<Option<i64>> {
 /// arm-time news sentiment is computed as of that point. Otherwise it's the
 /// real wall-clock `now`. A `replay_start` that can't be represented as a
 /// `DateTime` (out-of-range) falls back to `now` rather than failing arming.
-fn effective_arm_time(replay_start: Option<i64>, now: DateTime<Utc>) -> DateTime<Utc> {
+pub(crate) fn effective_arm_time(replay_start: Option<i64>, now: DateTime<Utc>) -> DateTime<Utc> {
     replay_start
         .and_then(|s| DateTime::<Utc>::from_timestamp(s, 0))
         .unwrap_or(now)
@@ -1659,569 +1119,6 @@ fn pick_prune_as_of(args: &Args, now: DateTime<Utc>, cursor_unix: i64, start: Op
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_pause_bundles(
-    roles: &Roles,
-    trade_id: &str,
-    instrument: &str,
-    account: &str,
-    broker: Broker,
-    out_dir: &Path,
-    key: &[u8; KEY_LEN],
-    now: DateTime<Utc>,
-) -> Result<Vec<PauseBundle>> {
-    let mut bundles = Vec::new();
-    if roles.blackout_pairs.is_empty() {
-        return Ok(bundles);
-    }
-    if trade_id.is_empty() {
-        return Err(eyre!(
-            "have blackout pairs but trade has no trade_id; refusing to arm"
-        ));
-    }
-    for (i, w) in roles.blackout_pairs.iter().enumerate() {
-        let pair_idx = i + 1;
-        let start_time = w.start();
-        let pause_dir = out_dir.join(format!("pause-{pair_idx}"));
-        fs::create_dir_all(&pause_dir).with_context(|| format!("mkdir {}", pause_dir.display()))?;
-        let spec = cli::PauseSpec {
-            trade_id: trade_id.to_string(),
-            blackout_id: None,
-            instrument: instrument.to_string(),
-            account: account.to_string(),
-            broker: broker_to_kind(broker),
-            start_time,
-            end_time: w.end(),
-            reason: Some(format!("news:{instrument}-{}", start_time.to_rfc3339())),
-        };
-        let built = cli::build_pause_from_spec(spec, now)
-            .with_context(|| format!("build pause #{pair_idx}"))?;
-        cli::write_pause(&built, key, &pause_dir)
-            .with_context(|| format!("write pause #{pair_idx}"))?;
-        bundles.push(PauseBundle {
-            built,
-            out_dir: pause_dir,
-        });
-    }
-    info!(count = bundles.len(), "pause bundles built");
-    Ok(bundles)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_news_bundles(
-    roles: &Roles,
-    trade_id: &str,
-    instrument: &str,
-    account: &str,
-    broker: Broker,
-    out_dir: &Path,
-    key: &[u8; KEY_LEN],
-    now: DateTime<Utc>,
-) -> Result<Vec<NewsBundle>> {
-    let mut bundles = Vec::new();
-    if roles.news_pairs.is_empty() {
-        return Ok(bundles);
-    }
-    if trade_id.is_empty() {
-        return Err(eyre!(
-            "have news pairs but trade has no trade_id; refusing to arm"
-        ));
-    }
-    for (i, w) in roles.news_pairs.iter().enumerate() {
-        let pair_idx = i + 1;
-        let start_time = w.start();
-        let news_dir = out_dir.join(format!("news-{pair_idx}"));
-        fs::create_dir_all(&news_dir).with_context(|| format!("mkdir {}", news_dir.display()))?;
-        let spec = cli::NewsSpec {
-            trade_id: trade_id.to_string(),
-            news_id: None,
-            instrument: instrument.to_string(),
-            account: account.to_string(),
-            broker: broker_to_kind(broker),
-            start_time,
-            end_time: w.end(),
-            reason: Some(format!("news:{instrument}-{}", start_time.to_rfc3339())),
-        };
-        let built = cli::build_news_from_spec(spec, now)
-            .with_context(|| format!("build news #{pair_idx}"))?;
-        cli::write_news(&built, key, &news_dir)
-            .with_context(|| format!("write news #{pair_idx}"))?;
-        bundles.push(NewsBundle {
-            built,
-            out_dir: news_dir,
-        });
-    }
-    info!(count = bundles.len(), "news bundles built");
-    Ok(bundles)
-}
-
-/// Position-tool direct entry. Read the drawn long/short position tool,
-/// convert its tick-distance SL/TP to absolute prices via the catalog
-/// `tick_size`, build + sign a naked enter, and POST it straight to the
-/// worker (placed on receipt). Returns the process exit code: `1` for a
-/// clean operator-facing rejection (no position drawn, stop/limit not
-/// supported yet), propagated `Err` for a real failure.
-#[allow(clippy::too_many_arguments)]
-fn run_position_entry(
-    args: &Args,
-    mode: PositionEntry,
-    broker: Broker,
-    roles: &Roles,
-    resolved: &ResolvedInstrument,
-    instrument: &str,
-    account: &str,
-    key: &[u8; KEY_LEN],
-    now: DateTime<Utc>,
-) -> Result<i32> {
-    let Some(pos) = roles.position.as_ref() else {
-        eprintln!(
-            "ERROR: --{}-entry was set but no long/short position tool is drawn on the chart.",
-            match mode {
-                PositionEntry::Market => "market",
-                PositionEntry::Stop => "stop",
-                PositionEntry::Limit => "limit",
-            }
-        );
-        return Ok(1);
-    };
-
-    // Tick-distance SL/TP → absolute prices. tick_size is the per-broker
-    // catalog value (NOT pip_size — see position_trade docs).
-    let levels = resolve_levels(pos, resolved.precision.tick_size)?;
-
-    // Expiry: a drawn trade-expiry line wins; otherwise now + flag hours.
-    let trade_expiry = match read_trade_expiry(roles) {
-        Ok(t) => t,
-        Err(_) => now + chrono::Duration::hours(i64::from(args.expiry_hours)),
-    };
-
-    let kind = match mode {
-        PositionEntry::Market => cli::PositionEntryKind::Market,
-        PositionEntry::Stop => cli::PositionEntryKind::Stop,
-        PositionEntry::Limit => cli::PositionEntryKind::Limit,
-    };
-    let direction = core_direction(pos.direction);
-
-    info!(
-        instrument,
-        direction = ?direction,
-        mode = ?mode,
-        entry = levels.entry,
-        stop_loss = levels.stop_loss,
-        take_profit = levels.take_profit,
-        tick_size = resolved.precision.tick_size,
-        trade_expiry = %trade_expiry.to_rfc3339(),
-        "position-tool direct entry"
-    );
-
-    let spec = cli::PositionEnterSpec {
-        instrument: instrument.to_string(),
-        account: account.to_string(),
-        broker: broker_to_kind(broker),
-        direction,
-        kind,
-        entry_price: levels.entry,
-        stop_loss: levels.stop_loss,
-        take_profit: levels.take_profit,
-        trade_expiry,
-        risk_amount: args.risk_amount,
-        pip_size: args.pip_size.or(Some(resolved.precision.pip_size)),
-        tick_size: args.tick_size.or(Some(resolved.precision.tick_size)),
-        dry_run: args.broker_dry_run,
-    };
-
-    let (trade_id, signed_body) = match cli::build_position_enter(&spec, key, now) {
-        Ok(v) => v,
-        // Build/validation failure (bad geometry, sign error) — clean rejection.
-        Err(e) => {
-            eprintln!("ERROR: {e}");
-            return Ok(1);
-        }
-    };
-
-    // Persist the signed body for audit (same place pattern bundles land).
-    let out_dir = arm_out_dir(instrument)?;
-    let body_path = out_dir.join(format!("{trade_id}-enter.yaml"));
-    fs::write(&body_path, &signed_body)
-        .with_context(|| format!("writing {}", body_path.display()))?;
-
-    // The whole point of the position path: POST straight to the worker,
-    // which places the order on receipt.
-    let resp = post_intent_blocking(signed_body).wrap_err("POST position enter to worker")?;
-    info!(trade_id = %trade_id, worker_response = %resp.trim(), "position enter POSTed");
-    println!("entered: trade_id={trade_id} — {}", resp.trim());
-    Ok(0)
-}
-
-/// Parse the trade-expiry timestamp from the classified drawings.
-/// Used both as the hard expiry for the trade bundle and (when known
-/// pre-auto-draw) as the lookahead horizon for calendar bars so the
-/// auto-draw covers the trade's full lifetime instead of just the
-/// next H1+ buffer window.
-fn read_trade_expiry(roles: &Roles) -> Result<DateTime<Utc>> {
-    let trade_expiry_d = roles
-        .trade_expiry
-        .as_ref()
-        .ok_or_else(|| eyre!("missing trade_expiry"))?;
-    let expiry_unix = trade_expiry_d
-        .points
-        .first()
-        .ok_or_else(|| eyre!("trade_expiry has no points"))?
-        .time;
-    Utc.timestamp_opt(expiry_unix, 0)
-        .single()
-        .ok_or_else(|| eyre!("invalid trade_expiry timestamp {expiry_unix}"))
-}
-
-/// Compute the calendar news-scope range `[cursor, expiry]` in unix seconds.
-///
-/// Left edge is the cursor (`--start` when given, else the last loaded bar) —
-/// so the scope is the trade's own lifetime, not the chart's visible area, and
-/// scrolling the chart doesn't change which news is considered. Right edge is
-/// the trade-expiry vertical; with no resolved expiry it collapses to the
-/// cursor, giving an empty range (`calendar_windows` then returns no windows)
-/// rather than fetching across all of time.
-fn calendar_scope_range(cursor_unix: i64, expiry_hint: Option<DateTime<Utc>>) -> (i64, i64) {
-    (
-        cursor_unix,
-        expiry_hint.map(|e| e.timestamp()).unwrap_or(cursor_unix),
-    )
-}
-
-/// Resolve blackout (pause) and news windows from the economic calendar over
-/// the trade's own lifetime `[from, to]`, at real event-minute precision.
-///
-/// `range` is `[cursor, trade-expiry]` in unix seconds — the cursor (`--start`
-/// or the last loaded bar) as the left edge, the trade-expiry vertical as the
-/// right. It is used **verbatim**: the news filter is bounded to the trade's
-/// lifetime, NOT the chart's visible area, so scrolling the chart left/right no
-/// longer changes which events are considered. An empty or reversed range
-/// (`to <= from`, e.g. a missing expiry) yields no windows.
-///
-/// Returns `(blackout_windows, news_windows, markers)`. Each kept event yields a
-/// **blackout** window `[event − before, event]` (no new entries in the run-up),
-/// a **news** window `[event, event + after]` (post-release), and a cosmetic
-/// **marker** (currency + stars + event minute) carrying the event detail the
-/// windows drop — used to draw the cosmetic armed-news lines (default on, opt
-/// out with `--skip-calendar-bars`). `before` / `after` default
-/// to the chart timeframe's buffers, overridden per-run by `--news-before-hours`
-/// / `--news-after-hours` when set.
-///
-/// No chart lines are drawn and nothing is read back — the returned windows are
-/// pushed straight into `Roles`, preserving the true event minute (e.g. a 14:30
-/// event on an H1 chart) instead of snapping it to a bar boundary.
-fn calendar_windows(
-    resolution: &str,
-    resolved: &crate::instrument_resolution::ResolvedInstrument,
-    range: (i64, i64),
-    before_hours: Option<f64>,
-    after_hours: Option<f64>,
-) -> Result<(Vec<NewsWindow>, Vec<NewsWindow>, Vec<NewsMarker>)> {
-    let timeframe = infer_calendar_timeframe(resolution).ok_or_else(|| {
-        eyre!("chart resolution {resolution:?} is below 15m; calendar bars skipped")
-    })?;
-    let window_start = Utc
-        .timestamp_opt(range.0, 0)
-        .single()
-        .ok_or_else(|| eyre!("invalid calendar-range start {}", range.0))?;
-    let lookahead_end = Utc
-        .timestamp_opt(range.1, 0)
-        .single()
-        .ok_or_else(|| eyre!("invalid calendar-range end {}", range.1))?;
-    if lookahead_end <= window_start {
-        info!(
-            window_start = %window_start.to_rfc3339(),
-            lookahead_end = %lookahead_end.to_rfc3339(),
-            "calendar range is empty (to <= from) — no calendar windows",
-        );
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
-    }
-    // Synthesise the tcm Instrument straight from the catalog Asset so non-FX
-    // assets (SMI, gold, indices) get correct news-currency exposure without
-    // the FX-only cli::parse_instrument path.
-    let instrument_parsed =
-        crate::instrument_resolution::synthesize_calendar_instrument(resolved.asset);
-    let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
-    let events = runtime
-        .block_on(cli::fetch_events_for_range(window_start, lookahead_end))
-        .wrap_err("fetch_events_for_range")?;
-    let inputs = cli::PlanInputs {
-        trade_id: String::new(),
-        instrument: resolved.broker_symbol.clone(),
-        account: String::new(),
-        broker: cli::BrokerKind::Oanda,
-    };
-    let plan = cli::plan_calendar_bars_within(
-        &events,
-        &instrument_parsed,
-        timeframe.into(),
-        window_start,
-        lookahead_end,
-        &inputs,
-    )
-    .wrap_err("plan_calendar_bars_within")?;
-
-    // Per-run buffer overrides. When a flag is absent, keep the planner's
-    // timeframe-derived spec boundary; when set, recompute from the event time.
-    let before = before_hours.map(hours_to_duration).transpose()?;
-    let after = after_hours.map(hours_to_duration).transpose()?;
-    let mut blackout = Vec::with_capacity(plan.rows.len());
-    let mut news = Vec::with_capacity(plan.rows.len());
-    let mut markers = Vec::with_capacity(plan.rows.len());
-    for row in &plan.rows {
-        let pause_start = match before {
-            Some(d) => row.event_time - d,
-            None => row.pause_spec.start_time,
-        };
-        let news_end = match after {
-            Some(d) => row.event_time + d,
-            None => row.news_spec.end_time,
-        };
-        blackout.push(NewsWindow::new(pause_start, row.event_time));
-        news.push(NewsWindow::new(row.event_time, news_end));
-        // Cosmetic marker: same kept row, carrying the currency/impact the
-        // windows discard. Drawn (opt-in) at the real event minute.
-        markers.push(NewsMarker::new(&row.currency, row.impact, row.event_time));
-    }
-    info!(
-        events_fetched = events.len(),
-        events_kept = plan.rows.len(),
-        blackout_windows = blackout.len(),
-        news_windows = news.len(),
-        window_start = %window_start.to_rfc3339(),
-        lookahead_end = %lookahead_end.to_rfc3339(),
-        "calendar windows resolved",
-    );
-    Ok((blackout, news, markers))
-}
-
-/// Convert a fractional-hours buffer (e.g. `0.5` = 30 min) to a `Duration`.
-/// Negative values are a hard error — a buffer can't run backwards.
-fn hours_to_duration(hours: f64) -> Result<chrono::Duration> {
-    if hours < 0.0 || !hours.is_finite() {
-        return Err(eyre!(
-            "news buffer hours must be finite and >= 0, got {hours}"
-        ));
-    }
-    let secs = (hours * 3600.0).round() as i64;
-    chrono::Duration::try_seconds(secs)
-        .ok_or_else(|| eyre!("news buffer {hours}h is out of representable range"))
-}
-
-/// One registered plan as seen in the `plan-list` response — only the two
-/// fields `--replace` needs to resolve a target. Other fields are ignored.
-#[derive(serde::Deserialize)]
-struct PlanListEntry {
-    trade_id: String,
-    instrument: String,
-}
-
-/// Decide which trade_id `--replace` should delete.
-///
-/// - An explicit, non-empty `target` is used verbatim (delete exactly that).
-/// - An empty `target` (bare `--replace`) auto-resolves by instrument: exactly
-///   one registered plan on `instrument` → delete it; none → `Ok(None)`
-///   (nothing to clear, proceed); more than one → a hard error naming the
-///   candidates so the operator re-runs with an explicit id.
-///
-/// Pure (takes the parsed plan list), so the resolution rules are unit-tested
-/// without the worker.
-fn resolve_replace_target(
-    target: &str,
-    instrument: &str,
-    plans: &[PlanListEntry],
-) -> Result<Option<String>> {
-    let target = target.trim();
-    if !target.is_empty() {
-        return Ok(Some(target.to_string()));
-    }
-    let matches: Vec<&str> = plans
-        .iter()
-        .filter(|p| p.instrument == instrument)
-        .map(|p| p.trade_id.as_str())
-        .collect();
-    match matches.as_slice() {
-        [] => Ok(None),
-        [only] => Ok(Some((*only).to_string())),
-        many => Err(eyre!(
-            "--replace: {} plans registered for {instrument} ({}); \
-             pass the trade_id explicitly: --replace <trade-id>",
-            many.len(),
-            many.join(", "),
-        )),
-    }
-}
-
-/// Re-arm support for `--register-plan`: resolve the prior plan for this
-/// instrument (or the explicit `--replace <id>`) and delete it from the engine
-/// before the fresh register. Queries `plan-list`, applies
-/// [`resolve_replace_target`], then POSTs a signed `plan-delete` (which clears
-/// both the `plan:` and `plan-state:` KV rows). A no-target resolution is a
-/// logged no-op. Hard-errors on an ambiguous auto-resolve or a worker rejection
-/// — better to stop than to leave a stale plan ticking beside the new one.
-fn replace_existing_plan(
-    target: &str,
-    instrument: &str,
-    key: &[u8; KEY_LEN],
-    now: DateTime<Utc>,
-) -> Result<()> {
-    // Query the registered plans so an auto-resolve can count them per
-    // instrument. Live plans only (`include_archived: false`) — a terminated
-    // plan in the archive must not count against the per-instrument tally.
-    let list_intent = cli::build_plan_list_intent(now, &register_suffix(now), false);
-    let list_body = cli::wrap_signed(&list_intent, key, now).wrap_err("sign plan-list intent")?;
-    let yaml = post_intent_blocking(list_body).wrap_err("query plan-list for --replace")?;
-    let plans: Vec<PlanListEntry> =
-        serde_yaml::from_str(&yaml).wrap_err("parse plan-list response")?;
-
-    let Some(trade_id) = resolve_replace_target(target, instrument, &plans)? else {
-        info!(instrument = %instrument, "--replace: no existing plan for this instrument; nothing to delete");
-        return Ok(());
-    };
-
-    let del_intent = cli::build_plan_delete_intent(&trade_id, now, &register_suffix(now));
-    let del_body = cli::wrap_signed(&del_intent, key, now).wrap_err("sign plan-delete intent")?;
-    info!(trade_id = %trade_id, instrument = %instrument, "--replace: deleting prior registered plan");
-    post_intent_blocking(del_body).wrap_err("delete prior plan for --replace")?;
-    info!(trade_id = %trade_id, "--replace: prior plan deleted");
-    Ok(())
-}
-
-/// Fold the built trade into one signed `register` `TradePlan` and (when
-/// `register` is true) POST it to the worker's server-side engine.
-///
-/// When `register` is false (`--plan-out` without `--register-plan`) the plan is
-/// still built and, if `plan_out` is set, written to disk — but no worker POST
-/// happens. This is the offline "just give me the JSON for replay" path.
-///
-/// The plan re-expresses every alert's condition as an engine [`Trigger`] (via
-/// [`build_trade_plan`], the inverse of `alert_spec`) and carries each alert's
-/// embedded intent verbatim. The pause/news/calendar **control bars** built
-/// upstream are folded in too — one `TimeReached` rule per bundle alert (see
-/// [`append_control_rules`]) — so the registered plan opens/closes the same
-/// blackout + news windows the legacy TV-alert path used to POST. It's
-/// signed with the same key + whole-body HMAC as the control intents (the plan
-/// rides `trade_plan` as single-line flow JSON, so it's fully signed) and
-/// POSTed directly to the baked webhook.
-///
-/// Hard-errors on an unsupported chart resolution or a worker rejection — but
-/// the signed alert bundle is already on disk by the time this runs, so the
-/// trade isn't lost on a register failure.
-#[allow(clippy::too_many_arguments)]
-fn register_trade_plan(
-    built_trade: &cli::BuiltTrade,
-    direction: Direction,
-    roles: &Roles,
-    resolution: &str,
-    pause_bundles: &[PauseBundle],
-    news_bundles: &[NewsBundle],
-    key: &[u8; KEY_LEN],
-    account: &str,
-    now: DateTime<Utc>,
-    shadow: bool,
-    plan_out: Option<&Path>,
-    register: bool,
-    replay_start: Option<i64>,
-    retest_atr_step: f64,
-    cross_buffer_pct: f64,
-    cross_buffer_atr: f64,
-    bcr_require_golden: bool,
-    armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
-) -> Result<()> {
-    use cli::TradePattern;
-    let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
-    let granularity = resolution_to_granularity(resolution).ok_or_else(|| {
-        eyre!(
-            "chart resolution {resolution:?} has no engine granularity; \
-             cannot register a server-side plan (supported: 1/5/15/60/240/D)"
-        )
-    })?;
-    // Effective arm time: when `--start` (journaling replay) is given, record
-    // the plan *as if* it were armed at that cursor, not at the wall-clock run
-    // time — so a replayed arming reads back the historical moment. Otherwise
-    // use the real `now`.
-    let armed_at = effective_arm_time(replay_start, now);
-    // Pullback prep (--pull-back): capture the arm-time anchor (live mid) and the
-    // ATR multiple so `build_trade_plan` can bake them onto the trigger. Read only
-    // when a pullback is armed. A live-mid read failure is fatal — a bad/guessed
-    // anchor would silently mis-fire every pullback (same discipline as the M/W
-    // arm-time spread read).
-    let pullback_arm = match built_trade.spec.pull_back {
-        Some(atr_mult) => {
-            let broker = built_trade.spec.broker;
-            let anchor_open = read_mid_blocking(kind_to_broker(broker), &built_trade.instrument)
-                .wrap_err("read live mid for --pull-back anchor")?;
-            Some(crate::trade_plan_build::PullbackArm {
-                anchor_open,
-                atr_mult,
-            })
-        }
-        None => None,
-    };
-    let mut plan = build_trade_plan(
-        &built_trade.trade_id,
-        &built_trade.instrument,
-        &built_trade.alerts,
-        direction,
-        roles,
-        granularity,
-        is_mw,
-        shadow,
-        replay_start,
-        retest_atr_step,
-        cross_buffer_pct,
-        cross_buffer_atr,
-        bcr_require_golden,
-        armed_at,
-        armed_sentiment,
-        pullback_arm,
-    );
-    // Unwrap the tv-arm bundle wrappers to the cli `BuiltPause`/`BuiltNews` the
-    // appender reads (each carries the signed intents + window times).
-    let pauses: Vec<&cli::BuiltPause> = pause_bundles.iter().map(|b| &b.built).collect();
-    let newses: Vec<&cli::BuiltNews> = news_bundles.iter().map(|b| &b.built).collect();
-    append_control_rules(&mut plan, &pauses, &newses);
-    let rule_count = plan.rules.len();
-    // Dump the fully-built plan (control rules folded in) for offline replay,
-    // before `build_register_intent` moves it into the register intent.
-    if let Some(path) = plan_out {
-        let json = serde_json::to_string_pretty(&plan).wrap_err("serialise trade plan")?;
-        fs::write(path, json).wrap_err_with(|| format!("write plan to {}", path.display()))?;
-        info!(path = %path.display(), "wrote trade plan JSON");
-    }
-    // Offline path: `--plan-out` without `--register-plan` stops here — the JSON
-    // is on disk, but we never POST the plan to the worker.
-    if !register {
-        info!(
-            trade_id = %built_trade.trade_id,
-            "plan built (--plan-out only); not registering with worker"
-        );
-        return Ok(());
-    }
-    // Mint a fresh register intent carrying the plan, sign it, POST it.
-    let suffix = register_suffix(now);
-    let intent = cli::build_register_intent(plan, Some(account), now, &suffix);
-    let body = cli::wrap_signed(&intent, key, now).wrap_err("sign register intent")?;
-    info!(
-        trade_id = %built_trade.trade_id,
-        instrument = %built_trade.instrument,
-        granularity = ?granularity,
-        rules = rule_count,
-        shadow = shadow,
-        "registering server-side trade plan",
-    );
-    post_register_blocking(body).wrap_err("register trade plan with worker")?;
-    info!(trade_id = %built_trade.trade_id, "trade plan registered");
-    Ok(())
-}
-
-/// A short per-call tag for the register intent id so two arms of the same
-/// trade_id in the same second don't collide on the worker's seen-id check.
-/// Derived from the sub-second clock — no rand dependency.
-fn register_suffix(now: DateTime<Utc>) -> String {
-    format!("{:06}", now.timestamp_subsec_micros() % 1_000_000)
-}
-
 // `Drawing::anchor_time_seconds` shim — `TimedAnchor::anchor_time`
 // already exists, but lives behind a trait import. Inline a fn
 // here so the pipeline doesn't need to import the trait.
@@ -2238,25 +1135,75 @@ impl AnchorTimeShim for Drawing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // M/W resolution moved to `crate::mw_resolve`; these tests exercise it
+    // directly. Imported HERE rather than at file scope so the non-test build
+    // doesn't carry unused imports.
+    use crate::calendar::calendar_scope_range;
+    use crate::hs_resolve::{
+        build_trade_spec, check_prep_expiries, hs_entry_level_vetos, prep_expiry_steps,
+    };
+    use crate::mw_resolve::{MwSpecAnchors, build_mw_trade_spec};
+    use crate::news_window::NewsWindow;
+    use crate::test_drawings::{fib, now, path_n, two_point, vline};
+    use crate::trade_plan_build::build_trade_plan;
+    use chrono::TimeZone;
     use clap::Parser;
-    use trading_view::drawings::{Point, Properties};
+    use trade_control_conventions::Direction;
 
-    fn vline(id: &str, unix: i64) -> Drawing {
-        Drawing {
-            id: id.to_string(),
-            points: vec![Point {
-                time: unix,
-                price: 1.0,
-            }],
-            properties: Properties {
-                text: None,
-                ..Default::default()
-            },
+    /// `arm_from_inputs` must make **no chart calls**. That is the entire point
+    /// of the split — everything below the seam has to work identically whether
+    /// its `SetupInputs` came from TradingView or from a frozen file.
+    ///
+    /// This scans the source rather than relying on types, because the property
+    /// is *transitive*: `arm_from_inputs` holds no `TvMcp`, so the compiler
+    /// already stops a direct call — but nothing stops a future edit from
+    /// calling a **helper** that constructs its own `TvMcp::new(...)` internally
+    /// and reaches the chart that way. The type system can't express "and
+    /// nothing you call does it either"; a scan can.
+    ///
+    /// Deliberately a scan of the function body's own text, not a grep of the
+    /// whole file: the chart half legitimately contains all of these.
+    #[test]
+    fn arm_from_inputs_makes_no_chart_calls() {
+        let src = include_str!("pipeline.rs");
+        let start = src
+            .find("\nfn arm_from_inputs(")
+            .expect("arm_from_inputs must exist — did it get renamed?");
+        // The body ends at the next column-0 `}`.
+        let rest = &src[start + 1..];
+        let end = rest.find("\n}\n").map_or(rest.len(), |i| i + 2);
+        let body = &rest[..end];
+
+        for banned in [
+            "TvMcp",
+            "get_state(",
+            "get_range(",
+            "list_drawings(",
+            "get_symbol_info(",
+            "draw_news_markers(",
+            "classify(",
+            "calendar_windows(",
+        ] {
+            // Skip comment lines — one legitimately mentions the retired tv-mcp
+            // alert path in prose.
+            let hit = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains(banned));
+            assert!(
+                !hit,
+                "arm_from_inputs (or its inlined body) references {banned:?} — the \
+                 chart/plan seam is broken, and a frozen-spec arm would try to reach \
+                 TradingView"
+            );
         }
-    }
-
-    fn now() -> DateTime<Utc> {
-        "2026-06-08T00:00:00Z".parse().unwrap()
+        // Sanity: the slice really is the function body, not an empty string —
+        // otherwise every assertion above passes vacuously.
+        assert!(
+            body.contains("build_trade_from_spec"),
+            "the extracted body doesn't look like arm_from_inputs; the scan would \
+             have passed vacuously"
+        );
     }
 
     #[test]
@@ -2276,10 +1223,7 @@ mod tests {
     }
 
     fn wallclock(at: DateTime<Utc>) -> AsOf {
-        AsOf {
-            at,
-            source: "wallclock",
-        }
+        AsOf::wallclock(at)
     }
 
     /// A `NewsWindow` from two unix-second boundaries — the calendar-resolved
@@ -2291,6 +1235,8 @@ mod tests {
         )
     }
 
+    // ===== control bundles ==============================================
+
     #[test]
     fn prep_expiry_future_without_prep_errors() {
         // Cutoff in the future but no break-and-close trend line → error.
@@ -2301,7 +1247,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let err = check_prep_expiries(&roles, now()).unwrap_err();
+        let err = check_prep_expiries(&PlanGeometry::from_roles(&roles), now()).unwrap_err();
         assert!(err.contains("break-and-close-expiry"), "msg = {err}");
         assert!(err.contains("never enter"), "msg = {err}");
     }
@@ -2310,15 +1256,23 @@ mod tests {
     fn prep_expiry_future_with_prep_ok() {
         // Same future cutoff, but the break-and-close line is present →
         // a legitimate "pattern got too big" cutoff. No error.
+        //
+        // The neckline must be a genuine TWO-point trendline. This fixture used a
+        // one-point `vline`, which the old presence check
+        // (`roles.break_and_close.is_some()`) happily accepted — even though
+        // plan-building would then produce NO `TrendlineCross` rule for it
+        // (`points.get(1)?` → `None`). So the old check could pass a setup that
+        // could never enter. Reading presence off `geom.neckline`, which requires
+        // both anchors, makes the guard agree with what plan-building needs.
         let roles = Roles {
-            break_and_close: Some(vline("neck", now().timestamp() - 7200)),
+            break_and_close: Some(two_point("neck", "neckline", 1.10, 1.09)),
             prep_expiries: vec![(
                 "break-and-close".into(),
                 vline("e", now().timestamp() + 3600),
             )],
             ..Default::default()
         };
-        check_prep_expiries(&roles, now()).unwrap();
+        check_prep_expiries(&PlanGeometry::from_roles(&roles), now()).unwrap();
     }
 
     #[test]
@@ -2329,7 +1283,7 @@ mod tests {
             prep_expiries: vec![("retest".into(), vline("e", now().timestamp() - 3600))],
             ..Default::default()
         };
-        check_prep_expiries(&roles, now()).unwrap();
+        check_prep_expiries(&PlanGeometry::from_roles(&roles), now()).unwrap();
     }
 
     #[test]
@@ -2342,7 +1296,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            prep_expiry_steps(&roles, &[]),
+            prep_expiry_steps(&PlanGeometry::from_roles(&roles), &[]),
             vec!["break-and-close", "retest"]
         );
     }
@@ -2361,7 +1315,10 @@ mod tests {
             ..Default::default()
         };
         let skip = vec!["break-and-close".to_string()];
-        assert_eq!(prep_expiry_steps(&roles, &skip), vec!["retest"]);
+        assert_eq!(
+            prep_expiry_steps(&PlanGeometry::from_roles(&roles), &skip),
+            vec!["retest"]
+        );
     }
 
     // ===== calendar news-scope range ====================================
@@ -2387,89 +1344,6 @@ mod tests {
         assert!(range.1 <= range.0, "empty range: to <= from");
     }
 
-    // ===== past control-pair drop =======================================
-
-    #[test]
-    fn drop_past_control_pairs_removes_elapsed_windows() {
-        // One live pair (ends in the future) and one elapsed pair (ends
-        // before `now`) for each of blackout + news. Only the live pairs
-        // survive — an elapsed window has nothing left to act on, and feeding
-        // it to build_pause/news_from_spec would hard-fail as a "stale" arm.
-        let t = now().timestamp();
-        let live = nw(t + 1800, t + 3600);
-        let past = nw(t - 7200, t - 3600);
-        let mut roles = Roles {
-            blackout_pairs: vec![past, live],
-            news_pairs: vec![past, live],
-            ..Default::default()
-        };
-
-        drop_past_control_pairs(&mut roles, wallclock(now()));
-
-        assert_eq!(roles.blackout_pairs.len(), 1);
-        assert_eq!(roles.blackout_pairs[0], live);
-        assert_eq!(roles.news_pairs.len(), 1);
-        assert_eq!(roles.news_pairs[0], live);
-    }
-
-    /// Cosmetic news markers stay in lock-step with the surviving news windows:
-    /// a marker survives iff a surviving news window opens at its event minute.
-    /// Crucially, a marker whose event minute has *passed* but whose post-release
-    /// news window is still open must survive — drawn == armed, not drawn ==
-    /// future. Uses `trade_control_cli::Impact` via the `NewsMarker` ctor.
-    #[test]
-    fn drop_past_control_pairs_keeps_markers_in_lockstep_with_news_windows() {
-        use trade_control_cli::Impact;
-        let t = now().timestamp();
-        // Live: event minute already passed (event = now-60), but the news
-        // window [event, event+1800] is still open → both window and marker live.
-        let live_event = DateTime::<Utc>::from_timestamp(t - 60, 0).unwrap();
-        // Past: whole news window elapsed → window dropped, marker dropped.
-        let past_event = DateTime::<Utc>::from_timestamp(t - 7200, 0).unwrap();
-        let mut roles = Roles {
-            news_pairs: vec![
-                nw(past_event.timestamp(), past_event.timestamp() + 1800), // ends t-5400 → past
-                nw(live_event.timestamp(), live_event.timestamp() + 1800), // ends t+1740 → live
-            ],
-            news_markers: vec![
-                NewsMarker::new("EUR", Impact::High, past_event),
-                NewsMarker::new("USD", Impact::High, live_event),
-            ],
-            ..Default::default()
-        };
-
-        drop_past_control_pairs(&mut roles, wallclock(now()));
-
-        // The past news window is gone; the live one (post-release tail still
-        // open, though its event minute already passed) survives.
-        assert_eq!(roles.news_pairs.len(), 1);
-        // The marker for the surviving window survives; the past one is dropped.
-        assert_eq!(roles.news_markers.len(), 1);
-        assert_eq!(roles.news_markers[0].currency, "USD");
-        assert_eq!(roles.news_markers[0].event_time, live_event);
-    }
-
-    #[test]
-    fn drop_past_control_pairs_keeps_window_ending_exactly_now() {
-        // Boundary: a window whose end is in the future by one second is
-        // live; one ending exactly at `now` is treated as elapsed (the gate
-        // is `end <= now`), mirroring build_pause_from_spec's own check.
-        let t = now().timestamp();
-        let live = nw(t, t + 1); // ends 1s out → live
-        let mut roles = Roles {
-            news_pairs: vec![
-                nw(t - 60, t), // ends exactly now → past
-                live,          // ends 1s out → live
-            ],
-            ..Default::default()
-        };
-
-        drop_past_control_pairs(&mut roles, wallclock(now()));
-
-        assert_eq!(roles.news_pairs.len(), 1);
-        assert_eq!(roles.news_pairs[0], live);
-    }
-
     // ===== as-of selection for control-pair pruning =====================
 
     /// Replay regression (the bug): a `--plan-out` build off a rewound chart
@@ -2491,17 +1365,17 @@ mod tests {
         assert_eq!(as_of.at, cursor);
         assert_eq!(as_of.source, "replay-cursor");
 
-        // An event 12h after the cursor (still in the past vs `now`) survives.
+        // …and that as-of actually reaches the prune: an event 12h after the
+        // cursor (still in the past vs `now`) survives. This is the integration
+        // half — `ControlWindows` owns and tests the prune rule itself; what
+        // matters here is that the *selected* yardstick is the one it's handed.
         let event_end = cursor.timestamp() + 12 * 3600;
-        let mut roles = Roles {
-            blackout_pairs: vec![nw(event_end - 1800, event_end)],
-            ..Default::default()
-        };
-        drop_past_control_pairs(&mut roles, as_of);
+        let control =
+            ControlWindows::new(vec![nw(event_end - 1800, event_end)], vec![], vec![], as_of);
         assert_eq!(
-            roles.blackout_pairs.len(),
+            control.blackout().len(),
             1,
-            "upcoming-vs-cursor pair kept"
+            "upcoming-vs-cursor window kept"
         );
     }
 
@@ -2569,67 +1443,81 @@ mod tests {
         assert_eq!(as_of.source, "replay-cursor");
     }
 
-    // ===== M / W neckline-% gate ========================================
+    // ===== --spec-in ====================================================
 
+    /// A frozen arm refuses the position tools **at runtime**, not just at the
+    /// clap layer.
+    ///
+    /// The clap `conflicts_with` catches an operator typing both flags, but it
+    /// is not the invariant: anything that builds `Args` directly — which every
+    /// test in this crate does, and which a future caller might — bypasses clap
+    /// entirely. Without this guard a frozen arm would reach
+    /// `run_position_entry` with `roles: None` and arm a *different trade* off
+    /// whatever the pattern path produced.
+    ///
+    /// Found by mutation: replacing the guard's condition with `false` left all
+    /// 314 tests green, so nothing was actually checking it.
     #[test]
-    fn gate_neckline_pct_default_ceiling_is_40() {
-        // < 40% passes without the flag.
-        assert!(gate_neckline_pct(0.399, false).is_ok());
-        // >= 40% needs the flag.
-        assert!(gate_neckline_pct(0.40, false).is_err());
-        assert!(gate_neckline_pct(0.499, false).is_err());
+    fn spec_in_refuses_the_position_tools_even_when_clap_is_bypassed() {
+        let spec = crate::frozen_setup::FrozenSetup::capture(
+            PlanGeometry::default(),
+            "60".into(),
+            "OANDA:EUR_USD".into(),
+            Some(1_700_000_000),
+            None,
+        );
+        let path = std::env::temp_dir().join(format!("spec-refuse-{}.json", std::process::id()));
+        spec.write(&path).expect("write spec");
+
+        // Built directly, exactly as a non-clap caller would — `market_entry`
+        // and `spec_in` both set, which clap would have rejected.
+        let mut args = mw_args(&[]);
+        args.market_entry = true;
+        args.spec_in = Some(path.clone());
+
+        let err = read_setup_from_spec(&args, &path)
+            .expect_err("a frozen arm has no drawn position tool")
+            .to_string();
+        assert!(
+            err.contains("position") && err.contains("--spec-in"),
+            "the error must say WHY, so the operator knows to arm off the chart: {err}"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
+    /// A spec with no cursor and no `--start` is refused rather than silently
+    /// defaulting to wall-clock "now".
+    ///
+    /// Defaulting would be wrong in the one case that matters: re-arming a
+    /// historical setup for the corpus. It'd prune every news window as elapsed
+    /// and score the trade against today's calendar instead of its own.
     #[test]
-    fn gate_neckline_pct_flag_raises_ceiling_to_50() {
-        assert!(gate_neckline_pct(0.40, true).is_ok());
-        assert!(gate_neckline_pct(0.499, true).is_ok());
-        assert!(gate_neckline_pct(0.50, true).is_ok());
-    }
+    fn a_cursorless_spec_without_start_is_refused() {
+        let spec = crate::frozen_setup::FrozenSetup::capture(
+            PlanGeometry::default(),
+            "60".into(),
+            "OANDA:EUR_USD".into(),
+            None, // no cursor
+            None,
+        );
+        let path = std::env::temp_dir().join(format!("spec-nocursor-{}.json", std::process::id()));
+        spec.write(&path).expect("write spec");
 
-    #[test]
-    fn gate_neckline_pct_above_50_always_errors() {
-        assert!(gate_neckline_pct(0.501, true).is_err());
-        assert!(gate_neckline_pct(0.501, false).is_err());
-    }
+        let err = read_setup_from_spec(&mw_args(&[]), &path)
+            .expect_err("no cursor anywhere")
+            .to_string();
+        assert!(err.contains("no cursor"), "err = {err}");
 
-    #[test]
-    fn gate_neckline_pct_nan_errors() {
-        assert!(gate_neckline_pct(f64::NAN, true).is_err());
+        // …and supplying --start resolves it.
+        let args = mw_args(&["--start", "2026-06-20T17:00"]);
+        assert!(
+            read_setup_from_spec(&args, &path).is_ok(),
+            "--start must supply the missing cursor"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     // ===== M / W trade-spec resolution ==================================
-
-    fn path(id: &str, prices: [f64; 3]) -> Drawing {
-        path_n(id, &prices)
-    }
-
-    fn path4(id: &str, prices: [f64; 4]) -> Drawing {
-        path_n(id, &prices)
-    }
-
-    fn path_n(id: &str, prices: &[f64]) -> Drawing {
-        Drawing {
-            id: id.to_string(),
-            points: prices
-                .iter()
-                .enumerate()
-                .map(|(i, &p)| Point {
-                    time: (i as i64 + 1) * 10,
-                    price: p,
-                })
-                .collect(),
-            properties: Properties {
-                text: None,
-                ..Default::default()
-            },
-        }
-    }
-
-    /// A representative arm-time spread (1 pip) the pure resolver bakes.
-    /// The live read that produces this in `run` is exercised separately
-    /// (the `spread` module's own tests + the demo protocol), not here.
-    const SPREAD: f64 = 1.0;
 
     fn mw_args(extra: &[&str]) -> Args {
         let mut argv = vec!["tv-arm"];
@@ -2637,397 +1525,57 @@ mod tests {
         Args::try_parse_from(argv).expect("parse mw args")
     }
 
-    /// A two-point drawing (e.g. a neckline trend line): two anchors in draw
-    /// order. For a *fib* use [`fib`] instead — the head↔neckline mapping is
-    /// `reverse`-dependent, not raw order.
-    fn two_point(id: &str, label: &str, a: f64, b: f64) -> Drawing {
-        Drawing {
-            id: id.to_string(),
-            points: vec![Point { time: 10, price: a }, Point { time: 20, price: b }],
-            properties: Properties {
-                text: (!label.is_empty()).then(|| label.to_string()),
-                ..Default::default()
-            },
-        }
-    }
-
-    /// A fib retracement whose `(head, neckline)` resolve as given, built to
-    /// match real TradingView readback: with `reverse: false` the `0`-reading
-    /// (head) sits at `points[1]` and the `1`-level (neckline) at `points[0]`.
-    /// This deliberately mirrors the AUD/CAD 2026-07 shape where the head is
-    /// `points[1]` — the exact case that broke the point-order rule.
-    fn fib(id: &str, head: f64, neckline: f64) -> Drawing {
-        Drawing {
-            id: id.to_string(),
-            // points[0] = neckline (1-level), points[1] = head (0-level).
-            points: vec![
-                Point {
-                    time: 20,
-                    price: neckline,
-                },
-                Point {
-                    time: 10,
-                    price: head,
-                },
-            ],
-            properties: Properties {
-                reverse: Some(false),
-                ..Default::default()
-            },
-        }
-    }
-
-    /// A single-anchor horizontal line at `price` with `label`.
-    fn hline(id: &str, label: &str, price: f64) -> Drawing {
-        Drawing {
-            id: id.to_string(),
-            points: vec![Point { time: 15, price }],
-            properties: Properties {
-                text: Some(label.to_string()),
-                ..Default::default()
-            },
-        }
-    }
-
-    /// A complete H&S `Roles`: fib (head→neckline), neckline trend line,
-    /// invalidation horizontal, and a future trade-expiry.
-    fn hs_roles(fib: Drawing, inv: Drawing) -> Roles {
-        Roles {
-            invalidation: Some(inv.clone()),
-            invalidation_label: inv.properties.text.clone(),
-            break_and_close: Some(two_point("neck", "neckline", 1.10, 1.10)),
-            retest: Some(two_point("neck", "neckline", 1.10, 1.10)),
-            tp_fib: Some(fib),
-            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
-            ..Default::default()
-        }
-    }
-
+    /// `--start` accepts the same forms `replay-candles --start` does.
+    ///
+    /// This used to call `DateTime::parse_from_rfc3339` directly, which demands
+    /// **seconds** and rejects a bare local time — so
+    /// `--start 2026-06-19T17:00+10:00` was a hard error on `tv-arm` while
+    /// working fine on `replay-candles`, even though `tv-arm ... replay`
+    /// forwards that exact string to it. The error read like a malformed
+    /// timestamp rather than like the two tools disagreeing.
     #[test]
-    fn hs_direction_comes_from_fib_not_invalidation_label() {
-        // Rule 1: the fib is authoritative. Head at 1.20 (0-reading, clicked
-        // first) sits ABOVE neckline 1.10 → this is a SHORT (H&S), regardless
-        // of the invalidation *label*. The invalidation sits inside the fib
-        // range so it passes rule 2.
-        let fib = fib("fib", 1.20, 1.10);
-        let inv = hline("inv", "too-high", 1.18);
-        let roles = hs_roles(fib, inv);
-        let args = mw_args(&[]);
-        let (dir, spec) = resolve_hs_trade(
-            &args,
-            &roles,
-            "EUR_USD",
-            "ms-oanda-1",
-            Broker::Oanda,
-            0.0001,
-            0.0001,
-        )
-        .expect("valid HS resolves");
-        assert_eq!(dir, Direction::Short);
-        assert_eq!(spec.pattern, cli::TradePattern::Hs);
-    }
-
-    #[test]
-    fn hs_inverse_direction_comes_from_fib() {
-        // Mirror: head 1.00 BELOW neckline 1.10 → LONG (iH&S). too-low floor
-        // at 1.05 sits inside the fib range.
-        let fib = fib("fib", 1.00, 1.10);
-        let inv = hline("inv", "too-low", 1.05);
-        let roles = hs_roles(fib, inv);
-        let args = mw_args(&[]);
-        let (dir, _) = resolve_hs_trade(
-            &args,
-            &roles,
-            "EUR_USD",
-            "ms-oanda-1",
-            Broker::Oanda,
-            0.0001,
-            0.0001,
-        )
-        .expect("valid iH&S resolves");
-        assert_eq!(dir, Direction::Long);
-    }
-
-    #[test]
-    fn hs_stale_invalidation_outside_fib_range_is_rejected() {
-        // The bug: a `too-low` left over from a DIFFERENT trade at 0.95 sits
-        // well outside this setup's fib range [1.10, 1.20]. Rule 2 rejects it
-        // rather than baking a poison level / mismatched setup.
-        let fib = fib("fib", 1.20, 1.10);
-        let inv = hline("inv", "too-low", 0.95);
-        let roles = hs_roles(fib, inv);
-        let args = mw_args(&[]);
-        match resolve_hs_trade(
-            &args,
-            &roles,
-            "EUR_USD",
-            "ms-oanda-1",
-            Broker::Oanda,
-            0.0001,
-            0.0001,
-        ) {
-            Err(ResolveError::Reject(msg)) => {
-                assert!(msg.contains("outside the fib range"), "msg = {msg}");
-            }
-            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
-        }
-    }
-
-    #[test]
-    fn hs_flat_fib_has_no_direction_and_errors() {
-        // A degenerate flat fib (both anchors equal) carries no direction.
-        let fib = fib("fib", 1.10, 1.10);
-        let inv = hline("inv", "too-high", 1.10);
-        let roles = hs_roles(fib, inv);
-        let args = mw_args(&[]);
-        match resolve_hs_trade(
-            &args,
-            &roles,
-            "EUR_USD",
-            "ms-oanda-1",
-            Broker::Oanda,
-            0.0001,
-            0.0001,
-        ) {
-            Err(ResolveError::Fatal(e)) => {
-                assert!(
-                    format!("{e}").contains("direction from the fib"),
-                    "err = {e}"
-                );
-            }
-            other => panic!("expected Fatal, got {:?}", other.map(|_| ())),
-        }
-    }
-
-    #[test]
-    fn tp_resistance_band_long_far_edge_is_tp() {
-        // Long: band hangs UNDER the TP (approach from below), TOP edge = TP.
-        // Centre one pct step below TP → the +pct edge lands back on TP.
-        let tp = 1.20;
-        let pct = 0.1 / 100.0;
-        let center = tp * (1.0 - pct);
-        let [lo, hi] = tp_resistance_band(tp, Direction::Long, 0.1);
-        assert_eq!(hi, round5(center * (1.0 + pct)), "far (top) edge is the TP");
-        assert_eq!(hi, round5(tp), "top edge lands exactly on TP");
-        assert_eq!(
-            lo,
-            round5(center * (1.0 - pct)),
-            "near edge is 2·pct below TP"
-        );
-        assert!(lo < hi, "lo < hi for a valid band");
-    }
-
-    #[test]
-    fn tp_resistance_band_short_far_edge_is_tp() {
-        // Short: band sits OVER the TP (approach from above), BOTTOM edge = TP.
-        // Centre one pct step above TP → the −pct edge lands back on TP.
-        let tp = 1.00;
-        let pct = 0.1 / 100.0;
-        let center = tp * (1.0 + pct);
-        let [lo, hi] = tp_resistance_band(tp, Direction::Short, 0.1);
-        assert_eq!(
-            lo,
-            round5(center * (1.0 - pct)),
-            "far (bottom) edge is the TP"
-        );
-        assert_eq!(lo, round5(tp), "bottom edge lands exactly on TP");
-        assert_eq!(
-            hi,
-            round5(center * (1.0 + pct)),
-            "near edge is 2·pct above TP"
-        );
-        assert!(lo < hi, "lo < hi for a valid band");
-    }
-
-    #[test]
-    fn tp_resistance_band_matches_a_drawn_sr_line_width() {
-        // The operator's requirement: the auto TP band must be the SAME total
-        // width as a drawn S/R line for the same pct — not the old half-width.
-        // A drawn line at price P → [P·(1−pct), P·(1+pct)]; its width is what the
-        // TP band must match. Compare at the TP band's own centre.
-        for (dir, tp) in [(Direction::Short, 1.00), (Direction::Long, 1.20)] {
-            let [lo, hi] = tp_resistance_band(tp, dir, 0.1);
-            let tp_width = hi - lo;
-            // A drawn band centred at this TP band's centre (the S/R "line").
-            let pct = 0.1 / 100.0;
-            let center = match dir {
-                Direction::Short => tp * (1.0 + pct),
-                Direction::Long => tp * (1.0 - pct),
-            };
-            let drawn = [round5(center * (1.0 - pct)), round5(center * (1.0 + pct))];
-            let drawn_width = drawn[1] - drawn[0];
+    fn start_accepts_the_forms_replay_candles_accepts() {
+        // All five spell the same instant: 17:00 Brisbane == 07:00 UTC.
+        let want = parse_start(&mw_args(&["--start", "2026-06-20T17:00:00+10:00"]))
+            .expect("the one form raw RFC3339 also accepts");
+        assert!(want.is_some());
+        for s in [
+            "2026-06-20T17:00",       // bare local, minute precision
+            "2026-06-20T17:00:00",    // bare local, seconds
+            "2026-06-20T17:00+10:00", // offset, no seconds
+            "2026-06-20T07:00Z",      // Z, no seconds
+        ] {
             assert!(
-                (tp_width - drawn_width).abs() < 1e-9,
-                "{dir:?}: TP band width {tp_width} must equal a drawn S/R band width {drawn_width}"
+                DateTime::parse_from_rfc3339(s).is_err(),
+                "{s:?} parses as raw RFC3339 — this test's premise is stale"
             );
-            // And it must be ~twice the old one-sided width (pct·tp), the bug.
-            let old_one_sided = pct * tp;
-            assert!(
-                tp_width > old_one_sided * 1.9,
-                "{dir:?}: new width {tp_width} must be ~2× the old one-sided {old_one_sided}"
+            assert_eq!(
+                parse_start(&mw_args(&["--start", s])).expect(s),
+                want,
+                "disagreement on {s:?}"
             );
         }
     }
 
+    /// A bare datetime is **Brisbane**, not UTC. Getting this wrong shifts the
+    /// journaling cursor by 10 hours — enough to arm against a different
+    /// session entirely, with no error anywhere.
     #[test]
-    fn hs_default_adds_tp_resistance_band() {
-        // Short H&S: head 1.20 above neckline 1.10 → TP = 2·1.10 − 1.20 = 1.00.
-        // No drawn S/R lines, default flags → exactly one auto band whose far
-        // (lower, for a short) edge is the TP.
-        let roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
-        let args = mw_args(&[]);
-        let (_dir, spec) = resolve_hs_trade(
-            &args,
-            &roles,
-            "EUR_USD",
-            "ms-oanda-1",
-            Broker::Oanda,
-            0.0001,
-            0.0001,
-        )
-        .expect("valid H&S resolves");
+    fn a_bare_start_is_brisbane_not_utc() {
+        let bne = parse_start(&mw_args(&["--start", "2026-06-20T17:00"])).expect("bare");
+        let utc = parse_start(&mw_args(&["--start", "2026-06-20T17:00Z"])).expect("Z");
+        assert_ne!(bne, utc, "a bare time must not be read as UTC");
         assert_eq!(
-            spec.sr_reversal_ranges.len(),
-            1,
-            "one auto band, no drawn S/R"
-        );
-        let [lo, _hi] = spec.sr_reversal_ranges[0];
-        assert_eq!(lo, round5(spec.tp_price), "short far edge (lo) == TP");
-    }
-
-    #[test]
-    fn hs_skip_tp_resistance_leaves_no_band() {
-        // Same setup, but --skip-tp-resistance and no drawn S/R → no bands, so
-        // no 07-close-on-sr-reversal alert gets emitted downstream.
-        let roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
-        let args = mw_args(&["--skip-tp-resistance"]);
-        let (_dir, spec) = resolve_hs_trade(
-            &args,
-            &roles,
-            "EUR_USD",
-            "ms-oanda-1",
-            Broker::Oanda,
-            0.0001,
-            0.0001,
-        )
-        .expect("valid H&S resolves");
-        assert!(
-            spec.sr_reversal_ranges.is_empty(),
-            "no drawn S/R and band skipped"
+            bne.zip(utc).map(|(b, u)| b - u),
+            Some(-10 * 3600),
+            "Brisbane is UTC+10, so the same clock face is 10h EARLIER in UTC terms"
         );
     }
 
     #[test]
-    fn hs_drawn_sr_plus_auto_band() {
-        // A drawn support/resistance line contributes its own band; the auto TP
-        // band is appended alongside it → two bands total.
-        let mut roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
-        roles.sr_levels = vec![hline("sr", "support", 1.05)];
-        let args = mw_args(&[]);
-        let (_dir, spec) = resolve_hs_trade(
-            &args,
-            &roles,
-            "EUR_USD",
-            "ms-oanda-1",
-            Broker::Oanda,
-            0.0001,
-            0.0001,
-        )
-        .expect("valid H&S resolves");
-        assert_eq!(
-            spec.sr_reversal_ranges.len(),
-            2,
-            "drawn band + auto TP band"
-        );
-    }
-
-    fn mw_roles(p: Drawing) -> Roles {
-        Roles {
-            mw_path: Some(p),
-            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
-            ..Default::default()
-        }
-    }
-
-    /// Drive the pure resolver with an injected spread — what the tests
-    /// use in place of `resolve_mw_trade` (which now reads the spread
-    /// live over the network).
-    fn resolve(
-        args: &Args,
-        roles: &Roles,
-        instrument: &str,
-        broker: Broker,
-        catalog_pip: f64,
-    ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
-        let pip_size = args.pip_size.unwrap_or(catalog_pip);
-        // Tests bake tick == pip (no separate catalog tick threaded here).
-        resolve_mw_trade_with_spread(
-            args, roles, instrument, "ms-tn-1", broker, pip_size, pip_size, SPREAD,
-        )
-    }
-
-    #[test]
-    fn resolve_mw_m_is_short_and_bakes_geometry() {
-        // Worked M: A=1.1000, B=1.1200, C=1.1120 → pct 0.40 (needs flag).
-        // No --pip-size, so the catalog pip (passed here) is baked.
-        let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1120]));
-        let args = mw_args(&["--allow-50-pct-m-trades"]);
-        let (dir, spec) = match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
-            Ok(v) => v,
-            Err(_) => panic!("expected Ok"),
-        };
-        assert_eq!(dir, Direction::Short);
-        assert_eq!(spec.pattern, cli::TradePattern::M);
-        assert_eq!(spec.max_retries, 0);
-        assert!(spec.prep_expiries.is_empty());
-        let mw = spec.mw.expect("mw baked");
-        assert!((mw.neckline - 1.1120).abs() < 1e-9);
-        assert!((mw.first_point - 1.1200).abs() < 1e-9);
-        assert!((mw.runup_start - 1.1000).abs() < 1e-9);
-        // The injected live spread flows through to the baked intent.
-        assert!((mw.spread_pips - SPREAD).abs() < 1e-9);
-        // Catalog pip flows through unchanged.
-        assert!((mw.pip_size - 0.0001).abs() < 1e-12);
-        // ...and is mirrored onto the top-level spec field.
-        assert_eq!(spec.pip_size, Some(0.0001));
-    }
-
-    #[test]
-    fn resolve_mw_4point_bakes_right_shoulder() {
-        // 4-point M: A=1.1000, B=1.1200, C=1.1120, D=1.1190 (valid: inside
-        // the 1.3 ceiling of the shorter shoulder, same side as B).
-        let roles = mw_roles(path4("p", [1.1000, 1.1200, 1.1120, 1.1190]));
-        let args = mw_args(&["--allow-50-pct-m-trades"]);
-        let (dir, spec) = resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001)
-            .expect("valid 4-point M resolves");
-        assert_eq!(dir, Direction::Short);
-        let mw = spec.mw.expect("mw baked");
-        assert_eq!(mw.right_shoulder, Some(1.1190));
-    }
-
-    #[test]
-    fn resolve_mw_4point_rejects_misaligned_right_shoulder() {
-        // D=1.1300 breaks the 1.3 alignment (taller shoulder past the
-        // ceiling of the shorter) → the drawing is rejected at arm.
-        let roles = mw_roles(path4("p", [1.1000, 1.1200, 1.1120, 1.1300]));
-        let args = mw_args(&["--allow-50-pct-m-trades"]);
-        match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
-            Err(ResolveError::Reject(msg)) => {
-                assert!(msg.contains("1.3 alignment"), "msg = {msg}")
-            }
-            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
-        }
-    }
-
-    #[test]
-    fn resolve_mw_4point_rejects_wrong_side_right_shoulder() {
-        // D=1.1100 sits below the neckline (wrong side for an M) → rejected.
-        let roles = mw_roles(path4("p", [1.1000, 1.1200, 1.1120, 1.1100]));
-        let args = mw_args(&["--allow-50-pct-m-trades"]);
-        match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
-            Err(ResolveError::Reject(msg)) => assert!(msg.contains("wrong side"), "msg = {msg}"),
-            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
-        }
+    fn start_absent_is_none_and_garbage_is_an_error() {
+        assert_eq!(parse_start(&mw_args(&[])).expect("no flag"), None);
+        assert!(parse_start(&mw_args(&["--start", "yesterday"])).is_err());
     }
 
     #[test]
@@ -3044,7 +1592,8 @@ mod tests {
             Direction::Short,
             now() + chrono::Duration::days(1),
             150.0,
-            &Roles::default(),
+            &PlanGeometry::default(),
+            false,
             0.01,
             // Distinct tick (finer than pip) to prove it's baked independently.
             0.001,
@@ -3070,7 +1619,8 @@ mod tests {
             Direction::Long,
             now() + chrono::Duration::days(1),
             1.05,
-            &Roles::default(),
+            &PlanGeometry::default(),
+            false,
             0.0001,
             0.0001,
             Vec::new(),
@@ -3088,7 +1638,8 @@ mod tests {
             Direction::Long,
             now() + chrono::Duration::days(1),
             1.05,
-            &Roles::default(),
+            &PlanGeometry::default(),
+            false,
             0.0001,
             0.0001,
             Vec::new(),
@@ -3097,6 +1648,58 @@ mod tests {
             !skipped.needs_golden,
             "--skip-golden must clear needs_golden on the spec"
         );
+    }
+
+    /// `close_on_news` reaches the spec verbatim from the caller's news fact.
+    ///
+    /// Previously this was derived inside `build_trade_spec` from a field on
+    /// `Roles` and no test covered it at all — a silent gap on the flag that
+    /// decides whether an open position gets flattened around a news release.
+    /// Now that the news windows live in `ControlWindows`, the fact is an
+    /// argument, so it's directly testable: assert both polarities so a
+    /// hard-coded `false` (or an inverted one) fails.
+    #[test]
+    fn close_on_news_is_carried_onto_the_spec_both_ways() {
+        let spec_for = |close_on_news| {
+            build_trade_spec(
+                &mw_args(&[]),
+                "EUR_USD",
+                "ms-oanda-1",
+                Broker::Oanda,
+                Direction::Long,
+                now() + chrono::Duration::days(1),
+                1.05,
+                &PlanGeometry::default(),
+                close_on_news,
+                0.0001,
+                0.0001,
+                Vec::new(),
+            )
+        };
+        assert!(
+            spec_for(true).close_on_news,
+            "a trade with a news window in its lifetime must close on news"
+        );
+        assert!(!spec_for(false).close_on_news, "…and one without must not");
+    }
+
+    /// The wiring the above can't see: `ControlWindows::has_news` is what the
+    /// pipeline actually passes, and it must read the PRUNED set. An all-elapsed
+    /// calendar would otherwise arm a news close for a window that has already
+    /// finished — arming a guard against an event that cannot recur.
+    #[test]
+    fn has_news_drives_close_on_news_from_the_pruned_window_set() {
+        let t = now().timestamp();
+        let as_of = wallclock(now());
+
+        let all_elapsed = ControlWindows::new(vec![], vec![nw(t - 7200, t - 3600)], vec![], as_of);
+        assert!(
+            !all_elapsed.has_news(),
+            "every news window elapsed → no close_on_news"
+        );
+
+        let live = ControlWindows::new(vec![], vec![nw(t + 60, t + 3600)], vec![], as_of);
+        assert!(live.has_news(), "a live news window → close_on_news");
     }
 
     /// End-to-end arm: build the HS spec the real `--plan-out` path builds,
@@ -3114,7 +1717,8 @@ mod tests {
             Direction::Short,
             now() + chrono::Duration::days(1),
             1.05,
-            &Roles::default(),
+            &PlanGeometry::default(),
+            false,
             0.0001,
             0.0001,
             Vec::new(),
@@ -3126,7 +1730,7 @@ mod tests {
             &built.instrument,
             &built.alerts,
             trade_control_conventions::Direction::Short,
-            &Roles::default(),
+            &PlanGeometry::from_roles(&Roles::default()),
             trade_control_core::broker::Granularity::H1,
             false,
             false,
@@ -3328,7 +1932,8 @@ mod tests {
             Direction::Long,
             now() + chrono::Duration::days(1),
             1.05,
-            &Roles::default(),
+            &PlanGeometry::default(),
+            false,
             pip_size,
             pip_size,
             Vec::new(),
@@ -3350,7 +1955,7 @@ mod tests {
             invalidation: Some(path_n("inv", &[1.1050])),
             ..Default::default()
         };
-        let vetos = hs_entry_level_vetos(&roles, Direction::Short);
+        let vetos = hs_entry_level_vetos(&PlanGeometry::from_roles(&roles), Direction::Short);
         let by = |n: &str| vetos.iter().find(|v| v.name == n).expect("present");
         // pcl = fib 1.8 = neckline + 0.8×(TP − neckline).
         //   tp = 2×1.0900 − 1.1000 = 1.0800,
@@ -3364,7 +1969,7 @@ mod tests {
 
         // Missing fib → only the invalidation veto is baked (NaN is skipped).
         roles.tp_fib = None;
-        let vetos = hs_entry_level_vetos(&roles, Direction::Short);
+        let vetos = hs_entry_level_vetos(&PlanGeometry::from_roles(&roles), Direction::Short);
         assert_eq!(vetos.len(), 1);
         assert_eq!(vetos[0].name, "too-high");
     }
@@ -3379,185 +1984,11 @@ mod tests {
             invalidation: Some(path_n("inv", &[1.0850])),
             ..Default::default()
         };
-        let vetos = hs_entry_level_vetos(&roles, Direction::Long);
+        let vetos = hs_entry_level_vetos(&PlanGeometry::from_roles(&roles), Direction::Long);
         let pcl = vetos.iter().find(|v| v.name == "too-high").expect("pcl");
         assert_eq!(pcl.past, VetoSide::Above);
         let inv = vetos.iter().find(|v| v.name == "too-low").expect("inv");
         assert_eq!(inv.past, VetoSide::Below);
         assert!((inv.level - 1.0850).abs() < 1e-9);
-    }
-
-    #[test]
-    fn resolve_mw_bakes_catalog_pip_when_no_override() {
-        // A JPY-like catalog pip of 0.01 is baked when --pip-size is absent.
-        let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1180])); // pct 0.10
-        let args = mw_args(&[]);
-        let (_dir, spec) =
-            resolve(&args, &roles, "USD_JPY", Broker::TradeNation, 0.01).expect("ok");
-        assert!((spec.mw.expect("mw").pip_size - 0.01).abs() < 1e-12);
-    }
-
-    #[test]
-    fn resolve_mw_pip_size_flag_overrides_catalog() {
-        // --pip-size beats the catalog value passed in.
-        let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1180])); // pct 0.10
-        let args = mw_args(&["--pip-size", "0.25"]);
-        let (_dir, spec) =
-            resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001).expect("ok");
-        assert!((spec.mw.expect("mw").pip_size - 0.25).abs() < 1e-12);
-    }
-
-    #[test]
-    fn resolve_mw_w_is_long() {
-        // Worked W: A=1.1200, B=1.1000, C=1.1080 → pct 0.40 (needs flag).
-        let roles = mw_roles(path("p", [1.1200, 1.1000, 1.1080]));
-        let args = mw_args(&["--allow-50-pct-m-trades"]);
-        let (dir, spec) =
-            resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001).expect("ok");
-        assert_eq!(dir, Direction::Long);
-        assert_eq!(spec.pattern, cli::TradePattern::W);
-    }
-
-    #[test]
-    fn resolve_mw_rejects_40_pct_without_flag() {
-        let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1120])); // pct 0.40
-        let args = mw_args(&[]); // no --allow-50-pct-m-trades
-        match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
-            Err(ResolveError::Reject(msg)) => {
-                assert!(msg.contains("40%"), "msg = {msg}");
-                assert!(msg.contains("--allow-50-pct-m-trades"), "msg = {msg}");
-            }
-            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
-        }
-    }
-
-    #[test]
-    fn check_mw_required_rejects_wrong_anchor_count() {
-        // A 2-anchor path fails the cheap guard before any spread read.
-        let roles = Roles {
-            mw_path: Some(Drawing {
-                id: "p".into(),
-                points: vec![
-                    Point {
-                        time: 10,
-                        price: 1.1,
-                    },
-                    Point {
-                        time: 20,
-                        price: 1.12,
-                    },
-                ],
-                properties: Properties {
-                    text: None,
-                    ..Default::default()
-                },
-            }),
-            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
-            ..Default::default()
-        };
-        match check_mw_required(&roles) {
-            Err(ResolveError::Reject(msg)) => {
-                assert!(
-                    msg.contains("3 anchors") && msg.contains("found 2"),
-                    "msg = {msg}"
-                )
-            }
-            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
-        }
-    }
-
-    #[test]
-    fn check_mw_required_accepts_four_anchor_path() {
-        // A 4-anchor path (right shoulder drawn) passes the count guard.
-        let roles = Roles {
-            mw_path: Some(path4("p", [1.1000, 1.1200, 1.1120, 1.1190])),
-            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
-            ..Default::default()
-        };
-        assert!(check_mw_required(&roles).is_ok());
-    }
-
-    #[test]
-    fn check_mw_required_rejects_missing_trade_expiry() {
-        let roles = Roles {
-            mw_path: Some(path("p", [1.1000, 1.1200, 1.1180])),
-            // no trade_expiry
-            ..Default::default()
-        };
-        match check_mw_required(&roles) {
-            Err(ResolveError::Reject(msg)) => assert!(msg.contains("trade-expiry"), "msg = {msg}"),
-            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
-        }
-    }
-
-    #[test]
-    fn resolve_mw_rejects_bad_structure() {
-        // retrace deeper than runup: A=1.1120, B=1.1200, C=1.1000.
-        let roles = mw_roles(path("p", [1.1120, 1.1200, 1.1000]));
-        let args = mw_args(&["--allow-50-pct-m-trades"]);
-        match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
-            Err(ResolveError::Reject(msg)) => assert!(msg.contains("runup leg"), "msg = {msg}"),
-            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
-        }
-    }
-
-    // ===== --replace target resolution =====
-
-    fn plan_entry(trade_id: &str, instrument: &str) -> PlanListEntry {
-        PlanListEntry {
-            trade_id: trade_id.into(),
-            instrument: instrument.into(),
-        }
-    }
-
-    #[test]
-    fn replace_explicit_target_used_verbatim() {
-        // An explicit id is deleted regardless of how many plans exist.
-        let plans = [
-            plan_entry("hs-eurusd-aaaa", "EUR_USD"),
-            plan_entry("hs-eurusd-bbbb", "EUR_USD"),
-        ];
-        let got = resolve_replace_target("hs-eurusd-bbbb", "EUR_USD", &plans).unwrap();
-        assert_eq!(got.as_deref(), Some("hs-eurusd-bbbb"));
-    }
-
-    #[test]
-    fn replace_auto_resolves_single_plan_for_instrument() {
-        let plans = [
-            plan_entry("hs-eurusd-aaaa", "EUR_USD"),
-            plan_entry("hs-gbpusd-cccc", "GBP_USD"),
-        ];
-        let got = resolve_replace_target("", "EUR_USD", &plans).unwrap();
-        assert_eq!(got.as_deref(), Some("hs-eurusd-aaaa"));
-    }
-
-    #[test]
-    fn replace_auto_no_plan_for_instrument_is_noop() {
-        let plans = [plan_entry("hs-gbpusd-cccc", "GBP_USD")];
-        let got = resolve_replace_target("", "EUR_USD", &plans).unwrap();
-        assert!(got.is_none(), "no plan on instrument → nothing to delete");
-    }
-
-    #[test]
-    fn replace_auto_multiple_plans_is_hard_error() {
-        let plans = [
-            plan_entry("hs-eurusd-aaaa", "EUR_USD"),
-            plan_entry("mw-eurusd-bbbb", "EUR_USD"),
-        ];
-        let err = resolve_replace_target("", "EUR_USD", &plans).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("2 plans"), "msg = {msg}");
-        assert!(msg.contains("hs-eurusd-aaaa"), "names candidates: {msg}");
-        assert!(msg.contains("mw-eurusd-bbbb"), "names candidates: {msg}");
-        // The error text points the operator at the *new* flag name.
-        assert!(msg.contains("--replace"), "error names --replace: {msg}");
-    }
-
-    #[test]
-    fn replace_whitespace_target_is_treated_as_auto() {
-        // clap's default_missing_value for a bare `--replace` is "" → auto.
-        let plans = [plan_entry("hs-eurusd-aaaa", "EUR_USD")];
-        let got = resolve_replace_target("  ", "EUR_USD", &plans).unwrap();
-        assert_eq!(got.as_deref(), Some("hs-eurusd-aaaa"));
     }
 }

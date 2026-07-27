@@ -1,0 +1,8 @@
+{
+  "instrument": "SGD_JPY",
+  "granularity": "m15",
+  "source": "oanda",
+  "start": "2026-07-13T04:45:00Z",
+  "end": "2026-07-14T10:30:00Z",
+  "message": "all three entries blocked by sl-widen-below-min-r: the spread-floor widens the SL until R falls under min_r=1.00, so nothing fills and the plan ends flat at trade-expiry. Pins that a blocked entry books NO leg (0R, not a break-even trade) — taken must read false here."
+}
