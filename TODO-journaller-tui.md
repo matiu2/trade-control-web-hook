@@ -157,7 +157,7 @@ delete rules).
 | depth | screen | what happens on ENTER (push) |
 |---|---|---|
 | 0 | **List** | — (the plan picker) |
-| 1 | **Timeline** | fetch + render `plan timeline`; **auto-loads TV** + fetches `plan export` to fill the info bar |
+| 1 | **Timeline** | fetch + render `plan timeline`; fetches `plan export` to fill the info bar. Does **not** touch the TV chart — press `l` |
 | 2 | **Replay** | run replay, render the report |
 | 3 | **Compare** | replay report ‖ live timeline (v2: computed diff) |
 
@@ -198,7 +198,7 @@ LIST (depth 0)                     TIMELINE (depth 1)          REPLAY (depth 2) 
 | `→` / `n` / `Enter` | push deeper (list→timeline→replay→compare) |
 | `←` | pop back one screen (from timeline → list) |
 | `/` | **search/filter the list** (list screen only) — see below |
-| `l` | (re)load current plan into TradingView (auto-fires on timeline push) |
+| `l` | (re)load current plan into TradingView — **operator-initiated only** |
 | `r` | (re)run replay for current plan |
 | `s` | **record** the trade's outcome to the journal DB (needs replay run) |
 | `c` | **copy** the full current view to the clipboard (not just the visible part) |
@@ -206,6 +206,22 @@ LIST (depth 0)                     TIMELINE (depth 1)          REPLAY (depth 2) 
 | `d` / `x` | **delete + done** — confirm modal; **disabled at depth 0** |
 | `Ctrl-L` | force a full repaint (recovers from residual screen corruption) |
 | `q` / `Ctrl-C` | quit |
+
+### TV chart loading (`l`) — never automatic
+Entering a screen does **not** load the TradingView chart (auto-load removed
+2026-07-27): walking the backlog shouldn't yank the live chart around. Press `l`.
+
+The one exception isn't a convenience: **`r` (replay) loads the chart if it
+isn't this plan's**, because `tv-arm --start … replay` re-arms from whatever
+chart is up — replaying against another plan's chart returns a *wrong answer*,
+not just a slow one. So the replay treats the load as a hard precondition and
+waits for it (`PlanData.tv_loaded`).
+
+If you press `l` before the plan detail has arrived, the request **parks**
+(`App.tv_load_pending`) and runs when the timeline job lands — the detail
+carries the broker that fixes the chart's exchange prefix. That flag is what
+distinguishes "the operator asked" from "a timeline happened to load"; don't
+drop it, or `l` silently no-ops on a not-yet-fetched plan.
 
 On the **Replay** screen the vim/arrow keys scroll the report instead of moving
 a selection (`j`/`k`/`u`/`d`/`g`/`G`, PgUp/PgDn/Home/End), so delete there is

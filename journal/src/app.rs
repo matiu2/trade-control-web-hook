@@ -97,6 +97,12 @@ pub struct App {
     record_db: Option<rusqlite::Connection>,
     /// The `/` search prompt + live query. Filters the list screen.
     pub search: SearchState,
+    /// A TV-load was **requested** (`l`, or the replay needing the chart) but
+    /// the plan detail — which carries the broker for the exchange prefix —
+    /// wasn't loaded yet, so it's parked until the timeline job lands. Nothing
+    /// loads the chart unless the operator asked for it: there is no auto-load
+    /// on screen entry (removed 2026-07-27).
+    tv_load_pending: bool,
 }
 
 /// Braille spinner frames for the "loading…" indicator.
@@ -125,6 +131,7 @@ impl App {
             needs_clear: false,
             record_db: None,
             search: SearchState::default(),
+            tv_load_pending: false,
         })
     }
 
@@ -297,13 +304,11 @@ impl App {
             return;
         };
         match screen {
-            Screen::Timeline => {
-                self.start_timeline(&trade_id);
-                // Auto-load TradingView on reaching the first deep screen. If the
-                // detail is already cached this fires immediately; otherwise the
-                // timeline job's completion (apply_job) fires it once loaded.
-                self.start_load_tv(&trade_id);
-            }
+            // NO auto TV-load here (removed 2026-07-27, operator's call): just
+            // walking into a plan shouldn't yank the live chart around. Press
+            // `l` to load it. The replay still loads the chart on demand,
+            // because it re-arms FROM the chart (see `start_replay`).
+            Screen::Timeline => self.start_timeline(&trade_id),
             Screen::Replay => self.start_replay(&trade_id),
             Screen::Compare => {
                 // Compare needs both; each is a no-op if already cached/running.
@@ -333,8 +338,11 @@ impl App {
     /// the plan's `armed_at` (from the detail) as the `--start` cursor AND the
     /// chart loaded to this plan. The detail is fetched by the timeline job; if
     /// it isn't cached yet, kick that and let the retry (on re-enter) run the
-    /// replay once it lands. The TV-load auto-fires on the Timeline screen, so by
-    /// Replay/Compare the chart is already this plan's.
+    /// replay once it lands. Since screen entry no longer auto-loads the chart,
+    /// the replay loads it itself when needed — that's not an "auto-load" of
+    /// convenience, it's a hard precondition: tv-arm re-arms from whatever chart
+    /// is up, so replaying against another plan's chart would give a wrong
+    /// answer rather than just being slow.
     fn start_replay(&mut self, trade_id: &str) {
         let cached = self
             .data
@@ -440,13 +448,16 @@ impl App {
                     .map(|p| p.trade_id == trade_id)
                     .unwrap_or(false);
                 if is_open {
-                    // Auto-load TradingView the first time we reach a deep screen
-                    // (the detail, carrying the broker, only exists now).
-                    if self.screen.depth() >= Screen::Timeline.depth() {
+                    // A TV-load or replay may have been ASKED FOR before the
+                    // export existed (both need the detail: the broker for the
+                    // exchange prefix, `armed_at` for the replay cursor), in
+                    // which case they parked themselves as pending and kicked
+                    // this timeline job. Now that the detail is here, run them.
+                    // Nothing auto-loads that the operator didn't request.
+                    if self.tv_load_pending {
+                        self.tv_load_pending = false;
                         self.start_load_tv(&trade_id);
                     }
-                    // A replay may have been requested before the export existed;
-                    // if we're on/at Replay or Compare, kick it now.
                     if matches!(self.screen, Screen::Replay | Screen::Compare) {
                         self.start_replay(&trade_id);
                     }
@@ -480,7 +491,8 @@ impl App {
     /// Load the current plan into TradingView (the `l` key) — set the live
     /// chart's symbol + timeframe for this setup (the operator scrolls/zooms to
     /// it manually), as a background job so the navigation doesn't freeze the
-    /// UI. Also auto-fired once when the Timeline screen is first reached.
+    /// UI. **Only ever operator-initiated**: `l`, or the replay needing the
+    /// chart it re-arms from. Entering a screen never loads the chart.
     pub fn load_tv(&mut self) {
         let Some(trade_id) = self.current_plan().map(|p| p.trade_id.clone()) else {
             return;
@@ -490,8 +502,10 @@ impl App {
 
     /// Spawn the TradingView-load job for `trade_id` once the plan detail is
     /// loaded — the detail carries the `broker`, which fixes the chart's
-    /// exchange prefix. If the detail isn't loaded yet, kick the timeline job;
-    /// `apply_job` re-tries the load when the detail lands.
+    /// exchange prefix. If the detail isn't loaded yet, park the request
+    /// (`tv_load_pending`) and kick the timeline job; `apply_job` runs the
+    /// parked load when the detail lands. Only called from an operator action
+    /// (`l`) or the replay, never on screen entry.
     fn start_load_tv(&mut self, trade_id: &str) {
         // Instrument + granularity come from the list row; broker from detail.
         let Some(row) = self.plans.iter().find(|p| p.trade_id == trade_id) else {
@@ -501,8 +515,11 @@ impl App {
         let granularity = row.granularity.clone();
         // Broker comes from the fetched detail (drives the exchange prefix).
         let Some(detail) = self.data.get(trade_id).and_then(|d| d.detail.as_ref()) else {
-            // Detail (with the broker) not loaded yet — fetch it; the Timeline
-            // completion will fire the load.
+            // Detail (with the broker) not loaded yet — park this request and
+            // fetch it; the Timeline completion runs the parked load. The flag
+            // is what distinguishes "the operator asked" from "we happened to
+            // load a timeline", now that screen entry no longer auto-loads.
+            self.tv_load_pending = true;
             self.start_timeline(trade_id);
             return;
         };
@@ -726,6 +743,7 @@ impl App {
             needs_clear: false,
             record_db: None,
             search: SearchState::default(),
+            tv_load_pending: false,
         }
     }
 
@@ -1008,6 +1026,89 @@ mod tests {
         app.set_screen(Screen::Replay);
         app.open_search();
         assert!(!app.search.active, "no search prompt off the list screen");
+    }
+
+    /// Walking into a plan must NOT touch the live TradingView chart — the
+    /// operator drives that with `l`. Only the timeline job is spawned.
+    #[test]
+    fn entering_a_screen_does_not_load_tv() {
+        let mut app = App::from_rows(vec![row("hs-aud-cad-a07622da")]);
+        app.select_to("hs-aud-cad-a07622da");
+        // Detail already cached, so nothing is waiting on a fetch: if an
+        // auto-load existed, it would fire immediately here.
+        app.seed_current(PlanData {
+            detail: parse_plan_export(EXPORT).ok(),
+            export_json: Some(EXPORT.to_string()),
+            timeline_json: Some(TIMELINE.to_string()),
+            replay_report: None,
+            tv_loaded: false,
+            max_depth: 0,
+        });
+        app.push_deeper(); // List → Timeline
+        assert_eq!(app.screen, Screen::Timeline);
+        assert!(
+            !app.in_flight
+                .contains(&("hs-aud-cad-a07622da".into(), JobKind::LoadTv)),
+            "entering Timeline must not load the chart"
+        );
+    }
+
+    /// `l` still loads it, even when the detail hasn't arrived yet: the request
+    /// parks and runs when the timeline job lands. This is the path that would
+    /// silently break if the pending flag were dropped along with the auto-load.
+    #[test]
+    fn pressing_l_before_detail_loads_still_loads_tv() {
+        let mut app = App::from_rows(vec![row("hs-aud-cad-a07622da")]);
+        app.select_to("hs-aud-cad-a07622da");
+        app.set_screen(Screen::Timeline);
+
+        app.load_tv(); // no detail cached yet → parks behind the timeline fetch
+        assert!(
+            !app.in_flight
+                .contains(&("hs-aud-cad-a07622da".into(), JobKind::LoadTv)),
+            "cannot load before the broker is known"
+        );
+
+        // The timeline job lands, carrying the detail (and the broker).
+        app.in_flight
+            .remove(&("hs-aud-cad-a07622da".into(), JobKind::Timeline));
+        app.inject_job(JobResult {
+            trade_id: "hs-aud-cad-a07622da".into(),
+            kind: JobKind::Timeline,
+            outcome: JobOutcome::Timeline {
+                export_json: EXPORT.to_string(),
+                timeline_json: TIMELINE.to_string(),
+            },
+        });
+        app.drain_jobs();
+        assert!(
+            app.in_flight
+                .contains(&("hs-aud-cad-a07622da".into(), JobKind::LoadTv)),
+            "the parked `l` request runs once the detail lands"
+        );
+    }
+
+    /// The same timeline completion must NOT load the chart when the operator
+    /// never asked — this is the auto-load, and it's gone.
+    #[test]
+    fn timeline_completion_alone_does_not_load_tv() {
+        let mut app = App::from_rows(vec![row("hs-aud-cad-a07622da")]);
+        app.select_to("hs-aud-cad-a07622da");
+        app.set_screen(Screen::Timeline);
+        app.inject_job(JobResult {
+            trade_id: "hs-aud-cad-a07622da".into(),
+            kind: JobKind::Timeline,
+            outcome: JobOutcome::Timeline {
+                export_json: EXPORT.to_string(),
+                timeline_json: TIMELINE.to_string(),
+            },
+        });
+        app.drain_jobs();
+        assert!(
+            !app.in_flight
+                .contains(&("hs-aud-cad-a07622da".into(), JobKind::LoadTv)),
+            "no `l` pressed → no chart load"
+        );
     }
 
     /// Replay must not fire until the chart is loaded (it re-arms from the live
