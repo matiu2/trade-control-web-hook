@@ -320,14 +320,38 @@ mod tests {
             &self.0
         }
     }
+    /// A private directory per call.
+    ///
+    /// The suffix is `(pid, monotonic counter)`, **not** `(pid, nanos)`. The
+    /// tests in this module run in one process on a parallel runner, so a
+    /// clock-derived suffix only separates them if no two happen to read the
+    /// clock in the same nanosecond — and when that lost, two tests shared a
+    /// cache directory and one saw the other's cached week (`miss_then_hit`
+    /// counting 1 fetch where it expected 2, or vice versa). Observed once in
+    /// CI, 2026-07-28; it reproduces roughly never by hand, which is exactly
+    /// what makes it worth removing by construction rather than by retry.
+    ///
+    /// A counter cannot collide within a process, and the pid separates
+    /// processes.
     fn tempdir() -> Tmp {
+        use std::sync::atomic::AtomicUsize;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         let pid = std::process::id();
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let base = std::env::temp_dir().join(format!("ff-cache-test-{pid}-{nanos}"));
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        let base = std::env::temp_dir().join(format!("ff-cache-test-{pid}-{n}"));
         std::fs::create_dir_all(&base).unwrap();
         Tmp(base)
+    }
+
+    /// Two `tempdir()` calls must never share a directory.
+    ///
+    /// This is the property the old `(pid, nanos)` suffix only had
+    /// probabilistically — see `tempdir`'s doc. Asserting it directly means a
+    /// future "simplification" back to a clock can't pass.
+    #[test]
+    fn tempdirs_are_unique_within_the_process() {
+        let a = tempdir();
+        let b = tempdir();
+        assert_ne!(a.path(), b.path(), "two tempdirs shared a path");
     }
 }
