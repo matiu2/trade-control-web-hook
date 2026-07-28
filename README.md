@@ -3283,10 +3283,45 @@ The position-entry tools (`--market-entry` / `--stop-entry` / `--limit-entry`)
 are **refused** with `--spec-in`: their SL/TP are TradingView drawing properties
 with no frozen equivalent.
 
+### Capturing a trade for the corpus: `--save-fixture`
+
+The one-flag version. Reads the chart once, freezes the setup, arms all six
+grid cells, and names everything for you:
+
+```sh
+tv-arm --save-fixture replay
+tv-arm --save-fixture --message "the S/R close cut a runner to +0.52R" replay
+```
+
+It expands to exactly the explicit form below, with the fixture name derived as
+`<instrument>-<granularity>-<YYYY-MM-DD>` (e.g. `eur-usd-h1-2026-07-20`):
+
+```sh
+--spec-out <fixtures-dir>/<name>.spec.json --save-matrix \
+  replay --save <name> --simulate true [--message <TEXT>]
+```
+
+The date is the **arm cursor** (`--start`) when journaling, not the wall clock —
+a re-arm of a June trade belongs to June. The name is deterministic, so
+re-capturing the same setup on the same day overwrites its own fixtures instead
+of growing near-duplicates (a re-capture is almost always a *correction*).
+
+- `--fixture-name <name>` overrides the derived name — use the journal page's
+  own id (`trade-124`).
+- `--message <text>` records what the fixture pins, into its `meta.json`. Safe
+  to add or reword later by editing that file directly: nothing validates it
+  against `expected.json`, and `--rebless` rewrites only `expected.json`, so
+  notes survive a re-bless.
+- Anything you put after `replay` still wins — the flag only fills in defaults.
+
+`--spec-out` is included on purpose: the chart read is the expensive,
+human-paced part, and freezing it is what makes every later re-run free.
+
 ### The entry-sensitivity grid: `--save-matrix`
 
-Arms three entry rules (`normal` / `skip-bcr` / `strategy-v2`) × news calendar
-on/off — six cells — from a **single** chart read:
+The explicit form. Arms three entry rules (`normal` / `skip-bcr` /
+`strategy-v2`) × news calendar on/off — six cells — from a **single** chart
+read:
 
 ```sh
 tv-arm --spec-out setups/trade-124.json --save-matrix \

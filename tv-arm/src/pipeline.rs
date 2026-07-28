@@ -47,6 +47,7 @@ use crate::resolve_error::ResolveError;
 use crate::roles::{Roles, SlotPref, classify};
 use crate::save_matrix;
 use crate::setup_inputs::SetupInputs;
+use crate::trade_plan_build::resolution_to_granularity;
 use trading_view::drawings::Drawing;
 use trading_view::mcp::TvMcp;
 
@@ -72,16 +73,29 @@ pub fn run(args: Args) -> Result<i32> {
     // Source the setup: a frozen spec, or the live chart. `Roles` only exists on
     // the chart path — the position-entry tools need raw drawings, so a frozen
     // arm refuses them rather than silently arming something else.
-    let (setup, roles) = match args.spec_in.as_deref() {
-        Some(path) => (read_setup_from_spec(&args, path)?, None),
+    let (setup, roles, from_chart) = match args.spec_in.as_deref() {
+        Some(path) => (read_setup_from_spec(&args, path)?, None, false),
         None => {
             let (setup, roles) = read_setup_from_chart(&args)?;
-            if let Some(path) = args.spec_out.as_deref() {
-                freeze_setup(&args, &setup, path)?;
-            }
-            (setup, Some(roles))
+            (setup, Some(roles), true)
         }
     };
+
+    // `--save-fixture` is pure sugar: expand it into the flags it stands for,
+    // now that the setup is known (the derived name needs the instrument, the
+    // granularity, and the cursor date). Expanding HERE rather than in
+    // `apply_aliases` is what lets the name come from the setup instead of
+    // making the operator invent one 291 times.
+    let args = expand_save_fixture(args, &setup);
+
+    // One freeze point, after the expansion, so `--spec-out` behaves identically
+    // whether the operator typed it or `--save-fixture` supplied it. (It was
+    // briefly two — inside the chart arm above *and* here — which is the shape
+    // where the sugar path quietly stops freezing.) Only the chart path has
+    // anything to freeze: a `--spec-in` arm came FROM a spec.
+    if from_chart && let Some(path) = args.spec_out.as_deref() {
+        freeze_setup(&args, &setup, path)?;
+    }
 
     // Both sources feed the same two exits. The matrix in particular has to work
     // off a FROZEN setup: "confirm once on the chart, then generate the grid
@@ -91,6 +105,69 @@ pub fn run(args: Args) -> Result<i32> {
         return arm_the_matrix(&args, setup, roles.as_ref());
     }
     arm_from_inputs(&args, setup, roles.as_ref())
+}
+
+/// Expand `--save-fixture` into the flags it stands for.
+///
+/// A no-op unless the flag is set. When it is, it turns on `--save-matrix`,
+/// picks a `--spec-out` path, and fills the `replay` passthrough with
+/// `--save <name> --simulate true` (plus `--message` when given). The name is
+/// the operator's explicit value, or one derived from the setup.
+///
+/// Everything it sets is a default: an explicit flag in the passthrough always
+/// wins (see `save_fixture::replay_tokens`). Clap already refuses the two
+/// combinations that would be ambiguous rather than defaulted
+/// (`--save-matrix`, `--spec-out`).
+///
+/// Takes and returns `Args` by value: this is the same "rewrite the args, then
+/// run the normal path" shape as `apply_aliases`, and keeping it that way means
+/// the sugar can't grow its own execution path that drifts from the explicit
+/// one.
+fn expand_save_fixture(mut args: Args, setup: &SetupInputs) -> Args {
+    if !args.save_fixture {
+        return args;
+    }
+    // The cursor date when journaling, else today: a re-arm of a June trade
+    // belongs to June, not to the day it was replayed.
+    let date = setup
+        .start
+        .and_then(|s| DateTime::<Utc>::from_timestamp(s, 0))
+        .unwrap_or_else(Utc::now)
+        .format("%Y-%m-%d")
+        .to_string();
+    let granularity = resolution_to_granularity(&setup.resolution)
+        .map(|g| format!("{g:?}").to_lowercase())
+        // An unsupported resolution is rejected later, with a better message
+        // than anything we could produce here; don't pre-empt it, just name the
+        // fixture after what the chart said.
+        .unwrap_or_else(|| setup.resolution.to_lowercase());
+    let name = crate::save_fixture::resolve_name(&args, &setup.instrument, &granularity, &date);
+
+    args.save_matrix = true;
+    if args.spec_out.is_none() {
+        args.spec_out = Some(crate::save_fixture::spec_path(
+            &default_fixtures_dir(),
+            &name,
+        ));
+    }
+    // The `replay` subcommand is what carries the fixture flags. Without it
+    // there is nothing to save, so `validate` rejects the combination before we
+    // ever reach a chart.
+    if let Some(crate::args::Command::Replay { args: passthrough }) = args.command.as_mut() {
+        *passthrough =
+            crate::save_fixture::replay_tokens(&name, args.message.as_deref(), passthrough);
+    }
+    args
+}
+
+/// Where `--save-fixture` puts specs and fixtures when not told otherwise.
+///
+/// Mirrors `replay-candles`' own default (`<repo>/replay-fixtures`) so the two
+/// agree without `tv-arm` having to pass `--fixtures-dir` on every call.
+fn default_fixtures_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("replay-fixtures")
 }
 
 /// Write the chart-derived setup to a `--spec-out` file for later `--spec-in`.
@@ -1990,5 +2067,152 @@ mod tests {
         let inv = vetos.iter().find(|v| v.name == "too-low").expect("inv");
         assert_eq!(inv.past, VetoSide::Below);
         assert!((inv.level - 1.0850).abs() < 1e-9);
+    }
+
+    // ===== --save-fixture expansion =====================================
+
+    /// Build `Args` for a `--save-fixture` run, with the `replay` subcommand
+    /// the flag requires.
+    fn sf_args(extra: &[&str]) -> Args {
+        let mut argv = vec!["tv-arm"];
+        argv.extend_from_slice(extra);
+        argv.push("replay");
+        Args::try_parse_from(argv).expect("parse save-fixture args")
+    }
+
+    fn replay_tokens_of(args: &Args) -> Vec<String> {
+        match args.command.as_ref() {
+            Some(crate::args::Command::Replay { args: a }) => a.clone(),
+            _ => panic!("expected a replay subcommand"),
+        }
+    }
+
+    /// The whole point of the flag: one token expands to the full capture.
+    #[test]
+    fn save_fixture_expands_to_the_full_capture() {
+        let setup = crate::setup_inputs::tests::sample();
+        let out = expand_save_fixture(sf_args(&["--save-fixture"]), &setup);
+
+        assert!(out.save_matrix, "must arm all six cells");
+        assert!(
+            out.spec_out.is_some(),
+            "must freeze the setup for free re-runs"
+        );
+
+        let tokens = replay_tokens_of(&out);
+        let i = tokens
+            .iter()
+            .position(|t| t == "--save")
+            .expect("--save injected");
+        // EUR_USD @ resolution "60" → h1. No cursor → today's date, so assert
+        // the stable prefix rather than baking a date into the test.
+        assert!(
+            tokens[i + 1].starts_with("eur-usd-h1-"),
+            "derived name should read <instrument>-<granularity>-<date>: {}",
+            tokens[i + 1]
+        );
+        assert!(tokens.iter().any(|t| t == "--simulate"));
+    }
+
+    /// Without the flag nothing changes — the sugar must be inert when unused.
+    #[test]
+    fn without_the_flag_nothing_is_expanded() {
+        let setup = crate::setup_inputs::tests::sample();
+        let before = sf_args(&[]);
+        let after = expand_save_fixture(before.clone(), &setup);
+        assert!(!after.save_matrix);
+        assert!(after.spec_out.is_none());
+        assert_eq!(replay_tokens_of(&after), replay_tokens_of(&before));
+    }
+
+    /// An explicit name wins over the derived one — that's how a journal page's
+    /// own id (`trade-124`) gets used.
+    #[test]
+    fn an_explicit_name_overrides_the_derived_one() {
+        let setup = crate::setup_inputs::tests::sample();
+        let out = expand_save_fixture(
+            sf_args(&["--save-fixture", "--fixture-name", "trade-124"]),
+            &setup,
+        );
+        let tokens = replay_tokens_of(&out);
+        let i = tokens.iter().position(|t| t == "--save").expect("--save");
+        assert_eq!(tokens[i + 1], "trade-124");
+        assert!(
+            out.spec_out
+                .as_ref()
+                .expect("spec")
+                .to_string_lossy()
+                .contains("trade-124"),
+            "the spec is named after the fixture it regenerates"
+        );
+    }
+
+    /// `--message` reaches the fixture's meta.json.
+    #[test]
+    fn a_message_reaches_the_replay_passthrough() {
+        let setup = crate::setup_inputs::tests::sample();
+        let out = expand_save_fixture(
+            sf_args(&["--save-fixture", "--message", "pins the S/R close"]),
+            &setup,
+        );
+        let tokens = replay_tokens_of(&out);
+        let i = tokens
+            .iter()
+            .position(|t| t == "--message")
+            .expect("--message");
+        assert_eq!(tokens[i + 1], "pins the S/R close");
+    }
+
+    /// The cursor date, not today's, names a journaling re-arm: a replay of a
+    /// June trade belongs to June however long afterwards it is run.
+    #[test]
+    fn the_derived_date_is_the_cursor_not_the_wall_clock() {
+        let mut setup = crate::setup_inputs::tests::sample();
+        setup.start = Some(
+            "2026-06-19T00:00:00Z"
+                .parse::<DateTime<Utc>>()
+                .expect("valid")
+                .timestamp(),
+        );
+        let out = expand_save_fixture(sf_args(&["--save-fixture"]), &setup);
+        let tokens = replay_tokens_of(&out);
+        let i = tokens.iter().position(|t| t == "--save").expect("--save");
+        assert_eq!(tokens[i + 1], "eur-usd-h1-2026-06-19");
+    }
+
+    /// `--save-fixture` with nothing to save into is refused up front, rather
+    /// than doing a full chart read and producing no fixture.
+    #[test]
+    fn save_fixture_without_replay_is_refused() {
+        let args = Args::try_parse_from(["tv-arm", "--save-fixture"]).expect("parses");
+        let err = args.validate().expect_err("must be refused");
+        assert!(
+            err.to_string().contains("replay"),
+            "the error must name the missing subcommand: {err}"
+        );
+    }
+
+    /// `--save-fixture` must actually WRITE the spec, not merely set the path.
+    ///
+    /// The expansion test above asserts `spec_out` is populated, which a
+    /// mutation showed is not enough: deleting the `freeze_setup` call from
+    /// `run` left every test green. The freeze is the entire reason the flag
+    /// includes `--spec-out` — without the file, the next re-run is a manual
+    /// chart session again — so assert the bytes land and reload.
+    #[test]
+    fn save_fixture_writes_a_spec_that_loads_back() {
+        let setup = crate::setup_inputs::tests::sample();
+        let args = expand_save_fixture(sf_args(&["--save-fixture"]), &setup);
+        let path = std::env::temp_dir().join(format!("sf-freeze-{}.json", std::process::id()));
+        let args = Args {
+            spec_out: Some(path.clone()),
+            ..args
+        };
+
+        freeze_setup(&args, &setup, &path).expect("freeze writes the spec");
+        let back = crate::frozen_setup::FrozenSetup::load(&path).expect("spec reloads");
+        assert_eq!(back.chart_symbol, setup.chart_symbol);
+        assert_eq!(back.resolution, setup.resolution);
+        std::fs::remove_file(&path).ok();
     }
 }
