@@ -46,6 +46,7 @@ mod register_post;
 mod replay;
 mod resolve_error;
 mod roles;
+mod save_fixture;
 mod save_matrix;
 mod sentiment;
 mod setup_inputs;

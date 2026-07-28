@@ -78,7 +78,7 @@ pub struct SetupInputs {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::plan_geometry::{Anchor, Line};
 
@@ -86,7 +86,7 @@ mod tests {
     /// `ResolvedInstrument` holds a `&'static Asset`, so there is no way to fake
     /// one, and going through `resolve_for_broker` means this helper exercises
     /// the same path `run` does.
-    fn sample() -> SetupInputs {
+    pub(crate) fn sample() -> SetupInputs {
         let resolved =
             crate::instrument_resolution::resolve_for_broker("OANDA:EURUSD", Broker::Oanda)
                 .expect("EURUSD is in the baseline catalog");

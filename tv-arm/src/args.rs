@@ -514,6 +514,49 @@ pub struct Args {
     #[arg(long, conflicts_with_all = ["skip_bcr", "strategy_v2", "skip_all", "quasimodo"])]
     pub save_matrix: bool,
 
+    /// **The one-flag corpus capture.** Read the chart once and save everything:
+    /// freezes the setup, arms all six grid cells, and writes the fixtures —
+    /// choosing the fixture name and the spec path for you.
+    ///
+    /// Equivalent to spelling out, with `<name>` derived as
+    /// `<instrument>-<granularity>-<YYYY-MM-DD>`:
+    ///
+    /// ```text
+    /// --spec-out <fixtures-dir>/<name>.spec.json --save-matrix \
+    ///   replay --save <name> --simulate true [--message <TEXT>]
+    /// ```
+    ///
+    /// The derived name is deterministic, so re-capturing the same setup on the
+    /// same day overwrites its own fixtures rather than growing a pile of
+    /// near-duplicates. Pass `--save-fixture <name>` to override the name when
+    /// you want the journal page's own id.
+    ///
+    /// `--spec-out` is included on purpose: the chart read is the expensive,
+    /// human-paced part, and freezing it is what makes every later re-run free.
+    /// Anything you put after `replay` still wins — this only fills in defaults.
+    /// Deliberately a **bare flag**, with the optional name split out into
+    /// `--fixture-name`. An `Option<String>` with `num_args = 0..=1` reads
+    /// better in isolation, but `tv-arm --save-fixture replay` — the most
+    /// natural thing to type — then silently parses `replay` as the *name* and
+    /// leaves the subcommand missing. A flag whose obvious spelling is wrong is
+    /// worse than one extra flag for the rarer case.
+    #[arg(long, conflicts_with_all = ["save_matrix", "spec_out"])]
+    pub save_fixture: bool,
+
+    /// Override the fixture name `--save-fixture` would derive (e.g. the
+    /// journal page's own id, `trade-124`).
+    #[arg(long, value_name = "NAME", requires = "save_fixture")]
+    pub fixture_name: Option<String>,
+
+    /// What the fixture is meant to pin — stored in its `meta.json` so a future
+    /// reader knows why it exists. Free text; never affects a verdict.
+    ///
+    /// Safe to add or reword later by editing the fixture's `meta.json` directly:
+    /// nothing validates it against `expected.json`, and `--rebless` rewrites
+    /// only `expected.json`, so notes survive a re-bless.
+    #[arg(long, value_name = "TEXT", requires = "save_fixture")]
+    pub message: Option<String>,
+
     /// Free-text note stored in a `--spec-out` file (e.g. the journal page this
     /// setup came from). Never read when arming.
     #[arg(long, value_name = "TEXT", requires = "spec_out")]
@@ -796,6 +839,18 @@ impl Args {
     /// order). The mutual exclusions with `--quasimodo` / `--entry-market` /
     /// `--skip-*` are enforced by clap's `conflicts_with_all` at parse time.
     pub fn validate(&self) -> color_eyre::eyre::Result<()> {
+        // `--save-fixture` saves fixtures, and only the `replay` subcommand can
+        // do that. Without it there is nothing to save, so the run would do a
+        // full chart read and then silently produce no corpus entry — the exact
+        // failure the flag exists to prevent.
+        if self.save_fixture && !self.replay() {
+            color_eyre::eyre::bail!(
+                "--save-fixture needs the `replay` subcommand to save into — it \
+                 fills in `replay --save <name> --simulate true` for you, but \
+                 the subcommand itself has to be there. Append `replay` to the \
+                 command (anything you add after it still wins)."
+            );
+        }
         if self.strategy_v2 && self.max_retries == Some(0) {
             color_eyre::eyre::bail!(
                 "--strategy-v2 requires a non-zero --max-retries: both enters \
