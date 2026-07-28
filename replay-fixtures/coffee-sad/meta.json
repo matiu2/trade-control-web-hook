@@ -1,0 +1,8 @@
+{
+  "instrument": "Coffee",
+  "granularity": "m15",
+  "source": "tradenation",
+  "start": "2026-07-20T13:00:00Z",
+  "end": "2026-07-22T16:00:00Z",
+  "message": "negative 3R mamamia"
+}

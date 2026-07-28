@@ -22,21 +22,37 @@ use clap_complete::{Shell, generate};
 use color_eyre::eyre::Result;
 
 mod args;
+mod broker_kind;
+mod broker_read;
+mod calendar;
+mod control_bundle;
+mod control_windows;
+mod frozen_setup;
 mod geometry;
+mod hs_resolve;
 mod instrument_recovery;
 mod instrument_resolution;
 mod mw_geometry;
+mod mw_resolve;
 mod news_marker;
 mod news_window;
 mod pipeline;
+mod plan_geometry;
+mod position_entry;
 mod position_trade;
 mod precision;
+mod register;
 mod register_post;
 mod replay;
+mod resolve_error;
 mod roles;
+mod save_matrix;
 mod sentiment;
+mod setup_inputs;
 mod spread;
 mod start_note;
+#[cfg(test)]
+mod test_drawings;
 mod timeframe;
 mod trade_plan_build;
 

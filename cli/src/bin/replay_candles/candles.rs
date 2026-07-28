@@ -83,9 +83,24 @@ pub async fn pull(
 ///    spell an instrument identically. That holds in today's catalog by luck,
 ///    not by design; separate tables make it structural.
 fn default_cache_dir(source: CandleSource) -> PathBuf {
-    let base = std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".cache"))
-        .unwrap_or_else(|_| PathBuf::from("."));
+    // With `HOME` unset this used to fall back to `.` — a silent degrade with real
+    // consequences, because under `postgres-storage` the TABLE NAME derives from
+    // this path's filename. The relative path resolves against the cwd, so the
+    // same command run from two directories would silently use two different
+    // caches (and reason (1) above — sharing the warm multi-hundred-GB table —
+    // quietly stops applying). Warn so a cold replay has a traceable cause; the
+    // path itself is unchanged so nothing breaks that previously worked.
+    let base = match std::env::var("HOME") {
+        Ok(home) => PathBuf::from(home).join(".cache"),
+        Err(_) => {
+            tracing::warn!(
+                "HOME is not set — falling back to a cwd-relative candle cache. Under \
+                 postgres-storage the table name comes from this path, so this replay \
+                 will NOT share the warm per-broker table and may be very slow."
+            );
+            PathBuf::from(".")
+        }
+    };
     match source {
         CandleSource::Oanda => base.join("candle_cache_oanda"),
         CandleSource::TradeNation => base.join("candle_cache_tradenation"),

@@ -4,5 +4,5 @@
   "source": "tradenation",
   "start": "2026-07-13T11:00:00Z",
   "end": "2026-07-22T02:00:00Z",
-  "message": "tests news blackout, rentry, and close on reversal"
+  "message": "tests news blackout, rentry, and close on reversal. Re-blessed at the fixture-corpus merge: d4a12e7 (bound the lifecycle broker clock at the bar OPEN) removed a premature fill, so entry #7 now fills 19:00 and stops 23:00 four bars later instead of resolving inside one bar. 1 SL/+0.35R -> 2 SL/-0.65R. The new verdict is the correct one."
 }

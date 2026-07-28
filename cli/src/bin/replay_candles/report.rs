@@ -30,6 +30,7 @@ use trade_control_core::spread_blackout::elevated_threshold_pips;
 use trade_control_engine::{BidAskCandle as EngineCandle, SweepReason, TradePlan};
 
 use super::brisbane::bne;
+use super::economics::ReplayEconomics;
 use super::replay::{Fire, Replay};
 use trade_control_cli::replay_args::DetectorMarkConfig;
 
@@ -233,11 +234,23 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
     })
 }
 
-/// Render the full replay report as a string. When `verbose` is set, a
-/// bar-by-bar trace of the engine's silent state changes (phase moves, the
-/// break-and-close / retest stamps, fires) is printed first — the events the
-/// per-fire report below can't show (notably the retest, which never fires an
-/// intent).
+/// The rendered report plus the economics it booked while rendering. The text is
+/// for the operator; the [`ReplayEconomics`] is the machine-readable result that
+/// `expected.json` records — both from the same single booking pass, so the
+/// printed Net R and the saved golden can never disagree.
+pub struct Rendered {
+    pub text: String,
+    pub economics: ReplayEconomics,
+}
+
+/// Render the full replay report. When `verbose` is set, a bar-by-bar trace of
+/// the engine's silent state changes (phase moves, the break-and-close / retest
+/// stamps, fires) is printed first — the events the per-fire report below can't
+/// show (notably the retest, which never fires an intent).
+///
+/// Also returns the [`ReplayEconomics`] booked during the render. With
+/// `simulate` off nothing is booked and it is left at its zero value (no legs,
+/// net 0R) — matching the report, which prints no summary in that mode.
 pub fn render(
     plan: &TradePlan,
     replay: &Replay,
@@ -245,7 +258,7 @@ pub fn render(
     verbose: bool,
     sentiment: Option<&PlanSentiment>,
     mark_cfg: &DetectorMarkConfig,
-) -> String {
+) -> Rendered {
     let mut out = String::new();
     out.push_str(&format!(
         "Plan {} ({}, {:?}) — {} fire(s) over the window\n",
@@ -262,7 +275,7 @@ pub fn render(
         out.push_str(&render_sentiment(s));
     }
 
-    let mut tally = Tally::new();
+    let mut tally = ReplayEconomics::new();
     // A monotonic id for each ENTER fire, so the journal can refer to an entry
     // (and its later widen/restore/break-even events) by a stable "#N" label
     // instead of leaving those events ambiguous when several enters fire.
@@ -327,7 +340,10 @@ pub fn render(
         replay.fires.len()
     ));
     if simulate {
-        out.push_str(&format!("  |  TP: {}  SL: {}", tally.wins, tally.losses));
+        out.push_str(&format!(
+            "  |  TP: {}  SL: {}",
+            tally.tp_hits, tally.sl_hits
+        ));
         if tally.reversal_closes > 0 {
             out.push_str(&format!("  REV: {}", tally.reversal_closes));
         }
@@ -344,7 +360,10 @@ pub fn render(
         out.push_str("  |  Net R: n/a (--simulate false)");
     }
     out.push('\n');
-    out
+    Rendered {
+        text: out,
+        economics: tally,
+    }
 }
 
 /// Render the news-sentiment block: the overall verdict line, then one line per
@@ -372,75 +391,6 @@ fn render_sentiment(s: &PlanSentiment) -> String {
         }
     }
     out
-}
-
-/// The account size a `--simulate` P&L projection compounds from: 1% risk per
-/// taken trade against a fresh $100k. Every fill's R multiple grows or shrinks
-/// this balance so the report shows what the sequence would have made on a
-/// standard account, not just the raw R sum.
-const START_ACCOUNT: f64 = 100_000.0;
-
-/// Fraction of the *remaining* account risked on each taken trade (1%).
-const RISK_FRACTION: f64 = 0.01;
-
-/// Running tally across a simulated replay: outcome counts, the net R (sum of
-/// per-trade R multiples), and a $100k account compounding at 1% risk per
-/// taken trade. `net_r` and `account` only move on *taken* fills (TP / SL /
-/// reversal-close); not-taken kinds (never-filled, declined, gate-blocked)
-/// contribute 0R and leave the balance untouched.
-struct Tally {
-    wins: usize,
-    losses: usize,
-    reversal_closes: usize,
-    expiry_closes: usize,
-    net_r: f64,
-    account: f64,
-}
-
-impl Tally {
-    fn new() -> Self {
-        Self {
-            wins: 0,
-            losses: 0,
-            reversal_closes: 0,
-            expiry_closes: 0,
-            net_r: 0.0,
-            account: START_ACCOUNT,
-        }
-    }
-
-    /// Book one taken trade's R multiple: add it to the net R and compound the
-    /// account by `1% × account × R` (the P&L of risking 1% of what's left).
-    /// Returns the dollar P&L of this trade so the per-fill line can show it.
-    fn book(&mut self, r: f64) -> f64 {
-        self.net_r += r;
-        let pnl = RISK_FRACTION * self.account * r;
-        self.account += pnl;
-        pnl
-    }
-
-    /// The trailing summary segment: net R and the compounded $100k-account P&L.
-    fn summary_line(&self) -> String {
-        let profit = self.account - START_ACCOUNT;
-        format!(
-            "  |  Net R: {:+.2}  |  $100k acct (1%/trade): ${:.0} ({:+.0})",
-            self.net_r, self.account, profit
-        )
-    }
-}
-
-/// The realized R multiple of a taken fill: signed reward over risk. `entry −
-/// stop_loss` is the risk (positive for a long, negative for a short), and
-/// `exit − entry` is the reward with the trade's own sign, so the quotient is
-/// `+1` on a clean TP and `−1` on a clean SL for *both* directions without a
-/// direction branch. Returns `0.0` when the stop sits at the entry (a
-/// degenerate/zero-risk bracket) so it can't divide by zero.
-fn realized_r(entry: f64, stop_loss: f64, exit: f64) -> f64 {
-    let risk = entry - stop_loss;
-    if risk.abs() < f64::EPSILON {
-        return 0.0;
-    }
-    (exit - entry) / risk
 }
 
 /// The always-on candle-detector summary line: how many bars the detector
@@ -540,7 +490,7 @@ fn render_fire(
     fire: &Fire,
     entry_no: Option<u32>,
     simulate: bool,
-    tally: &mut Tally,
+    tally: &mut ReplayEconomics,
 ) -> Vec<EntryEvent> {
     let intent = &fire.fired.intent;
     let candle = &fire.fired.candle;
@@ -679,8 +629,35 @@ fn render_fire(
 
     // The bracket the broker placed this order at — all the display lines below
     // annotate THIS (the stored floored stop), so they match the ledger's scored
-    // outcome. `None` only if the intent didn't resolve (nothing was placed).
-    let Some(placed) = fire.placed_bracket.as_ref() else {
+    // outcome.
+    //
+    // `None` means nothing was placed, which is NOT only "the intent didn't
+    // resolve": a gate-REJECTED enter (veto, cooldown, missing prep, SL floor)
+    // also has no placed bracket, because the worker 412/422/423s it before any
+    // order goes on. Those are exactly the fires an operator most wants in the
+    // report — "why didn't this enter?" — and a bare `return events` made them
+    // vanish from it silently, even though `resolve_fire_any` below has explicit
+    // `GateBlocked` handling for them. So say the fire happened and why, then let
+    // the flow continue to the resolution below rather than dropping the row.
+    let placed = match fire.placed_bracket.as_ref() {
+        Some(p) => Some(p),
+        None => {
+            events.push(EntryEvent {
+                at: candle.time,
+                note: format!(
+                    "{ev} no order placed{} → 0R",
+                    fire.rejected_reason()
+                        .map(|r| format!(" ({r})"))
+                        .unwrap_or_default()
+                ),
+                close: Some(candle.c),
+            });
+            None
+        }
+    };
+    // Everything below annotates a *placed* bracket, so it only applies when one
+    // exists. The no-placement case already has its row above.
+    let Some(placed) = placed else {
         return events;
     };
 
@@ -761,10 +738,12 @@ fn render_fire(
         return events;
     };
     let entry_price = result.entry_price;
-    // Score R off the ledger's floored stop + actual exit — the ledger is the
-    // single source of truth for the fill.
-    let ledger_stop = Some(result.stop_loss);
     let exit_price = result.exit_price.unwrap_or(entry_price);
+    // Book the position ONCE, up front — `ReplayEconomics` owns which counter
+    // moves, what R scores off the ledger's floored stop, and how the account
+    // compounds. Everything below is formatting. A not-taken kind books nothing
+    // and yields an empty fragment.
+    let r = book_r(tally, &result);
     match result.kind {
         FillKind::ClosedOnReversal => {
             events.push(EntryEvent {
@@ -772,8 +751,6 @@ fn render_fire(
                 note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
                 close: bar_close(&fire.forward, result.fill_at),
             });
-            tally.reversal_closes += 1;
-            let r = book_r(tally, ledger_stop, entry_price, exit_price);
             events.push(EntryEvent {
                 at: result.until,
                 note: format!(
@@ -789,8 +766,6 @@ fn render_fire(
                 note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
                 close: bar_close(&fire.forward, result.fill_at),
             });
-            tally.expiry_closes += 1;
-            let r = book_r(tally, ledger_stop, entry_price, exit_price);
             events.push(EntryEvent {
                 at: result.until,
                 note: format!(
@@ -800,6 +775,9 @@ fn render_fire(
                 close: bar_close(&fire.forward, result.until),
             });
         }
+        // Still open at the window end: booked as a 0R leg (the corpus needs to
+        // see the position existed) but scored neither win nor loss, so no R
+        // fragment is shown.
         FillKind::Open => events.push(EntryEvent {
             at: result.fill_at,
             note: format!(
@@ -814,8 +792,6 @@ fn render_fire(
                 note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
                 close: bar_close(&fire.forward, result.fill_at),
             });
-            tally.wins += 1;
-            let r = book_r(tally, ledger_stop, entry_price, exit_price);
             events.push(EntryEvent {
                 at: result.until,
                 note: format!(
@@ -831,8 +807,6 @@ fn render_fire(
                 note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
                 close: bar_close(&fire.forward, result.fill_at),
             });
-            tally.losses += 1;
-            let r = book_r(tally, ledger_stop, entry_price, exit_price);
             // A break-even scratch (SL→BE moved the stop to entry) exits at the
             // entry price for 0R, not a −1R loss — label it as such.
             let label = if (exit_price - entry_price).abs() < 1e-9 {
@@ -880,25 +854,23 @@ fn bar_close(forward: &[EngineCandle], at: DateTime<Utc>) -> Option<f64> {
     forward.iter().find(|c| c.time == at).map(|c| c.c)
 }
 
-/// Score a taken fill's R multiple against its protected stop, book it into the
-/// running tally (net R + compounding $100k account), and return the trailing
-/// `  (R: …  $100k acct: …)` fragment to append to the exit event. A `None`
-/// stop (bracket that never resolved) books nothing and returns an empty
-/// string.
-fn book_r(
-    tally: &mut Tally,
-    protected_stop: Option<f64>,
-    entry_price: f64,
-    exit_price: f64,
-) -> String {
-    let Some(stop_loss) = protected_stop else {
+/// Book a taken fill into the running economics and return the trailing
+/// `  (R: …  $100k acct: …)` fragment to append to the exit event. The booking
+/// (which counter moves, what R scores, how the account compounds) belongs to
+/// [`ReplayEconomics`]; this is only the formatting of what it booked.
+///
+/// An empty string means the fire booked no position — a not-taken outcome, or
+/// a bracket that never resolved.
+fn book_r(economics: &mut ReplayEconomics, result: &FireResult) -> String {
+    let before = economics.account();
+    let Some(leg) = economics.book(result) else {
         return String::new();
     };
-    let r = realized_r(entry_price, stop_loss, exit_price);
-    let pnl = tally.book(r);
+    let r = leg.r;
+    let after = economics.account();
     format!(
-        "  (R: {r:+.2}  |  $100k acct (1% risk): {:+.0} → ${:.0})",
-        pnl, tally.account
+        "  (R: {r:+.2}  |  $100k acct (1% risk): {:+.0} → ${after:.0})",
+        after - before,
     )
 }
 
@@ -1091,80 +1063,51 @@ mod tests {
         }
     }
 
+    /// R scoring, account compounding, and per-leg booking now live in
+    /// `economics.rs` and are tested there — this module only formats what it
+    /// booked. `book_r`'s formatting is covered below.
     #[test]
-    fn realized_r_is_plus_one_on_a_clean_tp_both_directions() {
-        // Long: entry 1.10, SL 1.09 (risk 0.01), TP 1.11 → +1R.
-        assert!((realized_r(1.10, 1.09, 1.11) - 1.0).abs() < 1e-9);
-        // Short: entry 1.10, SL 1.11 (risk 0.01 the other way), TP 1.09 → +1R.
-        assert!((realized_r(1.10, 1.11, 1.09) - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn realized_r_is_minus_one_on_a_clean_sl_both_directions() {
-        // Long stopped at its SL, short stopped at its SL → −1R each.
-        assert!((realized_r(1.10, 1.09, 1.09) + 1.0).abs() < 1e-9);
-        assert!((realized_r(1.10, 1.11, 1.11) + 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn realized_r_scales_with_a_partial_move() {
-        // Long risk 0.01, exit +0.005 → +0.5R; break-even scratch → 0R.
-        assert!((realized_r(1.10, 1.09, 1.105) - 0.5).abs() < 1e-9);
-        assert!(realized_r(1.10, 1.09, 1.10).abs() < 1e-9);
-    }
-
-    #[test]
-    fn realized_r_zero_risk_bracket_is_zero_not_nan() {
-        // SL sitting at the entry is a degenerate/zero-risk bracket — 0R, no div0.
-        let r = realized_r(1.10, 1.10, 1.11);
-        assert_eq!(r, 0.0);
-    }
-
-    #[test]
-    fn tally_compounds_a_100k_account_at_one_percent_risk() {
-        let mut t = Tally::new();
-        assert_eq!(t.account, 100_000.0);
-        // A +1R win risks 1% of 100k → +$1,000, account 101,000.
-        let pnl = t.book(1.0);
-        assert!((pnl - 1_000.0).abs() < 1e-6);
-        assert!((t.account - 101_000.0).abs() < 1e-6);
-        // A −1R loss now risks 1% of 101k → −$1,010, account 99,990.
-        let pnl = t.book(-1.0);
-        assert!((pnl + 1_010.0).abs() < 1e-6);
-        assert!((t.account - 99_990.0).abs() < 1e-6);
-        // Net R is the plain sum of the two multiples.
-        assert!(t.net_r.abs() < 1e-9);
-    }
-
-    #[test]
-    fn tally_summary_line_shows_net_r_and_projected_profit() {
-        let mut t = Tally::new();
-        t.book(1.0); // +$1,000 → 101,000
-        t.book(1.0); // +1% of 101,000 = +$1,010 → 102,010
-        let s = t.summary_line();
-        assert!(s.contains("Net R: +2.00"), "got: {s}");
-        assert!(s.contains("$102010"), "got: {s}");
-        assert!(s.contains("+2010"), "got: {s}");
-    }
-
-    #[test]
-    fn book_r_is_a_noop_without_a_stop() {
-        // An unresolved bracket (no protected stop) can't be scored → tally
-        // untouched, empty fragment returned.
-        let mut t = Tally::new();
-        let frag = book_r(&mut t, None, 1.10, 1.11);
+    fn book_r_is_a_noop_for_a_not_taken_outcome() {
+        // A never-filled order booked no position → economics untouched, empty
+        // fragment returned (nothing to append to the event line).
+        let mut e = ReplayEconomics::new();
+        let frag = book_r(
+            &mut e,
+            &FireResult {
+                direction: Direction::Long,
+                fill_at: Utc.with_ymd_and_hms(2026, 6, 18, 12, 0, 0).unwrap(),
+                until: Utc.with_ymd_and_hms(2026, 6, 18, 18, 0, 0).unwrap(),
+                entry_price: 1.10,
+                stop_loss: 1.09,
+                take_profit: 1.11,
+                exit_price: None,
+                kind: FillKind::NeverFilled,
+            },
+        );
         assert!(frag.is_empty());
-        assert_eq!(t.net_r, 0.0);
-        assert_eq!(t.account, 100_000.0);
+        assert_eq!(e.net_r, 0.0);
+        assert_eq!(e.account(), 100_000.0);
     }
 
     #[test]
     fn book_r_scores_and_formats_a_win() {
-        let mut t = Tally::new();
+        let mut e = ReplayEconomics::new();
         // Long: entry 1.10, SL 1.09, TP 1.11 → +1R, +$1,000.
-        let frag = book_r(&mut t, Some(1.09), 1.10, 1.11);
-        assert!((t.net_r - 1.0).abs() < 1e-9);
-        assert!((t.account - 101_000.0).abs() < 1e-6);
+        let frag = book_r(
+            &mut e,
+            &FireResult {
+                direction: Direction::Long,
+                fill_at: Utc.with_ymd_and_hms(2026, 6, 18, 12, 0, 0).unwrap(),
+                until: Utc.with_ymd_and_hms(2026, 6, 18, 18, 0, 0).unwrap(),
+                entry_price: 1.10,
+                stop_loss: 1.09,
+                take_profit: 1.11,
+                exit_price: Some(1.11),
+                kind: FillKind::TookProfit,
+            },
+        );
+        assert!((e.net_r - 1.0).abs() < 1e-9);
+        assert!((e.account() - 101_000.0).abs() < 1e-6);
         assert!(frag.contains("R: +1.00"), "got: {frag}");
         assert!(frag.contains("$101000"), "got: {frag}");
     }
@@ -1353,7 +1296,7 @@ mod tests {
             warnings: Vec::new(),
             traces: Vec::new(),
         };
-        let out = render(&plan_for(0.0001), &replay, true, false, None, &no_marks());
+        let out = render(&plan_for(0.0001), &replay, true, false, None, &no_marks()).text;
 
         // Top-level event lines, each naming entry #1 — no "bars (entry
         // timeline):" sub-heading, no OHLC dump, no leading-indent nested

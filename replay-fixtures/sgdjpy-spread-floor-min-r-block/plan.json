@@ -1,0 +1,253 @@
+{
+  "trade_id": "ihs-sgd-jpy-2c685fa6",
+  "instrument": "SGD_JPY",
+  "direction": "long",
+  "granularity": "m15",
+  "pip_size": 0.01,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 125.312,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-sgd-jpy-2c685fa6-too-low",
+        "not_after": "2026-07-14T11:00:00Z",
+        "action": "veto",
+        "instrument": "SGD_JPY",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-low",
+        "ttl_hours": 1,
+        "level": "close-positions",
+        "trade_id": "ihs-sgd-jpy-2c685fa6"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 125.60658250960876,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-sgd-jpy-2c685fa6-too-high",
+        "not_after": "2026-07-14T11:00:00Z",
+        "action": "veto",
+        "instrument": "SGD_JPY",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-high",
+        "ttl_hours": 1,
+        "level": "stop-next-entry",
+        "trade_id": "ihs-sgd-jpy-2c685fa6"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784025000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-sgd-jpy-2c685fa6-trade-expiry",
+        "not_before": "2026-07-14T10:30:00Z",
+        "not_after": "2026-07-14T11:00:00Z",
+        "action": "veto",
+        "instrument": "SGD_JPY",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "trade-expiry",
+        "ttl_hours": 1,
+        "level": "close-positions",
+        "trade_id": "ihs-sgd-jpy-2c685fa6"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1783684800,
+          "price": 125.357
+        },
+        "b": {
+          "at_epoch": 1783904400,
+          "price": 125.298
+        },
+        "extend_forward": true,
+        "bar_seconds": 900,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-sgd-jpy-2c685fa6-break-and-close",
+        "not_after": "2026-07-14T10:30:00Z",
+        "action": "prep",
+        "instrument": "SGD_JPY",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "ihs-sgd-jpy-2c685fa6"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1783684800,
+          "price": 125.357
+        },
+        "b": {
+          "at_epoch": 1783904400,
+          "price": 125.298
+        },
+        "extend_forward": true,
+        "bar_seconds": 900,
+        "dir": "down",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-sgd-jpy-2c685fa6-retest",
+        "not_after": "2026-07-14T10:30:00Z",
+        "action": "prep",
+        "instrument": "SGD_JPY",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "ihs-sgd-jpy-2c685fa6"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-sgd-jpy-2c685fa6-enter",
+        "not_after": "2026-07-15T23:52:41.628493573Z",
+        "action": "enter",
+        "instrument": "SGD_JPY",
+        "direction": "long",
+        "entry": {
+          "type": "stop",
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 125.67354
+        },
+        "broker": "oanda",
+        "account": "m-and-w",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 125.60658250960876,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 125.312,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-sgd-jpy-2c685fa6",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.01,
+        "tick_size": 0.001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-sgd-jpy-2c685fa6-close-on-sr-reversal",
+        "not_after": "2026-07-14T10:30:00Z",
+        "action": "close",
+        "instrument": "SGD_JPY",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-sgd-jpy-2c685fa6",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            125.43115,
+            125.68227
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1783917900,
+  "armed_at": "2026-07-13T04:45:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-10T04:45:00Z",
+    "period_end": "2026-07-13T04:45:00Z",
+    "overall_direction": "neutral",
+    "confidence": "low",
+    "currencies": []
+  }
+}

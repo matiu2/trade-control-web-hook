@@ -1,0 +1,8 @@
+{
+  "instrument": "XAU_XAG",
+  "granularity": "h1",
+  "source": "oanda",
+  "start": "2026-07-20T13:00:00Z",
+  "end": "2026-07-24T03:00:00Z",
+  "message": "should close on reversal from a resistance line, even after hiting the 80% veto-too-low"
+}

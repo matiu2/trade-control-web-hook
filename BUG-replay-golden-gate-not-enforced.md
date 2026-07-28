@@ -1,9 +1,22 @@
 # BUG: replay-candles never evaluates the golden-candle gate — entries fill on non-golden candles despite `needs_golden: true`
 
-**Status:** 🟥 OPEN — found 2026-06-28 while building the trade 075 Wheat entry-style comparison.
-**Component:** two defects, one per side of the pipeline:
-1. `tv-arm-staging` — `--skip-golden` does **not** clear the gate (plan still carries `needs_golden: true`).
-2. `replay-candles-staging` — the golden gate is **never evaluated** per-tick; entries fill regardless of golden status.
+**Status:** ✅ FIXED (`efe6378`, v109) — found 2026-06-28 while building the trade
+075 Wheat entry-style comparison. This header read 🟥 OPEN until 2026-07-28; the
+work had been completed and ticked off in `TODO-replay-golden-gate.md` without the
+header being updated. **Read that TODO's "Done" + "Notes" sections, not the
+diagnosis below** — the two-defect framing on the arm side turned out to be wrong.
+
+**Component:** the real defect was one-sided:
+1. ~~`tv-arm-staging` — `--skip-golden` does not clear the gate.~~ **NOT A BUG.**
+   `--skip-golden` threads onto every emitted enter correctly. The `rules[4]` that
+   looked like a leak is the *close guard*, which hardcodes `needs_golden: true`
+   by design — a reversal close needs a golden candle, and `--skip-golden` governs
+   the ENTRY gate only.
+2. `replay-candles-staging` — real: `resolve_fire_any` (the `--annotate` boxes and
+   the entry-style net-R chart) called `simulate_fill` without first running the
+   shared `entry_gate_block`, so a `needs_golden` enter with `golden != Some(true)`
+   filled and tallied an R the live worker would have 412'd. `render_fire` already
+   gated; this path did not.
 **Severity:** correctness — the golden gate is documented as *used on every trade, always*
 ([[project_entry_rule_tags]]). If the replay ignores it, **every as-designed replay outcome on
 every page may be wrong**: entries fire on the first stop-trigger instead of waiting for a

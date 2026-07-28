@@ -39,8 +39,12 @@
 
 mod replay_candles {
     pub mod annotate;
+    pub mod arm_record;
+    pub mod baseline;
+    pub mod batch;
     pub mod brisbane;
     pub mod candles;
+    pub mod economics;
     pub mod fill_sim;
     pub mod fixture;
     pub mod granularity;
@@ -58,7 +62,7 @@ mod replay_candles {
 use std::fs;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
@@ -66,10 +70,14 @@ use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
+use replay_candles::arm_record;
+use replay_candles::baseline;
+use replay_candles::batch;
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::tv::TvDefaults;
 use replay_candles::{
-    annotate, brisbane, candles, granularity, instrument, outcome, replay, report, sentiment, tv,
+    annotate, brisbane, candles, economics, granularity, instrument, outcome, replay, report,
+    sentiment, tv,
 };
 use trade_control_cli::replay_args::{CandleSource, DetectorMarkConfig, ReplayArgs as Args};
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan, Trigger};
@@ -93,6 +101,22 @@ fn default_fixtures_dir() -> PathBuf {
 /// See `replay_candles::outcome`.
 #[tokio::main]
 async fn main() {
+    // `--json` owns stdout: the failure line below would append trailing text to
+    // the JSON document and make it unparseable, which is the *same* ambiguity
+    // this machinery exists to remove — a driver that can't parse the output is
+    // back to guessing. Under `--json` the failure is already reported IN the
+    // JSON (`ok: false` + `error` per row, `failed` in the roll-up), so the text
+    // line is redundant as well as harmful. Sniffed from raw argv because a
+    // failure can predate the clap parse.
+    //
+    // Suppressing the line is only safe because `--json` now `requires =
+    // "test_mode"` and BOTH test-mode paths print their JSON *before* returning
+    // the error that sets the exit code (`run_test_mode_single` at the `--check`
+    // step, `run_test_mode_batch` before its `failed > 0` raise). So "exit != 0
+    // with `--json`" still comes with a document on stdout. If you add a
+    // test-mode failure that can return `Err` *before* its `println!`, this
+    // suppression turns it into zero bytes — emit a row there instead.
+    let json_mode = std::env::args().any(|a| a == "--json");
     match run().await {
         Ok(()) => std::process::exit(outcome::EXIT_OK),
         Err(report) => {
@@ -100,13 +124,15 @@ async fn main() {
             // The human-readable chain first (stderr), then the machine-readable
             // terminal line (stdout, where the summary it mirrors goes).
             eprintln!("Error: {report:?}");
-            println!(
-                "{}",
-                outcome::FailureLine {
-                    kind,
-                    detail: &report.to_string(),
-                }
-            );
+            if !json_mode {
+                println!(
+                    "{}",
+                    outcome::FailureLine {
+                        kind,
+                        detail: &report.to_string(),
+                    }
+                );
+            }
             std::process::exit(kind.exit_code());
         }
     }
@@ -300,17 +326,18 @@ async fn run() -> Result<()> {
     // Fail-soft — `None` on any miss, and the report simply omits the block.
     let replay_sentiment = sentiment::resolve_replay_sentiment(&plan, start).await;
 
-    print!(
-        "{}",
-        report::render(
-            &plan,
-            &replay,
-            simulate,
-            args.verbose,
-            replay_sentiment.as_ref(),
-            &mark_cfg,
-        )
+    // Render once and keep the economics it booked: `--save` records them into
+    // the fixture's `expected.json`, so the printed `Net R:` and the saved golden
+    // are the same computation.
+    let rendered = report::render(
+        &plan,
+        &replay,
+        simulate,
+        args.verbose,
+        replay_sentiment.as_ref(),
+        &mark_cfg,
     );
+    print!("{}", rendered.text);
 
     if annotate {
         let mcp = match &args.tv_mcp_root {
@@ -335,14 +362,40 @@ async fn run() -> Result<()> {
             start,
             end,
             message: args.message.clone(),
+            arm: Some(arm_record(&args)),
         };
-        let expected = ReplayOutcome::compute(&plan, &replay, simulate);
+        let expected = ReplayOutcome::compute(&replay, simulate, Some(&rendered.economics));
         let dir = fixtures_dir(&args).join(name);
         fixture::save(&dir, &plan, &candles, &meta, &expected)?;
         tracing::info!(dir = %dir.display(), "saved fixture");
     }
 
     Ok(())
+}
+
+/// Build the saved fixture's arming provenance from the `--arm-*` flags plus what
+/// this binary knows about itself.
+///
+/// `engine_version` is stamped from **our own** build (`GIT_VERSION`, a `git
+/// describe --tags --dirty`) rather than passed in — it's the version that
+/// produced the outcome, so the binary computing it is the only honest source.
+/// `tv_arm_version` has to be passed, since that's a different binary.
+///
+/// An unrecognised `--arm-entry-rule` is preserved verbatim (`EntryRule::Other`)
+/// rather than coerced to `normal`: a future strategy flag should show up as
+/// itself in the corpus, not silently masquerade as the default.
+fn arm_record(args: &Args) -> arm_record::ArmRecord {
+    arm_record::ArmRecord {
+        entry_rule: arm_record::EntryRule::parse(args.arm_entry_rule.as_deref()),
+        skip_calendar_bars: args.arm_skip_calendar_bars,
+        skip_golden: args.arm_skip_golden,
+        start: args.arm_start.clone(),
+        candle_source: Some(args.source.as_str().to_string()),
+        chart_symbol: args.arm_chart_symbol.clone(),
+        tv_arm_version: args.arm_tv_arm_version.clone(),
+        engine_version: Some(env!("GIT_VERSION").to_string()),
+        journal_ref: args.trade_ref.clone(),
+    }
 }
 
 /// Max look-back back-off attempts before we give up widening the warm-up pull.
@@ -544,19 +597,285 @@ fn fixtures_dir(args: &Args) -> PathBuf {
         .unwrap_or_else(default_fixtures_dir)
 }
 
-/// Replay a saved fixture offline. Loads plan + candles + meta from the fixture
-/// dir, runs the pure engine over the frozen candles, prints the report, and —
-/// under `--check` — diffs the computed outcome against `expected.json`,
-/// returning an error (non-zero exit) on any mismatch.
+/// Replay saved fixtures offline: one (`--fixture`) or many
+/// (`--fixtures-glob`). Dispatches to the batch path when a glob is given.
 async fn run_test_mode(args: &Args) -> Result<()> {
-    let name = args
-        .fixture
-        .as_deref()
-        .ok_or_else(|| outcome::bad_input(eyre!("--test-mode requires --fixture <name>")))?;
-    let dir = fixtures_dir(args).join(name);
-    tracing::info!(dir = %dir.display(), "replaying fixture offline");
+    // Chart annotation draws on a live TradingView chart, which test-mode has no
+    // connection to — so `--annotate` here is a no-op. Say so rather than accept
+    // it silently.
+    //
+    // Deliberately a warning and not a `conflicts_with`: `tv-arm … replay`
+    // *injects* `--annotate true` as its own default, so a hard conflict would
+    // reject a chained replay over a flag the operator never typed. Loud, not
+    // fatal.
+    if args.annotate || args.annotate_unfilled {
+        tracing::warn!(
+            "--annotate has no effect under --test-mode (there is no live chart to \
+             draw on) — ignoring it"
+        );
+    }
+    match args.fixtures_glob.as_deref() {
+        Some(pattern) => run_test_mode_batch(args, pattern).await,
+        None => run_test_mode_single(args).await,
+    }
+}
 
-    let inputs = fixture::load(&dir)?;
+/// Replay one saved fixture. Prints the human report (or a single JSON object
+/// under `--json`), and under `--check` diffs the computed outcome against
+/// `expected.json`, returning an error (non-zero exit) on any mismatch.
+async fn run_test_mode_single(args: &Args) -> Result<()> {
+    let name = args.fixture.as_deref().ok_or_else(|| {
+        outcome::bad_input(eyre!(
+            "--test-mode requires --fixture <name> or --fixtures-glob <glob>"
+        ))
+    })?;
+    let root = fixtures_dir(args);
+    let result = replay_one_fixture(args, &root.join(name), name).await;
+    if args.json {
+        // One object either way — a failure is a row, not silence.
+        println!("{}", serde_json::to_string_pretty(&result.row)?);
+    }
+    // Surface a failure as a non-zero exit, as before. The JSON row above is
+    // already printed, so a driver sees BOTH the machine-readable reason and the
+    // exit code.
+    result.error.map_or(Ok(()), Err)
+}
+
+/// Replay every fixture matching `pattern`. A failing fixture is **recorded and
+/// the batch continues** — one bad fixture must not hide the other 290.
+///
+/// Exits non-zero when any fixture failed (or, under `--check`, when any golden
+/// mismatched), so a driver can trust the exit code; but the per-fixture rows are
+/// always emitted first so it can see exactly which ones and why.
+async fn run_test_mode_batch(args: &Args, pattern: &str) -> Result<()> {
+    let root = fixtures_dir(args);
+    let dirs = batch::matching_fixtures(&root, pattern);
+    tracing::info!(
+        root = %root.display(),
+        pattern,
+        matched = dirs.len(),
+        "replaying fixture batch offline"
+    );
+
+    let mut rows = Vec::with_capacity(dirs.len());
+    // Each failing row's typed verdict, captured while its error chain is intact.
+    let mut kinds = Vec::new();
+    for dir in &dirs {
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let run = replay_one_fixture(args, dir, &name).await;
+        if let Some(kind) = run.kind {
+            kinds.push(kind);
+        }
+        rows.push(run.row);
+    }
+    let summary = batch::BatchSummary::from_results(rows);
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!("\n{}", summary.headline());
+    }
+
+    if dirs.is_empty() {
+        // Not an error — but say so loudly, since an empty batch that reads as
+        // success is exactly how a wrong glob produces a silently empty grid.
+        //
+        // This used to be a `warn!` and `Ok(())`: exit 0, an honest `matched: 0`
+        // in the JSON, and a stderr line that vanishes under `RUST_LOG=error`. A
+        // driver that checks only the exit code — which is what an exit code is
+        // FOR — read a typo'd glob as a clean sweep. Exit 4 instead: the operator
+        // named fixtures that don't exist, which is a bad *input*, not an
+        // infrastructure blip to retry.
+        //
+        // The rows are still printed first (an empty `results: []` above), so the
+        // JSON contract holds: a document on stdout, plus a failing exit code.
+        return Err(outcome::bad_input(eyre!(
+            "no fixtures matched {pattern:?} under {} — check the glob and \
+             --fixtures-dir. (Nothing ran, so the {:+.2} net R above is vacuous.)",
+            root.display(),
+            summary.net_r,
+        )));
+    }
+    // Tier-2 scoring. Deliberately BEFORE the `failed > 0` return: a partial
+    // sweep is exactly when you most want to see which cells moved, and an early
+    // return would throw that report away in favour of a bare exit code. The
+    // diff labels itself INCOMPLETE in that case (`unscored`), so it can't be
+    // mistaken for a full answer.
+    score_against_baseline(args, &summary)?;
+
+    if summary.failed > 0 {
+        let msg = eyre!(
+            "{} of {} fixture(s) failed — see the rows above (net R {:+.2} excludes them)",
+            summary.failed,
+            summary.matched,
+            summary.net_r,
+        );
+        // Re-tag with the aggregate of the rows' TYPED verdicts, so the batch exits
+        // the same code a single failing fixture would. Emphatically NOT by folding
+        // the rows' error text into this message and re-classifying it — the chain
+        // is data we don't control (a `--check` mismatch embeds the whole
+        // expected+got JSON), so a fixture whose warnings contained a marker phrase
+        // could hijack the verdict.
+        return Err(match aggregate_kind(&kinds) {
+            outcome::FailureKind::CheckMismatch => outcome::check_mismatch(msg),
+            outcome::FailureKind::BadInput => outcome::bad_input(msg),
+            // Untagged ⇒ infrastructure, the retryable default.
+            outcome::FailureKind::Infrastructure => msg,
+        });
+    }
+    Ok(())
+}
+
+/// How many movers the human diff lists before truncating.
+///
+/// The full set is always available as JSON (`--baseline … --json`); this only
+/// bounds the *terminal* rendering, and it says how many it withheld.
+const DIFF_ROWS_SHOWN: usize = 20;
+
+/// Tier-2 scoring: diff against a blessed baseline, and/or bless this run.
+///
+/// Both are no-ops unless the operator asked. Neither changes the exit code — a
+/// moved number is information, not a failure (that's `--check`'s job).
+///
+/// Ordering is deliberate: **diff first, then bless.** If both flags are given
+/// with the same file, the operator sees what changed before it's overwritten.
+/// The reverse order would silently bless a regression and then report a clean
+/// diff against the baseline it had just rewritten.
+fn score_against_baseline(args: &Args, summary: &batch::BatchSummary) -> Result<()> {
+    if let Some(path) = args.baseline.as_deref() {
+        let text = fs::read_to_string(path)
+            .wrap_err_with(|| format!("reading baseline {}", path.display()))
+            .map_err(outcome::bad_input)?;
+        let base: baseline::Baseline = serde_json::from_str(&text)
+            .wrap_err_with(|| format!("parsing baseline {}", path.display()))
+            .map_err(outcome::bad_input)?;
+
+        if !base.is_self_consistent() {
+            // Not fatal — the entries are still comparable — but a stored total
+            // that disagrees with its own rows means the file was edited by
+            // something other than a bless, and the "was" figure below is that
+            // stored total.
+            tracing::warn!(
+                stored = base.net_r,
+                recomputed = base.recomputed_net_r(),
+                "baseline's stored net R disagrees with its entries — it has been \
+                 hand-edited; the 'was' figure below is the stored one"
+            );
+        }
+
+        let diff = baseline::diff(&base, summary);
+        if args.json {
+            // A second document on stdout would break the one-object contract
+            // `--json` promises, so the diff goes to stderr when JSON is on.
+            eprintln!("{}", serde_json::to_string_pretty(&diff)?);
+        } else {
+            println!("\n{}", baseline::render(&diff, DIFF_ROWS_SHOWN));
+        }
+    }
+
+    if let Some(path) = args.bless_baseline.as_deref() {
+        let blessed = baseline::Baseline::from_summary(summary, args.baseline_label.clone());
+        let json = serde_json::to_string_pretty(&blessed)?;
+        fs::write(path, format!("{json}\n"))
+            .wrap_err_with(|| format!("writing baseline {}", path.display()))?;
+        tracing::info!(
+            path = %path.display(),
+            entries = blessed.entries.len(),
+            skipped = summary.failed,
+            net_r = blessed.net_r,
+            "blessed baseline"
+        );
+        if summary.failed > 0 {
+            // Say it on the way out, not just in a log line: a baseline blessed
+            // from a partial sweep is missing rows, and a later diff will report
+            // them as `added` rather than as the regressions they might be.
+            tracing::warn!(
+                skipped = summary.failed,
+                "blessed a PARTIAL batch — the failed fixtures are absent from the \
+                 baseline and will read as `added` when they come back"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The one verdict a batch of mixed failures reports.
+///
+/// Most-specific wins: a `--check` mismatch is a real regression and must never be
+/// masked by a co-occurring corrupt fixture or a flaky mount; bad input beats
+/// infrastructure because retrying verbatim cannot fix it. An empty set (or all
+/// rows somehow untagged) is infrastructure — the retryable default, since a wrong
+/// guess there costs one retry while the other way silently drops a result.
+fn aggregate_kind(kinds: &[outcome::FailureKind]) -> outcome::FailureKind {
+    if kinds.contains(&outcome::FailureKind::CheckMismatch) {
+        return outcome::FailureKind::CheckMismatch;
+    }
+    if kinds.contains(&outcome::FailureKind::BadInput) {
+        return outcome::FailureKind::BadInput;
+    }
+    outcome::FailureKind::Infrastructure
+}
+
+/// One fixture's replay, as a [`batch::BatchResult`] row plus the error (if any)
+/// the single-fixture path re-raises.
+///
+/// Every failure mode — unreadable fixture, missing `expected.json`, a `--check`
+/// mismatch — becomes an `ok: false` row rather than an early return, which is
+/// what lets a batch keep going and what makes "no row" mean only "the process
+/// died unhandled".
+struct FixtureRun {
+    row: batch::BatchResult,
+    error: Option<color_eyre::eyre::Error>,
+    /// This row's **typed** verdict, classified at the point of failure while the
+    /// real error chain is still intact.
+    ///
+    /// Load-bearing: a batch has to report one exit code for many failures, and it
+    /// must not do that by concatenating the rows' error *text* and re-classifying
+    /// the result. The chain contains data we don't control — remote HTTP bodies,
+    /// and for a `--check` mismatch the entire pretty-printed expected+got JSON —
+    /// so a fixture whose rule ids or warnings happened to contain "no such file"
+    /// could flip the whole batch's verdict. Classify each row once, here, then
+    /// aggregate the *verdicts*. See `outcome::FailureKind::classify`.
+    kind: Option<outcome::FailureKind>,
+}
+
+impl FixtureRun {
+    fn failed(name: &str, err: color_eyre::eyre::Error) -> Self {
+        Self {
+            row: batch::BatchResult::failed(name, format!("{err:#}")),
+            kind: Some(outcome::FailureKind::classify(&err)),
+            error: Some(err),
+        }
+    }
+
+    /// A fixture that replayed fine but disagreed with its golden.
+    ///
+    /// Unlike [`Self::failed`] this keeps the row's measurements — the run
+    /// produced a real `outcome`, and that number is exactly what you need to
+    /// judge whether the regression is benign. See `BatchResult::mismatched`.
+    fn mismatched(
+        row: batch::BatchResult,
+        expected: Option<&economics::ReplayEconomics>,
+        err: color_eyre::eyre::Error,
+    ) -> Self {
+        Self {
+            row: batch::BatchResult::mismatched(row, expected, format!("{err:#}")),
+            kind: Some(outcome::FailureKind::classify(&err)),
+            error: Some(err),
+        }
+    }
+}
+
+async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> FixtureRun {
+    tracing::info!(dir = %dir.display(), "replaying fixture offline");
+    let inputs = match fixture::load(dir) {
+        Ok(i) => i,
+        Err(e) => return FixtureRun::failed(name, e),
+    };
     let mark_cfg = DetectorMarkConfig::new(
         args.candle_detector_direction,
         args.candle_detector_golden,
@@ -574,33 +893,72 @@ async fn run_test_mode(args: &Args) -> Result<()> {
     // Market-hours blackout is read from the baked mask keyed on the instrument
     // (`core::intent::market_hours_blocked`) inside `sweep_reason`, so nothing to
     // pass here. Fixtures keep their saved verdict.
-    print!(
-        "{}",
-        report::render(
-            &inputs.plan,
-            &replay,
-            args.simulate,
-            args.verbose,
-            None,
-            &mark_cfg,
-        )
+    let rendered = report::render(
+        &inputs.plan,
+        &replay,
+        args.simulate,
+        args.verbose,
+        None,
+        &mark_cfg,
+    );
+    // Under --json the report text would corrupt the JSON on stdout; the rows
+    // carry the same numbers, so suppress it.
+    if !args.json {
+        print!("{}", rendered.text);
+    }
+    let economics = Some(&rendered.economics);
+    let computed = ReplayOutcome::compute(&replay, args.simulate, economics);
+
+    let row = batch::BatchResult::ok(
+        name,
+        Some(inputs.plan.trade_id.clone()),
+        inputs.meta.arm.clone(),
+        computed.outcome.clone(),
     );
 
     if args.check {
-        let computed = ReplayOutcome::compute(&inputs.plan, &replay, args.simulate);
-        let expected = fixture::load_expected(&dir)?;
-        if computed != expected {
-            return Err(diff_error(&expected, &computed));
+        match fixture::load_expected(dir) {
+            // A mismatch keeps the row's measurements (`mismatched`, not
+            // `failed`): this run scored fine, and its Net R next to the
+            // golden's is what makes a red sweep diagnosable rather than just
+            // red. The full diff still goes in `error` for a human.
+            Ok(expected) if computed != expected => {
+                let err = diff_error(&expected, &computed);
+                return FixtureRun::mismatched(row, expected.outcome.as_ref(), err);
+            }
+            Ok(_) => tracing::info!(fixture = name, "fixture matches expected.json"),
+            Err(e) => return FixtureRun::failed(name, e),
         }
-        tracing::info!("fixture matches expected.json");
     }
 
     if args.rebless {
-        let computed = ReplayOutcome::compute(&inputs.plan, &replay, args.simulate);
-        fixture::save_expected(&dir, &computed)?;
+        // `--simulate false` computes no economics, so `computed.outcome` is
+        // `None` — and writing that over a golden that HAD economics silently
+        // deletes the Net R gate this whole corpus exists to hold. Exit 0, no
+        // diff, nothing in the log: the fixture just quietly stops checking the
+        // number. Refuse instead. (Recoverable — the next `--check --simulate
+        // true` exits 5 — but only if someone happens to run it.)
+        if !args.simulate {
+            return FixtureRun::failed(
+                name,
+                outcome::bad_input(eyre!(
+                    "refusing to re-bless {name} with --simulate false: the outcome would \
+                     carry no economics (net_r / legs), silently removing the Net R gate \
+                     from this fixture. Re-bless with simulation on (the default)."
+                )),
+            );
+        }
+        if let Err(e) = fixture::save_expected(dir, &computed) {
+            return FixtureRun::failed(name, e);
+        }
         tracing::info!(dir = %dir.display(), "re-blessed expected.json from frozen inputs");
     }
-    Ok(())
+
+    FixtureRun {
+        row,
+        error: None,
+        kind: None,
+    }
 }
 
 /// Run the pure engine over a frozen candle window. Mirrors the live path's
@@ -768,49 +1126,16 @@ fn load_plan(path: &PathBuf) -> Result<TradePlan> {
     serde_json::from_str(&text).wrap_err_with(|| format!("parse plan JSON {}", path.display()))
 }
 
-/// Parse a `--start` / `--end` datetime. A **bare** datetime (no offset) is
-/// interpreted as **Brisbane time (UTC+10, no DST)** — the operator's zone and
-/// the zone this tool renders every candle/fill/exit in, so the window flags
-/// read the same way as the report. An **explicit** offset or `Z` is honoured
-/// as written (e.g. `...T07:00Z` = UTC, `...T17:00+10:00` = Brisbane spelled
-/// out). Accepts both minute and second precision on the bare form
-/// (`...T17:00` and `...T17:00:00`).
+/// Parse a `--start` / `--end` datetime.
+///
+/// Delegates to the **shared** parser in the cli library so `tv-arm --start`
+/// and `replay-candles --start` cannot disagree — `tv-arm ... replay` forwards
+/// the flag verbatim, so two parsers meant the arm cursor and the replay window
+/// could point at different instants. Tagged as bad *input* here (the library
+/// returns a plain error, since it has no exit-code vocabulary).
 fn parse_start_end(s: &str) -> Result<DateTime<Utc>> {
-    // Explicit offset / Z wins — honour exactly what was written. `parse_from_rfc3339`
-    // requires seconds + a `Z`/offset; the `%z` forms below also accept an offset
-    // with minute-only precision (`...T17:00+10:00`), which RFC3339 rejects.
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(dt.with_timezone(&Utc));
-    }
-    // Normalise a trailing `Z` to `+0000` so the `%z` parser accepts minute- and
-    // second-precision UTC (`...T07:00Z`), which RFC3339 rejects without seconds.
-    let normalised = s.strip_suffix('Z').map(|body| format!("{body}+0000"));
-    let candidate = normalised.as_deref().unwrap_or(s);
-    for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M%z"] {
-        if let Ok(dt) = DateTime::parse_from_str(candidate, fmt) {
-            return Ok(dt.with_timezone(&Utc));
-        }
-    }
-    // Bare datetime (no offset) → interpret in Brisbane (+10), convert to UTC.
-    let brisbane = FixedOffset::east_opt(BRISBANE_OFFSET_SECS)
-        .ok_or_else(|| eyre!("10h is a valid fixed offset"))?;
-    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
-            return brisbane
-                .from_local_datetime(&naive)
-                .single()
-                .map(|dt| dt.with_timezone(&Utc))
-                .ok_or_else(|| outcome::bad_input(eyre!("{s:?} is ambiguous in Brisbane time")));
-        }
-    }
-    Err(outcome::bad_input(eyre!(
-        "{s:?} is not a valid datetime (expected Brisbane YYYY-MM-DDTHH:MM[:SS], \
-         or an explicit offset like ...T07:00Z / ...T17:00+10:00)"
-    )))
+    trade_control_cli::start_time::parse_start_end(s).map_err(outcome::bad_input)
 }
-
-/// Brisbane's fixed UTC offset in seconds (+10:00, no DST).
-const BRISBANE_OFFSET_SECS: i32 = 10 * 3600;
 
 /// Emit the clap-generated zsh completion script. Binds the completion to the
 /// invoked binary name (argv[0] stem) so a renamed-on-install copy emits
@@ -1014,6 +1339,18 @@ mod tests {
             candle_detector_golden: GoldenFilter::Golden,
             annotate: false,
             annotate_unfilled: false,
+            arm_entry_rule: None,
+            arm_skip_calendar_bars: false,
+            arm_skip_golden: false,
+            arm_start: None,
+            arm_chart_symbol: None,
+            arm_tv_arm_version: None,
+            trade_ref: None,
+            fixtures_glob: None,
+            baseline: None,
+            bless_baseline: None,
+            baseline_label: None,
+            json: false,
             warmup_bars: 200,
             cache_dir: None,
             print_completions: false,
