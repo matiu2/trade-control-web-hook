@@ -1,0 +1,16 @@
+{
+  "instrument": "GBP_NZD",
+  "granularity": "h1",
+  "source": "oanda",
+  "start": "2026-07-22T20:00:00Z",
+  "end": "2026-07-27T22:00:00Z",
+  "arm": {
+    "entry_rule": "normal",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "oanda",
+    "chart_symbol": "OANDA:GBPNZD",
+    "tv_arm_version": "v116-127-gbf260c8",
+    "engine_version": "v116-127-gbf260c8"
+  }
+}

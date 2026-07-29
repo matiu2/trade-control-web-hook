@@ -287,6 +287,7 @@ fn fixtures_root() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::super::brisbane::bne;
     use super::*;
     use chrono::TimeZone;
     use std::path::PathBuf;
@@ -296,6 +297,11 @@ mod tests {
     /// specifically: it's the one exercising a reversal-close AND a trade-expiry
     /// flatten on open positions, over three legs.
     const UK_100: &str = "uk-100-news-blackout-rentry-close-on-reversal";
+
+    /// The iH&S long whose `too-low` **invalidation** veto flattened it four days
+    /// before the trade-expiry. Paired with [`UK_100`] (a genuine trade-expiry
+    /// flatten) these two pin both sides of the `ClosePositions` classification.
+    const GBP_NZD_INVALIDATION: &str = "gbp-nzd-h1-2026-07-22-normal-news-off";
 
     /// Resolve a fixture directory by name, **panicking** if it isn't there.
     ///
@@ -494,9 +500,22 @@ mod tests {
 
         // The rendered text must still SHOW them (formatting regression guard).
         let text = &rendered.text;
-        for want in ["CLOSED ON REVERSAL", "CLOSED AT EXPIRY", "EXP: 1"] {
+        for want in ["CLOSED ON REVERSAL", "CLOSED AT TRADE EXPIRY", "EXP: 1"] {
             assert!(text.contains(want), "report must show {want}:\n{text}");
         }
+        // uk-100's flatten is the genuine `02-veto-trade-expiry`, so it must stay
+        // on the expiry counter — this is the discriminator against the
+        // invalidation close the same `ClosePositions` arm also dispatches. If a
+        // future refactor keys the close reason off the veto LEVEL again, this
+        // fires: the count moves to `invalidation_closes`.
+        assert_eq!(
+            econ.invalidation_closes, 0,
+            "a trade-expiry flatten must not book as an invalidation close: {econ:#?}"
+        );
+        assert!(
+            !text.contains("CLOSED ON INVALIDATION"),
+            "a trade-expiry flatten must not be labelled an invalidation close:\n{text}"
+        );
 
         // And the SNAPSHOT must carry the same economics — this is the half that
         // `--check` gates on, and the reason a silent Net R regression can no
@@ -506,6 +525,110 @@ mod tests {
             snapshot.outcome.as_ref(),
             Some(econ),
             "the golden snapshot must record the booked economics verbatim"
+        );
+    }
+
+    /// GBP/NZD iH&S 2026-07-22: a `too-low` invalidation veto flattened the
+    /// position at 07-23 15:00 Brisbane, four days before the trade-expiry. Two
+    /// bugs showed in the journal, and this gates both:
+    ///
+    /// 1. the exit was labelled `CLOSED AT EXPIRY` (the loop keyed the close
+    ///    reason off `VetoLevel::ClosePositions`, which both vetos share), and
+    /// 2. the journal kept narrating **stop management after the exit** — an
+    ///    SL→break-even at 21:00 and a spread widen/restore the next day — because
+    ///    the reconstruction helpers walked the whole replay window and stop only
+    ///    at SL/TP, blind to a broker-side flatten.
+    ///
+    /// (2) is the half the golden `expected.json` can NOT catch: it records legs,
+    /// not journal text, and the mislabelled run booked an identical −0.25R leg.
+    /// So it has to be asserted on the rendered text, here.
+    #[tokio::test]
+    async fn an_invalidation_close_is_labelled_and_ends_the_journal() {
+        let dir = require_fixture(GBP_NZD_INVALIDATION);
+        let inputs = load(&dir).expect("load gbp-nzd fixture");
+        let expires_at = inputs
+            .candles
+            .last()
+            .map(|c| c.time)
+            .unwrap_or_else(Utc::now)
+            + chrono::Duration::days(365);
+        let mark_cfg = DetectorMarkConfig::new(
+            DirectionFilter::None,
+            GoldenFilter::None,
+            inputs.plan.direction,
+        );
+        let replay = super::super::replay::run(
+            &inputs.plan,
+            &inputs.candles,
+            inputs.meta.granularity,
+            inputs.meta.start,
+            expires_at,
+            mark_cfg,
+            &[],
+        )
+        .await;
+        let rendered =
+            super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
+        let econ = &rendered.economics;
+        let text = &rendered.text;
+
+        // (1) The close is an invalidation, not an expiry — on both the counter
+        // and the label. The trade-expiry is 07-27; nothing expired.
+        assert_eq!(
+            econ.invalidation_closes, 1,
+            "the too-low flatten must book as an invalidation close: {econ:#?}"
+        );
+        assert_eq!(
+            econ.expiry_closes, 0,
+            "nothing expired — trade-expiry is 4 days after this close: {econ:#?}"
+        );
+        assert!(
+            text.contains("CLOSED ON INVALIDATION"),
+            "the exit must name the invalidation:\n{text}"
+        );
+        assert!(
+            !text.contains("EXPIRY"),
+            "the journal must not mention expiry at all for this trade:\n{text}"
+        );
+
+        // (2) Nothing may be narrated for this entry after it left the book.
+        // Parse the exit time out of the journal rather than hardcoding an index,
+        // so a reordering can't quietly make this vacuous.
+        let leg = econ.legs.first().expect("one booked leg");
+        let exit_at = leg.exit_time.expect("a flattened position has an exit");
+        // `bne` renders "YYYY-MM-DD HH:MM:SS +10:00" — the same prefix the journal
+        // lines start with, so a lexicographic compare on it orders by time.
+        let exit_line = bne(exit_at)
+            .get(..16)
+            .expect("a Brisbane stamp is longer than 16 chars")
+            .to_string();
+        assert!(
+            text.contains(&exit_line),
+            "the exit bar {exit_line} must appear in the journal:\n{text}"
+        );
+
+        // Every stop-management line describes the live bracket, so each one dated
+        // after the exit is a claim about a position that no longer existed.
+        let stale: Vec<&str> = text
+            .lines()
+            .filter(|l| {
+                l.contains("SL→break-even")
+                    || l.contains("SL widened")
+                    || l.contains("SL restored")
+                    || l.contains("SL still widened")
+            })
+            .filter(|l| {
+                // Journal lines start with the Brisbane bar time; anything sorting
+                // after the exit's `YYYY-MM-DD HH:MM` prefix is post-exit.
+                l.trim()
+                    .get(..16)
+                    .is_some_and(|stamp| stamp > exit_line.as_str())
+            })
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "stop management narrated after the {exit_line} exit — the position was \
+             already flat:\n{stale:#?}\nfull journal:\n{text}"
         );
     }
 

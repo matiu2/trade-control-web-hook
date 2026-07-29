@@ -82,6 +82,22 @@ pub enum FillKind {
     /// still-open position at market when the plan expires). Booked at the
     /// expiry candle's close.
     ClosedAtExpiry,
+    /// Filled, then flattened by the structure-invalidation `close-positions`
+    /// veto — `01-veto-too-low` for a long, `01-veto-too-high` for a short:
+    /// price ran back past the shoulder, so the setup is dead.
+    ///
+    /// Distinct from [`Self::ClosedAtExpiry`] even though both come from a
+    /// `ClosePositions` veto. The replay loop used to hardcode `Expiry` for the
+    /// whole veto arm, so an invalidation close printed "CLOSED AT EXPIRY" with
+    /// the real trade-expiry days away (GBP/NZD iH&S 2026-07-22 — closed 15:00
+    /// on 07-23 against a 07-27 expiry).
+    ///
+    /// NOTE the name asymmetry that makes this easy to misread: for an iH&S
+    /// **long**, `too-low` is the *invalidation* veto (correctly
+    /// `ClosePositions`); for an H&S **short** it's the *pcl-exhausted* veto
+    /// (`StopNextEntry`, must never close — see
+    /// `BUG-too-low-closes-positions.md`).
+    ClosedOnInvalidation,
     /// A pending order that never triggered within the window. Not taken.
     NeverFilled,
     /// An entry the worker declined to place (entry past a baked at-entry level
@@ -115,6 +131,7 @@ impl FillKind {
                 | Self::TookProfit
                 | Self::ClosedOnReversal
                 | Self::ClosedAtExpiry
+                | Self::ClosedOnInvalidation
         )
     }
 }
@@ -349,6 +366,9 @@ pub fn render(
         }
         if tally.expiry_closes > 0 {
             out.push_str(&format!("  EXP: {}", tally.expiry_closes));
+        }
+        if tally.invalidation_closes > 0 {
+            out.push_str(&format!("  INV: {}", tally.invalidation_closes));
         }
         out.push_str(&tally.summary_line());
     } else {
@@ -661,9 +681,36 @@ fn render_fire(
         return events;
     };
 
+    // Resolve the ledger's outcome BEFORE narrating stop management, so the
+    // display helpers below can be bounded at the bar the position actually left
+    // the book. `resolve_fire_any` is a pure read of the broker ledger, so calling
+    // it here (rather than after) changes nothing about what it returns.
+    let realized = resolve_fire_any(plan, fire);
+
+    // The forward path for the position's LIFETIME — truncated at the realized
+    // exit bar. The stop-management helpers below stop at SL/TP on their own, but
+    // they know nothing about a broker-side flatten (a reversal-close or a
+    // `ClosePositions` veto), so on the full window they happily narrate a
+    // break-even arming and a spread widen for a position that was closed days
+    // earlier. GBP/NZD iH&S 2026-07-22: flattened 07-23 15:00, yet the journal
+    // reported SL→break-even at 21:00 and a widen/restore across 07-24.
+    //
+    // Bounding the INPUT (rather than filtering the output events) is what keeps
+    // the reconstruction honest: a helper walking a window that ends at the exit
+    // cannot arm off a bar the position never saw.
+    let lifetime = match realized.as_ref().filter(|r| r.kind.is_taken()) {
+        // `until` is the exit bar for a closed position and the last replayed bar
+        // for one still open, so this is inclusive-of-exit in both cases.
+        Some(r) => forward_until(&fire.forward, r.until),
+        // Not taken (never filled / gate-blocked): no position ever existed, so
+        // there's no lifetime to narrate. The helpers below need the full window
+        // anyway — they're the ones that decide there was no fill.
+        None => &fire.forward,
+    };
+
     // Break-even arming: the bar whose close runs past 50%-to-TP. The live cron
     // (`breakeven_watch`) amends the broker SL to entry here.
-    if let Some(armed_at) = breakeven_armed_at_resolved(placed, intent, &shell, &fire.forward) {
+    if let Some(armed_at) = breakeven_armed_at_resolved(placed, intent, &shell, lifetime) {
         events.push(EntryEvent {
             at: armed_at,
             note: format!("{ev} SL→break-even (a candle closed past 50%-to-TP)"),
@@ -686,7 +733,7 @@ fn render_fire(
         intent,
         &shell,
         plan.pip_size,
-        &fire.forward,
+        lifetime,
         widen_trigger,
     ) {
         events.push(EntryEvent {
@@ -709,10 +756,14 @@ fn render_fire(
                 close: bar_close(&fire.forward, restored_at),
             }),
             None => {
-                let at = fire.forward.last().map(|c| c.time).unwrap_or(widen.at);
+                // Anchor on the position's LAST bar, not the replay window's: a
+                // position closed mid-window whose widen never recovered was still
+                // widened when it *closed*, and dating that line at the window end
+                // puts it after the exit.
+                let at = lifetime.last().map(|c| c.time).unwrap_or(widen.at);
                 events.push(EntryEvent {
                     at,
-                    note: format!("{ev} SL still widened at window end (spread never recovered)"),
+                    note: format!("{ev} SL still widened at exit (spread never recovered)"),
                     close: bar_close(&fire.forward, at),
                 });
             }
@@ -729,7 +780,9 @@ fn render_fire(
     // tally it. Before this change, a direct `simulate_fill_windowed` here walked
     // the original resting order's path blind to the lifecycle cancel, so a
     // cancelled order still reported a full FILLED → exit → R sequence.
-    let Some(result) = resolve_fire_any(plan, fire) else {
+    // Resolved once, above, so the `lifetime` window and this rendered outcome are
+    // guaranteed to be the same verdict.
+    let Some(result) = realized else {
         events.push(EntryEvent {
             at: candle.time,
             note: format!("{ev} NO FILL — order cancelled in spread hour (not restored) → 0R"),
@@ -745,7 +798,11 @@ fn render_fire(
     // and yields an empty fragment.
     let r = book_r(tally, &result);
     match result.kind {
-        FillKind::ClosedOnReversal => {
+        // The three broker-side flattens (reversal-close, trade-expiry veto,
+        // structure-invalidation veto) render identically apart from the reason,
+        // so they share one arm — a new close reason gets a label, not a
+        // copy-pasted block that can drift.
+        FillKind::ClosedOnReversal | FillKind::ClosedAtExpiry | FillKind::ClosedOnInvalidation => {
             events.push(EntryEvent {
                 at: result.fill_at,
                 note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
@@ -754,22 +811,8 @@ fn render_fire(
             events.push(EntryEvent {
                 at: result.until,
                 note: format!(
-                    "{ev} CLOSED ON REVERSAL → {}{r}",
-                    fmt_price(exit_price, plan.pip_size)
-                ),
-                close: bar_close(&fire.forward, result.until),
-            });
-        }
-        FillKind::ClosedAtExpiry => {
-            events.push(EntryEvent {
-                at: result.fill_at,
-                note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
-                close: bar_close(&fire.forward, result.fill_at),
-            });
-            events.push(EntryEvent {
-                at: result.until,
-                note: format!(
-                    "{ev} CLOSED AT EXPIRY → {}{r}",
+                    "{ev} {} → {}{r}",
+                    close_label(result.kind),
                     fmt_price(exit_price, plan.pip_size)
                 ),
                 close: bar_close(&fire.forward, result.until),
@@ -846,6 +889,36 @@ fn render_fire(
     }
 
     events
+}
+
+/// The journal label for a broker-side flatten. One label per close reason, so
+/// the line names why the position went — a `ClosePositions` veto that fired
+/// because the structure broke must not read "AT EXPIRY" when the trade-expiry
+/// is still days out (GBP/NZD iH&S 2026-07-22).
+///
+/// Panics-free by construction: the non-flatten kinds never reach the arm that
+/// calls this, and they fall through to a label that says so rather than
+/// silently borrowing another reason's wording.
+fn close_label(kind: FillKind) -> &'static str {
+    match kind {
+        FillKind::ClosedOnReversal => "CLOSED ON REVERSAL",
+        FillKind::ClosedAtExpiry => "CLOSED AT TRADE EXPIRY",
+        FillKind::ClosedOnInvalidation => "CLOSED ON INVALIDATION (setup broke)",
+        _ => "CLOSED",
+    }
+}
+
+/// The forward path up to and **including** the bar at `until` — the position's
+/// lifetime, for the stop-management reconstructions that must not narrate past
+/// the exit.
+///
+/// `until` is a bar time taken from the ledger's own outcome, so it normally
+/// lands exactly on a bar. If it somehow doesn't (or sits past the window), every
+/// bar at or before it is kept, which degrades to the full window rather than
+/// silently truncating to nothing.
+fn forward_until(forward: &[EngineCandle], until: DateTime<Utc>) -> &[EngineCandle] {
+    let end = forward.partition_point(|c| c.time <= until);
+    &forward[..end]
 }
 
 /// The close of the forward-path bar at `at`, if present — for the `close=…`
@@ -1036,7 +1109,7 @@ fn describe_control_action(action: Action, rule_id: &str) -> String {
 mod tests {
     use super::super::replay::EnterGateOutcome;
     use super::*;
-    use chrono::{TimeZone, Utc};
+    use chrono::{Duration, TimeZone, Utc};
     use trade_control_cli::replay_args::{DirectionFilter, GoldenFilter};
 
     /// Detector marking off — the summary line is empty, so report assertions
@@ -1110,6 +1183,99 @@ mod tests {
         assert!((e.account() - 101_000.0).abs() < 1e-6);
         assert!(frag.contains("R: +1.00"), "got: {frag}");
         assert!(frag.contains("$101000"), "got: {frag}");
+    }
+
+    /// A bar every hour from 12:00, closing at `1.10 + i/1000`.
+    fn hourly(n: i64) -> Vec<EngineCandle> {
+        (0..n)
+            .map(|i| {
+                let t = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap() + Duration::hours(i);
+                let c = 1.10 + i as f64 / 1000.0;
+                EngineCandle {
+                    time: t,
+                    o: c,
+                    h: c,
+                    l: c,
+                    c,
+                    bid_o: c,
+                    bid_h: c,
+                    bid_l: c,
+                    bid_c: c,
+                    ask_o: c,
+                    ask_h: c,
+                    ask_l: c,
+                    ask_c: c,
+                }
+            })
+            .collect()
+    }
+
+    /// The position's lifetime ends AT its exit bar — inclusive, so the exit bar
+    /// itself is still narratable, but nothing after it is.
+    ///
+    /// This is the bound that stops the stop-management reconstructions from
+    /// narrating a break-even arming and a spread widen for a position the broker
+    /// already flattened (GBP/NZD iH&S 2026-07-22: closed 15:00, yet the journal
+    /// showed SL→break-even at 21:00 and a widen the next day).
+    #[test]
+    fn forward_until_bounds_the_window_inclusively_at_the_exit_bar() {
+        let bars = hourly(6); // 12:00 … 17:00
+        let exit = bars[2].time; // 14:00
+
+        let life = forward_until(&bars, exit);
+        assert_eq!(life.len(), 3, "12:00, 13:00, 14:00");
+        assert_eq!(
+            life.last().map(|c| c.time),
+            Some(exit),
+            "the exit bar is included — an exit-bar event is real"
+        );
+        assert!(
+            life.iter().all(|c| c.time <= exit),
+            "no bar after the exit may survive the bound"
+        );
+    }
+
+    /// Degenerate inputs must not silently truncate to an empty window (which
+    /// would suppress every stop-management line rather than just the post-exit
+    /// ones) nor panic.
+    #[test]
+    fn forward_until_degrades_to_the_full_window_past_the_end() {
+        let bars = hourly(4);
+        let past_end = bars.last().expect("bars").time + Duration::hours(50);
+        assert_eq!(
+            forward_until(&bars, past_end).len(),
+            bars.len(),
+            "an `until` past the window keeps every bar"
+        );
+        // An `until` before the first bar yields nothing — there is no lifetime.
+        let before = bars[0].time - Duration::hours(1);
+        assert!(forward_until(&bars, before).is_empty());
+        assert!(forward_until(&[], bars[0].time).is_empty());
+    }
+
+    /// Each broker-side flatten names its OWN reason. The invalidation label is
+    /// the one that regressed: it read "CLOSED AT EXPIRY" because the replay loop
+    /// keyed the close reason off `VetoLevel::ClosePositions`, which the
+    /// trade-expiry veto and the invalidation veto share.
+    #[test]
+    fn close_labels_name_their_own_reason() {
+        assert_eq!(
+            close_label(FillKind::ClosedOnReversal),
+            "CLOSED ON REVERSAL"
+        );
+        assert_eq!(
+            close_label(FillKind::ClosedAtExpiry),
+            "CLOSED AT TRADE EXPIRY"
+        );
+        let inv = close_label(FillKind::ClosedOnInvalidation);
+        assert!(
+            inv.contains("INVALIDATION"),
+            "an invalidation close must say so, got: {inv}"
+        );
+        assert!(
+            !inv.contains("EXPIRY"),
+            "an invalidation close must NOT claim the trade expired, got: {inv}"
+        );
     }
 
     #[test]

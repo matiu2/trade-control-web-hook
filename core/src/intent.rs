@@ -969,6 +969,18 @@ pub const MW_CANCEL_VETO_NAME: &str = "mw-cancel";
 /// enter-builder can't drift apart.
 pub const MW_OVERSHOOT_VETO_NAME: &str = "mw-overshoot";
 
+/// Fixed veto name for the time-fired trade-expiry close (`02-veto-trade-expiry`,
+/// built by `build_trade_expiry_alert`). Fires at wall-clock `trade_expiry` at
+/// `ClosePositions` level: flattens any still-open position and retires the plan.
+///
+/// It is **not** the only `ClosePositions` veto — the structure-invalidation veto
+/// (`too-low` for a long / `too-high` for a short) is one too. Anything that wants
+/// to tell "the clock ran out" from "the setup broke" must compare against this
+/// name rather than keying off [`VetoLevel::ClosePositions`], which both share.
+/// The replay journal did the latter and reported "CLOSED AT EXPIRY" for an
+/// invalidation close with the real expiry days away (GBP/NZD iH&S 2026-07-22).
+pub const TRADE_EXPIRY_VETO_NAME: &str = "trade-expiry";
+
 /// Returns true if `s` is a valid `trade_id` slug: lowercase ASCII
 /// alphanumerics + hyphens, 1..=64 chars, no leading/trailing hyphen,
 /// no consecutive hyphens. Used by [`Intent::validate`] and by the CLI

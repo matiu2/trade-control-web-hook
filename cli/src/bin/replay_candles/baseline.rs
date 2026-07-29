@@ -98,6 +98,11 @@ pub struct BaselineEntry {
     pub sl_hits: usize,
     pub reversal_closes: usize,
     pub expiry_closes: usize,
+    /// Flattened by the structure-invalidation `close-positions` veto. Separate
+    /// from `expiry_closes` so a setup-broke close and a clock-ran-out close are
+    /// a detectable change of character, not the same number.
+    #[serde(default)]
+    pub invalidation_closes: usize,
 }
 
 impl BaselineEntry {
@@ -119,16 +124,18 @@ impl BaselineEntry {
             sl_hits: outcome.sl_hits,
             reversal_closes: outcome.reversal_closes,
             expiry_closes: outcome.expiry_closes,
+            invalidation_closes: outcome.invalidation_closes,
         })
     }
 
     /// The exit-shape counters, for detecting a same-R change of character.
-    fn shape(&self) -> (usize, usize, usize, usize) {
+    fn shape(&self) -> (usize, usize, usize, usize, usize) {
         (
             self.tp_hits,
             self.sl_hits,
             self.reversal_closes,
             self.expiry_closes,
+            self.invalidation_closes,
         )
     }
 }
@@ -755,6 +762,28 @@ mod tests {
         };
         assert_eq!(tp.net_r, reversal.net_r);
         assert_eq!(classify(&tp, &reversal), Some(MoveKind::Reshaped));
+    }
+
+    /// "The clock ran out" and "the setup broke" are different lessons at the same
+    /// R, so they must be a detectable reshape. If `invalidation_closes` were left
+    /// out of `shape()`, the two would compare equal and the corpus would bless a
+    /// changed exit character as clean.
+    #[test]
+    fn expiry_vs_invalidation_close_is_a_change_of_shape() {
+        let expiry = BaselineEntry {
+            expiry_closes: 1,
+            ..BaselineEntry::from_row(&traded("a", -0.25, false)).expect("scored")
+        };
+        let invalidation = BaselineEntry {
+            invalidation_closes: 1,
+            ..BaselineEntry::from_row(&traded("a", -0.25, false)).expect("scored")
+        };
+        assert_eq!(expiry.net_r, invalidation.net_r);
+        assert_eq!(
+            classify(&expiry, &invalidation),
+            Some(MoveKind::Reshaped),
+            "an expiry close reclassified as an invalidation close is a reshape"
+        );
     }
 
     /// News-ON rows are flagged so calendar drift is never read as a code

@@ -125,6 +125,13 @@ pub enum ExitReason {
     Reversal,
     /// The trade-expiry `close-positions` veto flattened it at wall-clock expiry.
     Expiry,
+    /// The structure-invalidation veto (`too-low` for a long / `too-high` for a
+    /// short) flattened it at `ClosePositions` level — price ran back past the
+    /// shoulder, so the thesis is dead. Distinct from [`Self::Expiry`]: both are
+    /// `ClosePositions` vetos, but only one of them is the clock running out.
+    /// Conflating them printed "CLOSED AT EXPIRY" for an invalidation close with
+    /// the trade-expiry still days away (GBP/NZD iH&S 2026-07-22).
+    Invalidation,
 }
 
 /// A closed position in the broker's P&L ledger — the terminal record the report
@@ -260,8 +267,9 @@ pub struct ReplayBroker {
     /// The P&L ledger — closed positions in exit order.
     closed: RefCell<Vec<ClosedTrade>>,
     /// The reason the NEXT `close_positions` call records (Reversal by default;
-    /// the loop sets Expiry before dispatching the trade-expiry veto). Set via
-    /// `set_close_reason` right before the engine dispatches a close.
+    /// the loop sets Expiry / Invalidation before dispatching the corresponding
+    /// `ClosePositions` veto). Set via `set_close_reason` right before the engine
+    /// dispatches a close.
     close_reason: RefCell<ExitReason>,
 }
 
@@ -284,7 +292,8 @@ impl ReplayBroker {
 
     /// Set the reason the next `close_positions` records. The loop calls this
     /// right before the engine dispatches a close: `Reversal` for a
-    /// reversal-close fire, `Expiry` for the trade-expiry ClosePositions veto.
+    /// reversal-close fire, `Expiry` for the trade-expiry ClosePositions veto,
+    /// `Invalidation` for the structure-invalidation ClosePositions veto.
     pub fn set_close_reason(&self, reason: ExitReason) {
         *self.close_reason.borrow_mut() = reason;
     }
@@ -516,6 +525,7 @@ impl ReplayBroker {
                 ExitReason::TookProfit => FillKind::TookProfit,
                 ExitReason::Reversal => FillKind::ClosedOnReversal,
                 ExitReason::Expiry => FillKind::ClosedAtExpiry,
+                ExitReason::Invalidation => FillKind::ClosedOnInvalidation,
             };
             return Some(RealizedOutcome {
                 direction: t.direction,

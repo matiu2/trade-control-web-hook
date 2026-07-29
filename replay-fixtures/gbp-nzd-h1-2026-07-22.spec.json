@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1784581200,
+        "price": 2.30135
+      },
+      "b": {
+        "at_epoch": 1784728800,
+        "price": 2.3005
+      }
+    },
+    "invalidation": 2.3008945687750044,
+    "fib_head_neckline": [
+      2.29029,
+      2.3013665663744343
+    ],
+    "trade_expiry_epoch": 1785189600,
+    "sr_levels": [
+      2.324684578062727,
+      2.30834,
+      2.29029
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:GBPNZD",
+  "start": 1784750400,
+  "tv_arm_version": "v116-127-gbf260c8"
+}

@@ -503,17 +503,31 @@ pub async fn run(
                             .await;
                     }
                 }
-                // The trade-expiry veto at `ClosePositions` level flattens any open
-                // position at wall-clock expiry AND blocks entries (the entry block
-                // is the plan going `Done`, handled by the engine). Here we do the
-                // broker-side flatten the live ClosePositions veto performs via
-                // `broker.close_positions`. A non-ClosePositions veto (StopNextEntry,
-                // e.g. too-low) leaves the open position alone — no flatten.
+                // A `ClosePositions`-level veto flattens any open position AND blocks
+                // entries (the entry block is the plan going `Done`, handled by the
+                // engine). Here we do the broker-side flatten the live ClosePositions
+                // veto performs via `broker.close_positions`. A non-ClosePositions
+                // veto (StopNextEntry — the pcl-exhausted cap) leaves the open
+                // position alone: no flatten.
+                //
+                // TWO different vetos reach this arm and the journal must not conflate
+                // them: the time-fired `02-veto-trade-expiry` (the clock ran out) and
+                // the structure-invalidation veto (`too-low` for a long / `too-high`
+                // for a short — the setup broke). Classify on the veto NAME, not the
+                // level they share; keying off the level alone reported "CLOSED AT
+                // EXPIRY" for an invalidation close with the trade-expiry days away
+                // (GBP/NZD iH&S 2026-07-22, closed 15:00 on 07-23 vs a 07-27 expiry).
                 Action::Veto | Action::Invalidate
                     if fired.intent.level
                         == Some(trade_control_core::intent::VetoLevel::ClosePositions) =>
                 {
-                    replay_broker.set_close_reason(ExitReason::Expiry);
+                    let is_expiry = fired.intent.name.as_deref()
+                        == Some(trade_control_core::intent::TRADE_EXPIRY_VETO_NAME);
+                    replay_broker.set_close_reason(if is_expiry {
+                        ExitReason::Expiry
+                    } else {
+                        ExitReason::Invalidation
+                    });
                     replay_broker
                         .cancel_pending_for_instrument(&fired.intent.instrument)
                         .await;

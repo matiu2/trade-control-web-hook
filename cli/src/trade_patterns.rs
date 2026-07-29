@@ -1929,7 +1929,7 @@ fn build_trade_expiry_alert(
         trade_id,
     );
     intent.not_before = Some(trade_expiry);
-    intent.name = Some("trade-expiry".into());
+    intent.name = Some(trade_control_core::intent::TRADE_EXPIRY_VETO_NAME.into());
     intent.ttl_hours =
         trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, veto_expiry));
     intent.level = Some(VetoLevel::ClosePositions);

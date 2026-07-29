@@ -1,5 +1,68 @@
 # Changelog
 
+## v117 — 2026-07-30 — Replay journal: an invalidation close is no longer reported as "CLOSED AT EXPIRY", and stop management stops narrating after the exit
+
+**Why.** A GBP/NZD iH&S long replay (2026-07-22 chart, entry 07-23 12:00 Brisbane)
+printed this, with the real trade-expiry four days later on 07-27:
+
+```
+2026-07-23 15:00  entry #1 CLOSED AT EXPIRY → 2.29996  (R: -0.25 …)
+2026-07-23 15:00  Veto (01-veto-too-low) — no fill simulated
+2026-07-23 21:00  entry #1 SL→break-even (a candle closed past 50%-to-TP)
+2026-07-24 06:30  entry #1 SL widened → 2.28817 (spread blackout System 2 …)
+2026-07-24 18:00  entry #1 SL restored → 2.29315
+```
+
+Two separate bugs. Nothing expired — the `01-veto-too-low` **structure-invalidation**
+veto flattened the position — and the position was already flat for the last three
+lines. The −0.25R itself was always correct; what was wrong was the *story*.
+
+**What changed (behaviour).**
+
+1. **Close reasons are classified by veto NAME, not by `VetoLevel`.** The replay
+   loop's `Action::Veto | Invalidate if level == ClosePositions` arm hardcoded
+   `ExitReason::Expiry` for everything it caught — but the trade-expiry veto and
+   the structure-invalidation veto (`too-low` for a long / `too-high` for a short)
+   **share** that level. New `ExitReason::Invalidation` / `FillKind::ClosedOnInvalidation`,
+   selected by comparing against the new `core::intent::TRADE_EXPIRY_VETO_NAME`.
+   Journal now reads `CLOSED ON INVALIDATION (setup broke)`; the summary tallies
+   `INV:` separately from `EXP:`; `--annotate` labels the chart `invalidation`.
+   The three broker-flatten render arms were collapsed into one label-driven arm.
+2. **Stop-management lines are bounded at the realized exit.** `report::render_fire`
+   emitted SL→break-even and the spread widen/restore *before* resolving the exit,
+   and both reconstructions (`fill_sim::breakeven_armed_at_resolved`,
+   `widened_stop_at_resolved`) walk the forward window stopping only at SL/TP —
+   they know nothing about a broker-side flatten. The outcome is now resolved
+   first and the helpers get a `forward_until(&fire.forward, until)` slice, so
+   they cannot arm off a bar the position never saw. "SL still widened at window
+   end" became "at exit" and anchors on the position's last bar.
+
+**Breaking.** `ReplayEconomics` / `BaselineEntry` gain `invalidation_closes`
+(`#[serde(default)]`, so older goldens load). `ExitReason` and `FillKind` gain a
+variant — exhaustive matches on them need a new arm. `baseline::shape()` is now a
+5-tuple, so an expiry→invalidation reclassification is a detectable `Reshaped`
+move rather than silently clean.
+
+**Config.** None.
+
+**Tests.** `an_invalidation_close_is_labelled_and_ends_the_journal` (end-to-end on
+the gbp-nzd fixture; asserts the label AND that no stop-management line is dated
+after the exit — the golden `expected.json` can't catch the latter, since it
+records legs, not journal text, and the mislabelled run booked an identical
+−0.25R leg). Plus `invalidation_close_books_its_own_counter_not_expiry`,
+`expiry_vs_invalidation_close_is_a_change_of_shape`, `close_labels_name_their_own_reason`,
+two `forward_until` bound tests, and a new assertion on the existing uk-100 test
+pinning a *genuine* trade-expiry to `EXP` (the discriminator). Both fixes were
+mutation-verified. 6 × `gbp-nzd-h1-2026-07-22-*` fixtures re-blessed to
+`exit_reason: "invalidation"` with net_r/prices/times byte-identical.
+
+**Follow-up.** `--fixtures-glob '*' --check` reports 21 ok / 10 failed, and that
+count is **unchanged with this branch stashed** — a pre-existing 1-ULP float
+instability on the SL-spread floor, documented in
+`TODO-invalidation-close-label-and-post-exit-events.md`. Also noted there:
+`all_fixtures_match_expected` panics on the first mismatch, so it hides nine of
+the ten, and the `--check` diff's float rendering is misleading.
+
 ## v116 — 2026-07-24 — Auto TP-resistance band is now the same width as a drawn S/R line (was half)
 
 **Why.** The automatic take-profit resistance band tv-arm bakes on every H&S /

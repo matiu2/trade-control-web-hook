@@ -160,8 +160,8 @@ Now the three scoped actions, by the two axes:
 | concept | open position? | future entries? | scope | mechanism |
 |---|---|---|---|---|
 | **CLOSE** | **closes it** | **left open** | one position | reversal-close (`Action::Close`, `06-/07-close-on-…`) |
-| **VETO / INVALIDATE** | **left alone** | **blocked** | trade | `Action::Veto`/`Invalidate` at `StopNextEntry` → `Phase::Done` |
-| **CLOSE-VETO** (rare) | **closes it** | **blocked** | trade | `Action::Veto` at `ClosePositions` — only on true thesis-death |
+| **VETO / INVALIDATE** | **left alone** | **blocked** | trade | `Action::Veto`/`Invalidate` at `StopNextEntry` → `Phase::Done` (pcl-exhausted) |
+| **CLOSE-VETO** | **closes it** | **blocked** | trade | `Action::Veto` at `ClosePositions` — thesis-death (structure invalidation) + `trade-expiry` |
 
 - **CLOSE** — close **one open position**, but **do not** block future
   entries; the **trade lives** and may re-enter. This is the
@@ -174,12 +174,11 @@ Now the three scoped actions, by the two axes:
   path is a dormant no-op (section below). *"This position is wrong, close
   it — but the setup may still work, re-enter if it re-triggers."*
 - **VETO / INVALIDATE** — stop **all further entries**, but **do not
-  touch an open position**. This is the invalidation family:
-  `too-high`/`too-low` caps and the 80%-to-TP `pcl-exhausted` abort (a
-  **wick** past 80%-to-TP is enough). They're `Action::Veto` at the
-  default `StopNextEntry` level, which sets `Phase::Done` in the shared
-  `evaluate_plan` and retires the plan — **but an already-open position
-  is left to run to its own SL/TP.** They just stop *new* entries.
+  touch an open position**. This is the **pcl-exhausted** abort: the
+  80%-to-TP cap (a **wick** past 80%-to-TP is enough). It's `Action::Veto`
+  at the default `StopNextEntry` level, which sets `Phase::Done` in the
+  shared `evaluate_plan` and retires the plan — **but an already-open
+  position is left to run to its own SL/TP.** It just stops *new* entries.
   (`veto` blocks only entries that opt in by listing the name in
   `vetos:`; `invalidate` is instrument-wide — every enter blocked.)
   *"The thesis is dead — no more attempts, but I'm not force-closing
@@ -187,14 +186,39 @@ Now the three scoped actions, by the two axes:
 - **CLOSE-VETO** — the one case that does both: `Action::Veto` at
   `VetoLevel::ClosePositions` closes the open position **and** blocks
   entries. Reserved for genuine thesis-invalidation — see
-  `[[veto_close_only_when_thesis_invalidated]]`. `too-high`/`too-low`
-  are **not** this; they're `StopNextEntry`.
+  `[[veto_close_only_when_thesis_invalidated]]`. **The
+  structure-invalidation veto IS this**: price ran back past the right
+  shoulder, so the setup is dead (`build_invalidation_alert` at
+  `VetoLevel::ClosePositions`, `cli/src/trade_patterns.rs`).
+
+⚠️ **`too-high`/`too-low` are NOT a fixed pair of roles — the names swap
+with direction**, and only one of the pair is `ClosePositions`:
+
+| | invalidation (**CLOSE-VETO**, `ClosePositions`) | pcl-exhausted (**VETO**, `StopNextEntry`) |
+|---|---|---|
+| H&S **short** | `too-high` | `too-low` |
+| iH&S **long** | `too-low` | `too-high` |
+
+So "does a `too-low` veto close my open position?" has **no
+direction-free answer**: for a long it does (it's the invalidation floor);
+for a short it must never (it's pcl-exhausted — see
+`BUG-too-low-closes-positions.md`, which is exactly that bug). Always
+resolve the *role* from the pattern direction before reasoning about it.
+Corollary for anything reading a fired veto: **classify on the veto NAME,
+not on `VetoLevel::ClosePositions`** — the trade-expiry veto and the
+invalidation veto share that level, so keying off the level conflates
+"the clock ran out" with "the setup broke" (the replay journal did, and
+printed `CLOSED AT EXPIRY` for a `too-low` close with the real expiry 4
+days out — GBP/NZD iH&S 2026-07-22). Compare against
+`core::intent::TRADE_EXPIRY_VETO_NAME`.
 
 So: **CLOSE** is per-position, non-terminal, position-closing. **VETO/
-INVALIDATE** is per-trade, terminal, position-**preserving**. If you ask
-"does this reversal-close stop re-entry?" the answer is **no**; if you
-ask "does a `too-high` veto close my open position?" the answer is also
-**no** — it just stops the next entry. Note `Action::Close` also doubles
+INVALIDATE** at `StopNextEntry` is per-trade, terminal, position-**preserving**.
+If you ask "does this reversal-close stop re-entry?" the answer is **no**;
+"does the pcl-exhausted veto close my open position?" is also **no** — it
+just stops the next entry; but "does the *invalidation* veto close it?" is
+**yes** (it's the CLOSE-VETO), and which literal name that is depends on
+the direction — see the table above. Note `Action::Close` also doubles
 as the operator emergency-flatten, so the basenames keep the word
 "close" (it's correct); the internal engine kind was renamed
 `PerTradeExit` → `PerPositionClose` (2026-07-19) to match — "close",

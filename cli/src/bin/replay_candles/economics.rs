@@ -67,6 +67,11 @@ pub enum ExitReason {
     Reversal,
     /// Flattened by the trade-expiry `close-positions` veto at wall-clock expiry.
     Expiry,
+    /// Flattened by the structure-invalidation `close-positions` veto (`too-low`
+    /// for a long / `too-high` for a short) — the thesis died, the clock didn't
+    /// run out. Kept separate from [`Self::Expiry`] so "the setup broke" and "we
+    /// ran out of time" read as the different lessons they are.
+    Invalidation,
     /// Still open when the replay window ended. Books 0R — the position has no
     /// realized result yet, so it must not be scored as a win or a loss.
     OpenAtWindowEnd,
@@ -81,6 +86,7 @@ impl ExitReason {
             FillKind::TookProfit => Some(Self::TookProfit),
             FillKind::ClosedOnReversal => Some(Self::Reversal),
             FillKind::ClosedAtExpiry => Some(Self::Expiry),
+            FillKind::ClosedOnInvalidation => Some(Self::Invalidation),
             FillKind::Open => Some(Self::OpenAtWindowEnd),
             FillKind::NeverFilled | FillKind::Declined | FillKind::GateBlocked => None,
         }
@@ -138,6 +144,11 @@ pub struct ReplayEconomics {
     pub sl_hits: usize,
     pub reversal_closes: usize,
     pub expiry_closes: usize,
+    /// Positions flattened by the structure-invalidation `close-positions` veto.
+    /// `#[serde(default)]` so fixtures blessed before the counter existed still
+    /// deserialize (they recorded these under `expiry_closes`).
+    #[serde(default)]
+    pub invalidation_closes: usize,
     /// Positions still open when the window ended (0R, not scored either way).
     #[serde(default)]
     pub open_at_end: usize,
@@ -155,6 +166,7 @@ impl Default for ReplayEconomics {
             sl_hits: 0,
             reversal_closes: 0,
             expiry_closes: 0,
+            invalidation_closes: 0,
             open_at_end: 0,
             legs: Vec::new(),
         }
@@ -209,6 +221,7 @@ impl ReplayEconomics {
             ExitReason::StoppedOut => self.sl_hits += 1,
             ExitReason::Reversal => self.reversal_closes += 1,
             ExitReason::Expiry => self.expiry_closes += 1,
+            ExitReason::Invalidation => self.invalidation_closes += 1,
             ExitReason::OpenAtWindowEnd => self.open_at_end += 1,
         }
 
@@ -418,6 +431,26 @@ mod tests {
         // +0.5R then −0.5R.
         assert!(e.net_r.abs() < 1e-9, "net_r was {}", e.net_r);
         assert_eq!(e.legs.len(), 2);
+    }
+
+    /// An invalidation close books its OWN counter, not the expiry one. Both come
+    /// from a `ClosePositions` veto, and the replay loop used to hardcode `Expiry`
+    /// for the whole arm — so a `too-low` flatten reported "CLOSED AT EXPIRY" and
+    /// tallied `EXP` with the real trade-expiry days out (GBP/NZD 2026-07-22).
+    #[test]
+    fn invalidation_close_books_its_own_counter_not_expiry() {
+        let mut e = ReplayEconomics::new();
+        e.book(&long_fire(FillKind::ClosedOnInvalidation, Some(1.095)));
+        assert_eq!(e.invalidation_closes, 1);
+        assert_eq!(
+            e.expiry_closes, 0,
+            "an invalidation close must not be tallied as a trade-expiry close"
+        );
+        // Same −0.5R economics as any other flatten at that price: only the
+        // *reason* differs, so a relabel must not move the money.
+        assert!((e.net_r + 0.5).abs() < 1e-9, "net_r was {}", e.net_r);
+        assert_eq!(e.legs.len(), 1);
+        assert_eq!(e.legs[0].exit_reason, ExitReason::Invalidation);
     }
 
     /// A position still open at the window end is recorded but scores 0R — it

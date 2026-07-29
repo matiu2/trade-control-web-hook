@@ -1,0 +1,216 @@
+{
+  "trade_id": "ihs-gbp-nzd-4dce9ec2",
+  "instrument": "GBP_NZD",
+  "direction": "long",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 2.3008945687750044,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-nzd-4dce9ec2-too-low",
+        "not_after": "2026-07-27T22:30:00Z",
+        "action": "veto",
+        "instrument": "GBP_NZD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-low",
+        "ttl_hours": 1,
+        "level": "close-positions",
+        "trade_id": "ihs-gbp-nzd-4dce9ec2"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 2.310227819473982,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-nzd-4dce9ec2-too-high",
+        "not_after": "2026-07-27T22:30:00Z",
+        "action": "veto",
+        "instrument": "GBP_NZD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-high",
+        "ttl_hours": 1,
+        "level": "stop-next-entry",
+        "trade_id": "ihs-gbp-nzd-4dce9ec2"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785189600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-nzd-4dce9ec2-trade-expiry",
+        "not_before": "2026-07-27T22:00:00Z",
+        "not_after": "2026-07-27T22:30:00Z",
+        "action": "veto",
+        "instrument": "GBP_NZD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "trade-expiry",
+        "ttl_hours": 1,
+        "level": "close-positions",
+        "trade_id": "ihs-gbp-nzd-4dce9ec2"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-nzd-4dce9ec2-enter",
+        "not_after": "2026-07-28T06:55:23.567766125Z",
+        "action": "enter",
+        "instrument": "GBP_NZD",
+        "direction": "long",
+        "entry": {
+          "type": "stop",
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 2.31244
+        },
+        "broker": "oanda",
+        "account": "m-and-w",
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 2.310227819473982,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 2.3008945687750044,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-gbp-nzd-4dce9ec2",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-nzd-4dce9ec2-close-on-sr-reversal",
+        "not_after": "2026-07-27T22:00:00Z",
+        "action": "close",
+        "instrument": "GBP_NZD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-gbp-nzd-4dce9ec2",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            2.32236,
+            2.32701
+          ],
+          [
+            2.30603,
+            2.31065
+          ],
+          [
+            2.288,
+            2.29258
+          ],
+          [
+            2.30782,
+            2.31244
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1784750400,
+  "armed_at": "2026-07-22T20:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-21T20:00:00Z",
+    "period_end": "2026-07-22T20:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "medium",
+    "currencies": [
+      {
+        "currency": "GBP",
+        "direction": "bearish",
+        "net_score": -3.0,
+        "events": [
+          "CPI y/y: Actual (2.6%) lower than forecast (2.7%) [context-dependent]",
+          "Core CPI y/y: Actual (2.6%) higher than forecast (2.5%) [context-dependent]",
+          "PPI Input m/m: Actual (-2.0%) lower than forecast (-0.7%) [context-dependent]",
+          "PPI Output m/m: Actual (0.0%) higher than forecast (-0.1%) [context-dependent]",
+          "RPI y/y: Actual (3.0%) matched forecast (3.0%)",
+          "HPI y/y: Actual (2.7%) missed forecast (3.2%)"
+        ]
+      },
+      {
+        "currency": "NZD",
+        "direction": "bearish",
+        "net_score": -1.0,
+        "events": [
+          "Credit Card Spending y/y: Actual (3.1%) declined from previous (4.2%)"
+        ]
+      }
+    ]
+  }
+}
