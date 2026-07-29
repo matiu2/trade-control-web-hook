@@ -1,0 +1,17 @@
+{
+  "instrument": "EUR_USD",
+  "granularity": "h1",
+  "source": "oanda",
+  "start": "2026-07-22T20:00:00Z",
+  "end": "2026-07-24T13:00:00Z",
+  "message": "19.5-pip iH&S armed ~70% up the pattern: the pcl-exhausted abort (too-high, a fib level at 1.14328) sits only 3.9 pips under TP and fires INTRABAR, so a single 03:00Z wick (high 1.14358, close 1.1429) retires the plan ~32h before expiry. All six cells abort on that same wick. This cell: the QM leg enters 02:00Z @1.14276, also ahead of the abort.",
+  "arm": {
+    "entry_rule": "strategy-v2",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "oanda",
+    "chart_symbol": "OANDA:EURUSD",
+    "tv_arm_version": "v116-124-g10f0552",
+    "engine_version": "v116-124-g10f0552"
+  }
+}

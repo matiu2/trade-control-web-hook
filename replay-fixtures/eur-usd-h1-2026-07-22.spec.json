@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1784628000,
+        "price": 1.14223
+      },
+      "b": {
+        "at_epoch": 1784703600,
+        "price": 1.14122
+      }
+    },
+    "invalidation": 1.14032,
+    "fib_head_neckline": [
+      1.13974,
+      1.1415814438700054
+    ],
+    "trade_expiry_epoch": 1784898000,
+    "sr_levels": [
+      1.1446,
+      1.1422294378272524
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:EURUSD",
+  "start": 1784750400,
+  "tv_arm_version": "v116-124-g10f0552"
+}
