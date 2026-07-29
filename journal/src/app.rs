@@ -53,6 +53,8 @@ pub struct PlanData {
     pub tv_loaded: bool,
     /// Deepest screen ever reached for this plan (delete guard reads this).
     pub max_depth: u8,
+    /// The last fixture-capture report (`s`), if one has run this session.
+    pub fixture_report: Option<String>,
 }
 
 /// A confirmation the operator must answer before a destructive action.
@@ -92,9 +94,6 @@ pub struct App {
     /// the next frame to repaint from scratch (recovers from any residual screen
     /// corruption, e.g. a stray escape or a resize).
     pub needs_clear: bool,
-    /// The journal DB connection, opened lazily on the first `s` record and
-    /// cached for the session (see [`App::record_db`]).
-    record_db: Option<rusqlite::Connection>,
     /// The `/` search prompt + live query. Filters the list screen.
     pub search: SearchState,
     /// A TV-load was **requested** (`l`, or the replay needing the chart) but
@@ -103,6 +102,11 @@ pub struct App {
     /// loads the chart unless the operator asked for it: there is no auto-load
     /// on screen entry (removed 2026-07-27).
     tv_load_pending: bool,
+    /// A fixture capture (`s`) was **requested** but the chart wasn't loaded (or
+    /// the detail wasn't fetched) yet, so it's parked. Separate from
+    /// [`Self::tv_load_pending`]: that one means "load the chart", this one means
+    /// "capture once the chart is up". Both can be set by a single `s` press.
+    save_fixture_pending: bool,
 }
 
 /// Braille spinner frames for the "loading…" indicator.
@@ -129,9 +133,9 @@ impl App {
             popup_scroll: 0,
             replay_scroll: 0,
             needs_clear: false,
-            record_db: None,
             search: SearchState::default(),
             tv_load_pending: false,
+            save_fixture_pending: false,
         })
     }
 
@@ -501,6 +505,34 @@ impl App {
                 if is_open && matches!(self.screen, Screen::Replay | Screen::Compare) {
                     self.start_replay(&trade_id);
                 }
+                // A parked `s` capture was waiting on exactly this chart.
+                if is_open && self.save_fixture_pending {
+                    self.save_fixture_pending = false;
+                    let armed_at = self
+                        .data
+                        .get(&trade_id)
+                        .and_then(|d| d.detail.as_ref())
+                        .and_then(|d| d.armed_at.clone());
+                    match armed_at {
+                        Some(a) => self.spawn_save_fixture(&trade_id, a),
+                        None => {
+                            self.status =
+                                Status::error(format!("{trade_id}: no armed_at — cannot capture"))
+                        }
+                    }
+                }
+            }
+            JobOutcome::SaveFixture(report) => {
+                // Cache the capture report so the Replay screen can show it (it
+                // ends with tv-arm's per-cell grid summary). A failed capture
+                // arrives as `Failed` instead, so reaching here means success.
+                self.data
+                    .entry(trade_id.clone())
+                    .or_default()
+                    .fixture_report = Some(report);
+                self.status = Status::info(format!(
+                    "{trade_id}: fixtures saved to replay-fixtures/ (6 cells)"
+                ));
             }
             JobOutcome::Failed(msg) => {
                 self.status = Status::error(format!("{trade_id} {}: {msg}", kind.verb()));
@@ -559,55 +591,78 @@ impl App {
         );
     }
 
-    /// Record the current plan's outcome to the journal DB (the `s` key). Only
-    /// meaningful once both outcomes are loaded, so it requires the replay
-    /// report (which implies the timeline/detail were fetched first). The
-    /// real-life and replay outcomes are stored in separate columns.
-    pub fn record_current(&mut self) {
+    /// Capture the six-cell fixture corpus for the current plan (the `s` key) —
+    /// `tv-arm --save-fixture … replay`.
+    ///
+    /// Replaced the old "record the outcome to a SQLite journal" action
+    /// (2026-07-29): a fixture pins the actual candles + expected outcome and can
+    /// be re-run offline forever, which subsumes what a recorded row gave us.
+    ///
+    /// Shares the replay's hard precondition — tv-arm re-arms from whatever chart
+    /// is up, so the plan's chart must be loaded first or the capture freezes the
+    /// WRONG setup. Rather than refuse, this parks the request and drives the
+    /// chart load itself, mirroring [`Self::start_replay`].
+    pub fn save_fixture_current(&mut self) {
         let Some(trade_id) = self.current_plan().map(|p| p.trade_id.clone()) else {
             return;
         };
-        let Some(data) = self.data.get(&trade_id) else {
-            self.status = Status::error("open the plan first (→) before recording");
+        let armed_at = self
+            .data
+            .get(&trade_id)
+            .and_then(|d| d.detail.as_ref())
+            .and_then(|d| d.armed_at.clone());
+        let Some(armed_at) = armed_at else {
+            // No detail yet (it carries `armed_at` and the broker). Park the
+            // capture, and load the chart — which itself parks behind the
+            // timeline fetch. Both land via `apply_job`.
+            self.save_fixture_pending = true;
+            self.status = Status::info(format!("{trade_id}: loading plan before capture…"));
+            self.start_load_tv(&trade_id);
             return;
         };
-        let (Some(detail), Some(timeline), Some(replay)) = (
-            data.detail.as_ref(),
-            data.timeline_json.as_deref(),
-            data.replay_report.as_deref(),
-        ) else {
-            self.status =
-                Status::error("run the replay (→ to Replay) before recording — need both outcomes");
+        let tv_loaded = self
+            .data
+            .get(&trade_id)
+            .map(|d| d.tv_loaded)
+            .unwrap_or(false);
+        if !tv_loaded {
+            self.save_fixture_pending = true;
+            self.status = Status::info(format!("{trade_id}: loading chart before capture…"));
+            self.start_load_tv(&trade_id);
             return;
-        };
-        let now = chrono::Utc::now().to_rfc3339();
-        let rec = crate::record::TradeRecord::from_plan(detail, timeline, replay, now);
-        match self.record_db() {
-            Ok(conn) => match crate::record::upsert(conn, &rec) {
-                Ok(_) => {
-                    self.status = Status::info(format!(
-                        "recorded {trade_id} — live: {} / replay net R: {}",
-                        rec.live_outcome,
-                        rec.replay_net_r.as_deref().unwrap_or("n/a"),
-                    ))
-                }
-                Err(e) => self.status = Status::error(format!("record: {e}")),
-            },
-            Err(e) => self.status = Status::error(format!("open journal db: {e}")),
         }
+        self.spawn_save_fixture(&trade_id, armed_at);
     }
 
-    /// The journal DB connection, opened + migrated lazily on first record and
-    /// cached for the session.
-    fn record_db(&mut self) -> Result<&rusqlite::Connection> {
-        if self.record_db.is_none() {
-            let path = crate::record::db_path();
-            self.record_db = Some(crate::record::open_db(&path)?);
+    /// Spawn the capture job for a plan whose chart is already loaded. Split from
+    /// [`Self::save_fixture_current`] so the deferred path (chart just finished
+    /// loading) can reuse it without re-running the gates.
+    fn spawn_save_fixture(&mut self, trade_id: &str, armed_at: String) {
+        if !self.mark_in_flight(trade_id, JobKind::SaveFixture) {
+            return;
         }
-        // Safe: just ensured Some above.
-        self.record_db
-            .as_ref()
-            .ok_or_else(|| color_eyre::eyre::eyre!("journal db unavailable"))
+        // Same divergence guard as the replay: reproduce the ORIGINAL plan's prep
+        // set, or the captured fixtures pin the wrong gates.
+        let skip_flags: Vec<String> = self
+            .data
+            .get(trade_id)
+            .and_then(|d| d.detail.as_ref())
+            .map(|d| {
+                d.bcr_preps
+                    .tv_arm_skip_flags()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.status = Status::info(format!("{trade_id}: saving fixtures…"));
+        jobs::spawn_save_fixture(
+            self.job_tx.clone(),
+            trade_id.to_string(),
+            armed_at,
+            skip_flags,
+            trade_id.to_string(),
+        );
     }
 
     /// Request a replay re-run (the `r` key), bypassing the cache.
@@ -763,9 +818,9 @@ impl App {
             popup_scroll: 0,
             replay_scroll: 0,
             needs_clear: false,
-            record_db: None,
             search: SearchState::default(),
             tv_load_pending: false,
+            save_fixture_pending: false,
         }
     }
 
@@ -809,21 +864,14 @@ impl App {
         self.in_flight.len()
     }
 
-    /// Point the journal DB at a fresh in-memory database (test helper) so
-    /// `record_current` writes there instead of `~/.config`.
-    pub fn use_in_memory_db(&mut self) {
-        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
-        crate::record::migrate_for_test(&conn);
-        self.record_db = Some(conn);
+    /// Whether a fixture capture is parked waiting on the chart (test helper).
+    pub fn save_fixture_pending(&self) -> bool {
+        self.save_fixture_pending
     }
 
-    /// Count rows in the journal DB (test helper). Panics if no DB is set.
-    pub fn recorded_count(&self) -> i64 {
-        self.record_db
-            .as_ref()
-            .expect("db set")
-            .query_row("SELECT COUNT(*) FROM trades", [], |r| r.get(0))
-            .expect("count")
+    /// Whether a specific job is in flight (test helper).
+    pub fn in_flight_test(&self, trade_id: &str, kind: JobKind) -> bool {
+        self.in_flight.contains(&(trade_id.to_string(), kind))
     }
 }
 
@@ -896,30 +944,33 @@ mod tests {
     const TIMELINE: &str = include_str!("../tests/fixtures/plan_timeline.json");
     const REPLAY: &str = include_str!("../tests/fixtures/replay_report.txt");
 
-    /// Recording before the replay ran is rejected (need both outcomes), and no
-    /// row is written.
+    /// The capture re-arms from the live chart, so pressing `s` with the chart
+    /// NOT loaded must not fire tv-arm against whatever chart happens to be up —
+    /// it parks the request and loads the chart first.
     #[test]
-    fn record_requires_replay_report() {
+    fn save_fixture_defers_until_the_chart_is_loaded() {
         let mut app = App::from_rows(vec![row("hs-aud-cad-a07622da")]);
-        app.use_in_memory_db();
         app.seed_current(PlanData {
             detail: parse_plan_export(EXPORT).ok(),
             export_json: Some(EXPORT.to_string()),
             timeline_json: Some(TIMELINE.to_string()),
-            replay_report: None, // replay not run yet
-            tv_loaded: true,
+            replay_report: None,
+            tv_loaded: false, // chart NOT up
             max_depth: 1,
+            fixture_report: None,
         });
-        app.record_current();
-        assert!(app.status.is_error, "no-replay record should error");
-        assert_eq!(app.recorded_count(), 0, "nothing written");
+        app.save_fixture_current();
+        assert!(app.save_fixture_pending(), "capture parked");
+        assert!(
+            !app.in_flight_test("hs-aud-cad-a07622da", JobKind::SaveFixture),
+            "must NOT capture against an unloaded chart"
+        );
     }
 
-    /// With both outcomes loaded, `s` writes exactly one row.
+    /// With the chart loaded, `s` spawns the capture immediately.
     #[test]
-    fn record_writes_a_row_when_both_outcomes_present() {
+    fn save_fixture_runs_when_the_chart_is_loaded() {
         let mut app = App::from_rows(vec![row("hs-aud-cad-a07622da")]);
-        app.use_in_memory_db();
         app.seed_current(PlanData {
             detail: parse_plan_export(EXPORT).ok(),
             export_json: Some(EXPORT.to_string()),
@@ -927,15 +978,34 @@ mod tests {
             replay_report: Some(REPLAY.to_string()),
             tv_loaded: true,
             max_depth: 3,
+            fixture_report: None,
         });
-        app.record_current();
-        assert!(!app.status.is_error, "record ok: {}", app.status.text);
-        assert!(app.status.text.contains("recorded"), "{}", app.status.text);
-        assert_eq!(app.recorded_count(), 1);
+        app.save_fixture_current();
+        assert!(
+            app.in_flight_test("hs-aud-cad-a07622da", JobKind::SaveFixture),
+            "capture spawned: {}",
+            app.status.text
+        );
+        assert!(!app.save_fixture_pending(), "not parked — it ran");
+    }
 
-        // Recording again upserts — still one row.
-        app.record_current();
-        assert_eq!(app.recorded_count(), 1, "re-record upserts, no duplicate");
+    /// A finished capture caches its report and reports success.
+    #[test]
+    fn save_fixture_completion_caches_the_report() {
+        let mut app = App::from_rows(vec![row("t1")]);
+        app.mark_in_flight_test("t1", JobKind::SaveFixture);
+        app.inject_job(JobResult {
+            trade_id: "t1".into(),
+            kind: JobKind::SaveFixture,
+            outcome: JobOutcome::SaveFixture("saved 6 cells".into()),
+        });
+        app.drain_jobs();
+        assert!(!app.status.is_error, "{}", app.status.text);
+        assert_eq!(
+            app.data.get("t1").and_then(|d| d.fixture_report.as_deref()),
+            Some("saved 6 cells")
+        );
+        assert_eq!(app.in_flight_len(), 0);
     }
 
     /// Filtering must move the SELECTION with the rows, not just hide rows: the
@@ -1104,6 +1174,7 @@ mod tests {
             replay_report: None,
             tv_loaded: false,
             max_depth: 0,
+            fixture_report: None,
         });
         app.push_deeper(); // List → Timeline
         assert_eq!(app.screen, Screen::Timeline);
@@ -1186,6 +1257,7 @@ mod tests {
             replay_report: None,
             tv_loaded: false, // chart not loaded yet
             max_depth: 2,
+            fixture_report: None,
         });
         app.set_screen(Screen::Replay);
         app.start_replay("hs-aud-cad-a07622da");

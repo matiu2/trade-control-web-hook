@@ -15,7 +15,6 @@ mod divergence;
 mod jobs;
 mod keys;
 mod plan;
-mod record;
 mod screen;
 mod search;
 mod timeline;

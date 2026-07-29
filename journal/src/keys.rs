@@ -18,9 +18,11 @@ pub enum Action {
     Shallower,
     LoadTv,
     Replay,
-    /// Record the current trade's outcome to the journal DB (the `s` key on
-    /// Compare).
-    Record,
+    /// Capture the six-cell fixture corpus for the current trade — the `s` key.
+    /// Runs `tv-arm --save-fixture … replay`, which writes JSON fixtures under
+    /// `replay-fixtures/` (committed to git). Replaced the old journal-DB
+    /// "record" action on 2026-07-29.
+    SaveFixture,
     TogglePopup,
     RequestDelete,
     ConfirmYes,
@@ -154,7 +156,7 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
         KeyCode::Left => Action::Shallower,
         KeyCode::Char('l') => Action::LoadTv,
         KeyCode::Char('r') => Action::Replay,
-        KeyCode::Char('s') | KeyCode::Char('S') => Action::Record,
+        KeyCode::Char('s') | KeyCode::Char('S') => Action::SaveFixture,
         KeyCode::Char('c') => Action::Copy,
         KeyCode::Char('i') => Action::TogglePopup,
         KeyCode::Char('d') | KeyCode::Char('x') => Action::RequestDelete,
@@ -172,7 +174,7 @@ pub fn apply(app: &mut App, action: Action) {
         Action::Shallower => app.pop_shallower(),
         Action::LoadTv => app.load_tv(),
         Action::Replay => app.rerun_replay(),
-        Action::Record => app.record_current(),
+        Action::SaveFixture => app.save_fixture_current(),
         Action::TogglePopup => app.toggle_popup(),
         Action::RequestDelete => app.request_delete(),
         Action::ConfirmYes => app.resolve_confirm(true),
