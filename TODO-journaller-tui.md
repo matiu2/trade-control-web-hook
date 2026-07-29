@@ -200,12 +200,42 @@ LIST (depth 0)                     TIMELINE (depth 1)          REPLAY (depth 2) 
 | `/` | **search/filter the list** (list screen only) — see below |
 | `l` | (re)load current plan into TradingView — **operator-initiated only** |
 | `r` | (re)run replay for current plan |
-| `s` | **record** the trade's outcome to the journal DB (needs replay run) |
+| `s` | **save fixtures** — capture the 6-cell corpus (`tv-arm --save-fixture`) |
 | `c` | **copy** the full current view to the clipboard (not just the visible part) |
 | `i` | toggle the full plan-detail **popup** (overlay) |
 | `d` / `x` | **delete + done** — confirm modal; **disabled at depth 0** |
 | `Ctrl-L` | force a full repaint (recovers from residual screen corruption) |
 | `q` / `Ctrl-C` | quit |
+
+### Fixture capture (`s`) — replaced the SQLite journal DB (2026-07-29)
+
+`s` runs `tv-arm-<env> --start <armed_at> [skip flags] --save-fixture
+--fixture-name <trade_id> replay`, which reads the chart **once** and writes the
+six-cell grid (normal / skip-bcr / strategy-v2 × news on/off) under
+`replay-fixtures/`.
+
+It **replaced** the old `s` = "record the outcome to a SQLite journal DB"
+action, and `journal/src/record.rs` + the `rusqlite` dependency were deleted
+with it. Why: a fixture is JSON on disk that gets **committed to git** — so it's
+versioned, diffable, reviewable, and re-runnable offline forever. The DB was a
+local gitignored file only `sqlite3`-by-hand could read (its own module docs
+admitted querying was "out of scope"). No DB had ever been created, so nothing
+was migrated.
+
+Two constraints it inherits from the replay, both load-bearing:
+
+- **The chart must be loaded first.** tv-arm re-arms from whatever chart is up,
+  so capturing against the wrong chart freezes the *wrong setup* — a wrong
+  answer, not a slow one. `save_fixture_current` parks the request
+  (`save_fixture_pending`) and drives the load itself; `apply_job` runs it when
+  `LoadTv` completes.
+- **The skip flags must match the original plan.** A `--skip-bcr` plan re-armed
+  without them gets the full break-and-close-then-retest and pins the wrong
+  gates. Read from the stored plan's preps via `BcrPreps::tv_arm_skip_flags`.
+
+`--save-fixture` and `--fixture-name` are **tv-arm** flags, so they must precede
+the `replay` subcommand (`cli::save_fixture_args` enforces the order; a test
+pins it).
 
 ### TV chart loading (`l`) — never automatic
 Entering a screen does **not** load the TradingView chart (auto-load removed

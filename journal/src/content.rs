@@ -184,6 +184,7 @@ mod tests {
             replay_report: Some(REPLAY.to_string()),
             tv_loaded: true,
             max_depth: 3,
+            fixture_report: None,
         });
         app.set_screen(screen);
         app

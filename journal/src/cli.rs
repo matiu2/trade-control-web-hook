@@ -168,6 +168,77 @@ pub fn replay_via_tv_arm(armed_at: &str, skip_flags: &[&str]) -> Result<String> 
     Ok(stdout)
 }
 
+/// Build the argv for a fixture capture: `tv-arm --start <armed_at>
+/// [skip flags] --save-fixture --fixture-name <id> [--message <text>] replay`.
+///
+/// Split out from [`save_fixture_via_tv_arm`] so the flag ORDER is testable
+/// without launching anything. Order is load-bearing: `--save-fixture` and its
+/// `--fixture-name` / `--message` are **tv-arm** flags, so they must precede the
+/// `replay` subcommand — clap rejects them after it. Same rule as the skip flags.
+fn save_fixture_args<'a>(
+    armed_at: &'a str,
+    skip_flags: &[&'a str],
+    fixture_name: &'a str,
+    message: Option<&'a str>,
+) -> Vec<String> {
+    let mut args = vec!["--start".to_string(), armed_at.to_string()];
+    args.extend(skip_flags.iter().map(|s| s.to_string()));
+    args.push("--save-fixture".to_string());
+    args.push("--fixture-name".to_string());
+    args.push(fixture_name.to_string());
+    if let Some(m) = message {
+        args.push("--message".to_string());
+        args.push(m.to_string());
+    }
+    args.push("replay".to_string());
+    args
+}
+
+/// Capture the six-cell fixture corpus for this setup by re-arming it from the
+/// **live TradingView chart**, via `tv-arm --save-fixture … replay`.
+///
+/// `--save-fixture` is tv-arm's one-flag corpus capture: it freezes the setup to
+/// a `.spec.json`, arms all six grid cells (normal / skip-bcr / strategy-v2
+/// × news on/off), and saves each cell's candles + expected outcome under
+/// `replay-fixtures/`. So this shares the replay's hard precondition — the
+/// plan's chart must already be loaded, with its drawings intact — because
+/// tv-arm reads whatever chart is up.
+///
+/// `fixture_name` is passed explicitly (the journal uses the plan's `trade_id`)
+/// so a captured fixture traces back to the journal page it came from, rather
+/// than tv-arm's derived `<instrument>-<granularity>-<date>` name which would
+/// collide across two setups armed on the same instrument the same day.
+///
+/// The `skip_flags` caveat is the replay's, verbatim: a plan armed with
+/// `--skip-bcr` must re-arm with the skips or the captured fixtures pin the
+/// WRONG gate set. Returns the capture's stdout (ANSI stripped, as the replay).
+pub fn save_fixture_via_tv_arm(
+    armed_at: &str,
+    skip_flags: &[&str],
+    fixture_name: &str,
+    message: Option<&str>,
+) -> Result<String> {
+    let program = bin("tv-arm");
+    let args = save_fixture_args(armed_at, skip_flags, fixture_name, message);
+    let mut cmd = Command::new(&program);
+    cmd.args(&args);
+    if std::env::var_os("RUST_LOG").is_none() {
+        cmd.env("RUST_LOG", "warn");
+    }
+    let out = cmd.output().map_err(|e| launch_error(&program, e))?;
+    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    if !out.status.success() {
+        let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+        return Err(eyre!(
+            "`{program} {}` failed ({}): {}\n{stdout}",
+            args.join(" "),
+            out.status,
+            stderr.trim()
+        ));
+    }
+    Ok(stdout)
+}
+
 /// Remove ANSI escape sequences (`ESC [ … <final>`, and lone `ESC …`) from `s`.
 /// Handles the CSI sequences tracing emits for colour (`\x1b[32m`, `\x1b[0m`,
 /// …); a bare `ESC` not starting a CSI is dropped with its next byte. Keeps all
@@ -236,6 +307,75 @@ mod tests {
         let e = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let msg = launch_error("trade-control", e).to_string();
         assert!(!msg.contains("journal-staging"), "{msg}");
+    }
+
+    /// `--save-fixture` and its companions are **tv-arm** flags, so they must
+    /// come BEFORE the `replay` subcommand — clap rejects them after it. This is
+    /// the same ordering trap the skip flags have.
+    #[test]
+    fn save_fixture_flags_precede_the_replay_subcommand() {
+        let args = save_fixture_args("2026-07-22T20:58:53Z", &[], "trade-1", None);
+        let replay_at = args.iter().position(|a| a == "replay");
+        let save_at = args.iter().position(|a| a == "--save-fixture");
+        let name_at = args.iter().position(|a| a == "--fixture-name");
+        assert!(replay_at.is_some(), "the subcommand is present: {args:?}");
+        assert!(
+            save_at < replay_at,
+            "--save-fixture before replay: {args:?}"
+        );
+        assert!(
+            name_at < replay_at,
+            "--fixture-name before replay: {args:?}"
+        );
+        // `replay` is last, so anything appended later stays a replay-side flag.
+        assert_eq!(args.last().map(String::as_str), Some("replay"), "{args:?}");
+    }
+
+    /// The fixture name is the plan's trade_id, so a capture traces back to the
+    /// journal page rather than colliding on tv-arm's derived date-based name.
+    #[test]
+    fn save_fixture_names_the_fixture_after_the_trade() {
+        let args = save_fixture_args("2026-07-22T20:58:53Z", &[], "ihs-eur-usd-584d3770", None);
+        let i = args
+            .iter()
+            .position(|a| a == "--fixture-name")
+            .unwrap_or_default();
+        assert_eq!(
+            args.get(i + 1).map(String::as_str),
+            Some("ihs-eur-usd-584d3770")
+        );
+    }
+
+    /// A skip-BCR plan must capture WITH its skip flags, or the fixtures pin the
+    /// wrong gate set — the same divergence the replay path guards against.
+    #[test]
+    fn save_fixture_forwards_the_skip_flags_before_replay() {
+        let args = save_fixture_args(
+            "2026-07-22T20:58:53Z",
+            &["--skip-break-and-close", "--skip-retest"],
+            "trade-1",
+            None,
+        );
+        let replay_at = args.iter().position(|a| a == "replay");
+        for flag in ["--skip-break-and-close", "--skip-retest"] {
+            let at = args.iter().position(|a| a == flag);
+            assert!(at.is_some(), "{flag} forwarded: {args:?}");
+            assert!(at < replay_at, "{flag} before replay: {args:?}");
+        }
+    }
+
+    /// `--message` is optional: absent means no flag at all (not an empty one,
+    /// which clap would reject as a missing value).
+    #[test]
+    fn save_fixture_omits_message_when_none() {
+        let without = save_fixture_args("2026-07-22T20:58:53Z", &[], "t", None);
+        assert!(!without.iter().any(|a| a == "--message"), "{without:?}");
+        let with = save_fixture_args("2026-07-22T20:58:53Z", &[], "t", Some("why it exists"));
+        let i = with
+            .iter()
+            .position(|a| a == "--message")
+            .unwrap_or_default();
+        assert_eq!(with.get(i + 1).map(String::as_str), Some("why it exists"));
     }
 
     #[test]

@@ -24,6 +24,8 @@ pub enum JobKind {
     Replay,
     /// `replay-candles --plan --annotate` — draw positions on the live chart.
     LoadTv,
+    /// `tv-arm --save-fixture … replay` — capture the six-cell fixture corpus.
+    SaveFixture,
 }
 
 impl JobKind {
@@ -33,6 +35,7 @@ impl JobKind {
             JobKind::Timeline => "loading timeline",
             JobKind::Replay => "running replay",
             JobKind::LoadTv => "loading TradingView",
+            JobKind::SaveFixture => "saving fixtures",
         }
     }
 }
@@ -57,6 +60,8 @@ pub enum JobOutcome {
     Replay(String),
     /// TradingView annotate finished (no payload — the draw is a side effect).
     LoadTv,
+    /// The fixture-capture report text (tv-arm's per-cell summary).
+    SaveFixture(String),
     /// The job failed; the string is the error to surface in the footer.
     Failed(String),
 }
@@ -91,6 +96,26 @@ pub fn spawn_replay(
         let flags: Vec<&str> = skip_flags.iter().map(String::as_str).collect();
         let report = cli::replay_via_tv_arm(&armed_at, &flags)?;
         Ok(JobOutcome::Replay(report))
+    });
+}
+
+/// Spawn the fixture-capture job — `tv-arm --save-fixture … replay`, which
+/// re-arms from the **live chart** (already loaded) and writes the six-cell
+/// corpus. Same chart precondition and same `skip_flags` caveat as the replay:
+/// the capture must reproduce the ORIGINAL plan's prep set or it pins the wrong
+/// gates. `fixture_name` is the plan's `trade_id`, so a fixture traces back to
+/// its journal page.
+pub fn spawn_save_fixture(
+    tx: Sender<JobResult>,
+    trade_id: String,
+    armed_at: String,
+    skip_flags: Vec<String>,
+    fixture_name: String,
+) {
+    spawn(tx, trade_id, JobKind::SaveFixture, move || {
+        let flags: Vec<&str> = skip_flags.iter().map(String::as_str).collect();
+        let report = cli::save_fixture_via_tv_arm(&armed_at, &flags, &fixture_name, None)?;
+        Ok(JobOutcome::SaveFixture(report))
     });
 }
 

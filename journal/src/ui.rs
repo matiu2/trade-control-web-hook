@@ -65,15 +65,15 @@ fn render_body(f: &mut Frame, app: &App, area: Rect) {
 /// The one-line footer: context hints on the left, status on the right.
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = match app.screen {
-        Screen::List => "↑↓ move  →/n open  / search  c copy  q quit",
+        Screen::List => "↑↓ move  →/n open  / search  s fixtures  c copy  q quit",
         Screen::Replay => {
             "↑↓/jk scroll  ←/→ nav  r replay  c copy  ^L refresh  i detail  x delete  q quit"
         }
         Screen::Compare => {
-            "← back  l load-TV  r replay  s record  c copy  i detail  d/x delete  q quit"
+            "← back  l load-TV  r replay  s fixtures  c copy  i detail  d/x delete  q quit"
         }
         _ => {
-            "← back  →/n deeper  l load-TV  r replay  s record  c copy  i detail  d/x delete  q quit"
+            "← back  →/n deeper  l load-TV  r replay  s fixtures  c copy  i detail  d/x delete  q quit"
         }
     };
     let status_style = if app.status.is_error {
@@ -218,6 +218,7 @@ mod tests {
             replay_report: None,
             tv_loaded: true,
             max_depth: 1,
+            fixture_report: None,
         });
         app.set_screen(Screen::Timeline);
 
@@ -242,6 +243,7 @@ mod tests {
             replay_report: None,
             tv_loaded: true,
             max_depth: 1,
+            fixture_report: None,
         });
         app.set_screen(Screen::Timeline);
         app.toggle_popup(); // open the detail popup
@@ -288,6 +290,7 @@ mod tests {
             replay_report: Some(REPLAY.to_string()),
             tv_loaded: true,
             max_depth: 3,
+            fixture_report: None,
         });
         app.set_screen(Screen::Compare);
 
@@ -337,6 +340,7 @@ mod tests {
             replay_report: Some(REPLAY.to_string()),
             tv_loaded: true,
             max_depth: 2,
+            fixture_report: None,
         });
         app.set_screen(Screen::Replay);
 
