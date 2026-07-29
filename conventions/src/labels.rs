@@ -34,6 +34,18 @@ pub const INVALIDATION_LABELS: &[&str] = &["too-high", "too-low"];
 /// becomes a price band for the `07-close-on-sr-reversal` alert.
 pub const SR_LEVEL_LABELS: &[&str] = &["support", "resistance"];
 
+/// **Note**-tool label for a fixed stop-loss level. The operator drops a
+/// TradingView Note (tv-mcp kind `text_note`) with its **first anchor** at
+/// the price they want the stop — typically the shoulder or the head — and
+/// the enter uses that instead of the geometry-anchored default.
+///
+/// Matched with [`matches`], i.e. the **whole** label must be exactly one of
+/// these. A note reading `sl too tight, moved it` is commentary and is
+/// deliberately *not* a stop — same whole-label contract the `start` note
+/// uses, and the reason a chart can carry freeform Notes (`v2 entry`,
+/// `continuation`) alongside a load-bearing one without collision.
+pub const SL_LABELS: &[&str] = &["sl", "stop-loss"];
+
 /// Path-tool labels that mark an M / W reversal setup. The operator
 /// draws a 3-anchor PATH (runup start → first peak/trough → neckline
 /// retrace) and labels it `m` (double-top, short) or `w` (double-
@@ -120,6 +132,27 @@ mod tests {
     fn case_insensitive() {
         assert!(matches("NECKLINE", BREAK_LABELS));
         assert!(matches("Too-High", INVALIDATION_LABELS));
+    }
+
+    #[test]
+    fn matches_sl_labels() {
+        assert!(matches("sl", SL_LABELS));
+        assert!(matches("stop-loss", SL_LABELS));
+        assert!(matches("SL", SL_LABELS));
+        assert!(matches("  Stop-Loss  ", SL_LABELS));
+    }
+
+    /// A Note is free-form text, so the vocabulary must not swallow
+    /// commentary that merely *mentions* the stop. Whole-label match only —
+    /// otherwise a chart annotation would arm a real stop at whatever price
+    /// the operator happened to park the note at.
+    #[test]
+    fn sl_labels_reject_commentary() {
+        assert!(!matches("sl too tight, moved it", SL_LABELS));
+        assert!(!matches("stop-loss?", SL_LABELS));
+        assert!(!matches("slippage", SL_LABELS));
+        assert!(!matches("v2 entry\ncontinuation", SL_LABELS));
+        assert!(!matches("", SL_LABELS));
     }
 
     #[test]
