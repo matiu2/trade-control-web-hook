@@ -1724,9 +1724,42 @@ impl PriceAnchor {
 /// Reference to a price. Either anchored to the plaintext shell with a pip
 /// offset (TradingView fills in the anchor at fire time) or a fixed absolute
 /// price set at encode time (the worker uses it verbatim, ignoring the shell).
+///
+/// ## ⚠ Variant order is load-bearing
+///
+/// This enum is `#[serde(untagged)]`, so deserialization tries the variants
+/// **in declaration order** and takes the first that parses. `AbsoluteBuffered`
+/// is a superset of `Absolute`'s shape, so it MUST stay declared **first** —
+/// reorder them and a buffered SL parses as a bare `Absolute`, silently
+/// dropping the buffer and placing a live stop at the wrong price with no error
+/// anywhere. Pinned by `absolute_buffered_does_not_parse_as_absolute`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum PriceRef {
+    /// `{ absolute: 2.30380, offset_atr_pct: 50.0, sign: 1.0 }` — an absolute
+    /// price the operator **drew** (the `sl` chart Note, placed at the shoulder
+    /// or head), pushed clear of that level by a volatility-scaled buffer.
+    ///
+    /// The split of what's baked and what's deferred is deliberate:
+    ///
+    /// - `absolute` and `sign` are properties of the **setup**, so tv-arm bakes
+    ///   them at arm time. `sign` comes from the fib's direction (`+1.0` short
+    ///   → push the stop *up*, above the note; `-1.0` long → push it *down*),
+    ///   the same "always away from the pattern" convention
+    ///   [`PriceAnchor::buffer_sign`] encodes for anchored refs. It can't be
+    ///   derived here because an absolute price carries no anchor.
+    /// - `offset_atr_pct` is an **unsigned** magnitude resolved against
+    ///   `shell.atr` at fire time, because ATR is time-varying and must never be
+    ///   frozen into a plan (see the module docs on `tv-arm/src/plan_geometry.rs`;
+    ///   a baked buffer would also defeat `--spec-in` re-arms).
+    ///
+    /// A missing `shell.atr` rejects rather than falling back to the unbuffered
+    /// price — silently tightening a real stop is the worse failure.
+    AbsoluteBuffered {
+        absolute: f64,
+        offset_atr_pct: f64,
+        sign: f64,
+    },
     /// `{ absolute: 1.86236 }` — fixed price; shell ignored.
     Absolute { absolute: f64 },
     /// `{ from: signal_high, offset_atr_pct: 0.5 }` — anchor + an offset that
@@ -2058,6 +2091,11 @@ pub enum OffsetError {
     /// a short / failed broker feed — where a golden enter can't validly fire
     /// anyway. Reject this bar; the next tick recomputes ATR and retries.
     AtrUnavailable,
+    /// [`PriceRef::AbsoluteBuffered`]'s `sign` was not exactly `±1.0`. It is a
+    /// *direction* (which side of the drawn note the stop sits on), not a
+    /// second magnitude — anything else would silently rescale the buffer, and
+    /// `0.0`/`NaN` would quietly erase it.
+    InvalidBufferSign(f64),
 }
 
 impl core::fmt::Display for OffsetError {
@@ -2074,6 +2112,9 @@ impl core::fmt::Display for OffsetError {
             }
             Self::AtrUnavailable => {
                 f.write_str("offset_atr_pct set but ATR is unavailable (warmup / short feed)")
+            }
+            Self::InvalidBufferSign(v) => {
+                write!(f, "buffered-absolute sign must be +1.0 or -1.0, got {v}")
             }
         }
     }
@@ -2117,6 +2158,30 @@ pub fn resolve_offset(
     }
 }
 
+/// The signed price delta a [`PriceRef::AbsoluteBuffered`] adds to its drawn
+/// price: `sign × (offset_atr_pct / 100) × shell.atr`.
+///
+/// The sibling of [`resolve_offset`]'s ATR arm, differing only in where the
+/// sign comes from — an explicit field rather than [`PriceAnchor::buffer_sign`],
+/// because an absolute drawn price has no anchor to derive it from. The
+/// rejections are deliberately identical to that arm's, so a buffer behaves the
+/// same whether it hangs off an anchor or off a drawn level.
+fn buffer_delta(offset_atr_pct: f64, sign: f64, shell: &Shell) -> Result<f64, OffsetError> {
+    if !offset_atr_pct.is_finite() || offset_atr_pct < 0.0 {
+        return Err(OffsetError::NegativeAtrPct(offset_atr_pct));
+    }
+    if sign != 1.0 && sign != -1.0 {
+        return Err(OffsetError::InvalidBufferSign(sign));
+    }
+    // A zero-pct buffer is a legitimate "use the drawn price verbatim", so it
+    // must not require an ATR the shell may not have yet.
+    if offset_atr_pct == 0.0 {
+        return Ok(0.0);
+    }
+    let atr = shell.atr.ok_or(OffsetError::AtrUnavailable)?;
+    Ok(sign * (offset_atr_pct / 100.0) * atr)
+}
+
 impl PriceRef {
     /// Resolve to a concrete price. `Absolute` ignores the shell; `Anchored`
     /// resolves its offset via [`resolve_offset`] (ATR-pct preferred,
@@ -2125,6 +2190,11 @@ impl PriceRef {
     pub fn resolve(&self, shell: &Shell, pip_size: f64) -> Result<f64, OffsetError> {
         match self {
             PriceRef::Absolute { absolute } => Ok(*absolute),
+            PriceRef::AbsoluteBuffered {
+                absolute,
+                offset_atr_pct,
+                sign,
+            } => Ok(absolute + buffer_delta(*offset_atr_pct, *sign, shell)?),
             PriceRef::Anchored {
                 from,
                 offset_pips,
@@ -4823,5 +4893,161 @@ mod tests {
         let out = serde_yaml::to_string(&intent).unwrap();
         let back: Intent = serde_yaml::from_str(&out).unwrap();
         assert_eq!(intent.pip_size, back.pip_size);
+    }
+
+    // ---- `PriceRef::AbsoluteBuffered` — the drawn-`sl`-note stop ----------
+    //
+    // The operator drops a chart Note at the shoulder/head; tv-arm bakes that
+    // price plus the *sign* it derived from the fib, and defers the buffer's
+    // *magnitude* to fire time (ATR is time-varying — see the module docs on
+    // `tv-arm/src/plan_geometry.rs`).
+
+    /// A shell whose ATR is known, so the buffer has something to scale.
+    fn shell_with_atr(atr: f64) -> Shell {
+        Shell {
+            atr: Some(atr),
+            ..shell()
+        }
+    }
+
+    #[test]
+    fn absolute_buffered_pushes_a_short_stop_up() {
+        // Short → SL sits *above* the drawn note, so sign is +1: the stop
+        // clears the shoulder wick rather than resting exactly on it.
+        let sl = PriceRef::AbsoluteBuffered {
+            absolute: 2.30380,
+            offset_atr_pct: 50.0,
+            sign: 1.0,
+        };
+        // 50% of an 0.0020 ATR = 0.0010 above the note.
+        let got = sl.resolve(&shell_with_atr(0.0020), 0.0001).unwrap();
+        assert!(
+            (got - 2.30480).abs() < 1e-9,
+            "short stop should be buffered *above* the note, got {got}"
+        );
+    }
+
+    #[test]
+    fn absolute_buffered_pushes_a_long_stop_down() {
+        // Long → SL sits *below* the drawn note, so sign is −1. Mirror of the
+        // short case; a flat sign here would be a real bug (the stop would
+        // land inside the pattern instead of clear of it).
+        let sl = PriceRef::AbsoluteBuffered {
+            absolute: 2.30380,
+            offset_atr_pct: 50.0,
+            sign: -1.0,
+        };
+        let got = sl.resolve(&shell_with_atr(0.0020), 0.0001).unwrap();
+        assert!(
+            (got - 2.30280).abs() < 1e-9,
+            "long stop should be buffered *below* the note, got {got}"
+        );
+    }
+
+    #[test]
+    fn absolute_buffered_with_zero_pct_is_the_drawn_price() {
+        // Opting out of the buffer must give back exactly what was drawn —
+        // this is the "verbatim" behaviour, expressed as a zero magnitude.
+        let sl = PriceRef::AbsoluteBuffered {
+            absolute: 2.30380,
+            offset_atr_pct: 0.0,
+            sign: 1.0,
+        };
+        let got = sl.resolve(&shell_with_atr(0.0020), 0.0001).unwrap();
+        assert!((got - 2.30380).abs() < 1e-9, "got {got}");
+    }
+
+    #[test]
+    fn absolute_buffered_rejects_missing_atr() {
+        // ATR warmup / short feed. Loud failure, never a silent fallback to
+        // the unbuffered price — that would place a real stop tighter than
+        // the operator asked for, with no signal.
+        let sl = PriceRef::AbsoluteBuffered {
+            absolute: 2.30380,
+            offset_atr_pct: 50.0,
+            sign: 1.0,
+        };
+        assert!(matches!(
+            sl.resolve(&shell(), 0.0001),
+            Err(OffsetError::AtrUnavailable)
+        ));
+    }
+
+    #[test]
+    fn absolute_buffered_rejects_negative_pct() {
+        // The magnitude is unsigned — direction lives in `sign`. A negative
+        // pct would flip the stop to the wrong side of the note.
+        let sl = PriceRef::AbsoluteBuffered {
+            absolute: 2.30380,
+            offset_atr_pct: -10.0,
+            sign: 1.0,
+        };
+        assert!(matches!(
+            sl.resolve(&shell_with_atr(0.0020), 0.0001),
+            Err(OffsetError::NegativeAtrPct(_))
+        ));
+    }
+
+    #[test]
+    fn absolute_buffered_rejects_non_unit_sign() {
+        // `sign` is a direction, not a second magnitude. Anything but ±1
+        // would silently scale the buffer.
+        for bad in [0.0, 2.0, f64::NAN] {
+            let sl = PriceRef::AbsoluteBuffered {
+                absolute: 2.30380,
+                offset_atr_pct: 50.0,
+                sign: bad,
+            };
+            assert!(
+                matches!(
+                    sl.resolve(&shell_with_atr(0.0020), 0.0001),
+                    Err(OffsetError::InvalidBufferSign(_))
+                ),
+                "sign {bad} should be rejected"
+            );
+        }
+    }
+
+    /// **The untagged-order trap.** `PriceRef` is `#[serde(untagged)]`, so
+    /// serde takes the *first* variant that parses. If `AbsoluteBuffered` is
+    /// ever declared *after* `Absolute`, this payload parses as bare
+    /// `Absolute` and the buffer is silently dropped — a live stop at the
+    /// wrong price, with no error anywhere. This test is the tripwire.
+    #[test]
+    fn absolute_buffered_does_not_parse_as_absolute() {
+        let yaml = "absolute: 2.30380\noffset_atr_pct: 50.0\nsign: 1.0\n";
+        let parsed: PriceRef = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            matches!(parsed, PriceRef::AbsoluteBuffered { .. }),
+            "buffered SL parsed as the wrong variant — check that \
+             `AbsoluteBuffered` is declared BEFORE `Absolute`: {parsed:?}"
+        );
+    }
+
+    /// The other half of the wire contract: a plain `{absolute}` must keep
+    /// parsing as `Absolute`, or every already-signed plan in flight breaks.
+    #[test]
+    fn plain_absolute_still_parses_as_absolute() {
+        let parsed: PriceRef = serde_yaml::from_str("absolute: 1.86236\n").unwrap();
+        assert!(matches!(parsed, PriceRef::Absolute { .. }), "{parsed:?}");
+    }
+
+    #[test]
+    fn absolute_buffered_round_trips() {
+        let sl = PriceRef::AbsoluteBuffered {
+            absolute: 2.30380,
+            offset_atr_pct: 50.0,
+            sign: -1.0,
+        };
+        let out = serde_yaml::to_string(&sl).unwrap();
+        let back: PriceRef = serde_yaml::from_str(&out).unwrap();
+        // Compare through resolution — the shell-facing behaviour is what the
+        // wire has to preserve, not the field layout.
+        let atr_shell = shell_with_atr(0.0020);
+        assert_eq!(
+            sl.resolve(&atr_shell, 0.0001).unwrap(),
+            back.resolve(&atr_shell, 0.0001).unwrap(),
+            "buffered SL changed meaning across a wire round-trip:\n{out}"
+        );
     }
 }
