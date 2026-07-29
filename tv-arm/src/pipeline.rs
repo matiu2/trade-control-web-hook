@@ -202,6 +202,31 @@ fn freeze_setup(args: &Args, setup: &SetupInputs, path: &Path) -> Result<()> {
 /// validation gate that objects to one entry rule), and aborting on the first
 /// would throw away the cells that did work. Exit code is 0 only if every cell
 /// armed, so a driver can still trust it.
+/// Collect what this arm knew about itself, for a chained `--save` to record as
+/// the fixture's `arm` block.
+///
+/// Extracted from `arm_from_inputs` so it is **testable without a chart**. Every
+/// field here is a wire from an operator flag to a corpus column, and a severed
+/// wire is silent: the fixture still saves, still looks complete, and simply
+/// files itself under the wrong grid cell. That is precisely the failure a test
+/// has to be able to see, and it can't while the struct is built inline behind a
+/// live TradingView read.
+///
+/// `chart_symbol` is passed broker-qualified (`TRADENATION:EURUSD`) — a bare
+/// symbol silently resolves to the OANDA feed, so an unqualified capture can be
+/// off the wrong price data and still look perfectly plausible.
+fn arm_context<'a>(args: &'a Args, chart_symbol: &'a str) -> crate::replay::ArmContext<'a> {
+    crate::replay::ArmContext {
+        skip_bcr: args.skip_bcr,
+        strategy_v2: args.strategy_v2,
+        qm_entry: args.qm_entry,
+        skip_calendar_bars: args.skip_calendar_bars,
+        skip_golden: args.skip_golden,
+        start: args.start.as_deref(),
+        chart_symbol: Some(chart_symbol),
+    }
+}
+
 fn arm_the_matrix(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Result<i32> {
     let outcomes: Vec<save_matrix::CellOutcome> = save_matrix::GRID
         .iter()
@@ -767,14 +792,7 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
         // chart symbol (`TRADENATION:EURUSD`) — recorded qualified on purpose: a
         // bare symbol silently resolves to the OANDA feed, so an unqualified
         // capture can be off the wrong price data and look perfectly plausible.
-        let arm = crate::replay::ArmContext {
-            skip_bcr: args.skip_bcr,
-            strategy_v2: args.strategy_v2,
-            skip_calendar_bars: args.skip_calendar_bars,
-            skip_golden: args.skip_golden,
-            start: args.start.as_deref(),
-            chart_symbol: Some(&chart_symbol),
-        };
+        let arm = arm_context(args, &chart_symbol);
         crate::replay::run_replay(
             effective_plan_out.as_deref(),
             &trade_id,
@@ -2112,6 +2130,36 @@ mod tests {
             tokens[i + 1]
         );
         assert!(tokens.iter().any(|t| t == "--simulate"));
+    }
+
+    /// Every grid cell's flags must reach `ArmContext` and label themselves as
+    /// that cell.
+    ///
+    /// This pins the **wire**, not the endpoints. `Variant::apply` (which sets
+    /// the flags) and `entry_rule_label` (which reads them) are each tested on
+    /// their own, but neither notices if `arm_context` stops forwarding a field:
+    /// severing `qm_entry` here left all 359 tests green, and the only symptom
+    /// would have been every QM-market fixture quietly filing itself in the
+    /// `strategy-v2` column.
+    #[test]
+    fn every_grid_cell_labels_itself_through_the_arm_context() {
+        let base = sf_args(&[]);
+        for variant in crate::save_matrix::GRID.iter() {
+            let cell = variant.apply(&base);
+            let arm = arm_context(&cell, "TRADENATION:EURUSD");
+            assert_eq!(
+                arm.entry_rule_label(),
+                variant.entry_rule,
+                "cell {} must record itself as its own grid column",
+                variant.fixture_suffix()
+            );
+            assert_eq!(
+                arm.skip_calendar_bars,
+                variant.skip_calendar_bars,
+                "the news axis must reach the arm block for cell {}",
+                variant.fixture_suffix()
+            );
+        }
     }
 
     /// Without the flag nothing changes — the sugar must be inert when unused.

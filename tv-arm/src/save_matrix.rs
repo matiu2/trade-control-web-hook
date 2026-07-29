@@ -19,13 +19,21 @@
 //!
 //! ## The axes
 //!
-//! Three entry rules × news on/off = six cells:
+//! Four entry rules × news on/off = eight cells:
 //!
 //! | | news-on | news-off |
 //! |---|---|---|
 //! | **normal** | full gate chain | " |
 //! | **skip-bcr** | no preps | " |
-//! | **strategy-v2** | QM limit leg + confirming candle | " |
+//! | **strategy-v2** | QM **limit** leg + confirming candle | " |
+//! | **strategy-v2-qm-market** | QM **market** leg + confirming candle | " |
+//!
+//! The last two differ only in the QM leg's order type, and they answer
+//! different questions: the limit leg asks *"does waiting for the pullback pay
+//! for the fills it misses?"*, the market leg *"is the confirmation candle
+//! alone enough?"*. They are separate columns rather than one because folding
+//! them together would average a fill-rate difference into a returns
+//! difference and hide both.
 //!
 //! The cell names match [`EntryRule::label`] in the replay side's `arm_record`,
 //! because a batch tool groups on exactly that string. Renaming one without the
@@ -52,6 +60,10 @@ pub struct Variant {
     pub skip_bcr: bool,
     /// Arm the Quasimodo limit leg with a confirming candle (`--strategy-v2`).
     pub strategy_v2: bool,
+    /// Order type for the strategy-v2 QM leg (`--qm-entry`). `None` is the
+    /// default (limit). Only meaningful when `strategy_v2` is set — the flag
+    /// `requires = "strategy_v2"` at the clap layer.
+    pub qm_entry: Option<crate::args::QmEntry>,
     /// Skip the news calendar entirely (`--skip-calendar-bars`).
     pub skip_calendar_bars: bool,
 }
@@ -95,6 +107,7 @@ impl Variant {
         let mut args = base.clone();
         args.skip_bcr = self.skip_bcr;
         args.strategy_v2 = self.strategy_v2;
+        args.qm_entry = self.qm_entry;
         args.skip_calendar_bars = self.skip_calendar_bars;
         // The one expansion `apply_aliases` performs for these flags.
         if self.skip_bcr {
@@ -144,42 +157,65 @@ fn suffix_save_name(argv: &mut [String], suffix: &str) {
     }
 }
 
-/// The six cells, in a stable order so two matrix runs are diffable.
-pub const GRID: [Variant; 6] = [
+/// The eight cells, in a stable order so two matrix runs are diffable.
+pub const GRID: [Variant; 8] = [
     Variant {
         entry_rule: "normal",
         skip_bcr: false,
         strategy_v2: false,
+        qm_entry: None,
         skip_calendar_bars: false,
     },
     Variant {
         entry_rule: "normal",
         skip_bcr: false,
         strategy_v2: false,
+        qm_entry: None,
         skip_calendar_bars: true,
     },
     Variant {
         entry_rule: "skip-bcr",
         skip_bcr: true,
         strategy_v2: false,
+        qm_entry: None,
         skip_calendar_bars: false,
     },
     Variant {
         entry_rule: "skip-bcr",
         skip_bcr: true,
         strategy_v2: false,
+        qm_entry: None,
         skip_calendar_bars: true,
     },
     Variant {
         entry_rule: "strategy-v2",
         skip_bcr: false,
         strategy_v2: true,
+        // `None`, not `Some(Limit)`: limit IS the default, and leaving the flag
+        // off keeps this cell byte-identical to typing `--strategy-v2` alone —
+        // which is what every fixture captured before `--qm-entry` existed froze.
+        qm_entry: None,
         skip_calendar_bars: false,
     },
     Variant {
         entry_rule: "strategy-v2",
         skip_bcr: false,
         strategy_v2: true,
+        qm_entry: None,
+        skip_calendar_bars: true,
+    },
+    Variant {
+        entry_rule: "strategy-v2-qm-market",
+        skip_bcr: false,
+        strategy_v2: true,
+        qm_entry: Some(crate::args::QmEntry::Market),
+        skip_calendar_bars: false,
+    },
+    Variant {
+        entry_rule: "strategy-v2-qm-market",
+        skip_bcr: false,
+        strategy_v2: true,
+        qm_entry: Some(crate::args::QmEntry::Market),
         skip_calendar_bars: true,
     },
 ];
@@ -227,22 +263,24 @@ mod tests {
         Args::try_parse_from(["tv-arm"]).expect("parse")
     }
 
-    /// Six cells, six DISTINCT directory names.
+    /// Eight cells, eight DISTINCT directory names.
     ///
-    /// A convention that omitted the news axis would map six cells onto three
+    /// A convention that omitted the news axis would map eight cells onto four
     /// names, and the later saves would overwrite the earlier ones — half the
     /// grid gone, and it would still look complete.
     #[test]
     fn every_cell_has_a_distinct_fixture_name() {
         let names: std::collections::HashSet<String> =
             GRID.iter().map(|v| v.fixture_suffix()).collect();
-        assert_eq!(names.len(), 6, "colliding fixture names: {names:?}");
+        assert_eq!(names.len(), 8, "colliding fixture names: {names:?}");
         assert!(names.contains("normal-news-on"));
         assert!(names.contains("skip-bcr-news-off"));
         assert!(names.contains("strategy-v2-news-on"));
+        assert!(names.contains("strategy-v2-qm-market-news-on"));
+        assert!(names.contains("strategy-v2-qm-market-news-off"));
     }
 
-    /// The grid is exactly the 3×2 product — no duplicates, nothing missing.
+    /// The grid is exactly the 4×2 product — no duplicates, nothing missing.
     #[test]
     fn the_grid_is_the_full_product_of_both_axes() {
         let mut seen: Vec<(&str, bool)> = GRID
@@ -259,6 +297,8 @@ mod tests {
                 ("skip-bcr", true),
                 ("strategy-v2", false),
                 ("strategy-v2", true),
+                ("strategy-v2-qm-market", false),
+                ("strategy-v2-qm-market", true),
             ]
         );
     }
@@ -274,7 +314,10 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
-        assert_eq!(labels, vec!["normal", "skip-bcr", "strategy-v2"]);
+        assert_eq!(
+            labels,
+            vec!["normal", "skip-bcr", "strategy-v2", "strategy-v2-qm-market"]
+        );
     }
 
     /// `apply` sets the UNDERLYING flags, not just the alias.
@@ -332,6 +375,63 @@ mod tests {
         assert_eq!(args.skip_break_and_close, typed.skip_break_and_close);
         assert_eq!(args.skip_retest, typed.skip_retest);
         assert_eq!(args.require_confirmation, typed.require_confirmation);
+    }
+
+    /// The QM-market cell must be identical to typing
+    /// `--strategy-v2 --qm-entry market` by hand.
+    ///
+    /// The pairing is load-bearing: `--qm-entry` `requires = "strategy_v2"`, so a
+    /// cell that set `qm_entry` without `strategy_v2` describes a flag
+    /// combination clap would reject — it would never be caught here (the matrix
+    /// mutates a parsed `Args` rather than re-parsing) and would arm as something
+    /// no operator can type.
+    #[test]
+    fn qm_market_cell_matches_typing_the_flags() {
+        let v = GRID
+            .iter()
+            .find(|v| v.entry_rule == "strategy-v2-qm-market")
+            .expect("qm-market cell");
+        let args = v.apply(&base());
+        let typed = Args::try_parse_from(["tv-arm", "--strategy-v2", "--qm-entry", "market"])
+            .expect("the flag pair must be legal to type")
+            .apply_aliases();
+
+        assert_eq!(args.strategy_v2, typed.strategy_v2);
+        assert_eq!(args.qm_entry, typed.qm_entry);
+        assert_eq!(args.qm_entry, Some(crate::args::QmEntry::Market));
+        assert_eq!(args.skip_break_and_close, typed.skip_break_and_close);
+        assert_eq!(args.skip_retest, typed.skip_retest);
+        assert_eq!(args.require_confirmation, typed.require_confirmation);
+    }
+
+    /// The default-v2 cells must leave `--qm-entry` UNSET, not set it to `limit`.
+    ///
+    /// Limit is already the default, so both spell the same behaviour — but only
+    /// the unset form is byte-identical to the `--strategy-v2` arms captured
+    /// before `--qm-entry` existed. Setting it explicitly would make every old
+    /// fixture non-reproducible for no gain.
+    #[test]
+    fn the_plain_v2_cells_leave_qm_entry_unset() {
+        for v in GRID.iter().filter(|v| v.entry_rule == "strategy-v2") {
+            assert_eq!(
+                v.apply(&base()).qm_entry,
+                None,
+                "plain strategy-v2 must not pin --qm-entry"
+            );
+        }
+    }
+
+    /// Every cell that sets `qm_entry` must also set `strategy_v2` — the clap
+    /// `requires` relationship the matrix bypasses by mutating `Args` directly.
+    #[test]
+    fn no_cell_sets_qm_entry_without_strategy_v2() {
+        for v in GRID.iter().filter(|v| v.qm_entry.is_some()) {
+            assert!(
+                v.strategy_v2,
+                "{} sets --qm-entry without --strategy-v2, which clap forbids",
+                v.entry_rule
+            );
+        }
     }
 
     /// The same agreement check for `skip-bcr` — the cell must be identical to
@@ -401,8 +501,8 @@ mod tests {
 
         assert_eq!(
             names.iter().collect::<std::collections::HashSet<_>>().len(),
-            6,
-            "six cells must produce six distinct fixture names: {names:?}"
+            8,
+            "eight cells must produce eight distinct fixture names: {names:?}"
         );
         assert!(
             names.contains(&"trade-124-normal-news-on".to_string()),
@@ -410,6 +510,10 @@ mod tests {
         );
         assert!(
             names.contains(&"trade-124-strategy-v2-news-off".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"trade-124-strategy-v2-qm-market-news-on".to_string()),
             "{names:?}"
         );
     }
@@ -523,8 +627,8 @@ mod tests {
     /// A clean sweep says so without listing anything.
     #[test]
     fn a_full_sweep_lists_no_failures() {
-        let outcomes: Vec<CellOutcome> = (0..6).map(|i| cell(i, Ok(0))).collect();
+        let outcomes: Vec<CellOutcome> = (0..GRID.len()).map(|i| cell(i, Ok(0))).collect();
         let s = summarise(&outcomes);
-        assert_eq!(s, "save-matrix: 6/6 cell(s) armed");
+        assert_eq!(s, "save-matrix: 8/8 cell(s) armed");
     }
 }

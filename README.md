@@ -3285,7 +3285,7 @@ with no frozen equivalent.
 
 ### Capturing a trade for the corpus: `--save-fixture`
 
-The one-flag version. Reads the chart once, freezes the setup, arms all six
+The one-flag version. Reads the chart once, freezes the setup, arms all eight
 grid cells, and names everything for you:
 
 ```sh
@@ -3319,17 +3319,32 @@ human-paced part, and freezing it is what makes every later re-run free.
 
 ### The entry-sensitivity grid: `--save-matrix`
 
-The explicit form. Arms three entry rules (`normal` / `skip-bcr` /
-`strategy-v2`) × news calendar on/off — six cells — from a **single** chart
-read:
+The explicit form. Arms four entry rules × news calendar on/off — eight cells —
+from a **single** chart read:
+
+| entry rule | what it arms |
+|---|---|
+| `normal` | the full gate chain: break-and-close prep → retest prep → enter |
+| `skip-bcr` | both preps skipped; enter on the first qualifying signal |
+| `strategy-v2` | QM **limit** leg + confirming candle, alongside the BCR stop |
+| `strategy-v2-qm-market` | QM **market** leg + confirming candle |
 
 ```sh
 tv-arm --spec-out setups/trade-124.json --save-matrix \
   replay --save trade-124 --simulate true
-# → trade-124-{normal,skip-bcr,strategy-v2}-{news-on,news-off}
+# → trade-124-{normal,skip-bcr,strategy-v2,strategy-v2-qm-market}-{news-on,news-off}
 ```
 
-Reading once matters. Six separate `tv-arm` invocations would each re-classify
+The last two differ only in the QM leg's order type, and they answer different
+questions: the limit leg asks *"does waiting for the pullback pay for the fills
+it misses?"*, the market leg *"is the confirmation candle alone enough?"*. They
+are separate columns because folding them together would average a fill-rate
+difference into a returns difference and hide both. The plain `strategy-v2` cell
+leaves `--qm-entry` unset rather than passing `limit` explicitly — limit is
+already the default, and the unset form keeps the cell byte-identical to the
+`strategy-v2` fixtures captured before `--qm-entry` existed.
+
+Reading once matters. Eight separate `tv-arm` invocations would each re-classify
 roles against a chart that may have scrolled and re-read a calendar that may
 have moved, so the cells could differ by more than the flag under test — and the
 grid would be comparing *setups* rather than gates. One read means every cell
@@ -3338,11 +3353,13 @@ shares byte-identical geometry.
 It composes with `--spec-in`, which is the actual corpus workflow: confirm once
 on the chart, then regenerate the whole grid offline after any engine change.
 
-Each cell suffixes the replay's `--save` name, so six cells land in six
-directories rather than overwriting each other. A cell that fails to arm is
-recorded and the run continues (a variant can legitimately be rejected); the
-summary names what's missing, and the exit code is non-zero unless all six
-armed — a partial grid must not read as complete.
+Each cell suffixes the replay's `--save` name, so eight cells land in eight
+directories rather than overwriting each other, and records its own
+`arm.entry_rule` label so a batch tool groups columns from **data** rather than
+by parsing directory names. A cell that fails to arm is recorded and the run
+continues (a variant can legitimately be rejected); the summary names what's
+missing, and the exit code is non-zero unless all eight armed — a partial grid
+must not read as complete.
 
 ### Gotchas worth knowing
 

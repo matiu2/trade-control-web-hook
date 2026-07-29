@@ -53,6 +53,15 @@ fn replay_binary() -> String {
 pub struct ArmContext<'a> {
     pub skip_bcr: bool,
     pub strategy_v2: bool,
+    /// `--qm-entry` — which order type the strategy-v2 QM leg uses. `None` is the
+    /// default (limit), which the plain `strategy-v2` label already covers.
+    ///
+    /// Recorded because the QM leg's order type is a **separate axis** from the
+    /// entry rule: a market QM answers "is the confirmation candle alone enough?"
+    /// while the default limit asks "does waiting for the pullback pay for the
+    /// fills it misses?". Collapsing them into one label would average a
+    /// fill-rate difference into a returns difference.
+    pub qm_entry: Option<crate::args::QmEntry>,
     pub skip_calendar_bars: bool,
     pub skip_golden: bool,
     /// `--start` exactly as the operator typed it.
@@ -62,6 +71,34 @@ pub struct ArmContext<'a> {
 }
 
 impl ArmContext<'_> {
+    /// The grid-column label for this arm — the `--arm-entry-rule` value.
+    ///
+    /// **Must** match `EntryRule::parse`/`label` on the replay side
+    /// (`replay_candles::arm_record`), which is what a batch tool groups columns
+    /// on. A label that doesn't parse there degrades to `EntryRule::Other`,
+    /// which is recorded honestly but sits outside the known grid.
+    ///
+    /// The QM entry mode only qualifies the label when `strategy_v2` is on:
+    /// `--qm-entry` `requires = "strategy_v2"` at the clap layer, so the
+    /// combination can't otherwise occur, and reading it unconditionally would
+    /// invent labels for arms that never had a QM leg.
+    pub(crate) fn entry_rule_label(&self) -> String {
+        match (self.skip_bcr, self.strategy_v2) {
+            (true, false) => "skip-bcr".to_string(),
+            (false, true) => match self.qm_entry {
+                // The default QM leg is a limit, which is what plain
+                // `strategy-v2` has always meant — keep that label byte-identical
+                // so fixtures captured before `--qm-entry` existed still group
+                // into the same column.
+                None | Some(crate::args::QmEntry::Limit) => "strategy-v2".to_string(),
+                Some(crate::args::QmEntry::Market) => "strategy-v2-qm-market".to_string(),
+                Some(crate::args::QmEntry::Stop) => "strategy-v2-qm-stop".to_string(),
+            },
+            (true, true) => "skip-bcr+strategy-v2".to_string(),
+            (false, false) => "normal".to_string(),
+        }
+    }
+
     /// The `--arm-*` tokens to append. Empty when the passthrough has no
     /// `--save`, since every one of those flags `requires = "save"` and would be
     /// a clap error otherwise.
@@ -81,16 +118,7 @@ impl ArmContext<'_> {
                 out.push(value);
             }
         };
-        push_valued(
-            "--arm-entry-rule",
-            match (self.skip_bcr, self.strategy_v2) {
-                (true, false) => "skip-bcr",
-                (false, true) => "strategy-v2",
-                (true, true) => "skip-bcr+strategy-v2",
-                (false, false) => "normal",
-            }
-            .to_string(),
-        );
+        push_valued("--arm-entry-rule", self.entry_rule_label());
         if let Some(start) = self.start {
             push_valued("--arm-start", start.to_string());
         }
@@ -410,6 +438,71 @@ mod tests {
         );
         let parsed = ReplayArgs::try_parse_from(&argv).unwrap();
         assert_eq!(parsed.arm_entry_rule.as_deref(), Some("strategy-v2"));
+    }
+
+    /// `--qm-entry market` gets its OWN column label, distinct from the default
+    /// limit leg's.
+    ///
+    /// Without this the market cell records itself as plain `strategy-v2` and the
+    /// grid silently averages two different entry mechanics into one column.
+    #[test]
+    fn qm_market_records_its_own_entry_rule() {
+        let plan = PathBuf::from("/tmp/p.json");
+        let arm = ArmContext {
+            strategy_v2: true,
+            qm_entry: Some(crate::args::QmEntry::Market),
+            ..Default::default()
+        };
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &["--save".to_string(), "t".to_string()],
+            arm,
+        );
+        let parsed = ReplayArgs::try_parse_from(&argv).unwrap();
+        assert_eq!(
+            parsed.arm_entry_rule.as_deref(),
+            Some("strategy-v2-qm-market")
+        );
+    }
+
+    /// The DEFAULT QM leg (limit) keeps the plain `strategy-v2` label — both when
+    /// `--qm-entry` is absent and when it's explicitly `limit`.
+    ///
+    /// Load-bearing for continuity: every `strategy-v2` fixture captured before
+    /// `--qm-entry` existed froze the limit leg. If the label moved, those
+    /// fixtures would sit in a column the current code never writes to.
+    #[test]
+    fn the_default_qm_limit_leg_keeps_the_plain_v2_label() {
+        for qm_entry in [None, Some(crate::args::QmEntry::Limit)] {
+            let arm = ArmContext {
+                strategy_v2: true,
+                qm_entry,
+                ..Default::default()
+            };
+            assert_eq!(
+                arm.entry_rule_label(),
+                "strategy-v2",
+                "limit is the default; {qm_entry:?} must not rename the column"
+            );
+        }
+    }
+
+    /// `--qm-entry` only qualifies the label when `--strategy-v2` is on.
+    ///
+    /// Clap enforces `requires = "strategy_v2"`, so this pairing can't be typed —
+    /// but `ArmContext` is a plain struct a caller could fill in wrongly, and a
+    /// label like `strategy-v2-qm-market` on an arm with no QM leg would be a
+    /// silent lie in the corpus.
+    #[test]
+    fn qm_entry_without_strategy_v2_does_not_change_the_label() {
+        let arm = ArmContext {
+            strategy_v2: false,
+            qm_entry: Some(crate::args::QmEntry::Market),
+            ..Default::default()
+        };
+        assert_eq!(arm.entry_rule_label(), "normal");
     }
 
     /// An operator-supplied `--arm-*` must override ours, not collide with it —

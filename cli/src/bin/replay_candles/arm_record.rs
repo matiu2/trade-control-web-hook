@@ -46,6 +46,22 @@ pub enum EntryRule {
     SkipBcr,
     /// `--strategy-v2` — the Quasimodo limit leg, no preps, confirming candle.
     StrategyV2,
+    /// `--strategy-v2 --qm-entry market` — same as [`Self::StrategyV2`] except
+    /// the QM leg enters at **market** on the confirmation bar instead of resting
+    /// as a limit at the signal level.
+    ///
+    /// Its own column rather than a flavour of `strategy-v2`: the two answer
+    /// different questions. The limit leg asks "does waiting for the pullback pay
+    /// for the fills it misses?", the market leg "is the confirmation candle
+    /// alone enough?". Folding them together would average a fill-rate
+    /// difference into a returns difference and hide both.
+    StrategyV2QmMarket,
+    /// `--strategy-v2 --qm-entry stop` — the QM leg rests as a **stop** at
+    /// signal_low − buffer instead of a limit at the level.
+    ///
+    /// Not one of the standard grid cells, but reachable by hand, so it parses as
+    /// itself rather than degrading to [`Self::Other`].
+    StrategyV2QmStop,
     /// Something else (a future strategy, or a flag combination none of the above
     /// describes). Carries the raw label so an unrecognised variant is still
     /// *recorded* rather than silently mislabelled as `normal`.
@@ -59,6 +75,8 @@ impl EntryRule {
             Self::Normal => "normal",
             Self::SkipBcr => "skip-bcr",
             Self::StrategyV2 => "strategy-v2",
+            Self::StrategyV2QmMarket => "strategy-v2-qm-market",
+            Self::StrategyV2QmStop => "strategy-v2-qm-stop",
             Self::Other(s) => s,
         }
     }
@@ -76,6 +94,8 @@ impl EntryRule {
             None | Some("normal") => Self::Normal,
             Some("skip-bcr") => Self::SkipBcr,
             Some("strategy-v2") => Self::StrategyV2,
+            Some("strategy-v2-qm-market") => Self::StrategyV2QmMarket,
+            Some("strategy-v2-qm-stop") => Self::StrategyV2QmStop,
             Some(other) => Self::Other(other.to_string()),
         }
     }
@@ -158,6 +178,28 @@ mod tests {
         assert_eq!(EntryRule::parse(Some("normal")), EntryRule::Normal);
         assert_eq!(EntryRule::parse(Some("skip-bcr")), EntryRule::SkipBcr);
         assert_eq!(EntryRule::parse(Some("strategy-v2")), EntryRule::StrategyV2);
+        assert_eq!(
+            EntryRule::parse(Some("strategy-v2-qm-market")),
+            EntryRule::StrategyV2QmMarket
+        );
+    }
+
+    /// `strategy-v2-qm-market` must NOT collapse into `strategy-v2`.
+    ///
+    /// The labels share a prefix, so any parse written with `starts_with` (or a
+    /// `match` arm ordered the other way) would swallow the market cell into the
+    /// limit column — two variants averaged under one name, with nothing
+    /// reporting a problem.
+    #[test]
+    fn the_qm_market_label_is_not_swallowed_by_the_strategy_v2_prefix() {
+        assert_ne!(
+            EntryRule::parse(Some("strategy-v2-qm-market")),
+            EntryRule::StrategyV2
+        );
+        assert_eq!(
+            EntryRule::parse(Some("strategy-v2-qm-market")).label(),
+            "strategy-v2-qm-market"
+        );
     }
 
     /// `parse` is the inverse of `label` for every variant — the property that
@@ -168,6 +210,8 @@ mod tests {
             EntryRule::Normal,
             EntryRule::SkipBcr,
             EntryRule::StrategyV2,
+            EntryRule::StrategyV2QmMarket,
+            EntryRule::StrategyV2QmStop,
             EntryRule::Other("scaled-exit-80-90".into()),
         ] {
             assert_eq!(EntryRule::parse(Some(rule.label())), rule);
@@ -183,11 +227,16 @@ mod tests {
         assert_ne!(rule, EntryRule::Normal);
     }
 
-    /// The six cells of one trade's grid must produce six distinct keys.
+    /// The eight cells of one trade's grid must produce eight distinct keys.
     #[test]
-    fn the_six_grid_cells_have_distinct_keys() {
+    fn the_eight_grid_cells_have_distinct_keys() {
         let mut keys = Vec::new();
-        for rule in [EntryRule::Normal, EntryRule::SkipBcr, EntryRule::StrategyV2] {
+        for rule in [
+            EntryRule::Normal,
+            EntryRule::SkipBcr,
+            EntryRule::StrategyV2,
+            EntryRule::StrategyV2QmMarket,
+        ] {
             for skip_calendar_bars in [false, true] {
                 keys.push(
                     ArmRecord {
@@ -200,9 +249,10 @@ mod tests {
             }
         }
         let unique: std::collections::HashSet<_> = keys.iter().collect();
-        assert_eq!(unique.len(), 6, "six cells, six keys: {keys:?}");
+        assert_eq!(unique.len(), 8, "eight cells, eight keys: {keys:?}");
         assert!(keys.contains(&"normal/news-on".to_string()));
         assert!(keys.contains(&"strategy-v2/news-off".to_string()));
+        assert!(keys.contains(&"strategy-v2-qm-market/news-on".to_string()));
     }
 
     /// Round-trips through JSON, and the labels are the stable kebab-case forms a
@@ -224,6 +274,28 @@ mod tests {
         assert!(json.contains("\"skip-bcr\""), "kebab-case label: {json}");
         let back: ArmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(arm, back);
+    }
+
+    /// The serde spelling and the hand-written `label()` must agree.
+    ///
+    /// They are two independent renderings of the same variant: serde derives
+    /// `strategy-v2-qm-market` from `rename_all = "kebab-case"`, `label()` spells
+    /// it out. If they drift, a fixture serialises under one name and groups
+    /// under the other, and the grid quietly gains a phantom column.
+    #[test]
+    fn the_qm_market_serde_name_matches_its_label() {
+        let arm = ArmRecord {
+            entry_rule: EntryRule::StrategyV2QmMarket,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&arm).unwrap();
+        assert!(
+            json.contains("\"strategy-v2-qm-market\""),
+            "serde must spell it the same as label(): {json}"
+        );
+        let back: ArmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.entry_rule, EntryRule::StrategyV2QmMarket);
+        assert_eq!(back.entry_rule.label(), "strategy-v2-qm-market");
     }
 
     /// An `Other` variant survives the round-trip with its raw label — a future
