@@ -295,6 +295,36 @@ Things a refactorer must preserve:
 No SQL migration: the record persists as one `jsonb` body, so the new field is a
 `#[serde(default)]`.
 
+**Only `pending_lifecycle` talks to the broker about resting orders.** There is
+exactly one `list_pending_orders` call on the live path (`cancel_pass`). Spread
+hours and news pauses are *not* subsystems with their own broker access — they are
+`HoldReason` variants. Anything new that wants to hold resting orders belongs there
+as a variant, never as a second place that enumerates or cancels broker orders.
+
+**Per-instrument and per-trade reasons coexist on a per-trade record.**
+`SpreadHour` is per-instrument, `NewsPause` is per-trade, and the holder set lives
+on a per-trade record — which composes because `cancel_pass` iterates *every*
+resting order and derives the reasons per order. An instrument-scoped reason is
+**fanned out** to each affected trade (three EUR/USD trades in one spread hour ⇒
+three records, each holding `SpreadHour`), and release re-evaluates against each
+record's own `instrument`. Consequence: a hold is **trade-wide, never per-order**,
+so there is deliberately no per-order query API.
+
+**A failed cancel is classified, not swallowed (v121).** `CancelError` folds
+"already gone" in with a network blip, so when `cancel_order` errors the lifecycle
+re-looks-up via `Broker::lookup_attempt_state` — the re-lookup that error's own docs
+call for — and records a `CancelOutcome`:
+
+- `Vanished(why)` — filled, cancelled upstream, or not found ⇒ the `CancelledOrder`
+  is **pruned from the record**, because the OFF side would otherwise re-place an
+  entry whose original already filled.
+- `StillResting` — genuinely still there ⇒ entry kept, cancel retries next tick.
+- `Unresolved` — the lookup failed too ⇒ treated as still-resting (conservative),
+  reported distinctly so an outage doesn't masquerade as live orders.
+
+Every outcome lands in `LifecycleReport.cancel_failed`. Before this, a failed cancel
+appeared in *none* of the report's lists — invisible to the caller.
+
 ### "retry" / `max_retries` does NOT mean retrying failed placements
 
 This naming has bitten more than one debugging session. `max_retries`,

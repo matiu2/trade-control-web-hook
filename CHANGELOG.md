@@ -1,5 +1,52 @@
 # Changelog
 
+## v121 — 2026-07-30 — A failed cancel is classified, not swallowed
+
+**Why.** When `cancel_order` failed, `try_cancel_one` logged it and moved on —
+pushing **nothing** to the `LifecycleReport`. So a failed cancel appeared in neither
+`cancelled` nor `skipped`: invisible to the caller. Worse, the record still listed
+the order as cancelled, so if the cancel had failed because the order **already
+filled**, the OFF side would faithfully "restore" it — placing a fresh entry for a
+trade already in a position. DB state and broker state diverged silently.
+
+**What changed.** `CancelError` is a single `Transient` variant that deliberately
+folds "order already gone" together with a network blip, and its own docs say to
+treat the failure as "probably filled" and **re-lookup**. So the lifecycle now does
+exactly that, via `Broker::lookup_attempt_state`, and acts on the answer
+(`CancelOutcome`):
+
+- **`Vanished(why)`** — `OpenPosition` / `ClosedWin` / `ClosedLossOrBreakeven` /
+  `Cancelled` / `Unknown`: the order is no longer resting, so the `CancelledOrder` is
+  **pruned from the record** and its stored signed body deleted. Nothing to restore.
+  If that empties the record (no other cancelled orders, no widened stops) it is
+  cleared outright rather than left as a shell.
+- **`StillResting`** — `Pending`: the cancel genuinely failed. The entry is kept so
+  the next tick retries and the order stays restorable.
+- **`Unresolved`** — the lookup failed too. Treated as still-resting (conservative),
+  but reported distinctly so a lookup outage doesn't masquerade as a stream of live
+  orders.
+
+Every outcome now lands in the new `LifecycleReport.cancel_failed`, and the live
+watcher (`blackout_watch`) logs a per-account `warn!` when it is non-empty — a
+DB/broker disagreement on the money path deserves more than a per-order line.
+
+**Also documented** (no behaviour change, but non-obvious enough to have prompted the
+question): only `pending_lifecycle` talks to the broker about resting orders — there
+is exactly one `list_pending_orders` call on the live path, and the hold reasons are
+`HoldReason` variants rather than subsystems with their own broker access. And
+per-instrument (`SpreadHour`) and per-trade (`NewsPause`) reasons coexist on a
+per-trade record because `cancel_pass` derives the reasons **per resting order**, so
+an instrument-scoped reason is fanned out to each affected trade. Consequence: a hold
+is trade-wide, never per-order, so no per-order query API is needed.
+
+**Breaking.** `LifecycleReport` gains `cancel_failed`. New public `CancelOutcome`.
+
+**Tests.** 6 new: a filled order is reported *and* pruned; a still-resting order
+keeps its entry; an unresolvable lookup keeps it too; all four vanished states
+classify correctly; a successful cancel reports no failure. Verified by **mutation** —
+skipping the prune, and classifying everything as still-resting, each turn tests red.
+All 52 workspace suites green.
+
 ## v120 — 2026-07-30 — Resting-order holds become a shared refcount
 
 **Why.** v119 added the news pause as a second reason to pull a resting order, but
