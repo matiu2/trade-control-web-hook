@@ -1,7 +1,23 @@
 //! **The one shared resting-order lifecycle** — cancel a resting entry order
-//! through a spread-hour trough and re-drive it once the trough lifts, keyed off
-//! the single baked predicate
-//! [`spread_blackout::is_spread_hour`](crate::spread_blackout::is_spread_hour).
+//! through a period it must not be exposed to, and re-drive it once that period
+//! lifts. Two independent reasons pull an order ([`CancelReason`]):
+//!
+//! - **Spread hour** — the instrument entered its baked trough, keyed off
+//!   [`spread_blackout::is_spread_hour`](crate::spread_blackout::is_spread_hour).
+//!   Instrument-scoped, a pure function of the clock.
+//! - **News pause** — a `pause` standoff is armed for the order's *trade*
+//!   ([`pause_active`]). Trade-scoped, read from the store.
+//!
+//! The news half exists because a pause otherwise only blocked *new* entries
+//! (the `423 trade paused` gate at the head of [`run_enter`]) while leaving an
+//! already-resting order to sit through the event and fill on the spike — the
+//! 2026-07-30 bug. An entry we would refuse to place during a standoff is an
+//! entry we must not leave resting through one either.
+//!
+//! Both reasons are symmetric across ON and OFF: whatever can pull an order can
+//! also keep it pulled, so [`off_now`] will not re-place while *either* signal is
+//! still live. Asymmetry there would cancel an order and re-place it on the next
+//! tick, straight back into the window it was pulled from.
 //!
 //! This is the generic `core` home the live cron
 //! (`trade-control-cron::blackout_*`) and the offline replay both call, so the
@@ -13,6 +29,11 @@
 //! [`retry_gate::evaluate`](crate::retry_gate) already use.
 //!
 //! # The ON/OFF asymmetry (operator's framing — LOCKED)
+//!
+//! This asymmetry is about the **spread-hour** reason specifically. The news-pause
+//! reason has no such split: a pause is an explicit armed state in the store, so
+//! ON and OFF both read the same [`pause_active`] predicate and it is exact in
+//! replay and live alike.
 //!
 //! Turning spread-hour ON and OFF use **different** signals, on purpose:
 //!
@@ -160,8 +181,9 @@ pub struct LifecycleReport {
     pub cancelled: Vec<String>,
     /// `trade_id`s whose record was cleared this pass (OFF), with the reason.
     pub restored: Vec<(String, RestoreReason)>,
-    /// `order_id`s examined but left resting (no body, won't verify, not a
-    /// spread hour) — for visibility, not action.
+    /// `order_id`s examined but left resting (no body, won't verify, or neither
+    /// ON reason fired — no spread hour and no armed pause) — for visibility,
+    /// not action.
     pub skipped: Vec<String>,
 }
 
@@ -267,18 +289,39 @@ async fn cancel_pass<B: Broker, S: StateStore, V: VerifiedSource>(
         }
     };
     for order in &pendings {
-        // ON trigger — the pure baked clock, incl. the 30-min lead + NY-close
-        // fallback. NO live quote (the ON/OFF asymmetry).
-        if !is_spread_hour(&order.instrument, now) {
-            report.skipped.push(order.order_id.clone());
-            continue;
-        }
         try_cancel_one(broker, store, src, account, order, now, report).await;
+    }
+}
+
+/// Why a resting order is being pulled — the ON trigger, once one has fired.
+/// Both reasons cancel + back up identically; the distinction is for the log
+/// line, and (via [`off_now`]) for which signal must lift before the re-place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelReason {
+    /// The instrument entered its baked spread-hour trough (30-min lead
+    /// included). Instrument-scoped, pure clock, no store read.
+    SpreadHour,
+    /// A news standoff (`pause`) is armed for this order's trade. Trade-scoped.
+    NewsPause,
+}
+
+impl CancelReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SpreadHour => "spread-hour",
+            Self::NewsPause => "news-pause",
+        }
     }
 }
 
 /// Cancel + store a single resting order. Store-before-cancel (safety rail 1);
 /// no-recoverable-payload / won't-verify ⇒ leave resting (rails 2, 3).
+///
+/// The ON trigger is evaluated **inside** this fn rather than by the caller,
+/// because the news-pause half is keyed by `trade_id` — which only exists once
+/// the payload has been recovered through the [`VerifiedSource`] seam. The cheap
+/// instrument-only spread-hour test still short-circuits first, so a clean bar
+/// with no pause costs exactly one `get_order_body` read per resting order.
 async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
     broker: &B,
     store: &S,
@@ -289,6 +332,11 @@ async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
     report: &mut LifecycleReport,
 ) {
     let scope = account.unwrap_or("<global>");
+
+    // ON trigger, part 1 — the pure baked clock, incl. the 30-min lead + NY-close
+    // fallback. NO live quote (the ON/OFF asymmetry). Instrument-only, so it is
+    // tested before any store read; a hit here needs no pause lookup.
+    let spread_hour = is_spread_hour(&order.instrument, now);
 
     // The payload the live impl verifies: the store's `order:{id}` body. The
     // replay impl ignores it (uses its armed map). A store error is skip (can't
@@ -334,6 +382,20 @@ async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
         .trade_id
         .clone()
         .unwrap_or_else(|| order.order_id.clone());
+
+    // ON trigger, part 2 — a news standoff armed for THIS trade. Checked only
+    // when the spread-hour half missed, so a spread-hour cancel costs no extra
+    // store read. Neither reason firing ⇒ leave the order resting (this is the
+    // old `!is_spread_hour ⇒ skip` branch, now reason-complete).
+    let reason = if spread_hour {
+        CancelReason::SpreadHour
+    } else if pause_active(store, &trade_id).await {
+        CancelReason::NewsPause
+    } else {
+        report.skipped.push(order.order_id.clone());
+        return;
+    };
+
     let Some(pip_size) = verified
         .intent
         .pip_size
@@ -392,10 +454,11 @@ async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
         Ok(()) => {
             tracing::info!(
                 "pending-lifecycle[{scope}][{trade_id}]: cancelled resting {} order {} \
-                 (trigger={})",
+                 (trigger={}, reason={})",
                 if order.is_stop { "stop" } else { "limit" },
                 order.order_id,
                 order.trigger,
+                reason.as_str(),
             );
             report.cancelled.push(order.order_id.clone());
         }
@@ -531,7 +594,7 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verifi
     // spread recovered. This is the path that should restore AUD/CHF at the
     // 05:00Z block lift; because the record TTL now outlives its block (concern 1),
     // this wins BEFORE any expiry and long before the safety ceiling.
-    if off_now(broker, record, now).await {
+    if off_now(broker, store, record, now).await {
         // RAIL 6 — restore BEFORE clear.
         restore_cancelled_orders(broker, store, cfg_provider, src, record, now).await;
         finish_recover(
@@ -587,12 +650,52 @@ async fn finish_recover<S: StateStore>(
     }
 }
 
+/// Is a news standoff (`pause`) currently armed for this trade?
+///
+/// The second ON reason alongside `is_spread_hour`, and a veto on OFF. A pause is
+/// keyed `(trade_id, blackout_id)` and carries **no instrument**
+/// ([`PauseEntry`](crate::state::PauseEntry)) — deliberately, since it targets one
+/// setup rather than every order on the pair — so it can only be reached through
+/// a trade_id, which both call sites already have in hand (the ON side off the
+/// recovered `Verified`, the OFF side off the record).
+///
+/// A store error is treated as **paused** (`true`): on the ON side that is the
+/// safe direction only because the cancel is separately gated by rails 1–3, and
+/// on the OFF side it defers the restore by one tick rather than re-placing an
+/// order into a standoff we can't currently see. The 12h backstop remains the
+/// escape hatch if the store stays unreadable.
+async fn pause_active<S: StateStore>(store: &S, trade_id: &str) -> bool {
+    match store.list_pauses_for_trade(trade_id).await {
+        Ok(pauses) => !pauses.is_empty(),
+        Err(err) => {
+            tracing::error!(
+                "pending-lifecycle: list_pauses_for_trade({trade_id}) failed ({err}); treating as \
+                 PAUSED (hold the order rather than expose it to an unseen standoff)",
+            );
+            true
+        }
+    }
+}
+
 /// The OFF-side decision (excluding the backstop, handled by the caller):
-/// restore when the **live spread recovered** OR the **baked spread hour ended**.
+/// restore when the **live spread recovered** OR the **baked spread hour ended**
+/// — and, either way, only once **no news pause is still armed** for the trade.
 /// Live samples the quote (recovery, may un-block early); replay's quote is
 /// synthesised so it too can read recovery, but the baked-hour-end is the
 /// deterministic off-signal both share.
-async fn off_now<B: Broker>(broker: &B, record: &SpreadBlackoutRecord, now: DateTime<Utc>) -> bool {
+async fn off_now<B: Broker, S: StateStore>(
+    broker: &B,
+    store: &S,
+    record: &SpreadBlackoutRecord,
+    now: DateTime<Utc>,
+) -> bool {
+    // Pause veto FIRST — an armed news standoff holds the order back no matter
+    // what the spread says. Symmetric with the ON side: whatever can pull the
+    // order must also be able to keep it pulled, or a clean bar inside the
+    // standoff would re-place it on the very next tick.
+    if pause_active(store, &record.trade_id).await {
+        return false;
+    }
     // Baked-hour-end — the deterministic off-signal (replay + live). If the
     // instrument is no longer in a spread hour at `now`, the trough has lifted.
     if !is_spread_hour(&record.instrument, now) {
@@ -1114,9 +1217,15 @@ mod tests {
     #[test]
     fn off_now_true_when_baked_hour_ended() {
         let broker = MockBroker::default(); // no quote set
+        let store = MemStateStore::new(); // no pause armed
         let rec = applied_record("AUD/CHF", "2026-07-08T21:05:00Z");
         // Midday — no longer a spread hour → OFF regardless of any quote.
-        assert!(run(off_now(&broker, &rec, ts("2026-07-08T12:00:00Z"))));
+        assert!(run(off_now(
+            &broker,
+            &store,
+            &rec,
+            ts("2026-07-08T12:00:00Z")
+        )));
     }
 
     /// OFF fires EARLY (still inside the baked hour) when the LIVE spread has
@@ -1126,9 +1235,15 @@ mod tests {
     fn off_now_true_when_live_spread_recovered_inside_hour() {
         let broker = MockBroker::default();
         broker.set_quote(0.5600, 0.5602); // 2p spread ≤ 4p recovered cutoff
+        let store = MemStateStore::new(); // no pause armed
         let rec = applied_record("AUD/CHF", "2026-07-08T21:00:00Z");
         // Still inside the 21:00Z baked hour, but the live spread has calmed.
-        assert!(run(off_now(&broker, &rec, ts("2026-07-08T21:20:00Z"))));
+        assert!(run(off_now(
+            &broker,
+            &store,
+            &rec,
+            ts("2026-07-08T21:20:00Z")
+        )));
     }
 
     /// OFF does NOT fire inside the baked hour when the live spread is still
@@ -1137,13 +1252,20 @@ mod tests {
     fn off_now_false_inside_hour_with_wide_spread() {
         let broker = MockBroker::default();
         broker.set_quote(0.5590, 0.5602); // 12p spread, still blown
+        let store = MemStateStore::new(); // no pause armed
         let rec = applied_record("AUD/CHF", "2026-07-08T21:00:00Z");
-        assert!(!run(off_now(&broker, &rec, ts("2026-07-08T21:20:00Z"))));
+        assert!(!run(off_now(
+            &broker,
+            &store,
+            &rec,
+            ts("2026-07-08T21:20:00Z")
+        )));
 
         // No quote available → treated as "not yet recovered".
         let broker_noquote = MockBroker::default();
         assert!(!run(off_now(
             &broker_noquote,
+            &store,
             &rec,
             ts("2026-07-08T21:20:00Z")
         )));
@@ -1479,5 +1601,243 @@ mod tests {
         ));
         assert!(report.cancelled.is_empty());
         assert!(broker.cancel_calls.borrow().is_empty());
+    }
+
+    // --- news pause: a paused trade's resting order is pulled too ---
+
+    /// Arm a pause on trade `t` (the `trade_id` `armed_verified` bakes) so the
+    /// news-standoff branch of the ON trigger is live for that order.
+    async fn pause_trade(store: &MemStateStore, now: DateTime<Utc>) {
+        store
+            .set_pause("t", "cal-cpi-pause", Some("news:AUD/CHF"), now, 3600)
+            .await
+            .expect("set pause");
+    }
+
+    /// THE BUG (2026-07-30). A resting entry order on a trade whose news pause
+    /// is active must be CANCELLED, exactly as a spread hour cancels it —
+    /// otherwise it sits through the event and fills on the news spike while
+    /// `run_enter` is (correctly) rejecting new entries with 423. The bar here is
+    /// CLEAN (`!is_spread_hour`), so only the pause can drive the cancel.
+    #[test]
+    fn active_pause_cancels_the_resting_order_on_a_clean_bar() {
+        let broker = MockBroker::with_pending(pending("t-enter-o1", "AUD/CHF"));
+        let store = MemStateStore::new();
+        let mut armed = std::collections::HashMap::new();
+        armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
+        let source = ArmedSource { armed };
+
+        let now = ts("2026-07-08T12:00:00Z"); // clean bar — NOT a spread hour
+        store.set_clock(now);
+        let report = run(async {
+            pause_trade(&store, now).await;
+            pending_order_lifecycle(
+                &broker,
+                &store,
+                &StubCfg,
+                &source,
+                Some("reversals"),
+                now,
+                ClearPolicy::ClearRecord,
+            )
+            .await
+        });
+        assert_eq!(
+            report.cancelled,
+            vec!["t-enter-o1".to_string()],
+            "an active news pause must pull the resting order, like a spread hour does"
+        );
+        assert_eq!(
+            broker.cancel_calls.borrow().len(),
+            1,
+            "the broker cancel must have been issued"
+        );
+        // RAIL 1 — the crash-safe record was written before the cancel, so the
+        // OFF side can re-place the order when the pause lifts.
+        run(async {
+            let rec = store
+                .get_spread_blackout_record("t")
+                .await
+                .expect("record read")
+                .expect("a record was upserted before the cancel");
+            assert!(rec.applied);
+            assert_eq!(rec.cancelled_orders.len(), 1);
+            assert_eq!(rec.cancelled_orders[0].order_id, "t-enter-o1");
+        });
+    }
+
+    /// Scoping: the pause is keyed by `trade_id`, so a pause on a DIFFERENT
+    /// trade must not touch this order. Guards against the instrument-wide
+    /// widening that `core::state`'s `PauseEntry` docs explicitly reject.
+    #[test]
+    fn pause_on_another_trade_leaves_this_order_resting() {
+        let broker = MockBroker::with_pending(pending("t-enter-o1", "AUD/CHF"));
+        let store = MemStateStore::new();
+        let mut armed = std::collections::HashMap::new();
+        armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
+        let source = ArmedSource { armed };
+
+        let now = ts("2026-07-08T12:00:00Z"); // clean bar
+        store.set_clock(now);
+        let report = run(async {
+            // A pause on some OTHER setup on the same pair.
+            store
+                .set_pause("other-trade", "cal-cpi-pause", None, now, 3600)
+                .await
+                .expect("set pause");
+            pending_order_lifecycle(
+                &broker,
+                &store,
+                &StubCfg,
+                &source,
+                Some("reversals"),
+                now,
+                ClearPolicy::ClearRecord,
+            )
+            .await
+        });
+        assert!(
+            report.cancelled.is_empty(),
+            "a pause is trade-scoped — another trade's pause must not pull this order"
+        );
+        assert!(broker.cancel_calls.borrow().is_empty());
+    }
+
+    /// OFF side: while the pause is STILL ACTIVE the record must not restore,
+    /// even though the bar is clean (`!is_spread_hour`, which alone would have
+    /// returned true). Without this the order would be re-placed on the very
+    /// next cron tick — straight back into the news window it was pulled from.
+    #[test]
+    fn off_now_false_while_pause_still_active() {
+        let broker = MockBroker::default();
+        let store = MemStateStore::new();
+        let rec = applied_record("AUD/CHF", "2026-07-08T11:55:00Z");
+        let now = ts("2026-07-08T12:00:00Z"); // clean bar — spread side says OFF
+        store.set_clock(now);
+        let held = run(async {
+            store
+                .set_pause(&rec.trade_id, "cal-cpi-pause", None, now, 3600)
+                .await
+                .expect("set pause");
+            off_now(&broker, &store, &rec, now).await
+        });
+        assert!(
+            !held,
+            "an active pause must hold the order back even on a clean bar"
+        );
+    }
+
+    /// RAIL 5 still holds over a pause: the 12h backstop force-restores even
+    /// while a pause is armed. `pause_active` fails CLOSED (a store error reads
+    /// as paused), so without an escape hatch a stuck pause row — or a store
+    /// that never answers — would pin the order forever. The backstop is checked
+    /// independently of `off_now`, so it remains that hatch.
+    #[test]
+    fn backstop_restores_even_while_paused() {
+        let broker = MockBroker::default(); // no quote → never "recovered"
+        let store = MemStateStore::new();
+        let rec = applied_record("AUD/CHF", "2026-07-08T21:05:00Z");
+        // > 12h after opened_at, and a pause is STILL armed.
+        let now = ts("2026-07-09T21:30:00Z");
+        store.set_clock(now);
+        run(async {
+            store
+                .upsert_spread_blackout_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
+                .await
+                .expect("upsert record");
+            store
+                .set_pause(&rec.trade_id, "stuck-pause", None, now, 86_400)
+                .await
+                .expect("set pause");
+            // Precondition: the normal OFF path is genuinely blocked by the pause.
+            assert!(
+                !off_now(&broker, &store, &rec, now).await,
+                "the pause must be holding OFF back, or this test proves nothing"
+            );
+            let mut report = LifecycleReport::default();
+            recover_one(
+                &broker,
+                &store,
+                &StubCfg,
+                &src(),
+                &rec,
+                now,
+                ClearPolicy::ClearRecord,
+                &mut report,
+            )
+            .await;
+            assert_eq!(
+                report.restored,
+                vec![("t-off".to_string(), RestoreReason::Backstop)],
+                "the 12h backstop must still free a record wedged behind a pause"
+            );
+        });
+    }
+
+    /// The twin: once the pause is CLEARED the same record restores on the same
+    /// clean bar — so the pause genuinely gates OFF rather than wedging it.
+    #[test]
+    fn off_now_true_once_pause_cleared() {
+        let broker = MockBroker::default();
+        let store = MemStateStore::new();
+        let rec = applied_record("AUD/CHF", "2026-07-08T11:55:00Z");
+        let now = ts("2026-07-08T12:00:00Z");
+        store.set_clock(now);
+        let off = run(async {
+            store
+                .set_pause(&rec.trade_id, "cal-cpi-pause", None, now, 3600)
+                .await
+                .expect("set pause");
+            store
+                .clear_pause(&rec.trade_id, "cal-cpi-pause")
+                .await
+                .expect("clear pause");
+            off_now(&broker, &store, &rec, now).await
+        });
+        assert!(off, "pause cleared + clean bar ⇒ restore");
+    }
+
+    /// End-to-end through the shared lifecycle: pause active ⇒ cancelled and NOT
+    /// restored in the same pass. Proves `cancel_pass` and `recover_pass` agree
+    /// on the pause (a mismatch would cancel then immediately re-place).
+    #[test]
+    fn paused_order_is_not_restored_in_the_same_pass() {
+        let broker = MockBroker::with_pending(pending("t-enter-o1", "AUD/CHF"));
+        let store = MemStateStore::new();
+        let mut armed = std::collections::HashMap::new();
+        armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
+        let source = ArmedSource { armed };
+
+        let now = ts("2026-07-08T12:00:00Z"); // clean bar
+        store.set_clock(now);
+        let report = run(async {
+            pause_trade(&store, now).await;
+            pending_order_lifecycle(
+                &broker,
+                &store,
+                &StubCfg,
+                &source,
+                Some("reversals"),
+                now,
+                ClearPolicy::ClearRecord,
+            )
+            .await
+        });
+        assert_eq!(report.cancelled, vec!["t-enter-o1".to_string()]);
+        assert!(
+            report.restored.is_empty(),
+            "must not restore while the pause that caused the cancel is still active"
+        );
+        // The record survives for the post-pause restore.
+        run(async {
+            assert!(
+                store
+                    .get_spread_blackout_record("t")
+                    .await
+                    .expect("record read")
+                    .is_some(),
+                "the record must outlive the pause so the order can be re-placed"
+            );
+        });
     }
 }
