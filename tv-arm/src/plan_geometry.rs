@@ -155,6 +155,24 @@ pub struct PlanGeometry {
     /// long. A horizontal, so one price.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalidation: Option<f64>,
+    /// The stop-loss price the operator drew as an `sl` chart Note, when one is
+    /// present — see [`crate::sl_note`]. `None` (the common case) leaves the SL
+    /// geometry-anchored to the pattern extreme, exactly as before this field
+    /// existed.
+    ///
+    /// This IS setup geometry and so belongs here: it is a level the operator
+    /// chose for *this* pattern, and a `--spec-in` re-arm that lost it would
+    /// silently fall back to the anchored default — a different stop, no error,
+    /// no empty case. That is precisely the dropped-field failure this struct's
+    /// module docs warn about (`sr_levels` carries the same warning for the same
+    /// reason).
+    ///
+    /// Only the *price* is frozen. The buffer pushing the stop clear of that
+    /// level is ATR-scaled and resolved at fire time
+    /// ([`trade_control_core::intent::PriceRef::AbsoluteBuffered`]) — ATR is
+    /// time-varying and must not be frozen, per this module's scope rule above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_loss: Option<f64>,
     /// The fib's head and neckline readings, already resolved through the fib's
     /// `reverse` flag (NOT point order — that distinction caused two
     /// wrong-direction bugs; see `Drawing::fib_head_neckline`).
@@ -218,6 +236,12 @@ impl PlanGeometry {
                 .invalidation
                 .as_ref()
                 .and_then(|d| d.points.first().map(|p| p.price)),
+            // Not readable here: the `sl` Note is scoped by a window that needs
+            // the chart's bar size, which this pure function doesn't take. The
+            // pipeline layers it on via `with_sl_note` immediately after this
+            // call — see that method for why it's a separate step and not a
+            // later mutation.
+            stop_loss: None,
             // Resolved via the fib's `reverse` flag, not point order.
             fib_head_neckline: roles.tp_fib.as_ref().and_then(|d| d.fib_head_neckline()),
             // `time_trigger` was `points.first()?.time`.
@@ -272,6 +296,43 @@ impl PlanGeometry {
                 .filter_map(|d| d.points.first().map(|p| p.price))
                 .collect(),
         }
+    }
+
+    /// Resolve the operator's `sl` chart Note into [`Self::stop_loss`], scoped to
+    /// this setup's own time window.
+    ///
+    /// Split out of [`Self::from_roles`] rather than folded into it because the
+    /// window needs the chart's **bar size** (the lead is five *bars*, so it
+    /// scales with the timeframe) and `from_roles` is deliberately pure over
+    /// `Roles` alone. Kept as a consuming builder — not a `&mut` setter called
+    /// later — so the geometry is still finished in one expression at the single
+    /// extraction point, and a caller can't accidentally observe a
+    /// half-populated `PlanGeometry`.
+    ///
+    /// The window bounds come from geometry already resolved on `self` (the
+    /// fib's earliest anchor via `fib_earliest`, and `trade_expiry_epoch`), so
+    /// the scoping can't disagree with the rest of the plan.
+    ///
+    /// Returns `Err` when the chart is ambiguous (two `sl` Notes inside the
+    /// window) or a note's anchor is unreadable — the operator drew a stop, so
+    /// failing to resolve it must be loud, never a silent fall back to the
+    /// anchored default.
+    pub fn with_sl_note(
+        mut self,
+        notes: &[trading_view::drawings::Drawing],
+        fib_earliest: Option<i64>,
+        bar_seconds: i64,
+    ) -> color_eyre::eyre::Result<Self> {
+        let Some(window) =
+            crate::sl_note::sl_note_window(fib_earliest, self.trade_expiry_epoch, bar_seconds)
+        else {
+            // No computable window → the note can't be scoped to this setup, and
+            // an unscoped note is the stale-drawing hazard itself. Leave the SL
+            // geometry-anchored.
+            return Ok(self);
+        };
+        self.stop_loss = crate::sl_note::pick_sl_note(notes, window)?;
+        Ok(self)
     }
 
     /// The expiry epoch for a named prep step, if drawn.
@@ -488,6 +549,10 @@ mod tests {
                 b: Anchor::new(2000, 1.12),
             }),
             invalidation: Some(1.1500),
+            // Set deliberately: this round-trip IS the `--spec-in` freeze
+            // guarantee, and a drawn stop that didn't survive it would silently
+            // fall back to the anchored default on re-arm.
+            stop_loss: Some(1.1650),
             fib_head_neckline: Some((1.0800, 1.1000)),
             trade_expiry_epoch: Some(1784620800),
             prep_expiry_epochs: vec![("retest".into(), 1784600000)],

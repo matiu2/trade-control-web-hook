@@ -486,7 +486,28 @@ fn read_setup_from_chart(args: &Args) -> Result<(SetupInputs, Roles)> {
     //     an identical arm with no TradingView.
     // `roles` is still needed below for the things that AREN'T geometry: the
     // calendar windows it carries, the drawn S/R levels, and the position tool.
-    let geom = PlanGeometry::from_roles(&roles);
+    //
+    // The `sl` Note is layered on in the same expression (see `with_sl_note`):
+    // it's setup geometry like the rest, but scoping it to this setup needs the
+    // chart's bar size, which `from_roles` deliberately doesn't take. Its window
+    // starts a few *bars* before the fib, so the fib's earliest anchor is the
+    // reference — read off the same resolved `tp_fib` drawing the geometry uses.
+    let fib_earliest = roles
+        .tp_fib
+        .as_ref()
+        .map(|d| d.earliest_time())
+        .filter(|t| *t > 0);
+    // An unsupported resolution yields no bar size, so `with_sl_note` declines
+    // to read a note rather than guessing one — the arm is rejected downstream
+    // with a better message than anything we could produce here.
+    let bar_seconds = resolution_to_granularity(&state.resolution)
+        .map(|g| g.seconds())
+        .unwrap_or(0);
+    let geom = PlanGeometry::from_roles(&roles).with_sl_note(
+        &roles.sl_notes,
+        fib_earliest,
+        bar_seconds,
+    )?;
 
     // The as-of instant elapsed control windows are pruned against. Live
     // (`--register-plan`) prunes against wall-clock now; an offline replay

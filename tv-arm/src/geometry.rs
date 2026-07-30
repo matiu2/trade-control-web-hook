@@ -92,6 +92,32 @@ pub fn price_within_fib_range(price: f64, head: f64, neckline: f64) -> bool {
     price >= lo && price <= hi
 }
 
+/// Is `price` a plausible stop-loss for a trade in `direction` — i.e. on the
+/// **protective** side of the neckline (the opposite side from the take-profit)?
+///
+/// A short's TP sits below the neckline, so its stop belongs *above* it; a long
+/// mirrors. This is the geometric sanity check for an operator-drawn `sl` chart
+/// Note: a note left over from an earlier, opposite-direction setup would
+/// otherwise arm a stop on the profit side of the pattern, which is not a stop
+/// at all — it would close the trade for a loss the moment it went right.
+///
+/// The neckline is the reference rather than the entry price because the entry
+/// isn't known at arm time (it resolves against the live shell), whereas the
+/// neckline is fixed setup geometry. Deliberately a *side* test, not a distance
+/// one: how far past the neckline a stop belongs is the operator's call.
+///
+/// Returns `false` when either input is non-finite, or the price sits exactly on
+/// the neckline (a zero-risk stop is not a stop).
+pub fn sl_on_protective_side(price: f64, neckline: f64, direction: Direction) -> bool {
+    if !price.is_finite() || !neckline.is_finite() {
+        return false;
+    }
+    match direction {
+        Direction::Short => price > neckline,
+        Direction::Long => price < neckline,
+    }
+}
+
 /// Single horizontal-line price (the only point's price).
 ///
 /// Returns `f64::NAN` when the slice is empty.
@@ -226,5 +252,31 @@ mod tests {
         // Non-finite inputs are rejected, not accepted.
         assert!(!price_within_fib_range(f64::NAN, 1.20, 1.10));
         assert!(!price_within_fib_range(1.15, f64::NAN, 1.10));
+    }
+
+    #[test]
+    fn short_stop_belongs_above_the_neckline() {
+        // H&S short: TP is below the neckline, so the protective side is above.
+        assert!(sl_on_protective_side(1.15, 1.10, Direction::Short));
+        assert!(!sl_on_protective_side(1.05, 1.10, Direction::Short));
+    }
+
+    #[test]
+    fn long_stop_belongs_below_the_neckline() {
+        assert!(sl_on_protective_side(1.05, 1.10, Direction::Long));
+        assert!(!sl_on_protective_side(1.15, 1.10, Direction::Long));
+    }
+
+    #[test]
+    fn a_stop_exactly_on_the_neckline_is_not_a_stop() {
+        // Zero risk distance — almost certainly a misplaced note.
+        assert!(!sl_on_protective_side(1.10, 1.10, Direction::Short));
+        assert!(!sl_on_protective_side(1.10, 1.10, Direction::Long));
+    }
+
+    #[test]
+    fn non_finite_sl_inputs_are_rejected() {
+        assert!(!sl_on_protective_side(f64::NAN, 1.10, Direction::Short));
+        assert!(!sl_on_protective_side(1.15, f64::NAN, Direction::Short));
     }
 }

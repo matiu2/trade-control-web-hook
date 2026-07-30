@@ -35,8 +35,8 @@
 use color_eyre::eyre::Result;
 use tracing::{debug, info, warn};
 use trade_control_conventions::{
-    BREAK_LABELS, INVALIDATION_LABELS, RETEST_LABELS, SR_LEVEL_LABELS, TRADE_EXPIRY_LABELS,
-    matches, prep_name_from_expiry_label,
+    BREAK_LABELS, INVALIDATION_LABELS, RETEST_LABELS, SL_LABELS, SR_LEVEL_LABELS,
+    TRADE_EXPIRY_LABELS, matches, prep_name_from_expiry_label,
 };
 
 use trading_view::drawings::{Drawing, DrawingStub};
@@ -62,6 +62,11 @@ mod kind {
     pub const SHORT_POSITION: &str = "short_position";
     /// TradingView long-position tool. Same shape as `SHORT_POSITION`.
     pub const LONG_POSITION: &str = "long_position";
+    /// TradingView Note tool. Carries free-form `text` and two anchors (the
+    /// placed point, then the text box's opposite corner). Used for the `sl`
+    /// stop-loss note here, and for the `start` replay cursor in
+    /// [`super::super::start_note`].
+    pub const TEXT_NOTE: &str = "text_note";
 }
 
 /// Direction a position-tool drawing represents, read straight from the
@@ -96,6 +101,15 @@ pub struct Roles {
     /// Raw invalidation label, kept verbatim so downstream code can
     /// derive both the direction and the basename without reparsing.
     pub invalidation_label: Option<String>,
+    /// Every chart Note labelled `sl` / `stop-loss`, left **unresolved**.
+    ///
+    /// Deliberately not narrowed to one here, unlike every other single-slot
+    /// role. The `sl` note is scoped by the *setup's own* time window
+    /// (`[fib_earliest − 5 bars, trade_expiry]`), and computing that window
+    /// needs the chart's bar size — which `classify` has no access to. So the
+    /// candidates are collected here and [`crate::sl_note`] picks among them in
+    /// the pipeline, where the granularity is known.
+    pub sl_notes: Vec<Drawing>,
     /// Trend line for the neckline / break-and-close prep.
     pub break_and_close: Option<Drawing>,
     /// Trend line for the retest prep.
@@ -172,6 +186,8 @@ pub fn classify<F: DrawingFetcher>(
     let mut tp_fibs: Vec<Drawing> = Vec::new();
     let mut trade_expiries: Vec<Drawing> = Vec::new();
     let mut sr_levels: Vec<Drawing> = Vec::new();
+    // `sl` Notes: collected unresolved (see `Roles::sl_notes`).
+    let mut sl_notes: Vec<Drawing> = Vec::new();
     // Prep-expiry lines, grouped by resolved canonical prep step so a
     // duplicate (re-armed) line keeps only the latest per step.
     let mut prep_expiry_lines: Vec<(&'static str, Drawing)> = Vec::new();
@@ -209,6 +225,13 @@ pub fn classify<F: DrawingFetcher>(
             kind::HORIZONTAL_LINE if matches(lbl, SR_LEVEL_LABELS) => {
                 sr_levels.push(d);
                 Some("sr_level")
+            }
+            // Collected, not resolved: picking among these needs the setup's
+            // time window, which needs a bar size `classify` doesn't have. See
+            // `Roles::sl_notes`.
+            kind::TEXT_NOTE if matches(lbl, SL_LABELS) => {
+                sl_notes.push(d);
+                Some("sl_note")
             }
             kind::TREND_LINE if matches(lbl, BREAK_LABELS) => {
                 break_lines.push(d);
@@ -344,6 +367,7 @@ pub fn classify<F: DrawingFetcher>(
     // `classify` leaves `roles.blackout_pairs` / `news_pairs` empty here; there
     // is no readback, no independent start/end pruning, and no split-pair abort.
     roles.sr_levels = sr_levels;
+    roles.sl_notes = sl_notes;
     roles.prep_expiries = latest_prep_expiry_per_step(prep_expiry_lines);
     // M/W paths are already in-window-filtered by `is_mw_path`, so latest-wins
     // among qualifiers is correct in both modes (the window filter inside

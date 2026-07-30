@@ -54,6 +54,22 @@ const TEXT_NOTE_KIND: &str = "text_note";
 /// the window far enough to catch the previous setup's leftovers.
 pub const SL_NOTE_LEAD_BARS: i64 = 5;
 
+/// Default ATR-percent buffer pushing a drawn `sl` stop clear of the level the
+/// Note names.
+///
+/// The operator places the Note *at* the shoulder or head, so the stop belongs a
+/// little past that wick rather than exactly on it — resting exactly on a wick
+/// is the stop most likely to be clipped by the noise that formed the wick in
+/// the first place. Matches `DEFAULT_BUFFER_ATR_PCT`, the same fraction the
+/// pattern-anchored SL already uses, so a drawn stop and an anchored one sit the
+/// same distance clear of their level.
+///
+/// Resolved against the live ATR at fire time, never baked (see
+/// [`trade_control_core::intent::PriceRef::AbsoluteBuffered`]). Override
+/// per-arm with `--sl-note-buffer-atr-pct`; `0` opts out and uses the drawn
+/// price verbatim.
+pub const DEFAULT_SL_NOTE_BUFFER_ATR_PCT: f64 = 0.5;
+
 /// The time window an `sl` Note must be anchored inside to count for this
 /// setup: `[fib_earliest − SL_NOTE_LEAD_BARS × bar_seconds, trade_expiry]`.
 ///
@@ -107,7 +123,7 @@ pub fn resolve_sl_from_note<F: DrawingFetcher>(
 
 /// Pure picker over already-fetched Note drawings — the testable core of
 /// [`resolve_sl_from_note`]. `notes` should already be the `text_note` subset.
-fn pick_sl_note(notes: &[Drawing], (from, to): (i64, i64)) -> Result<Option<f64>> {
+pub(crate) fn pick_sl_note(notes: &[Drawing], (from, to): (i64, i64)) -> Result<Option<f64>> {
     let labelled: Vec<&Drawing> = notes
         .iter()
         .filter(|d| matches(d.label(), SL_LABELS))

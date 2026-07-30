@@ -287,7 +287,10 @@ pub fn build_mw_trade_spec(
         tp_price: round5(anchors.neckline),
         // M/W anchors SL via the worker-computed geometry, not an
         // absolute drawn stop.
+        // M/W geometry is worker-computed; the `sl` Note is an H&S-path
+        // feature, so no drawn stop here.
         sl_price: None,
+        sl_price_buffer_atr_pct: None,
         entry_deadline_pct: 80,
         allow_entry: args.entry_filter_script.clone(),
         // M/W entry is always a stop order at the worker-computed level;

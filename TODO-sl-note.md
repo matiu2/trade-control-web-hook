@@ -58,35 +58,39 @@ resolution path.
 
 ## Commits
 
-- [ ] **1 — core: `PriceRef::AbsoluteBuffered`**
-  - [ ] variant declared **above** `Absolute`; `{absolute, offset_atr_pct, sign}`
-  - [ ] `PriceRef::resolve` arm: `absolute + sign × (pct/100) × shell.atr`
-  - [ ] reuse `OffsetError::AtrUnavailable` / `NegativeAtrPct` — no new error type,
+- [x] **1 — core: `PriceRef::AbsoluteBuffered`**
+  - [x] variant declared **above** `Absolute`; `{absolute, offset_atr_pct, sign}`
+  - [x] `PriceRef::resolve` arm: `absolute + sign × (pct/100) × shell.atr`
+  - [x] reuse `OffsetError::AtrUnavailable` / `NegativeAtrPct` — no new error type,
         no silent fallback when ATR is missing (loud failure, per house rule)
-  - [ ] tests: resolves both directions; ATR-missing rejects; negative pct rejects;
+  - [x] tests: resolves both directions; ATR-missing rejects; negative pct rejects;
         **untagged-order test**; old `Absolute` / `Anchored` round-trip unchanged
-- [ ] **2 — conventions: `SL_LABELS`**
-  - [ ] `&["sl", "stop-loss"]` in `conventions/src/labels.rs`
-  - [ ] NOTE: `matches()` is exact-match; real notes are multi-line
-        (`"v2 entry\ncontinuation"` seen on the live chart). Decide + test:
-        exact-match only, or first-line match. Exact keeps it unambiguous.
-- [ ] **3 — tv-arm: read the note**
-  - [ ] new `tv-arm/src/sl_note.rs` (own module, one idea — mirrors `start_note.rs`)
-  - [ ] filter stubs to `text_note`, match label, bound by
+- [x] **2 — conventions: `SL_LABELS`**
+  - [x] `&["sl", "stop-loss"]` in `conventions/src/labels.rs`
+  - [x] RESOLVED: exact whole-label match, the same contract `start_note`
+        uses. Real notes are multi-line (`"v2 entry\ncontinuation"` is on the
+        live chart) and must not collide; `sl too tight, moved it` is
+        commentary. Pinned by `sl_labels_reject_commentary`.
+- [x] **3 — tv-arm: read the note**
+  - [x] new `tv-arm/src/sl_note.rs` (own module, one idea — mirrors `start_note.rs`)
+  - [x] filter stubs to `text_note`, match label, bound by
         `[fib_earliest − 5×bar_seconds, trade_expiry]`
-  - [ ] 0 → `None`; 2+ → error; 1 → `points[0].price`
-  - [ ] tests: in/out of window, duplicate, missing anchor, degenerate point
-- [ ] **4 — tv-arm: wire into the H&S spec**
-  - [ ] `Roles.sl_note` + `PlanGeometry.stop_loss` (frozen — a drawn price is
+  - [x] 0 → `None`; 2+ → error; 1 → `points[0].price`
+  - [x] tests: in/out of window, duplicate, missing anchor, degenerate point
+- [x] **4 — tv-arm: wire into the H&S spec**
+  - [x] `Roles.sl_notes` + `PlanGeometry.stop_loss` (frozen — a drawn price is
         setup geometry, so it MUST be in `PlanGeometry` or `--spec-in` re-arms
         lose it; see the dropped-field pattern that has bitten 3× already)
-  - [ ] wrong-side check against direction → hard error
-  - [ ] `TradeSpec.sl_price` + new `sl_buffer_atr_pct`, both → `AbsoluteBuffered`
-  - [ ] tests: short/long correct side, wrong side rejected, absent = unchanged
-- [ ] **5 — docs + fixture**
-  - [ ] README (wire format + operator workflow), CLAUDE.md hazards section
-  - [ ] CHANGELOG entry, `vNN` tag
-  - [ ] replay fixture proving the buffered SL resolves in replay too
+  - [x] wrong-side check against direction → hard error
+  - [x] `TradeSpec.sl_price` + new `sl_price_buffer_atr_pct`, both → `AbsoluteBuffered`
+  - [x] tests: short/long correct side, wrong side rejected, absent = unchanged
+- [x] **5 — docs + fixture**
+  - [x] README (wire format + operator workflow), CLAUDE.md hazards section
+  - [x] CHANGELOG entry, `vNN` tag
+  - [ ] **NOT DONE** — replay fixture exercising a buffered SL end-to-end.
+        Parity is *structural* (one `PriceRef::resolve`, shared by worker and
+        replay) and unit-tested, but no fixture drives a drawn stop through a
+        full replay yet. Worth adding on the first real `sl`-note setup.
 
 ## Verification
 
@@ -96,3 +100,23 @@ wrong-side check; each must turn a test red. If it doesn't, the test is
 scaffolding, not behaviour.
 
 Then: `cargo clippy` + `cargo fmt` per crate, dry-run on demo before live.
+
+## Outcome
+
+All five commits landed; `v118` tagged. One box is deliberately **not** ticked:
+no replay fixture exercises a buffered SL end-to-end yet (see commit 5).
+
+**Deviation from the original plan, worth knowing.** The note candidates are
+collected *unresolved* onto `Roles.sl_notes` and picked in the pipeline via
+`PlanGeometry::with_sl_note`, rather than resolved inside `classify` like every
+other single-slot role. `classify` has no access to the chart's bar size, and the
+window's lead is measured in *bars* so it scales with the timeframe. Threading
+granularity through `classify` would have touched all its call sites for one
+role; `with_sl_note` is a consuming builder called in the same expression as
+`from_roles`, so the geometry is still finished at a single extraction point and
+no caller can observe a half-populated `PlanGeometry`.
+
+**Pre-existing failure, not ours.** `replay_candles::fixture::tests::all_fixtures_match_expected`
+fails on the `eur-usd-h1-2026-07-22-skip-bcr-news-off` fixture. Verified
+identical on `main` with this branch's changes stashed — it arrived with commit
+`bf260c8` and is untouched by this work.

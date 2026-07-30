@@ -332,6 +332,20 @@ pub struct Args {
     #[arg(long)]
     pub cross_buffer_atr: Option<f64>,
 
+    /// Buffer, as a **percent of ATR**, keeping a stop drawn as an `sl` chart
+    /// Note *clear* of the level it names. Default 0.5 — the same fraction the
+    /// pattern-anchored SL already uses, so a drawn stop and an anchored one sit
+    /// the same distance clear of their level.
+    ///
+    /// The Note marks the shoulder or head, and a stop resting exactly on that
+    /// wick is the one most likely to be clipped by the noise that formed it.
+    /// Direction is automatic — above the level for a short, below for a long.
+    /// Pass `0` to use the drawn price verbatim. Resolved against the live ATR
+    /// at fire time, so it self-scales with volatility. No effect unless an `sl`
+    /// Note is on the chart.
+    #[arg(long)]
+    pub sl_note_buffer_atr_pct: Option<f64>,
+
     /// Require the break-and-close (`03`) and retest (`04`) candles to be
     /// **golden** — the crossing bar's full range (`high − low`) must be at
     /// least the Wilder ATR at that bar. A weak, indecisive bar that merely
