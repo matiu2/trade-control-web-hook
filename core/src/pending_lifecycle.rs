@@ -131,7 +131,7 @@ use crate::spread_blackout::{
     SAFETY_FORCE_RESTORE_SECONDS, SPREAD_BLACKOUT_RECOVERED_PIPS, is_spread_hour,
     spread_block_ttl_seconds,
 };
-use crate::state::{CancelledOrder, SpreadBlackoutRecord, StateStore};
+use crate::state::{CancelledOrder, HeldTradeRecord, StateStore};
 
 /// The one backend seam this function still needs: resolve the per-enter
 /// [`DispatchConfig`] (risk caps, pip/tick fallback, per-account caps) at the
@@ -292,7 +292,7 @@ pub enum RestoreReason {
     Recovered,
 }
 
-/// Who owns deleting the per-trade [`SpreadBlackoutRecord`] after the OFF-side
+/// Who owns deleting the per-trade [`HeldTradeRecord`] after the OFF-side
 /// restore. The record can carry BOTH System 3 (cancelled resting orders, which
 /// this fn restores) AND System 2 (widened open-position stops, which this fn
 /// does NOT touch). Whoever restores System 2 must clear the record — so the
@@ -512,7 +512,7 @@ async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
     // RAIL 1 — STORE FIRST (crash-safe): merge a CancelledOrder onto the
     // per-trade record, set `applied`, preserve any widened-stop originals,
     // and upsert BEFORE cancelling.
-    let existing = match store.get_spread_blackout_record(&trade_id).await {
+    let existing = match store.get_held_trade_record(&trade_id).await {
         Ok(r) => r,
         Err(err) => {
             tracing::error!(
@@ -538,7 +538,7 @@ async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
     // TTL = block length + grace (concern 1), keyed off the record's own
     // `opened_at` so it matches the `expires_at` the merge stamped.
     let ttl = spread_block_ttl_seconds(&order.instrument, record.opened_at);
-    if let Err(err) = store.upsert_spread_blackout_record(&record, ttl).await {
+    if let Err(err) = store.upsert_held_trade_record(&record, ttl).await {
         tracing::error!(
             "pending-lifecycle[{scope}]: upsert_record({trade_id}) FAILED ({err}); NOT cancelling \
              (no durable record ⇒ would strand the order)",
@@ -632,7 +632,7 @@ async fn classify_cancel_failure<B: Broker>(broker: &B, order: &PendingOrder) ->
 /// left as an empty shell that the OFF side would keep re-examining.
 async fn drop_cancelled_order<S: StateStore>(
     store: &S,
-    record: &SpreadBlackoutRecord,
+    record: &HeldTradeRecord,
     order_id: &str,
     ttl: u64,
 ) {
@@ -641,9 +641,9 @@ async fn drop_cancelled_order<S: StateStore>(
 
     let result = if pruned.cancelled_orders.is_empty() && pruned.original_stops.is_empty() {
         // Nothing left to restore on either system — don't leave a shell behind.
-        store.clear_spread_blackout_record(&pruned.trade_id).await
+        store.clear_held_trade_record(&pruned.trade_id).await
     } else {
-        store.upsert_spread_blackout_record(&pruned, ttl).await
+        store.upsert_held_trade_record(&pruned, ttl).await
     };
     if let Err(err) = result {
         tracing::error!(
@@ -672,7 +672,7 @@ fn account_id_of(account: Option<&str>) -> &str {
 /// not restore the order.
 #[allow(clippy::too_many_arguments)]
 fn merge_cancelled_order(
-    existing: Option<SpreadBlackoutRecord>,
+    existing: Option<HeldTradeRecord>,
     trade_id: &str,
     instrument: &str,
     account: Option<&str>,
@@ -680,8 +680,8 @@ fn merge_cancelled_order(
     cancelled: CancelledOrder,
     holding: &Holders,
     now: DateTime<Utc>,
-) -> SpreadBlackoutRecord {
-    let mut record = existing.unwrap_or_else(|| SpreadBlackoutRecord {
+) -> HeldTradeRecord {
+    let mut record = existing.unwrap_or_else(|| HeldTradeRecord {
         trade_id: trade_id.to_string(),
         instrument: instrument.to_string(),
         account: account.map(|s| s.to_string()),
@@ -728,7 +728,7 @@ fn merge_cancelled_order(
 /// `list_pending_orders(account_id)`): the caller passes ONE account's broker,
 /// so recover must only touch THAT account's records — else the live multi-account
 /// cron would `off_now`/re-drive account-Y's records against account-X's broker.
-/// `store.list_all_spread_blackout_records` is store-wide, so we filter by
+/// `store.list_all_held_trade_records` is store-wide, so we filter by
 /// `record.account == account`. The replay passes `account = None` and its records
 /// carry `account = None`, so its behaviour is unchanged.
 #[allow(clippy::too_many_arguments)]
@@ -742,7 +742,7 @@ async fn recover_pass<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verif
     clear_policy: ClearPolicy,
     report: &mut LifecycleReport,
 ) {
-    let records = match store.list_all_spread_blackout_records().await {
+    let records = match store.list_all_held_trade_records().await {
         Ok(v) => v,
         Err(err) => {
             tracing::error!("pending-lifecycle: list records failed: {err}");
@@ -780,7 +780,7 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verifi
     store: &S,
     cfg_provider: &P,
     src: &V,
-    record: &SpreadBlackoutRecord,
+    record: &HeldTradeRecord,
     now: DateTime<Utc>,
     clear_policy: ClearPolicy,
     report: &mut LifecycleReport,
@@ -819,7 +819,7 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verifi
         let mut narrowed = record.clone();
         narrowed.holders = surviving.clone();
         let ttl = spread_block_ttl_seconds(&record.instrument, record.opened_at);
-        if let Err(err) = store.upsert_spread_blackout_record(&narrowed, ttl).await {
+        if let Err(err) = store.upsert_held_trade_record(&narrowed, ttl).await {
             // Non-fatal: the reason will be re-evaluated next tick and the backstop
             // still bounds the worst case. Loud, because a persistently failing
             // write means partial releases aren't sticking.
@@ -863,7 +863,7 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verifi
 /// restore DID occur, and the report is the caller's signal that it did.
 async fn finish_recover<S: StateStore>(
     store: &S,
-    record: &SpreadBlackoutRecord,
+    record: &HeldTradeRecord,
     clear_policy: ClearPolicy,
     reason: RestoreReason,
     report: &mut LifecycleReport,
@@ -917,7 +917,7 @@ async fn pause_active<S: StateStore>(store: &S, trade_id: &str) -> bool {
 /// A quote error means "not yet recovered", so we wait for the hour end / backstop.
 async fn spread_hour_released<B: Broker>(
     broker: &B,
-    record: &SpreadBlackoutRecord,
+    record: &HeldTradeRecord,
     now: DateTime<Utc>,
 ) -> bool {
     // Baked-hour-end — the deterministic off-signal (replay + live).
@@ -949,7 +949,7 @@ async fn spread_hour_released<B: Broker>(
 async fn release_satisfied<B: Broker, S: StateStore>(
     broker: &B,
     store: &S,
-    record: &SpreadBlackoutRecord,
+    record: &HeldTradeRecord,
     now: DateTime<Utc>,
 ) -> (Holders, bool) {
     let mut holders = effective_holders(record);
@@ -978,7 +978,7 @@ async fn release_satisfied<B: Broker, S: StateStore>(
 ///
 /// Only reachable during the deploy window (holder rows are TTL'd, minutes to
 /// hours), but the failure mode it prevents is placing live orders into a blackout.
-fn effective_holders(record: &SpreadBlackoutRecord) -> Holders {
+fn effective_holders(record: &HeldTradeRecord) -> Holders {
     if record.applied && record.holders.is_empty() {
         let mut healed = Holders::new();
         healed.hold(HoldReason::SpreadHour);
@@ -999,7 +999,7 @@ async fn restore_cancelled_orders<
     store: &S,
     cfg_provider: &P,
     src: &V,
-    record: &SpreadBlackoutRecord,
+    record: &HeldTradeRecord,
     now: DateTime<Utc>,
 ) {
     for cancelled in &record.cancelled_orders {
@@ -1025,7 +1025,7 @@ async fn restore_one_order<B: Broker, S: StateStore, P: EnterConfigProvider, V: 
     store: &S,
     cfg_provider: &P,
     src: &V,
-    record: &SpreadBlackoutRecord,
+    record: &HeldTradeRecord,
     cancelled: &CancelledOrder,
     now: DateTime<Utc>,
 ) -> Result<(), String> {
@@ -1149,8 +1149,8 @@ async fn cleanup_body<S: StateStore>(store: &S, order_id: &str) {
 }
 
 /// Clear the record after restore. Returns `true` on success (for the report).
-async fn clear<S: StateStore>(store: &S, record: &SpreadBlackoutRecord) -> bool {
-    match store.clear_spread_blackout_record(&record.trade_id).await {
+async fn clear<S: StateStore>(store: &S, record: &HeldTradeRecord) -> bool {
+    match store.clear_held_trade_record(&record.trade_id).await {
         Ok(()) => true,
         Err(err) => {
             tracing::error!(
@@ -1503,14 +1503,14 @@ mod tests {
     async fn off(
         broker: &MockBroker,
         store: &MemStateStore,
-        rec: &SpreadBlackoutRecord,
+        rec: &HeldTradeRecord,
         now: DateTime<Utc>,
     ) -> bool {
         release_satisfied(broker, store, rec, now).await.1
     }
 
-    fn applied_record(instrument: &str, opened: &str) -> SpreadBlackoutRecord {
-        SpreadBlackoutRecord {
+    fn applied_record(instrument: &str, opened: &str) -> HeldTradeRecord {
+        HeldTradeRecord {
             trade_id: "t-off".into(),
             instrument: instrument.into(),
             account: None,
@@ -1616,7 +1616,7 @@ mod tests {
         store.set_clock(now);
         run(async {
             store
-                .upsert_spread_blackout_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
+                .upsert_held_trade_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
                 .await
                 .expect("upsert record");
             let mut report = LifecycleReport::default();
@@ -1661,7 +1661,7 @@ mod tests {
         store.set_clock(now);
         run(async {
             store
-                .upsert_spread_blackout_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
+                .upsert_held_trade_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
                 .await
                 .expect("upsert record");
             let mut report = LifecycleReport::default();
@@ -1686,7 +1686,7 @@ mod tests {
             // The record is LEFT for the caller — NOT deleted here — AND it still
             // carries its widened stop, so the watcher can restore System 2.
             let still_there = store
-                .get_spread_blackout_record("t-off")
+                .get_held_trade_record("t-off")
                 .await
                 .expect("record read")
                 .expect(
@@ -1713,7 +1713,7 @@ mod tests {
         store.set_clock(now);
         run(async {
             store
-                .upsert_spread_blackout_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
+                .upsert_held_trade_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
                 .await
                 .expect("upsert record");
             let mut report = LifecycleReport::default();
@@ -1733,7 +1733,7 @@ mod tests {
                 vec![("t-off".to_string(), RestoreReason::Recovered)]
             );
             let gone = store
-                .get_spread_blackout_record("t-off")
+                .get_held_trade_record("t-off")
                 .await
                 .expect("record read");
             assert!(gone.is_none(), "ClearRecord deletes the record");
@@ -1830,10 +1830,7 @@ mod tests {
         );
         // And the crash-safe record was written (store-before-cancel, RAIL 1).
         run(async {
-            let rec = store
-                .get_spread_blackout_record("t")
-                .await
-                .expect("record read");
+            let rec = store.get_held_trade_record("t").await.expect("record read");
             let rec = rec.expect("a record was upserted before the cancel");
             assert!(rec.applied);
             assert_eq!(rec.cancelled_orders.len(), 1);
@@ -1956,7 +1953,7 @@ mod tests {
         // OFF side can re-place the order when the pause lifts.
         run(async {
             let rec = store
-                .get_spread_blackout_record("t")
+                .get_held_trade_record("t")
                 .await
                 .expect("record read")
                 .expect("a record was upserted before the cancel");
@@ -2044,7 +2041,7 @@ mod tests {
         store.set_clock(now);
         run(async {
             store
-                .upsert_spread_blackout_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
+                .upsert_held_trade_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
                 .await
                 .expect("upsert record");
             store
@@ -2134,7 +2131,7 @@ mod tests {
         run(async {
             assert!(
                 store
-                    .get_spread_blackout_record("t")
+                    .get_held_trade_record("t")
                     .await
                     .expect("record read")
                     .is_some(),
@@ -2153,7 +2150,7 @@ mod tests {
 
     /// A record held by BOTH reasons, as the ON side would have written it when
     /// the pause arrived partway through the spread hour.
-    fn held_by_both(instrument: &str, opened: &str) -> SpreadBlackoutRecord {
+    fn held_by_both(instrument: &str, opened: &str) -> HeldTradeRecord {
         let mut rec = applied_record(instrument, opened);
         rec.holders = Holders::new();
         rec.holders.hold(HoldReason::SpreadHour);
@@ -2394,10 +2391,7 @@ mod tests {
         );
         // The record must no longer list the order — nothing to restore.
         run(async {
-            let rec = store
-                .get_spread_blackout_record("t")
-                .await
-                .expect("record read");
+            let rec = store.get_held_trade_record("t").await.expect("record read");
             match rec {
                 None => {} // pruned to nothing and cleared — also correct
                 Some(r) => assert!(
@@ -2421,7 +2415,7 @@ mod tests {
         );
         run(async {
             let rec = store
-                .get_spread_blackout_record("t")
+                .get_held_trade_record("t")
                 .await
                 .expect("record read")
                 .expect("the record must survive — the order is still out there");
@@ -2446,7 +2440,7 @@ mod tests {
         );
         run(async {
             let rec = store
-                .get_spread_blackout_record("t")
+                .get_held_trade_record("t")
                 .await
                 .expect("record read")
                 .expect("conservative: keep the record when we can't tell");

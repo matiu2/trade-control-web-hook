@@ -1,5 +1,52 @@
 # Changelog
 
+## v122 — 2026-07-30 — `SpreadBlackoutRecord` → `HeldTradeRecord`
+
+**Why.** The type long outgrew its name. It began as a spread-hour recovery record;
+since v120 it carries the resting-order **hold refcount**, whose reasons include a
+news pause — nothing to do with spreads. Anyone reading `SpreadBlackoutRecord` and
+finding `HoldReason::NewsPause` inside it has to stop and re-derive that the name is
+just historical.
+
+**What changed.** Pure rename, no behaviour change:
+
+- `SpreadBlackoutRecord` → **`HeldTradeRecord`**. Both things it remembers for
+  restoration — widened open-position stops (System 2, `original_stops`) and
+  cancelled pending orders (System 3, `cancelled_orders`) — are "what this trade is
+  holding", so the name follows the refcount's vocabulary rather than either payload.
+  (`PendingOrderControl` was considered and rejected: it reads as pending-orders-only
+  and would exclude the open-position stops that are half the payload.)
+- Store methods `*_spread_blackout_record*` → `*_held_trade_record*`.
+- Table `spread_blackout_record` → `held_trade_record`, plus its index and
+  primary-key constraint, in new migration **`0005_held_trade_record.sql`**.
+
+**NOT renamed:** `SpreadBlackoutWindow` (the global singleton) and the
+per-instrument `blackout_windows` table. Those are genuinely spread / market-hours
+concepts.
+
+**Migration notes.** `0001_state.sql` is **unchanged** — sqlx checksums applied
+migrations, so editing it would fail every already-migrated database on boot. It
+still creates the table under the old name; `0005` renames it. `ALTER TABLE ...
+RENAME` **preserves rows**, so in-flight holds survive the deploy — dropping them
+would strand every currently-cancelled resting order until its 12h backstop. The
+file is idempotent (`IF EXISTS` throughout, plus a `CREATE TABLE IF NOT EXISTS`
+guard) so it applies cleanly to a fresh database too.
+
+**Verified against a real Postgres**, not just compiled: seeded an in-flight record
+(two holders + a cancelled order) under the old name, applied `0005`, and confirmed
+the row survived intact with both holders and its cancelled order; confirmed the
+index *and* pkey now carry the new name; confirmed `blackout_windows` /
+`spread_blackout_window` were untouched; and booted the real worker to confirm the
+sqlx migrator validates the checksum ("Postgres connected + migrated"). Re-running
+is a no-op.
+
+**Also fixed:** the `gc_expired` TTL table list picked up the new name — a miss there
+silently leaks expired rows forever.
+
+**Tests.** No new behaviour, so no new tests; all 52 workspace suites green,
+including the store conformance suite that round-trips the record through every
+backend.
+
 ## v121 — 2026-07-30 — A failed cancel is classified, not swallowed
 
 **Why.** When `cancel_order` failed, `try_cancel_one` logged it and moved on —

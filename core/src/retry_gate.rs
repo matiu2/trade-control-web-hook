@@ -960,25 +960,25 @@ mod tests {
         ) -> Result<Vec<crate::intent::NoEntryWindow>, StateError> {
             Ok(Vec::new())
         }
-        async fn upsert_spread_blackout_record(
+        async fn upsert_held_trade_record(
             &self,
-            _record: &crate::state::SpreadBlackoutRecord,
+            _record: &crate::state::HeldTradeRecord,
             _ttl_seconds: u64,
         ) -> Result<(), StateError> {
             Ok(())
         }
-        async fn get_spread_blackout_record(
+        async fn get_held_trade_record(
             &self,
             _trade_id: &str,
-        ) -> Result<Option<crate::state::SpreadBlackoutRecord>, StateError> {
+        ) -> Result<Option<crate::state::HeldTradeRecord>, StateError> {
             Ok(None)
         }
-        async fn list_all_spread_blackout_records(
+        async fn list_all_held_trade_records(
             &self,
-        ) -> Result<Vec<crate::state::SpreadBlackoutRecord>, StateError> {
+        ) -> Result<Vec<crate::state::HeldTradeRecord>, StateError> {
             Ok(Vec::new())
         }
-        async fn clear_spread_blackout_record(&self, _trade_id: &str) -> Result<(), StateError> {
+        async fn clear_held_trade_record(&self, _trade_id: &str) -> Result<(), StateError> {
             Ok(())
         }
         async fn get_mw_state(

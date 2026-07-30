@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn absent_field_decodes_to_empty() {
-        // The `#[serde(default)]` path on SpreadBlackoutRecord: a pre-v120 row has
+        // The `#[serde(default)]` path on HeldTradeRecord: a pre-v120 row has
         // no `holders` key at all.
         let h: Holders = serde_json::from_str("[]").expect("empty array");
         assert!(h.is_empty());
