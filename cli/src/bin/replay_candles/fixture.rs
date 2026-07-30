@@ -98,9 +98,16 @@ pub struct FixtureMeta {
 }
 
 /// The golden snapshot of a replay: every fire's decision, what the run earned,
-/// the terminal flag/phase, and the deduped warnings. Equality is by serialized
-/// JSON (floats compare exactly as written), which is what the test harness
-/// asserts.
+/// the terminal flag/phase, and the deduped warnings.
+///
+/// **Compare with [`super::golden_eq::outcome_matches`], not `==`.** The derived
+/// `PartialEq` is bit-exact on `f64`, and the capture path (`--save`) and the
+/// check path (`--check` / the fixture test) legitimately disagree in the last
+/// bit or two — 2 ULP on a `stop_loss` red-flagged four EUR/USD cells on
+/// 2026-07-30. `golden_eq` keeps every structural field exact and tolerances only
+/// the measured floats. `PartialEq` is still derived because the
+/// save→load round-trip test wants it (same value in and out, so bit equality is
+/// the right predicate there).
 ///
 /// `deny_unknown_fields` because serde's default is to **silently ignore** a key
 /// it doesn't recognise, and that made the golden gate tolerate schema drift.
@@ -406,9 +413,12 @@ mod tests {
                 super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
             let computed = ReplayOutcome::compute(&replay, true, Some(&rendered.economics));
 
-            assert_eq!(
-                computed,
-                expected,
+            // Tolerant compare (`golden_eq`), NOT `assert_eq!`: `ReplayOutcome`'s
+            // derived `PartialEq` is bit-exact on floats, and the capture and
+            // check paths legitimately differ by an ULP or two. Everything
+            // structural is still exact.
+            assert!(
+                super::super::golden_eq::outcome_matches(&expected, &computed),
                 "fixture {name} diverged:\n got: {}\n exp: {}",
                 serde_json::to_string_pretty(&computed).unwrap_or_default(),
                 serde_json::to_string_pretty(&expected).unwrap_or_default(),

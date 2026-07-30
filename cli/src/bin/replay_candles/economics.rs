@@ -199,9 +199,17 @@ impl ReplayEconomics {
     /// So `net_r` and `legs[].r` — both still stored — carry the *same* residual
     /// exposure. Removing `account` narrowed the surface (it was the longest
     /// dependent chain, and the only value observed to actually differ across
-    /// profiles) but did not eliminate the class. If the golden gate ever flakes
-    /// again, look here first: the fix is a tolerance-based comparison for
-    /// `ReplayOutcome`, not another derived field.
+    /// profiles) but did not eliminate the class.
+    ///
+    /// **It flaked again, and the prescribed fix is now built.** On 2026-07-30 the
+    /// EUR/USD 2026-07-22 corpus failed `--check` on a leg's `stop_loss` differing
+    /// by **2 ULP** between the capture and check paths (`net_r` identical). The
+    /// comparison is no longer `==`: both the `--check` gate and the
+    /// `all_fixtures_match_expected` test go through
+    /// [`super::golden_eq::outcome_matches`], which compares stored floats with a
+    /// relative tolerance and everything structural exactly. Bit-exact float
+    /// equality on this snapshot is a bug — don't reinstate it, and don't reach for
+    /// rounding-on-write instead (`golden_eq`'s module doc says why not).
     pub fn account(&self) -> f64 {
         self.legs.iter().fold(START_ACCOUNT, |acct, leg| {
             acct + RISK_FRACTION * acct * leg.r

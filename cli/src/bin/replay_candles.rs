@@ -47,6 +47,7 @@ mod replay_candles {
     pub mod economics;
     pub mod fill_sim;
     pub mod fixture;
+    pub mod golden_eq;
     pub mod granularity;
     pub mod instrument;
     pub mod lifecycle;
@@ -76,8 +77,8 @@ use replay_candles::batch;
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::tv::TvDefaults;
 use replay_candles::{
-    annotate, brisbane, candles, economics, granularity, instrument, outcome, replay, report,
-    sentiment, tv,
+    annotate, brisbane, candles, economics, golden_eq, granularity, instrument, outcome, replay,
+    report, sentiment, tv,
 };
 use trade_control_cli::replay_args::{CandleSource, DetectorMarkConfig, ReplayArgs as Args};
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan, Trigger};
@@ -922,7 +923,9 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
             // `failed`): this run scored fine, and its Net R next to the
             // golden's is what makes a red sweep diagnosable rather than just
             // red. The full diff still goes in `error` for a human.
-            Ok(expected) if computed != expected => {
+            // Tolerant compare, NOT `!=`: bit-exact float equality made this gate
+            // flake across the capture and check paths (see `golden_eq`).
+            Ok(expected) if !golden_eq::outcome_matches(&expected, &computed) => {
                 let err = diff_error(&expected, &computed);
                 return FixtureRun::mismatched(row, expected.outcome.as_ref(), err);
             }
