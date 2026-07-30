@@ -35,7 +35,7 @@
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{AmendError, Broker};
 use trade_control_core::pending_lifecycle::ClearPolicy;
-use trade_control_core::state::{SpreadBlackoutRecord, StateStore};
+use trade_control_core::state::{HeldTradeRecord, StateStore};
 
 use crate::broker_handle::BrokerHandle;
 use crate::seam::CronEnv;
@@ -88,7 +88,7 @@ async fn affected_accounts<S: StateStore>(store: &S) -> Vec<Option<String>> {
         Ok(v) => v.iter().for_each(|a| push(&a.account)),
         Err(err) => tracing::error!("blackout watch: list_all_entry_attempts: {err}"),
     }
-    match store.list_all_spread_blackout_records().await {
+    match store.list_all_held_trade_records().await {
         Ok(v) => v.iter().for_each(|r| push(&r.account)),
         Err(err) => tracing::error!("blackout watch: list records failed: {err}"),
     }
@@ -144,7 +144,7 @@ where
     S: StateStore,
     C: CronEnv,
 {
-    let record = match store.get_spread_blackout_record(trade_id).await {
+    let record = match store.get_held_trade_record(trade_id).await {
         Ok(Some(r)) => r,
         // Already cleared (raced) — nothing to do.
         Ok(None) => return Ok(()),
@@ -166,7 +166,7 @@ where
 /// logged and skipped so the clear still proceeds; a closed position yields
 /// `AmendError::NotFound` and is treated as benign (nothing to restore).
 /// System 2 only ever moves a stop — it never closes or tightens.
-async fn restore_remembered_stops<C: CronEnv>(cron: &C, record: &SpreadBlackoutRecord) {
+async fn restore_remembered_stops<C: CronEnv>(cron: &C, record: &HeldTradeRecord) {
     if record.original_stops.is_empty() {
         return;
     }
@@ -225,11 +225,11 @@ async fn restore_remembered_stops<C: CronEnv>(cron: &C, record: &SpreadBlackoutR
 
 async fn clear<S: StateStore>(
     store: &S,
-    record: &SpreadBlackoutRecord,
+    record: &HeldTradeRecord,
     reason: &str,
 ) -> Result<(), String> {
     store
-        .clear_spread_blackout_record(&record.trade_id)
+        .clear_held_trade_record(&record.trade_id)
         .await
         .map_err(|e| format!("{reason} clear: {e}"))
 }

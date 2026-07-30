@@ -209,7 +209,7 @@ pub struct EntryAttempt {
     /// spread-blackout apply cron (Sub-plan 4 / System 2) source a
     /// `pip_size` for a cron-found open position — it joins an
     /// `OpenPosition` back to this row and bakes the pip onto the
-    /// `SpreadBlackoutRecord`, since the cron has no intent in hand. `None`
+    /// `HeldTradeRecord`, since the cron has no intent in hand. `None`
     /// on rows written before this field existed, and on the admin
     /// `adopt-trade` path which has no intent (Cron 1 falls back / skips the
     /// widen and logs — never widens with a wrong pip). See the pip-source
@@ -366,7 +366,7 @@ impl HasExpiry for MwState {
 /// NY-close edge with a derived ~3h TTL. Sub-plan 3 reads this to gate
 /// brand-new entries that have no per-trade record yet — a coarse "we
 /// think we're in a blackout" flag for the entry-reject side. Distinct
-/// from the per-trade [`SpreadBlackoutRecord::applied`] flag, which is
+/// from the per-trade [`HeldTradeRecord::applied`] flag, which is
 /// the *fine* "we actually touched THIS trade" signal the watcher keys
 /// on; see the safety rules in `src/cron/blackout_watch.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -417,13 +417,32 @@ impl HasExpiry for BlackoutHoursEntry {
     }
 }
 
-/// Per-trade-id blackout record. Written when a trade's stops/orders
-/// were actually touched. Sub-plan 4 (System 2) populates `applied = true`,
-/// `pip_size`, and `original_stops` (the widened stops' originals to restore
-/// on recovery). `cancelled_orders` stays **reserved** for Sub-plan 5
-/// (resting-order cancel/restore) so 5 doesn't reshape the schema.
+/// **What one trade is currently holding, and what to restore when it lets go.**
+/// Written when a trade's stops or orders were actually touched.
+///
+/// Two independent payloads, restored by different owners:
+///
+/// - **System 2** — `original_stops`: an open position's pre-widening stops, to
+///   amend back on recovery (`trade-control-cron::blackout_apply`).
+/// - **System 3** — `cancelled_orders`: resting entry orders pulled off the
+///   broker, to re-drive on recovery (`crate::pending_lifecycle`).
+///
+/// [`holders`](Self::holders) is the refcount gating **both**: the reasons
+/// currently demanding the hold ([`crate::hold`]). `applied` is the older, narrower
+/// flag — "this record mutated something at the broker" — which System 2's
+/// idempotency guard reads; it is **not** the holder set (see `crate::hold`).
+///
+/// Renamed from `SpreadBlackoutRecord` (v122). It began as a spread-hour recovery
+/// record, but its holders now include a news pause, which has nothing to do with
+/// spreads. The **table** is `held_trade_record`; migration `0001` still creates it
+/// as `spread_blackout_record` (its checksum is frozen — sqlx verifies applied
+/// migrations, so it must never be edited) and `0005` renames it.
+///
+/// Not to be confused with [`SpreadBlackoutWindow`] (a global singleton) or the
+/// per-instrument `blackout_windows` table — those are genuinely spread /
+/// market-hours concepts and keep their names.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SpreadBlackoutRecord {
+pub struct HeldTradeRecord {
     pub trade_id: String,
     pub instrument: String,
     /// `None` for worker-global, `Some(name)` for account-scoped. Same
@@ -477,7 +496,7 @@ pub struct SpreadBlackoutRecord {
     pub cancelled_orders: Vec<CancelledOrder>,
 }
 
-impl HasExpiry for SpreadBlackoutRecord {
+impl HasExpiry for HeldTradeRecord {
     fn expires_at(&self) -> DateTime<Utc> {
         self.expires_at
     }
@@ -530,7 +549,7 @@ pub fn account_from_scope(scope: &str) -> Option<String> {
 
 /// Read-only snapshot of the state store for the `status` action.
 ///
-/// Not `Eq`: [`SpreadBlackoutRecord`] carries `f64` stop prices, which
+/// Not `Eq`: [`HeldTradeRecord`] carries `f64` stop prices, which
 /// rules out a total-equality derive. `PartialEq` is retained for tests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -560,7 +579,7 @@ pub struct Snapshot {
     /// back-compat. The singleton `spread-blackout:window` marker is
     /// surfaced separately in [`Self::spread_blackout_window`].
     #[serde(default)]
-    pub spread_blackouts: Vec<SpreadBlackoutRecord>,
+    pub spread_blackouts: Vec<HeldTradeRecord>,
     /// The global spread-blackout window marker, if one is currently
     /// open. `None` outside a blackout window. `default` for back-compat.
     #[serde(default)]
@@ -930,28 +949,28 @@ pub trait StateStore {
 
     /// Create-or-update a per-trade blackout record. Sub-plans 4/5 call
     /// this with `applied = true` and populated payloads.
-    fn upsert_spread_blackout_record(
+    fn upsert_held_trade_record(
         &self,
-        record: &SpreadBlackoutRecord,
+        record: &HeldTradeRecord,
         ttl_seconds: u64,
     ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Read one per-trade record by `trade_id`. `None` if absent/expired.
-    fn get_spread_blackout_record(
+    fn get_held_trade_record(
         &self,
         trade_id: &str,
-    ) -> impl Future<Output = Result<Option<SpreadBlackoutRecord>, StateError>>;
+    ) -> impl Future<Output = Result<Option<HeldTradeRecord>, StateError>>;
 
     /// Enumerate every active per-trade record (recovery watcher).
     /// Mirrors [`Self::list_all_entry_attempts`].
-    fn list_all_spread_blackout_records(
+    fn list_all_held_trade_records(
         &self,
-    ) -> impl Future<Output = Result<Vec<SpreadBlackoutRecord>, StateError>>;
+    ) -> impl Future<Output = Result<Vec<HeldTradeRecord>, StateError>>;
 
     /// Delete a per-trade record (recovery cleared / backstop fired).
     /// Best-effort; succeeds even if already gone (mirrors
     /// [`Self::forget_seen`]).
-    fn clear_spread_blackout_record(
+    fn clear_held_trade_record(
         &self,
         trade_id: &str,
     ) -> impl Future<Output = Result<(), StateError>>;
@@ -1946,9 +1965,9 @@ mod memstore {
             }
         }
 
-        async fn upsert_spread_blackout_record(
+        async fn upsert_held_trade_record(
             &self,
-            record: &SpreadBlackoutRecord,
+            record: &HeldTradeRecord,
             ttl_seconds: u64,
         ) -> Result<(), StateError> {
             let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
@@ -1959,10 +1978,10 @@ mod memstore {
             Ok(())
         }
 
-        async fn get_spread_blackout_record(
+        async fn get_held_trade_record(
             &self,
             trade_id: &str,
-        ) -> Result<Option<SpreadBlackoutRecord>, StateError> {
+        ) -> Result<Option<HeldTradeRecord>, StateError> {
             let key = format!("spread-blackout:rec:{trade_id}");
             match self.get_live(&key, self.now()) {
                 Some(text) => serde_json::from_str(&text)
@@ -1972,9 +1991,7 @@ mod memstore {
             }
         }
 
-        async fn list_all_spread_blackout_records(
-            &self,
-        ) -> Result<Vec<SpreadBlackoutRecord>, StateError> {
+        async fn list_all_held_trade_records(&self) -> Result<Vec<HeldTradeRecord>, StateError> {
             let now = self.now();
             let inner = self.inner.borrow();
             let mut out = Vec::new();
@@ -1982,14 +1999,14 @@ mod memstore {
                 if !key.starts_with("spread-blackout:rec:") || *exp <= now {
                     continue;
                 }
-                let record: SpreadBlackoutRecord =
+                let record: HeldTradeRecord =
                     serde_json::from_str(val).map_err(|e| StateError::Backend(e.to_string()))?;
                 out.push(record);
             }
             Ok(out)
         }
 
-        async fn clear_spread_blackout_record(&self, trade_id: &str) -> Result<(), StateError> {
+        async fn clear_held_trade_record(&self, trade_id: &str) -> Result<(), StateError> {
             self.delete(&format!("spread-blackout:rec:{trade_id}"));
             Ok(())
         }
@@ -3059,7 +3076,7 @@ mod tests {
                 expires_at: ts("2026-05-14T15:00:00Z"),
                 account: Some("oanda-reversals-demo".into()),
             }],
-            spread_blackouts: vec![SpreadBlackoutRecord {
+            spread_blackouts: vec![HeldTradeRecord {
                 trade_id: "hs-eur-nzd-c1e0f25b".into(),
                 instrument: "EUR_NZD".into(),
                 account: Some("reversals".into()),
@@ -3621,8 +3638,8 @@ mod tests {
     }
 
     #[test]
-    fn spread_blackout_record_round_trips_with_reserved_fields() {
-        let record = SpreadBlackoutRecord {
+    fn held_trade_record_round_trips_with_reserved_fields() {
+        let record = HeldTradeRecord {
             trade_id: "hs-eur-nzd-c1e0f25b".into(),
             instrument: "EUR_NZD".into(),
             account: Some("reversals".into()),
@@ -3646,7 +3663,7 @@ mod tests {
             }],
         };
         let json = serde_json::to_string(&record).unwrap();
-        let parsed: SpreadBlackoutRecord = serde_json::from_str(&json).unwrap();
+        let parsed: HeldTradeRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, record);
         assert_eq!(parsed.pip_size, 0.0001);
         // The holder refcount survives the body round-trip. A dropped holder here
@@ -3660,7 +3677,7 @@ mod tests {
     /// decodes with the reserved fields defaulting to empty vecs and a
     /// missing `account` defaulting to `None`.
     #[test]
-    fn spread_blackout_record_decodes_with_defaulted_reserved_fields() {
+    fn held_trade_record_decodes_with_defaulted_reserved_fields() {
         let minimal = r#"{
             "trade_id": "hs-eur-nzd-c1e0f25b",
             "instrument": "EUR_NZD",
@@ -3668,7 +3685,7 @@ mod tests {
             "opened_at": "2026-03-12T21:05:00Z",
             "expires_at": "2026-03-13T00:05:00Z"
         }"#;
-        let parsed: SpreadBlackoutRecord = serde_json::from_str(minimal).unwrap();
+        let parsed: HeldTradeRecord = serde_json::from_str(minimal).unwrap();
         assert_eq!(parsed.trade_id, "hs-eur-nzd-c1e0f25b");
         assert!(!parsed.applied);
         assert_eq!(parsed.account, None);

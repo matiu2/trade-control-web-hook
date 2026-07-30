@@ -244,7 +244,7 @@ scoped per-position not per-trade.
 
 Several independent conditions can each want a resting (unfilled) entry order
 pulled off the broker. As of **v120** they all go through one shared refcount —
-`core::hold::{HoldReason, Holders}`, stored on `SpreadBlackoutRecord.holders` —
+`core::hold::{HoldReason, Holders}`, stored on `HeldTradeRecord.holders` —
 rather than each cancelling and restoring on its own:
 
 | `HoldReason` | holds while | releases when |
@@ -274,7 +274,15 @@ Things a refactorer must preserve:
   Adding a `HoldReason` variant is a **compile error** in `release_satisfied`
   until its release condition is written. Don't reintroduce an inline
   `is_spread_hour(..) || pause_active(..)` at a call site.
-- **`applied` is NOT the holder set.** `applied` means "this record mutated
+- **The record is `HeldTradeRecord` (table `held_trade_record`), renamed from
+`SpreadBlackoutRecord` in v122** — it began as a spread-hour recovery record but its
+holders now include a news pause. Migration `0001` still *creates* it under the old
+name (sqlx checksums applied migrations, so that file must never be edited) and
+`0005` renames it, preserving rows. Don't confuse it with `SpreadBlackoutWindow` (a
+global singleton) or the per-instrument `blackout_windows` table — those are
+genuinely spread/market-hours concepts and keep their names.
+
+**`applied` is NOT the holder set.** `applied` means "this record mutated
   something at the broker" and is load-bearing for **System 2** (widened
   open-position stops, `trade-control-cron/src/blackout_apply.rs`). `holders`
   answers the different question "which reasons still want the order pulled".
