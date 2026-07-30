@@ -608,6 +608,32 @@ On the Python side: `--risk-amount` adds `risk_amount: <n>` to the spec;
 `--broker-dry-run` adds `dry_run: true`. The Python `--dry-run` flag is
 unrelated — that one short-circuits before any POST to TradingView.
 
+### `PriceRef` is untagged — variant ORDER is load-bearing
+
+`trade_control_core::intent::PriceRef` is `#[serde(untagged)]`, so
+deserialization tries the variants **in declaration order** and takes the
+first that parses. `AbsoluteBuffered { absolute, offset_atr_pct, sign }` is a
+*superset* of `Absolute { absolute }`'s shape, so it MUST stay declared
+**first**. Reorder them and a buffered stop-loss parses as a bare `Absolute`:
+the buffer is **silently dropped**, a live stop is placed at the un-buffered
+price, and nothing errors anywhere. `absolute_buffered_does_not_parse_as_absolute`
+is the tripwire — if you're editing this enum and that test goes red, this is
+what it's telling you. The same trap applies to any future variant whose fields
+are a superset of an earlier one's.
+
+Related: the buffer's **magnitude** is deliberately *not* baked at arm time.
+`tv-arm/src/plan_geometry.rs`'s module docs forbid freezing time-varying values
+into a plan and name ATR specifically ("the engine computes it from candles, so
+there's nothing to carry"), and tv-arm has no candle feed anyway. So tv-arm bakes
+only the drawn price and the direction **sign** (both properties of the setup) and
+the worker multiplies by `shell.atr` at fire time. Don't "simplify" this by
+computing the buffer in tv-arm and emitting a plain `Absolute` — it would also
+defeat `--spec-in` re-arms, which exist to rebuild a plan against today's
+conditions. Resolution funnels through the single `PriceRef::resolve`, reached by
+both the worker (`core/src/intent/resolution.rs`) and the replay engine
+(`engine/src/evaluate.rs`), so replay==live parity is structural; don't add a
+second resolution path.
+
 ### Pip size is baked into the enter intent, not looked up by the worker
 
 Since 2026-06 the worker does **not** consult `instrument-lookup` (it's

@@ -37,6 +37,7 @@ use crate::calendar::read_trade_expiry;
 use crate::geometry::pcl_exhausted_price;
 use crate::plan_geometry::PlanGeometry;
 use crate::resolve_error::ResolveError;
+use crate::sl_note::DEFAULT_SL_NOTE_BUFFER_ATR_PCT;
 
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_hs_trade(
@@ -86,6 +87,25 @@ pub fn resolve_hs_trade(
             "invalidation line at {inv_price} is outside the fib range [{lo}, {hi}] — it \
              looks like a stale `too-high`/`too-low` from a different trade; redraw or \
              remove it"
+        )));
+    }
+    // Rule 2b: a drawn `sl` Note must sit on the PROTECTIVE side of the
+    // neckline — above it for a short, below for a long. A note left over from
+    // an opposite-direction setup would otherwise arm a "stop" on the profit
+    // side, which closes the trade for a loss the moment it goes right. Reject
+    // rather than fall back to the anchored default: the operator drew a stop,
+    // and silently substituting a different one is the worse outcome.
+    if let Some(sl) = geom.stop_loss
+        && !crate::geometry::sl_on_protective_side(sl, neckline, direction)
+    {
+        let side = match direction {
+            Direction::Short => "above",
+            Direction::Long => "below",
+        };
+        return Err(ResolveError::Reject(format!(
+            "the `sl` Note at {sl} is on the wrong side of the neckline ({neckline}) for a \
+             {direction:?} — a stop must sit {side} it; move the note (or delete a stale one \
+             from an earlier setup)"
         )));
     }
     let tp = crate::geometry::tp_price(head, neckline);
@@ -282,8 +302,16 @@ pub fn build_trade_spec(
             sl_offset_atr_pct: None,
             sl_anchor: None,
             tp_price: round5(tp),
-            // H&S anchors SL to the pattern extreme, not an absolute price.
-            sl_price: None,
+            // SL is normally anchored to the pattern extreme. An `sl` chart Note
+            // overrides that with the level the operator drew (shoulder or head)
+            // — see `crate::sl_note`. The buffer keeps the stop *clear* of that
+            // level; its direction is derived from `direction` when the spec is
+            // lowered (`build_enter_alert`), not stored here.
+            sl_price: geom.stop_loss.map(round5),
+            sl_price_buffer_atr_pct: geom.stop_loss.map(|_| {
+                args.sl_note_buffer_atr_pct
+                    .unwrap_or(DEFAULT_SL_NOTE_BUFFER_ATR_PCT)
+            }),
             entry_deadline_pct: 80,
             allow_entry: args.entry_filter_script.clone(),
             // Pattern-path entry order type: explicit `--entry-{market,stop,limit}`
@@ -851,5 +879,83 @@ mod tests {
             2,
             "drawn band + auto TP band"
         );
+    }
+
+    // ---- the `sl` chart Note --------------------------------------------
+    //
+    // `PlanGeometry.stop_loss` is already resolved by this point (the note is
+    // read and window-scoped upstream, in `sl_note`), so these cover the
+    // *spec-building* half: does a drawn stop reach the spec, is a wrong-side
+    // one rejected, and is its absence still the anchored default?
+
+    /// Resolve an H&S short (fib head 1.20 above neckline 1.10) with `stop_loss`
+    /// set as given.
+    fn resolve_with_sl(
+        stop_loss: Option<f64>,
+        extra: &[&str],
+    ) -> std::result::Result<cli::TradeSpec, ResolveError> {
+        let roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        let mut geom = PlanGeometry::from_roles(&roles);
+        geom.stop_loss = stop_loss;
+        resolve_hs_trade(
+            &mw_args(extra),
+            &geom,
+            false,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        )
+        .map(|(_dir, spec)| spec)
+    }
+
+    #[test]
+    fn a_drawn_sl_note_becomes_the_specs_stop_with_the_default_buffer() {
+        // Short: 1.15 sits above the 1.10 neckline, so it's a valid stop.
+        let spec = resolve_with_sl(Some(1.15), &[]).expect("valid H&S resolves");
+        assert_eq!(spec.sl_price, Some(1.15));
+        assert_eq!(
+            spec.sl_price_buffer_atr_pct,
+            Some(DEFAULT_SL_NOTE_BUFFER_ATR_PCT),
+            "a drawn stop should pick up the default ATR buffer"
+        );
+    }
+
+    #[test]
+    fn no_sl_note_leaves_the_stop_geometry_anchored() {
+        // The feature is opt-in: absent a note, the spec must look exactly as it
+        // did before it existed.
+        let spec = resolve_with_sl(None, &[]).expect("valid H&S resolves");
+        assert_eq!(spec.sl_price, None);
+        assert_eq!(spec.sl_price_buffer_atr_pct, None);
+    }
+
+    #[test]
+    fn sl_note_buffer_is_overridable_and_zero_means_verbatim() {
+        let spec = resolve_with_sl(Some(1.15), &["--sl-note-buffer-atr-pct", "0"])
+            .expect("valid H&S resolves");
+        assert_eq!(spec.sl_price, Some(1.15));
+        assert_eq!(spec.sl_price_buffer_atr_pct, Some(0.0));
+    }
+
+    /// The stale-note guard. A note left over from a long setup sits *below* the
+    /// neckline; used on this short it would be a "stop" on the profit side,
+    /// closing the trade for a loss the moment it went right.
+    #[test]
+    fn a_wrong_side_sl_note_is_rejected_not_silently_ignored() {
+        let err = resolve_with_sl(Some(1.05), &[]).expect_err("wrong-side stop must reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("wrong side"), "{msg}");
+        assert!(
+            msg.contains("1.05"),
+            "the message should name the offending price: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_sl_note_exactly_on_the_neckline_is_rejected() {
+        // Zero risk distance — a misplaced note, not a stop.
+        assert!(resolve_with_sl(Some(1.10), &[]).is_err());
     }
 }

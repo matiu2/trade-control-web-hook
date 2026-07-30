@@ -159,6 +159,7 @@ mod tests {
                 b: Anchor::new(1_750_360_000, 1.1200),
             }),
             invalidation: Some(1.1500),
+            stop_loss: None,
             fib_head_neckline: Some((1.0800, 1.1000)),
             trade_expiry_epoch: Some(1_750_600_000),
             prep_expiry_epochs: vec![("retest".into(), 1_750_500_000)],

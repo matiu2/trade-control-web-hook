@@ -1,5 +1,62 @@
 # Changelog
 
+## v118 — 2026-07-30 — Fixed stop-loss from an `sl` chart Note
+
+**Why.** The H&S / iH&S stop was always anchored to the pattern extreme
+(`signal_high` / `signal_low`) + the ATR buffer. There was no way to say "put the
+stop *here*" — at the shoulder, or beyond the head — short of the position-tool
+path, which bypasses the whole pattern pipeline.
+
+**What changed.** Drop a TradingView **Note** labelled `sl` (or `stop-loss`) with
+its first anchor at the price you want; the `05-enter` carries that level instead
+of the anchored geometry. H&S / iH&S only — M/W computes its geometry in the
+worker and ignores the note. Absent a note, output is byte-identical to before.
+
+The drawn price is pushed **clear** of the level it names by
+`--sl-note-buffer-atr-pct` (default `0.5`, the same fraction the anchored SL
+uses): up for a short, down for a long, direction from the fib. `0` = verbatim.
+
+**The buffer resolves at fire time, not arm time.** `plan_geometry.rs` forbids
+freezing time-varying values into a plan and names ATR specifically, and tv-arm
+has no candle feed anyway. So tv-arm bakes only what belongs to the *setup* —
+the drawn price and the direction sign — and the *magnitude* is multiplied by
+`shell.atr` when the alert fires. A baked buffer would also defeat `--spec-in`
+re-arms, which exist to rebuild a plan against today's conditions.
+
+**Which note counts.** Charts accumulate Notes, so only one anchored inside
+`[fib_earliest − 5 bars, trade_expiry]` is read (the lead is in *bars*, so it
+scales with the timeframe). Outside → ignored + logged. Two or more inside →
+**rejected** as ambiguous, never latest-wins. Wrong side of the neckline for the
+direction → **rejected**, so a note from an opposite-direction setup can't arm a
+"stop" on the profit side. Whole-label match, so `sl too tight, moved it` is
+commentary.
+
+**Wire.** New `PriceRef::AbsoluteBuffered { absolute, offset_atr_pct, sign }`.
+⚠ `PriceRef` is `#[serde(untagged)]` — the new variant MUST stay declared
+**before** `Absolute`, or a buffered SL parses as a bare `Absolute` and silently
+drops the buffer (a live stop at the wrong price, no error). Pinned by
+`absolute_buffered_does_not_parse_as_absolute`. Resolution funnels through the
+existing `PriceRef::resolve`, reached by both the worker and the replay engine,
+so replay==live parity is structural. Rejects rather than degrading on missing
+ATR / negative pct / non-±1 sign; a zero pct is a legitimate verbatim and needs
+no ATR.
+
+**Config.** `--sl-note-buffer-atr-pct <f>` (default 0.5). New
+`PlanGeometry.stop_loss` (frozen — a drawn level is setup geometry, and a
+`--spec-in` re-arm that lost it would silently fall back to the anchored
+default), `Roles.sl_notes`, `TradeSpec.sl_price_buffer_atr_pct`, conventions
+`SL_LABELS`.
+
+**Tests.** 34 new across core / conventions / tv-arm / cli. Verified by
+**mutation**, not just green: swapping the `PriceRef` variant order, flipping the
+buffer sign in `core` and again in the CLI lowering, deleting the sign check,
+disabling the window filter, and reading `points.last()` instead of `points[0]`
+each turn specific tests red.
+
+**Follow-up.** M/W is untouched. The `sl` note is read for the H&S path only; if
+M/W ever wants a drawn stop it needs its own decision about overriding
+worker-computed geometry.
+
 ## v117 — 2026-07-30 — Replay journal: an invalidation close is no longer reported as "CLOSED AT EXPIRY", and stop management stops narrating after the exit
 
 **Why.** A GBP/NZD iH&S long replay (2026-07-22 chart, entry 07-23 12:00 Brisbane)

@@ -418,6 +418,21 @@ pub struct TradeSpec {
     /// byte-identical to pre-feature output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sl_price: Option<f64>,
+    /// Optional ATR-percent buffer pushing [`Self::sl_price`] *clear* of the
+    /// level it names, resolved against the live ATR at fire time — the enter
+    /// then carries `PriceRef::AbsoluteBuffered` instead of `Absolute`.
+    ///
+    /// Set by the H&S path when the operator drew an `sl` chart Note: the note
+    /// marks the shoulder or head, and the stop belongs just past it, not
+    /// exactly on the wick. The buffer's *direction* isn't carried here — it is
+    /// derived from the trade direction at lowering time (short pushes up, long
+    /// pushes down), the same "always away from the pattern" rule anchored SLs
+    /// get from `PriceAnchor::buffer_sign`.
+    ///
+    /// Ignored unless `sl_price` is also set. `None` (the position-tool path,
+    /// and any pattern with no `sl` note) keeps the plain verbatim `Absolute`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sl_price_buffer_atr_pct: Option<f64>,
     /// Entry window end as a percentage of (trade_expiry − now). Default
     /// 80 — leaves a tail of trade_expiry to chase a late retest only if
     /// the operator extends the window.
@@ -1042,6 +1057,7 @@ fn build_pattern(
         tp_price,
         // Interactive/questionnaire path always anchors SL to geometry.
         sl_price: None,
+        sl_price_buffer_atr_pct: None,
         entry_deadline_pct,
         allow_entry: None,
         entry_mode: EntryMode::default(),
@@ -1187,6 +1203,7 @@ fn assemble_trade(
         sl_offset,
         spec.tp_price,
         spec.sl_price,
+        spec.sl_price_buffer_atr_pct,
         spec.risk_pct,
         spec.risk_amount,
         spec.dry_run,
@@ -1245,6 +1262,7 @@ fn assemble_trade(
             sl_offset,
             spec.tp_price,
             spec.sl_price,
+            spec.sl_price_buffer_atr_pct,
             spec.risk_pct,
             spec.risk_amount,
             spec.dry_run,
@@ -2080,6 +2098,7 @@ fn build_enter_alert(
     sl_offset: OffsetSpec,
     tp_price: f64,
     sl_price: Option<f64>,
+    sl_price_buffer_atr_pct: Option<f64>,
     risk_pct: f64,
     risk_amount: Option<f64>,
     dry_run: bool,
@@ -2187,14 +2206,30 @@ fn build_enter_alert(
             },
         },
     });
-    // SL is normally anchored to the pattern extreme + offset. The
-    // position-tool direct entry instead supplies an absolute stop the
-    // operator drew, so when `sl_price` is set we emit `Absolute` and
-    // ignore the geometry anchor / offset entirely.
+    // SL is normally anchored to the pattern extreme + offset. A drawn stop
+    // (the position tool's, or an `sl` chart Note) instead supplies an absolute
+    // price, and we ignore the geometry anchor / offset entirely.
+    //
+    // Two absolute forms, by whether a buffer was asked for:
+    //   * no buffer  → `Absolute`, the price verbatim (position-tool path).
+    //   * buffer     → `AbsoluteBuffered`, pushed clear of the drawn level by an
+    //     ATR fraction resolved at fire time. The *sign* is derived here from
+    //     the trade direction — short stops sit above the level, long stops
+    //     below — matching what `PriceAnchor::buffer_sign` does for anchored
+    //     refs. An absolute price has no anchor to carry it, so it must be
+    //     explicit on the wire.
     let (sl_offset_pips, sl_offset_atr_pct) = sl_offset.as_fields();
-    intent.stop_loss = Some(match sl_price {
-        Some(absolute) => PriceRef::Absolute { absolute },
-        None => PriceRef::Anchored {
+    intent.stop_loss = Some(match (sl_price, sl_price_buffer_atr_pct) {
+        (Some(absolute), Some(offset_atr_pct)) => PriceRef::AbsoluteBuffered {
+            absolute,
+            offset_atr_pct,
+            sign: match geometry.direction {
+                Direction::Short => 1.0,
+                Direction::Long => -1.0,
+            },
+        },
+        (Some(absolute), None) => PriceRef::Absolute { absolute },
+        (None, _) => PriceRef::Anchored {
             from: geometry.sl_anchor,
             offset_pips: sl_offset_pips,
             offset_atr_pct: sl_offset_atr_pct,
@@ -2705,6 +2740,7 @@ mod tests {
                 OffsetSpec::Pips(1.0),
                 1.0800,
                 None,
+                None,
                 1.0,
                 None,
                 false,
@@ -2760,6 +2796,7 @@ mod tests {
                 sl_offset_atr_pct: None,
                 tp_price: 1.0500,
                 sl_price: None,
+                sl_price_buffer_atr_pct: None,
                 entry_deadline_pct: DEFAULT_ENTRY_DEADLINE_PCT,
                 allow_entry: None,
                 entry_mode: EntryMode::Stop,
@@ -2799,6 +2836,7 @@ mod tests {
             OffsetSpec::Pips(-1.0), // entry: 1 pip below signal_low (short break)
             OffsetSpec::Pips(1.0),  // SL: 1 pip above signal_high
             1.0500,
+            None,
             None,
             1.0,
             None,
@@ -2898,6 +2936,7 @@ mod tests {
                 OffsetSpec::Pips(1.0),
                 1.0500,
                 None,
+                None,
                 1.0,
                 None,
                 false,
@@ -2992,6 +3031,7 @@ mod tests {
             OffsetSpec::Pips(1.0),
             1.0500,
             None,
+            None,
             1.0,
             None,
             false,
@@ -3033,6 +3073,7 @@ mod tests {
             OffsetSpec::Pips(1.0), // entry: 1 pip above signal_high (long break)
             OffsetSpec::Pips(-1.0), // SL: 1 pip below signal_low
             1.1500,
+            None,
             None,
             1.0,
             None,
@@ -3115,6 +3156,7 @@ mod tests {
             OffsetSpec::Pips(1.0),
             1.0500,
             Some(1.0850),
+            None,
             1.0,
             None,
             false,
@@ -3152,6 +3194,109 @@ mod tests {
             }
             other => panic!("expected absolute TP, got {other:?}"),
         }
+    }
+
+    /// Build an enter alert carrying a drawn stop, with or without a buffer —
+    /// the `sl`-chart-Note lowering path.
+    fn enter_with_drawn_sl(
+        pattern: TradePattern,
+        sl_price: Option<f64>,
+        buffer: Option<f64>,
+    ) -> BuiltAlert {
+        build_enter_alert(
+            "EUR_USD",
+            "sl-note-1",
+            &PatternGeometry::for_pattern(pattern),
+            ts("2026-05-24T00:00:00Z"),
+            OffsetSpec::Pips(1.0),
+            OffsetSpec::Pips(1.0),
+            1.0500,
+            sl_price,
+            buffer,
+            1.0,
+            None,
+            false,
+            0,
+            None,
+            None,
+            EntryMode::Market,
+            false,
+            false,
+            &[],
+            false,
+            None,
+            None,
+            BlackoutCloseAction::default(),
+            &BrokerKind::Oanda,
+            "demo",
+            false,
+            &[],
+            RecoverEntryAction::Skip,
+            false,
+            None,
+            None,
+        )
+    }
+
+    /// A drawn stop on a **short** must be pushed UP, clear of the shoulder the
+    /// note marks — `sign: +1.0`. The magnitude stays unsigned; the worker
+    /// multiplies it by the live ATR at fire time.
+    #[test]
+    fn drawn_sl_on_a_short_lowers_to_a_positive_buffer_sign() {
+        let alert = enter_with_drawn_sl(TradePattern::Hs, Some(1.0850), Some(0.5));
+        match &alert.intent.stop_loss {
+            Some(PriceRef::AbsoluteBuffered {
+                absolute,
+                offset_atr_pct,
+                sign,
+            }) => {
+                assert!((absolute - 1.0850).abs() < 1e-9, "{absolute}");
+                assert!((offset_atr_pct - 0.5).abs() < 1e-9, "{offset_atr_pct}");
+                assert!((sign - 1.0).abs() < 1e-9, "short must push UP, got {sign}");
+            }
+            other => panic!("expected AbsoluteBuffered SL, got {other:?}"),
+        }
+    }
+
+    /// Mirror: an iH&S **long** pushes DOWN — `sign: -1.0`. A flat sign here
+    /// would put the stop inside the pattern instead of clear of it.
+    #[test]
+    fn drawn_sl_on_a_long_lowers_to_a_negative_buffer_sign() {
+        let alert = enter_with_drawn_sl(TradePattern::Ihs, Some(1.0850), Some(0.5));
+        match &alert.intent.stop_loss {
+            Some(PriceRef::AbsoluteBuffered { sign, .. }) => {
+                assert!(
+                    (sign - -1.0).abs() < 1e-9,
+                    "long must push DOWN, got {sign}"
+                );
+            }
+            other => panic!("expected AbsoluteBuffered SL, got {other:?}"),
+        }
+    }
+
+    /// No buffer asked for → the plain verbatim `Absolute`. This is what keeps
+    /// `--sl-note-buffer-atr-pct 0`'s sibling case and the position-tool path on
+    /// the pre-existing wire form.
+    #[test]
+    fn drawn_sl_without_a_buffer_stays_plain_absolute() {
+        let alert = enter_with_drawn_sl(TradePattern::Hs, Some(1.0850), None);
+        assert!(
+            matches!(alert.intent.stop_loss, Some(PriceRef::Absolute { .. })),
+            "got {:?}",
+            alert.intent.stop_loss
+        );
+    }
+
+    /// A buffer with no drawn price must NOT invent an absolute stop — the SL
+    /// stays anchored to the pattern extreme.
+    #[test]
+    fn a_buffer_without_a_drawn_sl_stays_anchored() {
+        let alert = enter_with_drawn_sl(TradePattern::Hs, None, Some(0.5));
+        assert!(
+            matches!(alert.intent.stop_loss, Some(PriceRef::Anchored { .. })),
+            "got {:?}",
+            alert.intent.stop_loss
+        );
     }
 
     fn position_spec(kind: PositionEntryKind) -> PositionEnterSpec {
@@ -3257,6 +3402,7 @@ mod tests {
             sl_offset_atr_pct: None,
             tp_price: 1.0500,
             sl_price: None,
+            sl_price_buffer_atr_pct: None,
             entry_deadline_pct: 80,
             allow_entry: None,
             entry_mode: EntryMode::Stop,
