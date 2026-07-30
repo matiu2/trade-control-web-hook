@@ -589,6 +589,18 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
     let account = resolve_account(args, broker);
     let out_dir = arm_out_dir(&raw_symbol)?;
     let now = Utc::now();
+    // The time this arm treats as "now" for everything time-derived on the plan:
+    // the `--start` cursor when journaling, else wall-clock. Computed once here
+    // so the bundle's windows, the plan's `armed_at`, and the operator-facing
+    // arm note can't disagree.
+    //
+    // Load-bearing for reproducibility. The enter's `not_after` is a percentage
+    // of the span from this instant to `trade_expiry`
+    // (`cli::derive_entry_deadline`), so feeding it wall-clock made a `--start`
+    // re-arm produce a DIFFERENT enter window every run — same spec, same
+    // candles, different fills. See
+    // `the_trade_bundle_is_built_at_the_effective_arm_time_not_wallclock`.
+    let arm_time = effective_arm_time(start, now);
 
     // 2c. Position-tool direct entry. When one of --market-entry /
     //     --stop-entry / --limit-entry is set, ignore the pattern
@@ -685,8 +697,8 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
     } else {
         cli::BuildStrictness::Lenient
     };
-    let built_trade =
-        cli::build_trade_from_spec(trade_spec, now, strictness).wrap_err("build trade bundle")?;
+    let built_trade = cli::build_trade_from_spec(trade_spec, arm_time, strictness)
+        .wrap_err("build trade bundle")?;
     let trade_id = built_trade.trade_id.clone();
     cli::write_trade(&built_trade, &key, &out_dir).wrap_err("write trade bundle")?;
 
@@ -754,7 +766,10 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
         // time (`--start` cursor when journaling, else `now`), printed for the
         // operator, and baked onto the plan for after-the-fact journalling only.
         // Fail-soft — a fetch failure yields `None` and never blocks arming.
-        let armed_at = effective_arm_time(start, now);
+        // Same instant the bundle's windows were built from (computed once at the
+        // top of this function), so `armed_at` and the enter's `not_after` can
+        // never disagree about when this arm happened.
+        let armed_at = arm_time;
         // `--cross-buffer-pct` is deprecated in favour of the volatility-relative
         // `--cross-buffer-atr`. If the operator still passes it, honour it (it's
         // summed on top of the ATR term) but warn — a fixed % of price is
@@ -1319,6 +1334,54 @@ mod tests {
             body.contains("build_trade_from_spec"),
             "the extracted body doesn't look like arm_from_inputs; the scan would \
              have passed vacuously"
+        );
+    }
+
+    /// The trade bundle must be built at the **effective arm time**, not raw
+    /// wall-clock — otherwise a `--start` re-arm is not reproducible.
+    ///
+    /// `derive_entry_deadline` (cli) computes the enter's `not_after` as a
+    /// percentage of the span from its `now` to `trade_expiry`. Passing
+    /// `Utc::now()` there makes that deadline move every time you re-arm, so the
+    /// same frozen spec replayed on two different days yields two different
+    /// enter windows — and therefore different fills. Observed on
+    /// `eur-usd-h1-2026-07-22`: a `--spec-in` re-run four hours later shifted
+    /// `not_after` from 10:25:26Z to 14:20:20Z and turned +1.06R into no trade.
+    ///
+    /// Every other time-derived field in the plan already uses the cursor
+    /// (`armed_at` via `effective_arm_time`, control-window pruning via
+    /// `prune_as_of`). This was the one hold-out, which is why the plans differed
+    /// in exactly one field.
+    ///
+    /// A source scan, because the property is about *which value reaches a
+    /// callee* deep inside a function that needs a live chart to run. Pair it
+    /// with `effective_arm_time`'s own unit tests below, which pin the value.
+    #[test]
+    fn the_trade_bundle_is_built_at_the_effective_arm_time_not_wallclock() {
+        let src = include_str!("pipeline.rs");
+        let start = src
+            .find("\nfn arm_from_inputs(")
+            .expect("arm_from_inputs must exist — did it get renamed?");
+        let rest = &src[start + 1..];
+        let end = rest.find("\n}\n").map_or(rest.len(), |i| i + 2);
+        let body = &rest[..end];
+
+        let call = body
+            .find("build_trade_from_spec(")
+            .expect("arm_from_inputs must still build the bundle");
+        // The argument list up to the closing paren of the call.
+        let args_src = &body[call..];
+        let args_end = args_src.find(')').unwrap_or(args_src.len());
+        let args_src = &args_src[..args_end];
+
+        assert!(
+            args_src.contains("arm_time"),
+            "build_trade_from_spec must receive the cursor-aware arm time, not raw \
+             wall-clock `now` — a --start re-arm has to be reproducible. Got: {args_src:?}"
+        );
+        assert!(
+            !args_src.contains(" now,") && !args_src.contains("(now,"),
+            "build_trade_from_spec is still being passed raw wall-clock `now`: {args_src:?}"
         );
     }
 
