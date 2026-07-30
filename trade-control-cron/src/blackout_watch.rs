@@ -115,6 +115,24 @@ where
             tracing::error!("blackout watch[{trade_id}]: System-2 restore/clear: {err}");
         }
     }
+
+    // A failed cancel means the DB and the broker disagreed about a resting order
+    // on the live money path — surface it at account scope, not just in the
+    // per-order line inside the shared fn. `Vanished` entries have already been
+    // pruned from their record (nothing to restore); the others retry next tick.
+    if !report.cancel_failed.is_empty() {
+        tracing::warn!(
+            "blackout watch[{}]: {} resting order(s) could not be cancelled: {}",
+            account.unwrap_or("<global>"),
+            report.cancel_failed.len(),
+            report
+                .cancel_failed
+                .iter()
+                .map(|(id, outcome)| format!("{id}={outcome:?}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
 }
 
 /// The System-2 half + the single clear for one restored record. Re-reads the

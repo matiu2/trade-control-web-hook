@@ -35,6 +35,34 @@
 //! conditions every ~5s, so an incrementing count would reach the hundreds within
 //! an hour and never return to zero. [`Holders::hold`] is idempotent.
 //!
+//! # Only THIS module talks to the broker about resting orders
+//!
+//! There is exactly **one** `list_pending_orders` call on the live path — in
+//! [`cancel_pass`]. Neither reason reaches the broker itself; they are
+//! [`HoldReason`] variants, not subsystems with their own broker access. Anything
+//! new that wants to hold resting orders belongs here as a variant, **not** as
+//! another place that enumerates or cancels broker orders.
+//!
+//! # Per-instrument and per-trade reasons on a per-trade record
+//!
+//! The two reasons have **different natural scopes**, which is easy to misread as a
+//! mismatch:
+//!
+//! - `SpreadHour` is per-**instrument** (a property of the pair's clock).
+//! - `NewsPause` is per-**trade** (keyed `(trade_id, blackout_id)`, no instrument).
+//! - The holder set lives on a per-**trade** record.
+//!
+//! This composes correctly because [`cancel_pass`] iterates **every resting order**
+//! and derives [`hold_reasons`] per order. So an instrument-scoped reason is
+//! *fanned out* to each affected trade — three EUR/USD trades in one spread hour get
+//! three records, each holding `SpreadHour` — rather than stored once per instrument.
+//! Release is symmetric: each record re-evaluates `is_spread_hour` against its own
+//! `record.instrument`.
+//!
+//! The consequence worth knowing: a hold is **trade-wide, never per-order**
+//! ("pause all this trade's resting orders"), so no caller needs to ask per-order
+//! questions and there is deliberately no per-order query API.
+//!
 //! This is the generic `core` home the live cron
 //! (`trade-control-cron::blackout_*`) and the offline replay both call, so the
 //! decision runs identically in production and in replay
@@ -93,7 +121,7 @@
 use chrono::{DateTime, Duration, Utc};
 
 use crate::blackout_recreate::{RestorePlan, restore_plan};
-use crate::broker::{Broker, PendingOrder};
+use crate::broker::{AttemptState, Broker, PendingOrder};
 use crate::dispatch::run_enter;
 use crate::dispatch_config::DispatchConfig;
 use crate::hold::{HoldReason, Holders, Release};
@@ -202,6 +230,56 @@ pub struct LifecycleReport {
     /// ON reason fired — no spread hour and no armed pause) — for visibility,
     /// not action.
     pub skipped: Vec<String>,
+    /// `order_id`s the broker refused to cancel, with what a follow-up lookup
+    /// said about them. **Never silently empty:** before this existed a failed
+    /// cancel appeared in *none* of the report's lists, so an order the record
+    /// claimed was pulled — but which was still live at the broker, or had
+    /// already filled — was invisible to the caller.
+    ///
+    /// A [`CancelOutcome::Vanished`] entry has already been dropped from the
+    /// record, so the OFF side will not re-drive it.
+    pub cancel_failed: Vec<(String, CancelOutcome)>,
+}
+
+/// What a follow-up lookup found after `cancel_order` returned an error.
+///
+/// [`CancelError`](crate::broker::CancelError) is a single `Transient` variant
+/// that deliberately folds "order already gone" together with a network blip —
+/// its own docs say to treat the failure as "probably filled" and **re-lookup**.
+/// So the distinction is resolved where the docs say to resolve it, via
+/// [`Broker::lookup_attempt_state`], and this is the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// The order is **no longer resting** at the broker — it filled, or was
+    /// cancelled/expired/rejected out-of-band. There is nothing to restore, so it
+    /// is removed from the record: leaving it would have the OFF side re-place an
+    /// entry whose original already filled.
+    Vanished(&'static str),
+    /// The order is **still resting** at the broker — the cancel genuinely failed
+    /// (network, 5xx). Left on the record: the next tick retries the cancel, and
+    /// the hold still applies.
+    StillResting,
+    /// The lookup itself failed, so we can't tell. Treated as `StillResting`
+    /// (conservative: keep the record entry, retry next tick) but reported
+    /// separately so a persistent lookup outage is visible rather than looking
+    /// like a stream of live orders.
+    Unresolved,
+}
+
+impl CancelOutcome {
+    /// Should the [`CancelledOrder`] be removed from the record?
+    fn drops_from_record(&self) -> bool {
+        matches!(self, Self::Vanished(_))
+    }
+
+    /// Operator-facing label for the log line.
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Vanished(why) => why,
+            Self::StillResting => "still-resting",
+            Self::Unresolved => "lookup-failed",
+        }
+    }
 }
 
 /// Why a record cleared on the OFF side. Ordered by precedence in
@@ -485,12 +563,97 @@ async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
             );
             report.cancelled.push(order.order_id.clone());
         }
-        Err(err) => tracing::error!(
-            "pending-lifecycle[{scope}][{trade_id}]: cancel order {} FAILED ({err:?}); record \
-             stays (recovery re-drive is bounded by gates if still live)",
-            order.order_id,
-        ),
+        Err(err) => {
+            // The cancel failed. `CancelError` folds "already gone" in with a
+            // network blip, so resolve which it was the way its own docs say to —
+            // re-lookup — and act on the answer. Doing nothing here (the old
+            // behaviour) left the record claiming an order was pulled when it had
+            // actually FILLED, and the OFF side would then re-place an entry for a
+            // trade that was already in a position.
+            let outcome = classify_cancel_failure(broker, order).await;
+            tracing::error!(
+                "pending-lifecycle[{scope}][{trade_id}]: cancel order {} FAILED ({err:?}); \
+                 lookup says {} — {}",
+                order.order_id,
+                outcome.as_str(),
+                if outcome.drops_from_record() {
+                    "dropping it from the record (nothing to restore)"
+                } else {
+                    "record stays, cancel retries next tick"
+                },
+            );
+            if outcome.drops_from_record() {
+                drop_cancelled_order(store, &record, &order.order_id, ttl).await;
+            }
+            report.cancel_failed.push((order.order_id.clone(), outcome));
+        }
     }
+}
+
+/// Resolve a failed cancel into a [`CancelOutcome`] via
+/// [`Broker::lookup_attempt_state`] — the re-lookup `CancelError`'s docs call for.
+///
+/// `Pending` is the only state that means "genuinely still resting, retry"; every
+/// filled-or-dead state means the order is gone and must not be restored. A lookup
+/// error is `Unresolved`, treated conservatively as still-resting.
+async fn classify_cancel_failure<B: Broker>(broker: &B, order: &PendingOrder) -> CancelOutcome {
+    match broker
+        .lookup_attempt_state(&order.instrument, &order.order_id, None)
+        .await
+    {
+        Ok(AttemptState::Pending) => CancelOutcome::StillResting,
+        // Filled — restoring would double up on a live/finished position.
+        Ok(AttemptState::OpenPosition { .. }) => CancelOutcome::Vanished("filled-open-position"),
+        Ok(AttemptState::ClosedWin { .. }) | Ok(AttemptState::ClosedLossOrBreakeven { .. }) => {
+            CancelOutcome::Vanished("filled-and-closed")
+        }
+        // Dead without filling (rejected / expired / cancelled upstream).
+        Ok(AttemptState::Cancelled) => CancelOutcome::Vanished("cancelled-upstream"),
+        // Not found anywhere: we lost track. Still "not resting", so the same
+        // no-restore conclusion holds — logged distinctly, per AttemptState's doc.
+        Ok(AttemptState::Unknown) => CancelOutcome::Vanished("not-found"),
+        Err(err) => {
+            tracing::error!(
+                "pending-lifecycle: lookup_attempt_state({}) failed ({err:?}); assuming still \
+                 resting (conservative — keeps the record so the cancel retries)",
+                order.order_id,
+            );
+            CancelOutcome::Unresolved
+        }
+    }
+}
+
+/// Remove one [`CancelledOrder`] from the record after its cancel failed because
+/// the order is gone from the broker.
+///
+/// Best-effort: a write failure leaves the entry in place, which is the same state
+/// the old code always left it in — the next tick re-derives. If the record has no
+/// other cancelled orders and no widened stops it is cleared outright rather than
+/// left as an empty shell that the OFF side would keep re-examining.
+async fn drop_cancelled_order<S: StateStore>(
+    store: &S,
+    record: &SpreadBlackoutRecord,
+    order_id: &str,
+    ttl: u64,
+) {
+    let mut pruned = record.clone();
+    pruned.cancelled_orders.retain(|c| c.order_id != order_id);
+
+    let result = if pruned.cancelled_orders.is_empty() && pruned.original_stops.is_empty() {
+        // Nothing left to restore on either system — don't leave a shell behind.
+        store.clear_spread_blackout_record(&pruned.trade_id).await
+    } else {
+        store.upsert_spread_blackout_record(&pruned, ttl).await
+    };
+    if let Err(err) = result {
+        tracing::error!(
+            "pending-lifecycle[{}]: pruning vanished order {order_id} FAILED ({err}); it stays on \
+             the record and the OFF side may try to re-place it",
+            pruned.trade_id,
+        );
+    }
+    // The stored signed body is dead weight once the order is gone.
+    cleanup_body(store, order_id).await;
 }
 
 fn account_id_of(account: Option<&str>) -> &str {
@@ -1153,6 +1316,11 @@ mod tests {
         pendings: RefCell<Vec<PendingOrder>>,
         cancel_calls: RefCell<Vec<(String, String)>>,
         quote: RefCell<Option<Quote>>,
+        /// When true, `cancel_order` returns `Transient` — the failure the
+        /// vanished-order path exists to classify.
+        cancel_fails: RefCell<bool>,
+        /// What `lookup_attempt_state` answers. `None` ⇒ a lookup error.
+        lookup: RefCell<Option<AttemptState>>,
     }
 
     impl MockBroker {
@@ -1163,6 +1331,12 @@ mod tests {
         }
         fn set_quote(&self, bid: f64, ask: f64) {
             *self.quote.borrow_mut() = Some(Quote { bid, ask });
+        }
+        /// Fail the cancel, and answer a follow-up lookup with `state`.
+        fn failing_cancel(self, state: Option<AttemptState>) -> Self {
+            *self.cancel_fails.borrow_mut() = true;
+            *self.lookup.borrow_mut() = state;
+            self
         }
     }
 
@@ -1187,7 +1361,7 @@ mod tests {
             _broker_order_id: &str,
             _broker_trade_id: Option<&str>,
         ) -> Result<AttemptState, LookupError> {
-            Err(LookupError::Transient)
+            self.lookup.borrow().clone().ok_or(LookupError::Transient)
         }
         async fn cancel_order(
             &self,
@@ -1197,6 +1371,9 @@ mod tests {
             self.cancel_calls
                 .borrow_mut()
                 .push((account_id.to_string(), broker_order_id.to_string()));
+            if *self.cancel_fails.borrow() {
+                return Err(CancelError::Transient);
+            }
             Ok(())
         }
         async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
@@ -2162,5 +2339,168 @@ mod tests {
             emptied,
             "healed row restores once the spread hour has lifted"
         );
+    }
+
+    // --- A cancel that FAILS: DB/broker divergence ---
+    //
+    // The old code logged the failure and moved on, pushing nothing to the report.
+    // So an order the record claimed was pulled — but which had actually FILLED —
+    // was invisible, and the OFF side would faithfully re-place an entry for a
+    // trade already in a position. These pin the classification + the prune.
+
+    /// Drive one ON pass over a spread-hour order whose cancel fails, with
+    /// `lookup` as the follow-up answer.
+    fn cancel_failure_pass(lookup: Option<AttemptState>) -> (LifecycleReport, MemStateStore) {
+        let broker =
+            MockBroker::with_pending(pending("t-enter-o1", "AUD/CHF")).failing_cancel(lookup);
+        let store = MemStateStore::new();
+        let mut armed = std::collections::HashMap::new();
+        armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
+        let source = ArmedSource { armed };
+        let now = ts("2026-07-08T21:00:00Z"); // AUD/CHF baked spread hour
+        store.set_clock(now);
+        let report = run(pending_order_lifecycle(
+            &broker,
+            &store,
+            &StubCfg,
+            &source,
+            Some("reversals"),
+            now,
+            ClearPolicy::LeaveForCaller, // don't let the OFF side clear it out from under us
+        ));
+        (report, store)
+    }
+
+    /// THE DIVERGENCE. The cancel fails because the order already FILLED. It must
+    /// be reported and **dropped from the record**, so the OFF side never re-places
+    /// an entry for a position that already exists.
+    #[test]
+    fn cancel_failure_on_a_filled_order_drops_it_from_the_record() {
+        let (report, store) = cancel_failure_pass(Some(AttemptState::OpenPosition {
+            broker_trade_id: "TRADE-7".into(),
+        }));
+
+        assert!(
+            report.cancelled.is_empty(),
+            "a failed cancel is not a cancel"
+        );
+        assert_eq!(
+            report.cancel_failed,
+            vec![(
+                "t-enter-o1".to_string(),
+                CancelOutcome::Vanished("filled-open-position")
+            )],
+            "the failure must be REPORTED, not silently swallowed"
+        );
+        // The record must no longer list the order — nothing to restore.
+        run(async {
+            let rec = store
+                .get_spread_blackout_record("t")
+                .await
+                .expect("record read");
+            match rec {
+                None => {} // pruned to nothing and cleared — also correct
+                Some(r) => assert!(
+                    r.cancelled_orders.is_empty(),
+                    "a filled order must not stay on the record, or the OFF side re-places it"
+                ),
+            }
+        });
+    }
+
+    /// A cancel that fails while the order is genuinely **still resting** (network
+    /// blip) must KEEP the record entry, so the next tick retries the cancel and
+    /// the order is still restorable.
+    #[test]
+    fn cancel_failure_while_still_resting_keeps_the_record_entry() {
+        let (report, store) = cancel_failure_pass(Some(AttemptState::Pending));
+
+        assert_eq!(
+            report.cancel_failed,
+            vec![("t-enter-o1".to_string(), CancelOutcome::StillResting)],
+        );
+        run(async {
+            let rec = store
+                .get_spread_blackout_record("t")
+                .await
+                .expect("record read")
+                .expect("the record must survive — the order is still out there");
+            assert_eq!(
+                rec.cancelled_orders.len(),
+                1,
+                "a still-resting order stays on the record so the cancel can retry"
+            );
+        });
+    }
+
+    /// A failed cancel whose follow-up LOOKUP also fails is `Unresolved` and
+    /// treated conservatively as still-resting — the entry stays. Reported
+    /// distinctly so a lookup outage doesn't masquerade as live orders.
+    #[test]
+    fn cancel_failure_with_an_unresolvable_lookup_keeps_the_entry() {
+        let (report, store) = cancel_failure_pass(None); // lookup errors
+
+        assert_eq!(
+            report.cancel_failed,
+            vec![("t-enter-o1".to_string(), CancelOutcome::Unresolved)],
+        );
+        run(async {
+            let rec = store
+                .get_spread_blackout_record("t")
+                .await
+                .expect("record read")
+                .expect("conservative: keep the record when we can't tell");
+            assert_eq!(rec.cancelled_orders.len(), 1);
+        });
+    }
+
+    /// Every "not resting any more" state drops the order, not just the filled one:
+    /// cancelled-upstream (TN rejects / OANDA TIF expiry) and not-found both mean
+    /// there is nothing to restore.
+    #[test]
+    fn every_vanished_state_drops_the_order() {
+        for (state, want) in [
+            (AttemptState::Cancelled, "cancelled-upstream"),
+            (AttemptState::Unknown, "not-found"),
+            (
+                AttemptState::ClosedWin { realized_pl: 12.0 },
+                "filled-and-closed",
+            ),
+            (
+                AttemptState::ClosedLossOrBreakeven { realized_pl: -8.0 },
+                "filled-and-closed",
+            ),
+        ] {
+            let (report, _) = cancel_failure_pass(Some(state.clone()));
+            assert_eq!(
+                report.cancel_failed,
+                vec![("t-enter-o1".to_string(), CancelOutcome::Vanished(want))],
+                "state {state:?} must classify as vanished/{want}"
+            );
+        }
+    }
+
+    /// A successful cancel reports NOTHING in `cancel_failed` — the new field is
+    /// only populated on the failure path, so it stays a useful signal.
+    #[test]
+    fn a_successful_cancel_reports_no_failure() {
+        let broker = MockBroker::with_pending(pending("t-enter-o1", "AUD/CHF"));
+        let store = MemStateStore::new();
+        let mut armed = std::collections::HashMap::new();
+        armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
+        let source = ArmedSource { armed };
+        let now = ts("2026-07-08T21:00:00Z");
+        store.set_clock(now);
+        let report = run(pending_order_lifecycle(
+            &broker,
+            &store,
+            &StubCfg,
+            &source,
+            Some("reversals"),
+            now,
+            ClearPolicy::LeaveForCaller,
+        ));
+        assert_eq!(report.cancelled, vec!["t-enter-o1".to_string()]);
+        assert!(report.cancel_failed.is_empty());
     }
 }
