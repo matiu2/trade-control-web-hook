@@ -62,7 +62,7 @@ cut a fresh `staging` from `main` carrying the week's accumulated changes.
 | pine | `v2.4` (study title `Candle Signals v24`) | — | pinned to the pre-`open` version; chart **unchanged** this deploy. v25 worker degrades gracefully when `open` is absent (rides baked geometry). `tv-arm-staging` bakes this study title. |
 | tv-arm | `0.1.0` | 2026-07-30 | installed as `tv-arm-staging` (staging URL + `Candle Signals v24` baked) |
 | trade-control | `0.2.0` | 2026-07-30 | installed as `trade-control-staging` (staging URL baked) |
-| backend | `staging` @ `bef262a` (`v122-1`) | 2026-07-30 | Merged `main` v119–v122: news pause pulls resting orders; shared hold refcount; failed-cancel classification; `HeldTradeRecord` rename. **DB migration `0005` applied** — table renamed in place, all 12 live plan states / 4 pauses / 3 order bodies survived the restart (hold table was empty, so nothing in flight to preserve). **Promotion-gate week restarts from this deploy.** |
+| backend | `staging` @ `bef262a` (`v122-1`) | 2026-07-30 | Merged `main` v119–v122: news pause pulls resting orders; shared hold refcount; failed-cancel classification; `HeldTradeRecord` rename. **DB migration `0005` applied** — table renamed in place, all 12 live plan states / 4 pauses / 3 order bodies survived the restart (hold table was empty, so nothing in flight to preserve). **Promotion-gate week restarts from this deploy.** Also registered the **`not-taken`** account (tradenation/demo) — it existed on dev and in the TN enc store but was missing from staging's `accounts` table, so `hs-cad-chf-92c281e5` failed broker acquisition on every cron tick. No restart needed (the cron looks accounts up live per tick). |
 | contract | `v3` | — | unchanged by v23 (recording is observe-only) |
 
 ### prod
