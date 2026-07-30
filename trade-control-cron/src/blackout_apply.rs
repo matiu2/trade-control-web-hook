@@ -3,7 +3,7 @@
 //! spread-blackout window marker, then — **System 2** — widens every open
 //! position's stop-loss away from price so the post-NY-close spread blowout
 //! can't clip it, remembering each original stop on a per-trade
-//! `SpreadBlackoutRecord` for the recovery watcher to restore.
+//! `HeldTradeRecord` for the recovery watcher to restore.
 //!
 //! Per-row discipline (same as the order sweep): one position's
 //! `list_open_positions` / `amend_stop` failure logs and continues — it must
@@ -30,11 +30,12 @@ use std::collections::HashMap;
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::blackout_widen::{clamp_widen, spread_hour_widen_size, widened_stop};
 use trade_control_core::broker::{AmendError, Broker, OpenPosition};
+use trade_control_core::hold::{HoldReason, Holders};
 use trade_control_core::ny_clock::is_ny_close_edge;
 use trade_control_core::spread_blackout::{
     NY_CLOSE_WINDOW_MARKER_TTL_SECONDS, spread_hour_widen_frac, widen_frac_to_pips,
 };
-use trade_control_core::state::{EntryAttempt, RememberedStop, SpreadBlackoutRecord, StateStore};
+use trade_control_core::state::{EntryAttempt, HeldTradeRecord, RememberedStop, StateStore};
 
 use crate::broker_handle::BrokerHandle;
 use crate::constants::spread_block_ttl_seconds;
@@ -80,7 +81,7 @@ where
 /// **System 2** — pre-emptively widen every open position's stop away from
 /// price during that instrument's learned **spread hour(s)**, so the spread
 /// spike can't clip the stop, remembering each original on a per-trade
-/// `SpreadBlackoutRecord` for the recovery watcher to restore.
+/// `HeldTradeRecord` for the recovery watcher to restore.
 ///
 /// # Why this is separate from [`apply_if_ny_close_edge`]
 ///
@@ -251,7 +252,7 @@ async fn widen_one<S: StateStore>(
     // Idempotency guard — only widen if no `applied` record exists for this
     // trade. A re-fire (CF double-deliver / mid-window restart) must not
     // double-widen or re-capture the (already-widened) SL as "original".
-    match store.get_spread_blackout_record(&trade_id).await {
+    match store.get_held_trade_record(&trade_id).await {
         Ok(Some(rec)) if rec.applied => {
             tracing::info!(
                 "blackout widen[{}]: trade {trade_id} already applied; skip",
@@ -313,11 +314,20 @@ async fn widen_one<S: StateStore>(
     // of the backstop split): the recovery watcher's block-lift restore must
     // still find the widened-stop record to restore the original SL.
     let ttl = spread_block_ttl_seconds(&position.instrument, now);
-    let record = SpreadBlackoutRecord {
+    let record = HeldTradeRecord {
         trade_id: trade_id.clone(),
         instrument: position.instrument.clone(),
         account: account.map(|s| s.to_string()),
         applied: true,
+        // System 2 (widening an open position's stop) is driven by spread hours
+        // only, so the record it creates is held by that one reason. Stated
+        // explicitly rather than left empty: an empty set on an `applied` record
+        // means "pre-refcount row" to the OFF side, and this is not one.
+        holders: {
+            let mut h = Holders::new();
+            h.hold(HoldReason::SpreadHour);
+            h
+        },
         opened_at: now,
         expires_at: now + Duration::seconds(ttl as i64),
         pip_size,
@@ -327,7 +337,7 @@ async fn widen_one<S: StateStore>(
         }],
         cancelled_orders: Vec::new(),
     };
-    if let Err(err) = store.upsert_spread_blackout_record(&record, ttl).await {
+    if let Err(err) = store.upsert_held_trade_record(&record, ttl).await {
         tracing::error!(
             "blackout widen[{}]: upsert_record({trade_id}) FAILED ({err}); NOT amending (no \
              remembered original ⇒ no widen)",

@@ -1,7 +1,67 @@
 //! **The one shared resting-order lifecycle** — cancel a resting entry order
-//! through a spread-hour trough and re-drive it once the trough lifts, keyed off
-//! the single baked predicate
-//! [`spread_blackout::is_spread_hour`](crate::spread_blackout::is_spread_hour).
+//! through a period it must not be exposed to, and re-drive it once that period
+//! lifts. Several independent reasons can pull an order, tracked as a refcount of
+//! named [`HoldReason`]s (see [`crate::hold`]):
+//!
+//! - **[`HoldReason::SpreadHour`]** — the instrument entered its baked trough,
+//!   keyed off
+//!   [`spread_blackout::is_spread_hour`](crate::spread_blackout::is_spread_hour).
+//!   Instrument-scoped, a pure function of the clock.
+//! - **[`HoldReason::NewsPause`]** — a `pause` standoff is armed for the order's
+//!   *trade* ([`pause_active`]). Trade-scoped, read from the store.
+//!
+//! The news reason exists because a pause otherwise only blocked *new* entries
+//! (the `423 trade paused` gate at the head of [`run_enter`]) while leaving an
+//! already-resting order to sit through the event and fill on the spike — the
+//! 2026-07-30 bug. An entry we would refuse to place during a standoff is an
+//! entry we must not leave resting through one either.
+//!
+//! # One derivation, one predicate (why the refcount)
+//!
+//! Reasons **overlap** and **lift independently**: a spread hour running 06:30–08:00
+//! with a news pause from 07:00 leaves the pause armed when the spread lifts at
+//! 08:00. So a reason never cancels or restores directly — it holds and releases,
+//! and the order is re-placed on the release that **empties** the set
+//! ([`Release::Emptied`], a transition, so exactly once per hold episode).
+//!
+//! Both sides funnel through one place: [`hold_reasons`] derives the set (ON) and
+//! [`release_satisfied`] narrows it (OFF). That replaced two hand-written OR
+//! expressions which had to be kept in agreement by hand — an out-of-sync pair
+//! cancels an order and re-places it on the very next ~5s tick, straight back into
+//! the window it was pulled from. Adding a `HoldReason` variant is now a compile
+//! error in [`release_satisfied`] until its release condition is written.
+//!
+//! Note the set is **named**, not a bare counter: the cron re-evaluates the same
+//! conditions every ~5s, so an incrementing count would reach the hundreds within
+//! an hour and never return to zero. [`Holders::hold`] is idempotent.
+//!
+//! # Only THIS module talks to the broker about resting orders
+//!
+//! There is exactly **one** `list_pending_orders` call on the live path — in
+//! [`cancel_pass`]. Neither reason reaches the broker itself; they are
+//! [`HoldReason`] variants, not subsystems with their own broker access. Anything
+//! new that wants to hold resting orders belongs here as a variant, **not** as
+//! another place that enumerates or cancels broker orders.
+//!
+//! # Per-instrument and per-trade reasons on a per-trade record
+//!
+//! The two reasons have **different natural scopes**, which is easy to misread as a
+//! mismatch:
+//!
+//! - `SpreadHour` is per-**instrument** (a property of the pair's clock).
+//! - `NewsPause` is per-**trade** (keyed `(trade_id, blackout_id)`, no instrument).
+//! - The holder set lives on a per-**trade** record.
+//!
+//! This composes correctly because [`cancel_pass`] iterates **every resting order**
+//! and derives [`hold_reasons`] per order. So an instrument-scoped reason is
+//! *fanned out* to each affected trade — three EUR/USD trades in one spread hour get
+//! three records, each holding `SpreadHour` — rather than stored once per instrument.
+//! Release is symmetric: each record re-evaluates `is_spread_hour` against its own
+//! `record.instrument`.
+//!
+//! The consequence worth knowing: a hold is **trade-wide, never per-order**
+//! ("pause all this trade's resting orders"), so no caller needs to ask per-order
+//! questions and there is deliberately no per-order query API.
 //!
 //! This is the generic `core` home the live cron
 //! (`trade-control-cron::blackout_*`) and the offline replay both call, so the
@@ -13,6 +73,11 @@
 //! [`retry_gate::evaluate`](crate::retry_gate) already use.
 //!
 //! # The ON/OFF asymmetry (operator's framing — LOCKED)
+//!
+//! This asymmetry is about the **spread-hour** reason specifically. The news-pause
+//! reason has no such split: a pause is an explicit armed state in the store, so
+//! ON and OFF both read the same [`pause_active`] predicate and it is exact in
+//! replay and live alike.
 //!
 //! Turning spread-hour ON and OFF use **different** signals, on purpose:
 //!
@@ -56,16 +121,17 @@
 use chrono::{DateTime, Duration, Utc};
 
 use crate::blackout_recreate::{RestorePlan, restore_plan};
-use crate::broker::{Broker, PendingOrder};
+use crate::broker::{AttemptState, Broker, PendingOrder};
 use crate::dispatch::run_enter;
 use crate::dispatch_config::DispatchConfig;
+use crate::hold::{HoldReason, Holders, Release};
 use crate::incoming::{self, IncomingError, Verified};
 use crate::intent::Resolved;
 use crate::spread_blackout::{
     SAFETY_FORCE_RESTORE_SECONDS, SPREAD_BLACKOUT_RECOVERED_PIPS, is_spread_hour,
     spread_block_ttl_seconds,
 };
-use crate::state::{CancelledOrder, SpreadBlackoutRecord, StateStore};
+use crate::state::{CancelledOrder, HeldTradeRecord, StateStore};
 
 /// The one backend seam this function still needs: resolve the per-enter
 /// [`DispatchConfig`] (risk caps, pip/tick fallback, per-account caps) at the
@@ -160,9 +226,60 @@ pub struct LifecycleReport {
     pub cancelled: Vec<String>,
     /// `trade_id`s whose record was cleared this pass (OFF), with the reason.
     pub restored: Vec<(String, RestoreReason)>,
-    /// `order_id`s examined but left resting (no body, won't verify, not a
-    /// spread hour) — for visibility, not action.
+    /// `order_id`s examined but left resting (no body, won't verify, or neither
+    /// ON reason fired — no spread hour and no armed pause) — for visibility,
+    /// not action.
     pub skipped: Vec<String>,
+    /// `order_id`s the broker refused to cancel, with what a follow-up lookup
+    /// said about them. **Never silently empty:** before this existed a failed
+    /// cancel appeared in *none* of the report's lists, so an order the record
+    /// claimed was pulled — but which was still live at the broker, or had
+    /// already filled — was invisible to the caller.
+    ///
+    /// A [`CancelOutcome::Vanished`] entry has already been dropped from the
+    /// record, so the OFF side will not re-drive it.
+    pub cancel_failed: Vec<(String, CancelOutcome)>,
+}
+
+/// What a follow-up lookup found after `cancel_order` returned an error.
+///
+/// [`CancelError`](crate::broker::CancelError) is a single `Transient` variant
+/// that deliberately folds "order already gone" together with a network blip —
+/// its own docs say to treat the failure as "probably filled" and **re-lookup**.
+/// So the distinction is resolved where the docs say to resolve it, via
+/// [`Broker::lookup_attempt_state`], and this is the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// The order is **no longer resting** at the broker — it filled, or was
+    /// cancelled/expired/rejected out-of-band. There is nothing to restore, so it
+    /// is removed from the record: leaving it would have the OFF side re-place an
+    /// entry whose original already filled.
+    Vanished(&'static str),
+    /// The order is **still resting** at the broker — the cancel genuinely failed
+    /// (network, 5xx). Left on the record: the next tick retries the cancel, and
+    /// the hold still applies.
+    StillResting,
+    /// The lookup itself failed, so we can't tell. Treated as `StillResting`
+    /// (conservative: keep the record entry, retry next tick) but reported
+    /// separately so a persistent lookup outage is visible rather than looking
+    /// like a stream of live orders.
+    Unresolved,
+}
+
+impl CancelOutcome {
+    /// Should the [`CancelledOrder`] be removed from the record?
+    fn drops_from_record(&self) -> bool {
+        matches!(self, Self::Vanished(_))
+    }
+
+    /// Operator-facing label for the log line.
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Vanished(why) => why,
+            Self::StillResting => "still-resting",
+            Self::Unresolved => "lookup-failed",
+        }
+    }
 }
 
 /// Why a record cleared on the OFF side. Ordered by precedence in
@@ -175,7 +292,7 @@ pub enum RestoreReason {
     Recovered,
 }
 
-/// Who owns deleting the per-trade [`SpreadBlackoutRecord`] after the OFF-side
+/// Who owns deleting the per-trade [`HeldTradeRecord`] after the OFF-side
 /// restore. The record can carry BOTH System 3 (cancelled resting orders, which
 /// this fn restores) AND System 2 (widened open-position stops, which this fn
 /// does NOT touch). Whoever restores System 2 must clear the record — so the
@@ -267,18 +384,51 @@ async fn cancel_pass<B: Broker, S: StateStore, V: VerifiedSource>(
         }
     };
     for order in &pendings {
-        // ON trigger — the pure baked clock, incl. the 30-min lead + NY-close
-        // fallback. NO live quote (the ON/OFF asymmetry).
-        if !is_spread_hour(&order.instrument, now) {
-            report.skipped.push(order.order_id.clone());
-            continue;
-        }
         try_cancel_one(broker, store, src, account, order, now, report).await;
     }
 }
 
+/// Evaluate **every** hold reason for one order at `now` — the single place the
+/// reason set is derived, for both the ON and the OFF side.
+///
+/// This is what replaced the two hand-written OR expressions (one in the cancel
+/// path, one in `off_now`). Having a single derivation is the point: a third
+/// reason added here is automatically honoured by both sides, so the
+/// cancel-then-immediately-restore bug that an out-of-sync pair produces cannot
+/// be written. Adding a `HoldReason` variant without extending this fn is a
+/// non-exhaustive `match` — a compile error.
+///
+/// The cheap instrument-only spread-hour test is evaluated first, but note both
+/// reasons are always computed: the OFF side needs the *full* set to know whether
+/// anything still holds, not just whether one reason fired.
+async fn hold_reasons<S: StateStore>(
+    store: &S,
+    instrument: &str,
+    trade_id: &str,
+    now: DateTime<Utc>,
+) -> Holders {
+    let mut holders = Holders::new();
+    // SpreadHour — the pure baked clock, incl. the 30-min lead + NY-close
+    // fallback. NO live quote (the ON/OFF asymmetry: the quote only ever
+    // *releases* this reason early, in `spread_hour_released`).
+    if is_spread_hour(instrument, now) {
+        holders.hold(HoldReason::SpreadHour);
+    }
+    // NewsPause — a standoff armed for THIS trade.
+    if pause_active(store, trade_id).await {
+        holders.hold(HoldReason::NewsPause);
+    }
+    holders
+}
+
 /// Cancel + store a single resting order. Store-before-cancel (safety rail 1);
 /// no-recoverable-payload / won't-verify ⇒ leave resting (rails 2, 3).
+///
+/// The ON trigger is evaluated **inside** this fn rather than by the caller,
+/// because the news-pause half is keyed by `trade_id` — which only exists once
+/// the payload has been recovered through the [`VerifiedSource`] seam. The cheap
+/// instrument-only spread-hour test still short-circuits first, so a clean bar
+/// with no pause costs exactly one `get_order_body` read per resting order.
 async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
     broker: &B,
     store: &S,
@@ -334,6 +484,18 @@ async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
         .trade_id
         .clone()
         .unwrap_or_else(|| order.order_id.clone());
+
+    // ON trigger — derive EVERY hold reason (one shared derivation, see
+    // `hold_reasons`). Nothing holding ⇒ leave the order resting. Note the full
+    // set is persisted, not just the first reason that fired: overlapping reasons
+    // must each be released before the re-place, which is the whole point of the
+    // refcount.
+    let holders = hold_reasons(store, &order.instrument, &trade_id, now).await;
+    if holders.is_empty() {
+        report.skipped.push(order.order_id.clone());
+        return;
+    }
+
     let Some(pip_size) = verified
         .intent
         .pip_size
@@ -350,7 +512,7 @@ async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
     // RAIL 1 — STORE FIRST (crash-safe): merge a CancelledOrder onto the
     // per-trade record, set `applied`, preserve any widened-stop originals,
     // and upsert BEFORE cancelling.
-    let existing = match store.get_spread_blackout_record(&trade_id).await {
+    let existing = match store.get_held_trade_record(&trade_id).await {
         Ok(r) => r,
         Err(err) => {
             tracing::error!(
@@ -370,12 +532,13 @@ async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
             order_id: order.order_id.clone(),
             signed_intent,
         },
+        &holders,
         now,
     );
     // TTL = block length + grace (concern 1), keyed off the record's own
     // `opened_at` so it matches the `expires_at` the merge stamped.
     let ttl = spread_block_ttl_seconds(&order.instrument, record.opened_at);
-    if let Err(err) = store.upsert_spread_blackout_record(&record, ttl).await {
+    if let Err(err) = store.upsert_held_trade_record(&record, ttl).await {
         tracing::error!(
             "pending-lifecycle[{scope}]: upsert_record({trade_id}) FAILED ({err}); NOT cancelling \
              (no durable record ⇒ would strand the order)",
@@ -392,19 +555,105 @@ async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
         Ok(()) => {
             tracing::info!(
                 "pending-lifecycle[{scope}][{trade_id}]: cancelled resting {} order {} \
-                 (trigger={})",
+                 (trigger={}, held_by=[{}])",
                 if order.is_stop { "stop" } else { "limit" },
                 order.order_id,
                 order.trigger,
+                holders.describe(),
             );
             report.cancelled.push(order.order_id.clone());
         }
-        Err(err) => tracing::error!(
-            "pending-lifecycle[{scope}][{trade_id}]: cancel order {} FAILED ({err:?}); record \
-             stays (recovery re-drive is bounded by gates if still live)",
-            order.order_id,
-        ),
+        Err(err) => {
+            // The cancel failed. `CancelError` folds "already gone" in with a
+            // network blip, so resolve which it was the way its own docs say to —
+            // re-lookup — and act on the answer. Doing nothing here (the old
+            // behaviour) left the record claiming an order was pulled when it had
+            // actually FILLED, and the OFF side would then re-place an entry for a
+            // trade that was already in a position.
+            let outcome = classify_cancel_failure(broker, order).await;
+            tracing::error!(
+                "pending-lifecycle[{scope}][{trade_id}]: cancel order {} FAILED ({err:?}); \
+                 lookup says {} — {}",
+                order.order_id,
+                outcome.as_str(),
+                if outcome.drops_from_record() {
+                    "dropping it from the record (nothing to restore)"
+                } else {
+                    "record stays, cancel retries next tick"
+                },
+            );
+            if outcome.drops_from_record() {
+                drop_cancelled_order(store, &record, &order.order_id, ttl).await;
+            }
+            report.cancel_failed.push((order.order_id.clone(), outcome));
+        }
     }
+}
+
+/// Resolve a failed cancel into a [`CancelOutcome`] via
+/// [`Broker::lookup_attempt_state`] — the re-lookup `CancelError`'s docs call for.
+///
+/// `Pending` is the only state that means "genuinely still resting, retry"; every
+/// filled-or-dead state means the order is gone and must not be restored. A lookup
+/// error is `Unresolved`, treated conservatively as still-resting.
+async fn classify_cancel_failure<B: Broker>(broker: &B, order: &PendingOrder) -> CancelOutcome {
+    match broker
+        .lookup_attempt_state(&order.instrument, &order.order_id, None)
+        .await
+    {
+        Ok(AttemptState::Pending) => CancelOutcome::StillResting,
+        // Filled — restoring would double up on a live/finished position.
+        Ok(AttemptState::OpenPosition { .. }) => CancelOutcome::Vanished("filled-open-position"),
+        Ok(AttemptState::ClosedWin { .. }) | Ok(AttemptState::ClosedLossOrBreakeven { .. }) => {
+            CancelOutcome::Vanished("filled-and-closed")
+        }
+        // Dead without filling (rejected / expired / cancelled upstream).
+        Ok(AttemptState::Cancelled) => CancelOutcome::Vanished("cancelled-upstream"),
+        // Not found anywhere: we lost track. Still "not resting", so the same
+        // no-restore conclusion holds — logged distinctly, per AttemptState's doc.
+        Ok(AttemptState::Unknown) => CancelOutcome::Vanished("not-found"),
+        Err(err) => {
+            tracing::error!(
+                "pending-lifecycle: lookup_attempt_state({}) failed ({err:?}); assuming still \
+                 resting (conservative — keeps the record so the cancel retries)",
+                order.order_id,
+            );
+            CancelOutcome::Unresolved
+        }
+    }
+}
+
+/// Remove one [`CancelledOrder`] from the record after its cancel failed because
+/// the order is gone from the broker.
+///
+/// Best-effort: a write failure leaves the entry in place, which is the same state
+/// the old code always left it in — the next tick re-derives. If the record has no
+/// other cancelled orders and no widened stops it is cleared outright rather than
+/// left as an empty shell that the OFF side would keep re-examining.
+async fn drop_cancelled_order<S: StateStore>(
+    store: &S,
+    record: &HeldTradeRecord,
+    order_id: &str,
+    ttl: u64,
+) {
+    let mut pruned = record.clone();
+    pruned.cancelled_orders.retain(|c| c.order_id != order_id);
+
+    let result = if pruned.cancelled_orders.is_empty() && pruned.original_stops.is_empty() {
+        // Nothing left to restore on either system — don't leave a shell behind.
+        store.clear_held_trade_record(&pruned.trade_id).await
+    } else {
+        store.upsert_held_trade_record(&pruned, ttl).await
+    };
+    if let Err(err) = result {
+        tracing::error!(
+            "pending-lifecycle[{}]: pruning vanished order {order_id} FAILED ({err}); it stays on \
+             the record and the OFF side may try to re-place it",
+            pruned.trade_id,
+        );
+    }
+    // The stored signed body is dead weight once the order is gone.
+    cleanup_body(store, order_id).await;
 }
 
 fn account_id_of(account: Option<&str>) -> &str {
@@ -412,23 +661,32 @@ fn account_id_of(account: Option<&str>) -> &str {
 }
 
 /// Pure record merge: push `cancelled` onto a fresh-or-existing record, set
-/// `applied = true`, and preserve any widened-stop `original_stops`. Idempotent:
-/// re-cancelling the same order id de-dups. Relocated verbatim from
-/// `blackout_cancel::merge_cancelled_order`.
+/// `applied = true`, **union `holding` onto the record's holder set**, and
+/// preserve any widened-stop `original_stops`. Idempotent: re-cancelling the same
+/// order id de-dups, and re-holding a reason already present is a no-op (which is
+/// what makes the ~5s polling cron safe).
+///
+/// The holder union is why a second reason arriving mid-block is additive rather
+/// than a replacement: a spread hour that starts at 06:30 and a pause that arrives
+/// at 07:00 leave the record holding **both**, so the 08:00 spread lift alone does
+/// not restore the order.
+#[allow(clippy::too_many_arguments)]
 fn merge_cancelled_order(
-    existing: Option<SpreadBlackoutRecord>,
+    existing: Option<HeldTradeRecord>,
     trade_id: &str,
     instrument: &str,
     account: Option<&str>,
     pip_size: f64,
     cancelled: CancelledOrder,
+    holding: &Holders,
     now: DateTime<Utc>,
-) -> SpreadBlackoutRecord {
-    let mut record = existing.unwrap_or_else(|| SpreadBlackoutRecord {
+) -> HeldTradeRecord {
+    let mut record = existing.unwrap_or_else(|| HeldTradeRecord {
         trade_id: trade_id.to_string(),
         instrument: instrument.to_string(),
         account: account.map(|s| s.to_string()),
         applied: false,
+        holders: Holders::new(),
         opened_at: now,
         // Placeholder — overwritten below from the block-length TTL.
         expires_at: now,
@@ -437,6 +695,11 @@ fn merge_cancelled_order(
         cancelled_orders: Vec::new(),
     });
     record.applied = true;
+    // Union, not replace — see the fn doc. `hold` is idempotent, so a reason that
+    // re-asserts itself every tick doesn't accumulate.
+    for reason in holding.iter() {
+        record.holders.hold(reason);
+    }
     // Concern 1: the record must OUTLIVE its own spread-hour block so the
     // block-lift restore can find it. Size the TTL from the block length off the
     // (possibly-preserved) `opened_at`, not a flat backstop.
@@ -465,7 +728,7 @@ fn merge_cancelled_order(
 /// `list_pending_orders(account_id)`): the caller passes ONE account's broker,
 /// so recover must only touch THAT account's records — else the live multi-account
 /// cron would `off_now`/re-drive account-Y's records against account-X's broker.
-/// `store.list_all_spread_blackout_records` is store-wide, so we filter by
+/// `store.list_all_held_trade_records` is store-wide, so we filter by
 /// `record.account == account`. The replay passes `account = None` and its records
 /// carry `account = None`, so its behaviour is unchanged.
 #[allow(clippy::too_many_arguments)]
@@ -479,7 +742,7 @@ async fn recover_pass<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verif
     clear_policy: ClearPolicy,
     report: &mut LifecycleReport,
 ) {
-    let records = match store.list_all_spread_blackout_records().await {
+    let records = match store.list_all_held_trade_records().await {
         Ok(v) => v,
         Err(err) => {
             tracing::error!("pending-lifecycle: list records failed: {err}");
@@ -517,7 +780,7 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verifi
     store: &S,
     cfg_provider: &P,
     src: &V,
-    record: &SpreadBlackoutRecord,
+    record: &HeldTradeRecord,
     now: DateTime<Utc>,
     clear_policy: ClearPolicy,
     report: &mut LifecycleReport,
@@ -527,11 +790,13 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verifi
         return;
     }
 
-    // NORMAL OFF trigger FIRST — the block lifted (`!is_spread_hour`) OR the live
-    // spread recovered. This is the path that should restore AUD/CHF at the
+    // NORMAL OFF trigger FIRST — release every satisfied reason. The restore fires
+    // only on the release that EMPTIES the holder set, so overlapping reasons each
+    // have to lift first. This is the path that should restore AUD/CHF at the
     // 05:00Z block lift; because the record TTL now outlives its block (concern 1),
     // this wins BEFORE any expiry and long before the safety ceiling.
-    if off_now(broker, record, now).await {
+    let (surviving, emptied) = release_satisfied(broker, store, record, now).await;
+    if emptied {
         // RAIL 6 — restore BEFORE clear.
         restore_cancelled_orders(broker, store, cfg_provider, src, record, now).await;
         finish_recover(
@@ -543,6 +808,34 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verifi
         )
         .await;
         return;
+    }
+
+    // Still held by at least one reason. Persist the *narrowed* set so a partial
+    // release is durable — otherwise a reason that lifted would be re-derived as
+    // held on every subsequent tick, and (worse) a crash-restart would lose the
+    // fact that it had already released. Only write when it actually changed, to
+    // keep the ~5s cron from rewriting an unchanged row forever.
+    if surviving != record.holders {
+        let mut narrowed = record.clone();
+        narrowed.holders = surviving.clone();
+        let ttl = spread_block_ttl_seconds(&record.instrument, record.opened_at);
+        if let Err(err) = store.upsert_held_trade_record(&narrowed, ttl).await {
+            // Non-fatal: the reason will be re-evaluated next tick and the backstop
+            // still bounds the worst case. Loud, because a persistently failing
+            // write means partial releases aren't sticking.
+            tracing::error!(
+                "pending-lifecycle[{}]: narrowing holders to [{}] FAILED ({err}); will re-derive \
+                 next tick",
+                record.trade_id,
+                surviving.describe(),
+            );
+        } else {
+            tracing::info!(
+                "pending-lifecycle[{}]: still held by [{}] — not restoring yet",
+                record.trade_id,
+                surviving.describe(),
+            );
+        }
     }
 
     // SAFETY force-restore (last resort) — a record still `applied` a very long
@@ -570,7 +863,7 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verifi
 /// restore DID occur, and the report is the caller's signal that it did.
 async fn finish_recover<S: StateStore>(
     store: &S,
-    record: &SpreadBlackoutRecord,
+    record: &HeldTradeRecord,
     clear_policy: ClearPolicy,
     reason: RestoreReason,
     report: &mut LifecycleReport,
@@ -587,25 +880,111 @@ async fn finish_recover<S: StateStore>(
     }
 }
 
-/// The OFF-side decision (excluding the backstop, handled by the caller):
-/// restore when the **live spread recovered** OR the **baked spread hour ended**.
-/// Live samples the quote (recovery, may un-block early); replay's quote is
-/// synthesised so it too can read recovery, but the baked-hour-end is the
-/// deterministic off-signal both share.
-async fn off_now<B: Broker>(broker: &B, record: &SpreadBlackoutRecord, now: DateTime<Utc>) -> bool {
-    // Baked-hour-end — the deterministic off-signal (replay + live). If the
-    // instrument is no longer in a spread hour at `now`, the trough has lifted.
+/// Is a news standoff (`pause`) currently armed for this trade?
+///
+/// The second ON reason alongside `is_spread_hour`, and a veto on OFF. A pause is
+/// keyed `(trade_id, blackout_id)` and carries **no instrument**
+/// ([`PauseEntry`](crate::state::PauseEntry)) — deliberately, since it targets one
+/// setup rather than every order on the pair — so it can only be reached through
+/// a trade_id, which both call sites already have in hand (the ON side off the
+/// recovered `Verified`, the OFF side off the record).
+///
+/// A store error is treated as **paused** (`true`): on the ON side that is the
+/// safe direction only because the cancel is separately gated by rails 1–3, and
+/// on the OFF side it defers the restore by one tick rather than re-placing an
+/// order into a standoff we can't currently see. The 12h backstop remains the
+/// escape hatch if the store stays unreadable.
+async fn pause_active<S: StateStore>(store: &S, trade_id: &str) -> bool {
+    match store.list_pauses_for_trade(trade_id).await {
+        Ok(pauses) => !pauses.is_empty(),
+        Err(err) => {
+            tracing::error!(
+                "pending-lifecycle: list_pauses_for_trade({trade_id}) failed ({err}); treating as \
+                 PAUSED (hold the order rather than expose it to an unseen standoff)",
+            );
+            true
+        }
+    }
+}
+
+/// Has the `SpreadHour` reason released?
+///
+/// The documented ON/OFF asymmetry, carried verbatim: turning **on** is the pure
+/// baked clock, but turning **off** is the **baked hour ending OR the live spread
+/// recovering** — the live worker samples the quote so it can un-block early,
+/// possibly before the nominal hour ends. Replay's synthesised quote inside the
+/// hour keeps it held until the baked hour ends, its deterministic off-signal.
+/// A quote error means "not yet recovered", so we wait for the hour end / backstop.
+async fn spread_hour_released<B: Broker>(
+    broker: &B,
+    record: &HeldTradeRecord,
+    now: DateTime<Utc>,
+) -> bool {
+    // Baked-hour-end — the deterministic off-signal (replay + live).
     if !is_spread_hour(&record.instrument, now) {
         return true;
     }
-    // Live-spread recovery — un-block early if the live spread has already
-    // calmed even though the nominal baked hour hasn't ended. A quote error
-    // (or a synthesised replay quote still inside the hour) simply means "not
-    // yet recovered" and we wait for the baked-hour-end / backstop.
+    // Live-spread recovery — the early un-block, still inside the baked hour.
     match broker.get_quote(&record.instrument).await {
         Ok(quote) => spread_recovered(spread_in_pips(quote.spread(), record.pip_size)),
         Err(_) => false,
     }
+}
+
+/// The OFF-side decision (excluding the backstop, handled by the caller):
+/// **release every reason that is now satisfied, and restore only if that empties
+/// the holder set.**
+///
+/// This is the shared refcount doing its job. Each reason owns its own release
+/// condition — `SpreadHour` via [`spread_hour_released`] (baked-hour-end or live
+/// recovery), `NewsPause` via the absence of a pause row — and they lift
+/// **independently**. The operator's case: a 06:30–08:00 spread hour with a pause
+/// from 07:00 releases `SpreadHour` at 08:00 but stays held by `NewsPause`, so the
+/// order is not re-placed into the standoff.
+///
+/// Returns the surviving holder set and whether the release **emptied** it (the
+/// restore trigger — a transition, so it fires exactly once per hold episode).
+/// Adding a [`HoldReason`] variant forces a new arm here: that non-exhaustive
+/// `match` is the compile error that keeps ON and OFF from drifting apart.
+async fn release_satisfied<B: Broker, S: StateStore>(
+    broker: &B,
+    store: &S,
+    record: &HeldTradeRecord,
+    now: DateTime<Utc>,
+) -> (Holders, bool) {
+    let mut holders = effective_holders(record);
+    let mut emptied = false;
+    for reason in holders.clone().iter() {
+        let released = match reason {
+            HoldReason::SpreadHour => spread_hour_released(broker, record, now).await,
+            HoldReason::NewsPause => !pause_active(store, &record.trade_id).await,
+        };
+        if released && holders.release(reason) == Release::Emptied {
+            emptied = true;
+        }
+    }
+    (holders, emptied)
+}
+
+/// The holder set to reason about, healing a **pre-v120 row**.
+///
+/// A record written before the refcount existed has `applied: true` but no
+/// `holders` (the field decodes to empty via `#[serde(default)]`). Treating that
+/// as "nothing holds it" would restore every in-flight order on the first tick
+/// after deploy — re-placing them into spread hours and news standoffs that are
+/// still live. So an `applied` record with an empty set is read as holding
+/// `{SpreadHour}`, the pre-v120 meaning: it then re-derives normally on this tick
+/// and restores only if that reason has genuinely released.
+///
+/// Only reachable during the deploy window (holder rows are TTL'd, minutes to
+/// hours), but the failure mode it prevents is placing live orders into a blackout.
+fn effective_holders(record: &HeldTradeRecord) -> Holders {
+    if record.applied && record.holders.is_empty() {
+        let mut healed = Holders::new();
+        healed.hold(HoldReason::SpreadHour);
+        return healed;
+    }
+    record.holders.clone()
 }
 
 /// Re-drive (or drop) every cancelled resting order on a record. Relocated from
@@ -620,7 +999,7 @@ async fn restore_cancelled_orders<
     store: &S,
     cfg_provider: &P,
     src: &V,
-    record: &SpreadBlackoutRecord,
+    record: &HeldTradeRecord,
     now: DateTime<Utc>,
 ) {
     for cancelled in &record.cancelled_orders {
@@ -646,7 +1025,7 @@ async fn restore_one_order<B: Broker, S: StateStore, P: EnterConfigProvider, V: 
     store: &S,
     cfg_provider: &P,
     src: &V,
-    record: &SpreadBlackoutRecord,
+    record: &HeldTradeRecord,
     cancelled: &CancelledOrder,
     now: DateTime<Utc>,
 ) -> Result<(), String> {
@@ -770,8 +1149,8 @@ async fn cleanup_body<S: StateStore>(store: &S, order_id: &str) {
 }
 
 /// Clear the record after restore. Returns `true` on success (for the report).
-async fn clear<S: StateStore>(store: &S, record: &SpreadBlackoutRecord) -> bool {
-    match store.clear_spread_blackout_record(&record.trade_id).await {
+async fn clear<S: StateStore>(store: &S, record: &HeldTradeRecord) -> bool {
+    match store.clear_held_trade_record(&record.trade_id).await {
         Ok(()) => true,
         Err(err) => {
             tracing::error!(
@@ -871,6 +1250,13 @@ mod tests {
 
     // --- merge_cancelled_order (relocated from blackout_cancel) ---
 
+    /// A holder set with just `reason` — the common test shape.
+    fn held_by(reason: HoldReason) -> Holders {
+        let mut h = Holders::new();
+        h.hold(reason);
+        h
+    }
+
     fn cancelled(order_id: &str) -> CancelledOrder {
         CancelledOrder {
             order_id: order_id.into(),
@@ -887,6 +1273,7 @@ mod tests {
             Some("reversals"),
             0.0001,
             cancelled("ORD-1"),
+            &held_by(HoldReason::SpreadHour),
             ts("2026-07-08T21:05:00Z"),
         );
         assert!(rec.applied, "cancel is a real broker mutation");
@@ -906,6 +1293,7 @@ mod tests {
             None,
             0.0001,
             cancelled("ORD-1"),
+            &held_by(HoldReason::SpreadHour),
             ts("2026-07-08T21:05:00Z"),
         );
         let rec = merge_cancelled_order(
@@ -915,6 +1303,7 @@ mod tests {
             None,
             0.0001,
             cancelled("ORD-1"),
+            &held_by(HoldReason::SpreadHour),
             ts("2026-07-08T21:06:00Z"),
         );
         assert_eq!(rec.cancelled_orders.len(), 1, "no exact-duplicate growth");
@@ -927,6 +1316,11 @@ mod tests {
         pendings: RefCell<Vec<PendingOrder>>,
         cancel_calls: RefCell<Vec<(String, String)>>,
         quote: RefCell<Option<Quote>>,
+        /// When true, `cancel_order` returns `Transient` — the failure the
+        /// vanished-order path exists to classify.
+        cancel_fails: RefCell<bool>,
+        /// What `lookup_attempt_state` answers. `None` ⇒ a lookup error.
+        lookup: RefCell<Option<AttemptState>>,
     }
 
     impl MockBroker {
@@ -937,6 +1331,12 @@ mod tests {
         }
         fn set_quote(&self, bid: f64, ask: f64) {
             *self.quote.borrow_mut() = Some(Quote { bid, ask });
+        }
+        /// Fail the cancel, and answer a follow-up lookup with `state`.
+        fn failing_cancel(self, state: Option<AttemptState>) -> Self {
+            *self.cancel_fails.borrow_mut() = true;
+            *self.lookup.borrow_mut() = state;
+            self
         }
     }
 
@@ -961,7 +1361,7 @@ mod tests {
             _broker_order_id: &str,
             _broker_trade_id: Option<&str>,
         ) -> Result<AttemptState, LookupError> {
-            Err(LookupError::Transient)
+            self.lookup.borrow().clone().ok_or(LookupError::Transient)
         }
         async fn cancel_order(
             &self,
@@ -971,6 +1371,9 @@ mod tests {
             self.cancel_calls
                 .borrow_mut()
                 .push((account_id.to_string(), broker_order_id.to_string()));
+            if *self.cancel_fails.borrow() {
+                return Err(CancelError::Transient);
+            }
             Ok(())
         }
         async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
@@ -1093,14 +1496,29 @@ mod tests {
         assert!(report.skipped.contains(&"ORD-clean".to_string()));
     }
 
-    // --- OFF decision (off_now): pure of run_enter ---
+    // --- OFF decision (release_satisfied): pure of run_enter ---
 
-    fn applied_record(instrument: &str, opened: &str) -> SpreadBlackoutRecord {
-        SpreadBlackoutRecord {
+    /// `true` when the OFF pass released everything and the order should be
+    /// re-placed. Wraps `release_satisfied`, whose bool is the restore trigger.
+    async fn off(
+        broker: &MockBroker,
+        store: &MemStateStore,
+        rec: &HeldTradeRecord,
+        now: DateTime<Utc>,
+    ) -> bool {
+        release_satisfied(broker, store, rec, now).await.1
+    }
+
+    fn applied_record(instrument: &str, opened: &str) -> HeldTradeRecord {
+        HeldTradeRecord {
             trade_id: "t-off".into(),
             instrument: instrument.into(),
             account: None,
             applied: true,
+            // The existing OFF tests describe a spread-hour-created record, so
+            // that is the reason holding it. `held_with` overrides for the
+            // overlap cases.
+            holders: held_by(HoldReason::SpreadHour),
             opened_at: ts(opened),
             expires_at: ts(opened) + Duration::seconds(SAFETY_FORCE_RESTORE_SECONDS as i64),
             pip_size: 0.0001,
@@ -1112,38 +1530,42 @@ mod tests {
     /// OFF fires when the baked spread hour has ended (the deterministic
     /// off-signal shared by replay + live) — no quote needed.
     #[test]
-    fn off_now_true_when_baked_hour_ended() {
+    fn spread_hour_releases_when_baked_hour_ended() {
         let broker = MockBroker::default(); // no quote set
+        let store = MemStateStore::new(); // no pause armed
         let rec = applied_record("AUD/CHF", "2026-07-08T21:05:00Z");
         // Midday — no longer a spread hour → OFF regardless of any quote.
-        assert!(run(off_now(&broker, &rec, ts("2026-07-08T12:00:00Z"))));
+        assert!(run(off(&broker, &store, &rec, ts("2026-07-08T12:00:00Z"))));
     }
 
     /// OFF fires EARLY (still inside the baked hour) when the LIVE spread has
     /// recovered — the live-only early-un-block. Replay (no quote) would wait
     /// for the baked-hour-end instead.
     #[test]
-    fn off_now_true_when_live_spread_recovered_inside_hour() {
+    fn spread_hour_releases_early_when_live_spread_recovered() {
         let broker = MockBroker::default();
         broker.set_quote(0.5600, 0.5602); // 2p spread ≤ 4p recovered cutoff
+        let store = MemStateStore::new(); // no pause armed
         let rec = applied_record("AUD/CHF", "2026-07-08T21:00:00Z");
         // Still inside the 21:00Z baked hour, but the live spread has calmed.
-        assert!(run(off_now(&broker, &rec, ts("2026-07-08T21:20:00Z"))));
+        assert!(run(off(&broker, &store, &rec, ts("2026-07-08T21:20:00Z"))));
     }
 
     /// OFF does NOT fire inside the baked hour when the live spread is still
     /// blown (and no quote → also not recovered).
     #[test]
-    fn off_now_false_inside_hour_with_wide_spread() {
+    fn spread_hour_still_holds_inside_hour_with_wide_spread() {
         let broker = MockBroker::default();
         broker.set_quote(0.5590, 0.5602); // 12p spread, still blown
+        let store = MemStateStore::new(); // no pause armed
         let rec = applied_record("AUD/CHF", "2026-07-08T21:00:00Z");
-        assert!(!run(off_now(&broker, &rec, ts("2026-07-08T21:20:00Z"))));
+        assert!(!run(off(&broker, &store, &rec, ts("2026-07-08T21:20:00Z"))));
 
         // No quote available → treated as "not yet recovered".
         let broker_noquote = MockBroker::default();
-        assert!(!run(off_now(
+        assert!(!run(off(
             &broker_noquote,
+            &store,
             &rec,
             ts("2026-07-08T21:20:00Z")
         )));
@@ -1194,7 +1616,7 @@ mod tests {
         store.set_clock(now);
         run(async {
             store
-                .upsert_spread_blackout_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
+                .upsert_held_trade_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
                 .await
                 .expect("upsert record");
             let mut report = LifecycleReport::default();
@@ -1239,7 +1661,7 @@ mod tests {
         store.set_clock(now);
         run(async {
             store
-                .upsert_spread_blackout_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
+                .upsert_held_trade_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
                 .await
                 .expect("upsert record");
             let mut report = LifecycleReport::default();
@@ -1264,7 +1686,7 @@ mod tests {
             // The record is LEFT for the caller — NOT deleted here — AND it still
             // carries its widened stop, so the watcher can restore System 2.
             let still_there = store
-                .get_spread_blackout_record("t-off")
+                .get_held_trade_record("t-off")
                 .await
                 .expect("record read")
                 .expect(
@@ -1291,7 +1713,7 @@ mod tests {
         store.set_clock(now);
         run(async {
             store
-                .upsert_spread_blackout_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
+                .upsert_held_trade_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
                 .await
                 .expect("upsert record");
             let mut report = LifecycleReport::default();
@@ -1311,7 +1733,7 @@ mod tests {
                 vec![("t-off".to_string(), RestoreReason::Recovered)]
             );
             let gone = store
-                .get_spread_blackout_record("t-off")
+                .get_held_trade_record("t-off")
                 .await
                 .expect("record read");
             assert!(gone.is_none(), "ClearRecord deletes the record");
@@ -1408,10 +1830,7 @@ mod tests {
         );
         // And the crash-safe record was written (store-before-cancel, RAIL 1).
         run(async {
-            let rec = store
-                .get_spread_blackout_record("t")
-                .await
-                .expect("record read");
+            let rec = store.get_held_trade_record("t").await.expect("record read");
             let rec = rec.expect("a record was upserted before the cancel");
             assert!(rec.applied);
             assert_eq!(rec.cancelled_orders.len(), 1);
@@ -1479,5 +1898,603 @@ mod tests {
         ));
         assert!(report.cancelled.is_empty());
         assert!(broker.cancel_calls.borrow().is_empty());
+    }
+
+    // --- news pause: a paused trade's resting order is pulled too ---
+
+    /// Arm a pause on trade `t` (the `trade_id` `armed_verified` bakes) so the
+    /// news-standoff branch of the ON trigger is live for that order.
+    async fn pause_trade(store: &MemStateStore, now: DateTime<Utc>) {
+        store
+            .set_pause("t", "cal-cpi-pause", Some("news:AUD/CHF"), now, 3600)
+            .await
+            .expect("set pause");
+    }
+
+    /// THE BUG (2026-07-30). A resting entry order on a trade whose news pause
+    /// is active must be CANCELLED, exactly as a spread hour cancels it —
+    /// otherwise it sits through the event and fills on the news spike while
+    /// `run_enter` is (correctly) rejecting new entries with 423. The bar here is
+    /// CLEAN (`!is_spread_hour`), so only the pause can drive the cancel.
+    #[test]
+    fn active_pause_cancels_the_resting_order_on_a_clean_bar() {
+        let broker = MockBroker::with_pending(pending("t-enter-o1", "AUD/CHF"));
+        let store = MemStateStore::new();
+        let mut armed = std::collections::HashMap::new();
+        armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
+        let source = ArmedSource { armed };
+
+        let now = ts("2026-07-08T12:00:00Z"); // clean bar — NOT a spread hour
+        store.set_clock(now);
+        let report = run(async {
+            pause_trade(&store, now).await;
+            pending_order_lifecycle(
+                &broker,
+                &store,
+                &StubCfg,
+                &source,
+                Some("reversals"),
+                now,
+                ClearPolicy::ClearRecord,
+            )
+            .await
+        });
+        assert_eq!(
+            report.cancelled,
+            vec!["t-enter-o1".to_string()],
+            "an active news pause must pull the resting order, like a spread hour does"
+        );
+        assert_eq!(
+            broker.cancel_calls.borrow().len(),
+            1,
+            "the broker cancel must have been issued"
+        );
+        // RAIL 1 — the crash-safe record was written before the cancel, so the
+        // OFF side can re-place the order when the pause lifts.
+        run(async {
+            let rec = store
+                .get_held_trade_record("t")
+                .await
+                .expect("record read")
+                .expect("a record was upserted before the cancel");
+            assert!(rec.applied);
+            assert_eq!(rec.cancelled_orders.len(), 1);
+            assert_eq!(rec.cancelled_orders[0].order_id, "t-enter-o1");
+        });
+    }
+
+    /// Scoping: the pause is keyed by `trade_id`, so a pause on a DIFFERENT
+    /// trade must not touch this order. Guards against the instrument-wide
+    /// widening that `core::state`'s `PauseEntry` docs explicitly reject.
+    #[test]
+    fn pause_on_another_trade_leaves_this_order_resting() {
+        let broker = MockBroker::with_pending(pending("t-enter-o1", "AUD/CHF"));
+        let store = MemStateStore::new();
+        let mut armed = std::collections::HashMap::new();
+        armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
+        let source = ArmedSource { armed };
+
+        let now = ts("2026-07-08T12:00:00Z"); // clean bar
+        store.set_clock(now);
+        let report = run(async {
+            // A pause on some OTHER setup on the same pair.
+            store
+                .set_pause("other-trade", "cal-cpi-pause", None, now, 3600)
+                .await
+                .expect("set pause");
+            pending_order_lifecycle(
+                &broker,
+                &store,
+                &StubCfg,
+                &source,
+                Some("reversals"),
+                now,
+                ClearPolicy::ClearRecord,
+            )
+            .await
+        });
+        assert!(
+            report.cancelled.is_empty(),
+            "a pause is trade-scoped — another trade's pause must not pull this order"
+        );
+        assert!(broker.cancel_calls.borrow().is_empty());
+    }
+
+    /// OFF side: while the pause is STILL ACTIVE the record must not restore,
+    /// even though the bar is clean (`!is_spread_hour`, which alone would have
+    /// returned true). Without this the order would be re-placed on the very
+    /// next cron tick — straight back into the news window it was pulled from.
+    #[test]
+    fn off_now_false_while_pause_still_active() {
+        let broker = MockBroker::default();
+        let store = MemStateStore::new();
+        let mut rec = applied_record("AUD/CHF", "2026-07-08T11:55:00Z");
+        rec.holders = held_by(HoldReason::NewsPause); // pause-created record
+        let now = ts("2026-07-08T12:00:00Z"); // clean bar — spread side says OFF
+        store.set_clock(now);
+        let held = run(async {
+            store
+                .set_pause(&rec.trade_id, "cal-cpi-pause", None, now, 3600)
+                .await
+                .expect("set pause");
+            off(&broker, &store, &rec, now).await
+        });
+        assert!(
+            !held,
+            "an active pause must hold the order back even on a clean bar"
+        );
+    }
+
+    /// RAIL 5 still holds over a pause: the 12h backstop force-restores even
+    /// while a pause is armed. `pause_active` fails CLOSED (a store error reads
+    /// as paused), so without an escape hatch a stuck pause row — or a store
+    /// that never answers — would pin the order forever. The backstop is checked
+    /// independently of `off_now`, so it remains that hatch.
+    #[test]
+    fn backstop_restores_even_while_paused() {
+        let broker = MockBroker::default(); // no quote → never "recovered"
+        let store = MemStateStore::new();
+        let mut rec = applied_record("AUD/CHF", "2026-07-08T21:05:00Z");
+        rec.holders = held_by(HoldReason::NewsPause);
+        // > 12h after opened_at, and a pause is STILL armed.
+        let now = ts("2026-07-09T21:30:00Z");
+        store.set_clock(now);
+        run(async {
+            store
+                .upsert_held_trade_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
+                .await
+                .expect("upsert record");
+            store
+                .set_pause(&rec.trade_id, "stuck-pause", None, now, 86_400)
+                .await
+                .expect("set pause");
+            // Precondition: the normal OFF path is genuinely blocked by the pause.
+            assert!(
+                !off(&broker, &store, &rec, now).await,
+                "the pause must be holding OFF back, or this test proves nothing"
+            );
+            let mut report = LifecycleReport::default();
+            recover_one(
+                &broker,
+                &store,
+                &StubCfg,
+                &src(),
+                &rec,
+                now,
+                ClearPolicy::ClearRecord,
+                &mut report,
+            )
+            .await;
+            assert_eq!(
+                report.restored,
+                vec![("t-off".to_string(), RestoreReason::Backstop)],
+                "the 12h backstop must still free a record wedged behind a pause"
+            );
+        });
+    }
+
+    /// The twin: once the pause is CLEARED the same record restores on the same
+    /// clean bar — so the pause genuinely gates OFF rather than wedging it.
+    #[test]
+    fn off_now_true_once_pause_cleared() {
+        let broker = MockBroker::default();
+        let store = MemStateStore::new();
+        let rec = applied_record("AUD/CHF", "2026-07-08T11:55:00Z");
+        let now = ts("2026-07-08T12:00:00Z");
+        store.set_clock(now);
+        let off_fired = run(async {
+            store
+                .set_pause(&rec.trade_id, "cal-cpi-pause", None, now, 3600)
+                .await
+                .expect("set pause");
+            store
+                .clear_pause(&rec.trade_id, "cal-cpi-pause")
+                .await
+                .expect("clear pause");
+            off(&broker, &store, &rec, now).await
+        });
+        assert!(off_fired, "pause cleared + clean bar ⇒ restore");
+    }
+
+    /// End-to-end through the shared lifecycle: pause active ⇒ cancelled and NOT
+    /// restored in the same pass. Proves `cancel_pass` and `recover_pass` agree
+    /// on the pause (a mismatch would cancel then immediately re-place).
+    #[test]
+    fn paused_order_is_not_restored_in_the_same_pass() {
+        let broker = MockBroker::with_pending(pending("t-enter-o1", "AUD/CHF"));
+        let store = MemStateStore::new();
+        let mut armed = std::collections::HashMap::new();
+        armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
+        let source = ArmedSource { armed };
+
+        let now = ts("2026-07-08T12:00:00Z"); // clean bar
+        store.set_clock(now);
+        let report = run(async {
+            pause_trade(&store, now).await;
+            pending_order_lifecycle(
+                &broker,
+                &store,
+                &StubCfg,
+                &source,
+                Some("reversals"),
+                now,
+                ClearPolicy::ClearRecord,
+            )
+            .await
+        });
+        assert_eq!(report.cancelled, vec!["t-enter-o1".to_string()]);
+        assert!(
+            report.restored.is_empty(),
+            "must not restore while the pause that caused the cancel is still active"
+        );
+        // The record survives for the post-pause restore.
+        run(async {
+            assert!(
+                store
+                    .get_held_trade_record("t")
+                    .await
+                    .expect("record read")
+                    .is_some(),
+                "the record must outlive the pause so the order can be re-placed"
+            );
+        });
+    }
+
+    // --- OVERLAP: a spread hour and a news pause at the same time ---
+    //
+    // The operator's case (2026-07-30): "spread hour is 06:30–08:00, but what if
+    // the news pause happens at 07:00?" Both reasons hold; they lift
+    // independently; only the LAST one out may restore the order. AUD/CHF 21:00Z
+    // is the baked spread hour these tests use (12:00Z is clean), so the
+    // "spread hour" leg is real baked data rather than an invented window.
+
+    /// A record held by BOTH reasons, as the ON side would have written it when
+    /// the pause arrived partway through the spread hour.
+    fn held_by_both(instrument: &str, opened: &str) -> HeldTradeRecord {
+        let mut rec = applied_record(instrument, opened);
+        rec.holders = Holders::new();
+        rec.holders.hold(HoldReason::SpreadHour);
+        rec.holders.hold(HoldReason::NewsPause);
+        rec
+    }
+
+    /// OVERLAP 1 — **the spread hour lifts first, the pause is still armed.**
+    /// This is the operator's exact scenario: the 06:30–08:00 trough ends at
+    /// 08:00 but the 07:00 news standoff runs on. `SpreadHour` releases,
+    /// `NewsPause` survives, and the order must NOT be re-placed.
+    #[test]
+    fn overlap_spread_lifts_first_pause_still_holds() {
+        let broker = MockBroker::default();
+        let store = MemStateStore::new();
+        let rec = held_by_both("AUD/CHF", "2026-07-08T21:05:00Z");
+        // Midday: the baked spread hour has ended (so SpreadHour releases)...
+        let now = ts("2026-07-08T12:00:00Z");
+        store.set_clock(now);
+        let (surviving, emptied) = run(async {
+            // ...but the news pause is still armed.
+            store
+                .set_pause(&rec.trade_id, "cal-cpi-pause", None, now, 3600)
+                .await
+                .expect("set pause");
+            release_satisfied(&broker, &store, &rec, now).await
+        });
+        assert!(
+            !emptied,
+            "the pause still holds — the order must NOT be re-placed at the spread lift"
+        );
+        assert_eq!(surviving.len(), 1, "count went 2 → 1, not 2 → 0");
+        assert!(surviving.contains(HoldReason::NewsPause));
+        assert!(
+            !surviving.contains(HoldReason::SpreadHour),
+            "the released reason is dropped from the set"
+        );
+    }
+
+    /// OVERLAP 2 — **the pause clears first, the spread hour is still live.**
+    /// The mirror image. Note the live quote must be BLOWN, because
+    /// `SpreadHour`'s release condition includes early live-spread recovery — a
+    /// narrow quote would legitimately release it and empty the set.
+    #[test]
+    fn overlap_pause_clears_first_spread_hour_still_holds() {
+        let broker = MockBroker::default();
+        broker.set_quote(0.5590, 0.5602); // 12p — still blown, no early release
+        let store = MemStateStore::new();
+        let rec = held_by_both("AUD/CHF", "2026-07-08T21:00:00Z");
+        // Inside the baked 21:00Z spread hour, and no pause is armed.
+        let now = ts("2026-07-08T21:20:00Z");
+        store.set_clock(now);
+        let (surviving, emptied) = run(release_satisfied(&broker, &store, &rec, now));
+        assert!(
+            !emptied,
+            "the spread hour still holds — the order must NOT be re-placed when the pause clears"
+        );
+        assert_eq!(surviving.len(), 1);
+        assert!(surviving.contains(HoldReason::SpreadHour));
+        assert!(!surviving.contains(HoldReason::NewsPause));
+    }
+
+    /// OVERLAP 3 — **both lift** ⇒ the set empties and the order is restored.
+    /// The other side of 1 and 2: proves they're held by a live condition rather
+    /// than something that never releases.
+    #[test]
+    fn overlap_both_lift_then_restores() {
+        let broker = MockBroker::default();
+        let store = MemStateStore::new(); // no pause armed
+        let rec = held_by_both("AUD/CHF", "2026-07-08T21:05:00Z");
+        let now = ts("2026-07-08T12:00:00Z"); // clean bar — spread lifted too
+        store.set_clock(now);
+        let (surviving, emptied) = run(release_satisfied(&broker, &store, &rec, now));
+        assert!(emptied, "both reasons released ⇒ restore");
+        assert!(surviving.is_empty());
+    }
+
+    /// OVERLAP 4 — the pause arrives PARTWAY THROUGH a spread hour and the ON
+    /// side unions it onto the existing record, taking the count 1 → 2. Without
+    /// the union the second reason would overwrite the first and the 08:00 spread
+    /// lift would restore straight into the standoff.
+    #[test]
+    fn overlap_second_reason_unions_onto_an_existing_record() {
+        let existing = applied_record("AUD/CHF", "2026-07-08T21:00:00Z");
+        assert_eq!(existing.holders.len(), 1, "starts held by the spread hour");
+
+        // The pause arrives; the ON side merges with only NewsPause in hand.
+        let merged = merge_cancelled_order(
+            Some(existing),
+            "t-off",
+            "AUD/CHF",
+            None,
+            0.0001,
+            cancelled("ORD-2"),
+            &held_by(HoldReason::NewsPause),
+            ts("2026-07-08T21:30:00Z"),
+        );
+        assert_eq!(merged.holders.len(), 2, "union, not replace");
+        assert!(merged.holders.contains(HoldReason::SpreadHour));
+        assert!(merged.holders.contains(HoldReason::NewsPause));
+    }
+
+    /// OVERLAP 5 — the ~5s cron re-deriving the SAME reason many times must not
+    /// inflate the set. This is the property a bare integer refcount would fail
+    /// (it would climb to 200/hour and never reach zero), checked here through the
+    /// real merge path rather than only on `Holders` in isolation.
+    #[test]
+    fn overlap_repeated_ticks_do_not_inflate_the_holder_set() {
+        let mut rec = applied_record("AUD/CHF", "2026-07-08T21:00:00Z");
+        for tick in 0..50 {
+            rec = merge_cancelled_order(
+                Some(rec),
+                "t-off",
+                "AUD/CHF",
+                None,
+                0.0001,
+                cancelled("ORD-1"),               // same order id every tick
+                &held_by(HoldReason::SpreadHour), // same reason every tick
+                ts("2026-07-08T21:00:00Z") + Duration::seconds(5 * tick),
+            );
+        }
+        assert_eq!(rec.holders.len(), 1, "50 ticks must not accumulate holders");
+        assert_eq!(rec.cancelled_orders.len(), 1, "nor duplicate the order");
+    }
+
+    /// BACK-COMPAT — a pre-refcount (v119) row in flight during the deploy has
+    /// `applied: true` and NO holders. Treated naively ("empty ⇒ restore") the
+    /// first tick after deploy would re-place every such order into windows that
+    /// are still live. `effective_holders` reads it as `{SpreadHour}` so it
+    /// re-derives instead: here, inside the baked hour with a blown quote, it
+    /// must still be held.
+    #[test]
+    fn pre_refcount_row_does_not_restore_blind() {
+        let broker = MockBroker::default();
+        broker.set_quote(0.5590, 0.5602); // still blown
+        let store = MemStateStore::new();
+        let mut rec = applied_record("AUD/CHF", "2026-07-08T21:00:00Z");
+        rec.holders = Holders::new(); // a v119 row: applied, no holders
+        let now = ts("2026-07-08T21:20:00Z"); // inside the baked spread hour
+        store.set_clock(now);
+        let (surviving, emptied) = run(release_satisfied(&broker, &store, &rec, now));
+        assert!(
+            !emptied,
+            "a pre-refcount row must NOT restore blind while its block is still live"
+        );
+        assert!(surviving.contains(HoldReason::SpreadHour));
+    }
+
+    /// An `!applied` record with no holders must NOT report `emptied` — there is
+    /// nothing to restore, and reporting the transition would let a record the box
+    /// never mutated drive a re-place. `recover_one` gates on `!applied` first
+    /// (rail 4), so this is defence in depth for direct callers; it is load-bearing
+    /// because `emptied` is what triggers the broker re-drive.
+    #[test]
+    fn unapplied_holderless_record_never_reports_emptied() {
+        let broker = MockBroker::default();
+        let store = MemStateStore::new();
+        let mut rec = applied_record("AUD/CHF", "2026-07-08T21:05:00Z");
+        rec.applied = false;
+        rec.holders = Holders::new();
+        let now = ts("2026-07-08T12:00:00Z"); // block lifted — the tempting case
+        store.set_clock(now);
+        let (surviving, emptied) = run(release_satisfied(&broker, &store, &rec, now));
+        assert!(
+            !emptied,
+            "no holders were ever released, so there is no transition to restore on"
+        );
+        assert!(surviving.is_empty());
+    }
+
+    /// The twin: the same healed pre-refcount row DOES restore once its block has
+    /// genuinely lifted — the healing defers the decision, it doesn't wedge it.
+    #[test]
+    fn pre_refcount_row_restores_once_its_block_lifts() {
+        let broker = MockBroker::default();
+        let store = MemStateStore::new();
+        let mut rec = applied_record("AUD/CHF", "2026-07-08T21:05:00Z");
+        rec.holders = Holders::new(); // a v119 row
+        let now = ts("2026-07-08T12:00:00Z"); // clean bar — block lifted
+        store.set_clock(now);
+        let (_, emptied) = run(release_satisfied(&broker, &store, &rec, now));
+        assert!(
+            emptied,
+            "healed row restores once the spread hour has lifted"
+        );
+    }
+
+    // --- A cancel that FAILS: DB/broker divergence ---
+    //
+    // The old code logged the failure and moved on, pushing nothing to the report.
+    // So an order the record claimed was pulled — but which had actually FILLED —
+    // was invisible, and the OFF side would faithfully re-place an entry for a
+    // trade already in a position. These pin the classification + the prune.
+
+    /// Drive one ON pass over a spread-hour order whose cancel fails, with
+    /// `lookup` as the follow-up answer.
+    fn cancel_failure_pass(lookup: Option<AttemptState>) -> (LifecycleReport, MemStateStore) {
+        let broker =
+            MockBroker::with_pending(pending("t-enter-o1", "AUD/CHF")).failing_cancel(lookup);
+        let store = MemStateStore::new();
+        let mut armed = std::collections::HashMap::new();
+        armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
+        let source = ArmedSource { armed };
+        let now = ts("2026-07-08T21:00:00Z"); // AUD/CHF baked spread hour
+        store.set_clock(now);
+        let report = run(pending_order_lifecycle(
+            &broker,
+            &store,
+            &StubCfg,
+            &source,
+            Some("reversals"),
+            now,
+            ClearPolicy::LeaveForCaller, // don't let the OFF side clear it out from under us
+        ));
+        (report, store)
+    }
+
+    /// THE DIVERGENCE. The cancel fails because the order already FILLED. It must
+    /// be reported and **dropped from the record**, so the OFF side never re-places
+    /// an entry for a position that already exists.
+    #[test]
+    fn cancel_failure_on_a_filled_order_drops_it_from_the_record() {
+        let (report, store) = cancel_failure_pass(Some(AttemptState::OpenPosition {
+            broker_trade_id: "TRADE-7".into(),
+        }));
+
+        assert!(
+            report.cancelled.is_empty(),
+            "a failed cancel is not a cancel"
+        );
+        assert_eq!(
+            report.cancel_failed,
+            vec![(
+                "t-enter-o1".to_string(),
+                CancelOutcome::Vanished("filled-open-position")
+            )],
+            "the failure must be REPORTED, not silently swallowed"
+        );
+        // The record must no longer list the order — nothing to restore.
+        run(async {
+            let rec = store.get_held_trade_record("t").await.expect("record read");
+            match rec {
+                None => {} // pruned to nothing and cleared — also correct
+                Some(r) => assert!(
+                    r.cancelled_orders.is_empty(),
+                    "a filled order must not stay on the record, or the OFF side re-places it"
+                ),
+            }
+        });
+    }
+
+    /// A cancel that fails while the order is genuinely **still resting** (network
+    /// blip) must KEEP the record entry, so the next tick retries the cancel and
+    /// the order is still restorable.
+    #[test]
+    fn cancel_failure_while_still_resting_keeps_the_record_entry() {
+        let (report, store) = cancel_failure_pass(Some(AttemptState::Pending));
+
+        assert_eq!(
+            report.cancel_failed,
+            vec![("t-enter-o1".to_string(), CancelOutcome::StillResting)],
+        );
+        run(async {
+            let rec = store
+                .get_held_trade_record("t")
+                .await
+                .expect("record read")
+                .expect("the record must survive — the order is still out there");
+            assert_eq!(
+                rec.cancelled_orders.len(),
+                1,
+                "a still-resting order stays on the record so the cancel can retry"
+            );
+        });
+    }
+
+    /// A failed cancel whose follow-up LOOKUP also fails is `Unresolved` and
+    /// treated conservatively as still-resting — the entry stays. Reported
+    /// distinctly so a lookup outage doesn't masquerade as live orders.
+    #[test]
+    fn cancel_failure_with_an_unresolvable_lookup_keeps_the_entry() {
+        let (report, store) = cancel_failure_pass(None); // lookup errors
+
+        assert_eq!(
+            report.cancel_failed,
+            vec![("t-enter-o1".to_string(), CancelOutcome::Unresolved)],
+        );
+        run(async {
+            let rec = store
+                .get_held_trade_record("t")
+                .await
+                .expect("record read")
+                .expect("conservative: keep the record when we can't tell");
+            assert_eq!(rec.cancelled_orders.len(), 1);
+        });
+    }
+
+    /// Every "not resting any more" state drops the order, not just the filled one:
+    /// cancelled-upstream (TN rejects / OANDA TIF expiry) and not-found both mean
+    /// there is nothing to restore.
+    #[test]
+    fn every_vanished_state_drops_the_order() {
+        for (state, want) in [
+            (AttemptState::Cancelled, "cancelled-upstream"),
+            (AttemptState::Unknown, "not-found"),
+            (
+                AttemptState::ClosedWin { realized_pl: 12.0 },
+                "filled-and-closed",
+            ),
+            (
+                AttemptState::ClosedLossOrBreakeven { realized_pl: -8.0 },
+                "filled-and-closed",
+            ),
+        ] {
+            let (report, _) = cancel_failure_pass(Some(state.clone()));
+            assert_eq!(
+                report.cancel_failed,
+                vec![("t-enter-o1".to_string(), CancelOutcome::Vanished(want))],
+                "state {state:?} must classify as vanished/{want}"
+            );
+        }
+    }
+
+    /// A successful cancel reports NOTHING in `cancel_failed` — the new field is
+    /// only populated on the failure path, so it stays a useful signal.
+    #[test]
+    fn a_successful_cancel_reports_no_failure() {
+        let broker = MockBroker::with_pending(pending("t-enter-o1", "AUD/CHF"));
+        let store = MemStateStore::new();
+        let mut armed = std::collections::HashMap::new();
+        armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
+        let source = ArmedSource { armed };
+        let now = ts("2026-07-08T21:00:00Z");
+        store.set_clock(now);
+        let report = run(pending_order_lifecycle(
+            &broker,
+            &store,
+            &StubCfg,
+            &source,
+            Some("reversals"),
+            now,
+            ClearPolicy::LeaveForCaller,
+        ));
+        assert_eq!(report.cancelled, vec!["t-enter-o1".to_string()]);
+        assert!(report.cancel_failed.is_empty());
     }
 }

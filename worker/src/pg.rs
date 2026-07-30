@@ -23,8 +23,8 @@ use trade_control_core::control_event::ControlEvent;
 use trade_control_core::intent::{Action, NoEntryWindow};
 use trade_control_core::plan_state::PlanState;
 use trade_control_core::state::{
-    ArchivedPlan, EntryAttempt, MIN_TTL_SECONDS, MwState, NewsEntry, PauseEntry, SeenEntry,
-    Snapshot, SpreadBlackoutRecord, SpreadBlackoutWindow, StateError, StateStore, StoredPlan,
+    ArchivedPlan, EntryAttempt, HeldTradeRecord, MIN_TTL_SECONDS, MwState, NewsEntry, PauseEntry,
+    SeenEntry, Snapshot, SpreadBlackoutWindow, StateError, StateStore, StoredPlan,
 };
 use trade_control_core::trade_plan::TradePlan;
 
@@ -110,8 +110,11 @@ impl PgStateStore {
     /// Native-only — this lives on [`PgStateStore`] and is **not** on the
     /// [`StateStore`] trait; the wasm KV store gets free TTL and needs no GC.
     pub async fn gc_expired(&self) -> Result<u64, StateError> {
-        // Every table with an `expires_at` column in 0001_state.sql. Keep this
-        // list exhaustive — a missed table silently leaks expired rows forever.
+        // Every table with an `expires_at` column, across ALL migrations. Keep
+        // this list exhaustive — a missed table silently leaks expired rows
+        // forever. Note `held_trade_record` is created by 0001 under its old name
+        // (`spread_blackout_record`) and renamed by 0005; only the final name
+        // belongs here.
         const TTL_TABLES: &[&str] = &[
             "seen",
             "cooldown",
@@ -123,7 +126,7 @@ impl PgStateStore {
             "retry_fire",
             "spread_blackout_window",
             "blackout_windows",
-            "spread_blackout_record",
+            "held_trade_record",
             "mw_state",
         ];
 
@@ -1017,18 +1020,18 @@ impl PgStateStore {
     }
 }
 
-// ──────────────── spread_blackout_record (per-trade, TTL) ───────────────────
+// ──────────────── held_trade_record (per-trade, TTL) ───────────────────
 
 impl PgStateStore {
-    async fn upsert_spread_blackout_record_impl(
+    async fn upsert_held_trade_record_impl(
         &self,
-        record: &SpreadBlackoutRecord,
+        record: &HeldTradeRecord,
         ttl_seconds: u64,
     ) -> Result<(), StateError> {
         let expires_at = control_expires_at(Utc::now(), ttl_seconds);
         let body = to_jsonb(record)?;
         sqlx::query(
-            "INSERT INTO spread_blackout_record (trade_id, body, expires_at)
+            "INSERT INTO held_trade_record (trade_id, body, expires_at)
              VALUES ($1, $2, $3)
              ON CONFLICT (trade_id) DO UPDATE SET body = EXCLUDED.body,
                expires_at = EXCLUDED.expires_at",
@@ -1042,12 +1045,12 @@ impl PgStateStore {
         Ok(())
     }
 
-    async fn get_spread_blackout_record_impl(
+    async fn get_held_trade_record_impl(
         &self,
         trade_id: &str,
-    ) -> Result<Option<SpreadBlackoutRecord>, StateError> {
+    ) -> Result<Option<HeldTradeRecord>, StateError> {
         let row: Option<(serde_json::Value,)> = sqlx::query_as(
-            "SELECT body FROM spread_blackout_record WHERE trade_id = $1 AND expires_at > now()",
+            "SELECT body FROM held_trade_record WHERE trade_id = $1 AND expires_at > now()",
         )
         .bind(trade_id)
         .fetch_optional(&self.pool)
@@ -1056,19 +1059,17 @@ impl PgStateStore {
         row.map(|(v,)| from_jsonb(v)).transpose()
     }
 
-    async fn list_all_spread_blackout_records_impl(
-        &self,
-    ) -> Result<Vec<SpreadBlackoutRecord>, StateError> {
+    async fn list_all_held_trade_records_impl(&self) -> Result<Vec<HeldTradeRecord>, StateError> {
         let rows: Vec<(serde_json::Value,)> =
-            sqlx::query_as("SELECT body FROM spread_blackout_record WHERE expires_at > now()")
+            sqlx::query_as("SELECT body FROM held_trade_record WHERE expires_at > now()")
                 .fetch_all(&self.pool)
                 .await
                 .map_err(backend)?;
         rows.into_iter().map(|(v,)| from_jsonb(v)).collect()
     }
 
-    async fn clear_spread_blackout_record_impl(&self, trade_id: &str) -> Result<(), StateError> {
-        sqlx::query("DELETE FROM spread_blackout_record WHERE trade_id = $1")
+    async fn clear_held_trade_record_impl(&self, trade_id: &str) -> Result<(), StateError> {
+        sqlx::query("DELETE FROM held_trade_record WHERE trade_id = $1")
             .bind(trade_id)
             .execute(&self.pool)
             .await
@@ -1549,7 +1550,7 @@ impl PgStateStore {
                     account: r.account,
                 })
                 .collect(),
-            spread_blackouts: self.list_all_spread_blackout_records_impl().await?,
+            spread_blackouts: self.list_all_held_trade_records_impl().await?,
             spread_blackout_window: self.get_spread_blackout_window_impl().await?,
         })
     }
@@ -1802,27 +1803,25 @@ impl StateStore for PgStateStore {
     ) -> Result<Vec<NoEntryWindow>, StateError> {
         self.get_blackout_windows_impl(instrument).await
     }
-    async fn upsert_spread_blackout_record(
+    async fn upsert_held_trade_record(
         &self,
-        record: &SpreadBlackoutRecord,
+        record: &HeldTradeRecord,
         ttl_seconds: u64,
     ) -> Result<(), StateError> {
-        self.upsert_spread_blackout_record_impl(record, ttl_seconds)
+        self.upsert_held_trade_record_impl(record, ttl_seconds)
             .await
     }
-    async fn get_spread_blackout_record(
+    async fn get_held_trade_record(
         &self,
         trade_id: &str,
-    ) -> Result<Option<SpreadBlackoutRecord>, StateError> {
-        self.get_spread_blackout_record_impl(trade_id).await
+    ) -> Result<Option<HeldTradeRecord>, StateError> {
+        self.get_held_trade_record_impl(trade_id).await
     }
-    async fn list_all_spread_blackout_records(
-        &self,
-    ) -> Result<Vec<SpreadBlackoutRecord>, StateError> {
-        self.list_all_spread_blackout_records_impl().await
+    async fn list_all_held_trade_records(&self) -> Result<Vec<HeldTradeRecord>, StateError> {
+        self.list_all_held_trade_records_impl().await
     }
-    async fn clear_spread_blackout_record(&self, trade_id: &str) -> Result<(), StateError> {
-        self.clear_spread_blackout_record_impl(trade_id).await
+    async fn clear_held_trade_record(&self, trade_id: &str) -> Result<(), StateError> {
+        self.clear_held_trade_record_impl(trade_id).await
     }
     async fn get_mw_state(
         &self,

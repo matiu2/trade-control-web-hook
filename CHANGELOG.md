@@ -1,5 +1,224 @@
 # Changelog
 
+## v122 — 2026-07-30 — `SpreadBlackoutRecord` → `HeldTradeRecord`
+
+**Why.** The type long outgrew its name. It began as a spread-hour recovery record;
+since v120 it carries the resting-order **hold refcount**, whose reasons include a
+news pause — nothing to do with spreads. Anyone reading `SpreadBlackoutRecord` and
+finding `HoldReason::NewsPause` inside it has to stop and re-derive that the name is
+just historical.
+
+**What changed.** Pure rename, no behaviour change:
+
+- `SpreadBlackoutRecord` → **`HeldTradeRecord`**. Both things it remembers for
+  restoration — widened open-position stops (System 2, `original_stops`) and
+  cancelled pending orders (System 3, `cancelled_orders`) — are "what this trade is
+  holding", so the name follows the refcount's vocabulary rather than either payload.
+  (`PendingOrderControl` was considered and rejected: it reads as pending-orders-only
+  and would exclude the open-position stops that are half the payload.)
+- Store methods `*_spread_blackout_record*` → `*_held_trade_record*`.
+- Table `spread_blackout_record` → `held_trade_record`, plus its index and
+  primary-key constraint, in new migration **`0005_held_trade_record.sql`**.
+
+**NOT renamed:** `SpreadBlackoutWindow` (the global singleton) and the
+per-instrument `blackout_windows` table. Those are genuinely spread / market-hours
+concepts.
+
+**Migration notes.** `0001_state.sql` is **unchanged** — sqlx checksums applied
+migrations, so editing it would fail every already-migrated database on boot. It
+still creates the table under the old name; `0005` renames it. `ALTER TABLE ...
+RENAME` **preserves rows**, so in-flight holds survive the deploy — dropping them
+would strand every currently-cancelled resting order until its 12h backstop. The
+file is idempotent (`IF EXISTS` throughout, plus a `CREATE TABLE IF NOT EXISTS`
+guard) so it applies cleanly to a fresh database too.
+
+**Verified against a real Postgres**, not just compiled: seeded an in-flight record
+(two holders + a cancelled order) under the old name, applied `0005`, and confirmed
+the row survived intact with both holders and its cancelled order; confirmed the
+index *and* pkey now carry the new name; confirmed `blackout_windows` /
+`spread_blackout_window` were untouched; and booted the real worker to confirm the
+sqlx migrator validates the checksum ("Postgres connected + migrated"). Re-running
+is a no-op.
+
+**Also fixed:** the `gc_expired` TTL table list picked up the new name — a miss there
+silently leaks expired rows forever.
+
+**Tests.** No new behaviour, so no new tests; all 52 workspace suites green,
+including the store conformance suite that round-trips the record through every
+backend.
+
+## v121 — 2026-07-30 — A failed cancel is classified, not swallowed
+
+**Why.** When `cancel_order` failed, `try_cancel_one` logged it and moved on —
+pushing **nothing** to the `LifecycleReport`. So a failed cancel appeared in neither
+`cancelled` nor `skipped`: invisible to the caller. Worse, the record still listed
+the order as cancelled, so if the cancel had failed because the order **already
+filled**, the OFF side would faithfully "restore" it — placing a fresh entry for a
+trade already in a position. DB state and broker state diverged silently.
+
+**What changed.** `CancelError` is a single `Transient` variant that deliberately
+folds "order already gone" together with a network blip, and its own docs say to
+treat the failure as "probably filled" and **re-lookup**. So the lifecycle now does
+exactly that, via `Broker::lookup_attempt_state`, and acts on the answer
+(`CancelOutcome`):
+
+- **`Vanished(why)`** — `OpenPosition` / `ClosedWin` / `ClosedLossOrBreakeven` /
+  `Cancelled` / `Unknown`: the order is no longer resting, so the `CancelledOrder` is
+  **pruned from the record** and its stored signed body deleted. Nothing to restore.
+  If that empties the record (no other cancelled orders, no widened stops) it is
+  cleared outright rather than left as a shell.
+- **`StillResting`** — `Pending`: the cancel genuinely failed. The entry is kept so
+  the next tick retries and the order stays restorable.
+- **`Unresolved`** — the lookup failed too. Treated as still-resting (conservative),
+  but reported distinctly so a lookup outage doesn't masquerade as a stream of live
+  orders.
+
+Every outcome now lands in the new `LifecycleReport.cancel_failed`, and the live
+watcher (`blackout_watch`) logs a per-account `warn!` when it is non-empty — a
+DB/broker disagreement on the money path deserves more than a per-order line.
+
+**Also documented** (no behaviour change, but non-obvious enough to have prompted the
+question): only `pending_lifecycle` talks to the broker about resting orders — there
+is exactly one `list_pending_orders` call on the live path, and the hold reasons are
+`HoldReason` variants rather than subsystems with their own broker access. And
+per-instrument (`SpreadHour`) and per-trade (`NewsPause`) reasons coexist on a
+per-trade record because `cancel_pass` derives the reasons **per resting order**, so
+an instrument-scoped reason is fanned out to each affected trade. Consequence: a hold
+is trade-wide, never per-order, so no per-order query API is needed.
+
+**Breaking.** `LifecycleReport` gains `cancel_failed`. New public `CancelOutcome`.
+
+**Tests.** 6 new: a filled order is reported *and* pruned; a still-resting order
+keeps its entry; an unresolvable lookup keeps it too; all four vanished states
+classify correctly; a successful cancel reports no failure. Verified by **mutation** —
+skipping the prune, and classifying everything as still-resting, each turn tests red.
+All 52 workspace suites green.
+
+## v120 — 2026-07-30 — Resting-order holds become a shared refcount
+
+**Why.** v119 added the news pause as a second reason to pull a resting order, but
+did it as an **ad-hoc OR written twice** — once in the cancel path, once in
+`off_now`. Two problems. The pair has to be kept in agreement by hand: add a third
+reason to one side only and you get cancel-then-immediately-restore, re-placing the
+order on the next ~5s tick straight back into the window it was pulled from. And
+nothing recorded *why* an order was held, so overlapping reasons couldn't lift
+independently. The case that exposed it (operator): a spread hour running
+06:30–08:00 with a news pause from 07:00 — at 08:00 the spread lifts while the
+standoff is still live.
+
+**What changed.** One shared system: `core::hold::{HoldReason, Holders}`, a
+refcount of **named** holders stored on `SpreadBlackoutRecord.holders`. Reasons
+`hold` and `release`; the order is re-placed on the release that **empties** the
+set (`Release::Emptied` — a *transition*, so the restore is exactly-once per hold
+episode and a tick that merely observes an empty set re-places nothing).
+
+- `HoldReason::SpreadHour` — releases on baked-hour-end **or** live-spread
+  recovery. The documented ON/OFF asymmetry is carried verbatim, now as this
+  reason's release condition (`spread_hour_released`).
+- `HoldReason::NewsPause` — releases when no pause row remains for the trade.
+- `hold_reasons` (ON) and `release_satisfied` (OFF) are the only places the set is
+  derived. Adding a variant is a **compile error** in `release_satisfied` until its
+  release condition is written — the two sides can no longer drift apart.
+- A partial release is **persisted** (the narrowed set is written back), so a
+  reason that already lifted isn't re-derived as held after a restart.
+
+**A typed key, and a set rather than a counter.** `HoldReason` is a closed enum:
+`hold("spread-hour")` paired with `release("spread_hour")` would be a typo that
+strands an order until the 12h backstop. And a bare integer is unsafe here because
+the cron re-evaluates the same conditions every ~5s — `count += 1` reaches the
+hundreds within an hour and never returns to zero. `Holders::hold` is idempotent;
+the count is `holders.len()`.
+
+**Breaking.** `SpreadBlackoutRecord` gains `holders`; `merge_cancelled_order` takes
+a `&Holders`. `off_now` is replaced by `release_satisfied` (returns the surviving
+set plus the emptied flag). **No SQL migration** — the record persists as one
+`jsonb` body, so the field is a `#[serde(default)]`.
+
+**Deploy safety.** A v119 row in flight has `applied: true` and no holders. Read
+naively that means "nothing holds it", which would re-place every such order into
+still-live windows on the first tick after deploy. `effective_holders` reads it as
+`{SpreadHour}` so it re-derives instead. Healing is at read time, not a serde
+default, so the stored body stays faithful to what was written.
+
+**Preserved.** `applied` stays distinct from `holders` — it means "this record
+mutated something at the broker" and is load-bearing for System 2 (widened stops,
+`blackout_apply.rs`), which System 2's idempotency guard reads. Rail 5's 12h
+backstop still ignores holders, so a stuck holder (or an unreadable store, since
+`pause_active` fails closed) can't strand an order.
+
+**Tests.** 15 new: 8 on `Holders` itself, plus the overlap matrix — spread lifts
+first / pause clears first (with the quote still blown, since a narrow quote
+legitimately releases `SpreadHour`) / both lift / second reason unions onto an
+existing record / 50 repeated ticks don't inflate the set — and the two
+pre-refcount deploy cases. The store conformance suite now round-trips a two-holder
+record and a partial release through every backend. Verified by **mutation**:
+`release` always reporting `Emptied`, a non-idempotent `hold`, and a disabled
+pre-v120 heal each turn tests red. All 52 workspace suites green, including the two
+EUR/USD golden cells v119 moved — the refactor is behaviour-preserving.
+
+**Follow-up.** `SpreadBlackoutRecord` is now a misleading name (it carries news-pause
+holds too); a rename to something like `RestingOrderHoldRecord` is worth doing when
+something else touches that type.
+
+## v119 — 2026-07-30 — A news pause cancels resting orders, like a spread hour
+
+**Why.** A news pause only blocked *new* entries — the `423 trade paused`
+rejection at the head of `run_enter`. An entry order **already resting** at the
+broker when the standoff opened was left untouched, so it sat through the event
+and filled on the news spike. That is precisely the trade the pause exists to
+avoid: an entry we refuse to *place* during a standoff is one we must not leave
+*resting* through one either. Caught on a live trade (2026-07-30) where a pending
+order filled mid-blackout.
+
+**What changed.** The resting-order cancel/re-place machinery already existed for
+spread hours, so the pause becomes a **second ON reason** on that one shared
+lifecycle instead of a parallel path:
+
+- `pending_lifecycle::pause_active` — is a `pause` armed for this trade? Pauses
+  are keyed `(trade_id, blackout_id)` and carry **no instrument** (deliberate — a
+  pause targets one setup, not the whole pair), so it is reached via the trade_id
+  both call sites already hold. **Fails closed**: a store error reads as paused
+  rather than exposing the order to a standoff we can't currently see.
+- **ON** — the trigger moves from `cancel_pass` into `try_cancel_one`, because the
+  trade_id only exists after the `VerifiedSource` recovery. The cheap
+  instrument-only `is_spread_hour` test still short-circuits first, so a
+  spread-hour cancel costs no extra store read.
+- **OFF** — `off_now` gains the same pause veto, so the order is not re-placed
+  while the standoff is still live. Without it the cancel would be undone on the
+  next cron tick, straight back into the window it was pulled from.
+
+A **filled** position is still left to run to its own SL/TP — a pause is not a
+close. See the PAUSE row added to the vocabulary table in `CLAUDE.md`.
+
+**Replay == live, structurally.** All of it lands in `core`, generic over the
+existing `Broker` + `StateStore` seams, so the live worker and the offline replay
+both pick it up from the single shared `pending_order_lifecycle` with no
+per-side code — the replay already writes pause rows via `pause_gate::apply_pause`
+and calls that same function.
+
+**Safety.** Rail 5 is preserved and now *tested*: the 12h backstop force-restores
+even while a pause is armed, so a stuck pause row — or an unreadable store, given
+`pause_active` fails closed — cannot strand an order forever.
+
+**Fixtures.** Two golden cells moved, both the same setup and both the bug
+reproducing: EUR/USD `strategy-v2` news-off/-on had a 02:00Z placement still
+resting when the 03:00Z pause fired (window 04:15Z–12:45Z), filling at 08:00Z and
+stopping out at 11:00Z — both inside the standoff. Now no leg: **−1.00R → 0.00R**,
+with identical fires. Re-blessed, reason recorded in each `meta.json`. Worth
+noting the second cell was **masked** by the fixture test panicking on the first
+mismatch.
+
+**Tests.** 6 new: ON cancel on a clean bar, trade-scoping negative (another
+trade's pause must not pull this order), OFF held while paused, OFF once cleared,
+no cancel-then-restore within one pass, and backstop-over-pause. Verified by
+**mutation** — disabling either half of the trigger, or gating the backstop behind
+the pause, each turns them red.
+
+**Breaking / Config.** None. No wire, schema, or CLI change.
+
+**Follow-up.** The `news-off` fixture cells still carry a pause rule despite
+`skip_calendar_bars: true` — a pre-existing corpus quirk, unrelated to this fix.
+
 ## v118 — 2026-07-30 — Fixed stop-loss from an `sl` chart Note
 
 **Why.** The H&S / iH&S stop was always anchored to the pattern extreme

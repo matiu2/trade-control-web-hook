@@ -162,6 +162,22 @@ Now the three scoped actions, by the two axes:
 | **CLOSE** | **closes it** | **left open** | one position | reversal-close (`Action::Close`, `06-/07-close-on-…`) |
 | **VETO / INVALIDATE** | **left alone** | **blocked** | trade | `Action::Veto`/`Invalidate` at `StopNextEntry` → `Phase::Done` (pcl-exhausted) |
 | **CLOSE-VETO** | **closes it** | **blocked** | trade | `Action::Veto` at `ClosePositions` — thesis-death (structure invalidation) + `trade-expiry` |
+| **PAUSE** | **left alone** (but a *resting order* is pulled) | **blocked while armed** | trade | `Action::Pause`/`Resume` — news standoff; non-terminal, reversible |
+
+⚠️ **PAUSE is not a veto** — it's a *reversible* standoff, and it is the only
+concept here that touches **resting (unfilled) orders** without touching a
+**filled position**. While armed it (a) rejects new entries with `423 trade
+paused` at the head of `run_enter`, and (b) since 2026-07-30 **cancels any
+resting entry order for that trade** via the shared
+`core::pending_lifecycle::pending_order_lifecycle`, re-placing it once the pause
+lifts — exactly as a spread hour does. Both reasons go through one **refcount of
+named holders** (`core::hold::{HoldReason, Holders}`, v120): they overlap and lift
+independently, and the order is re-placed only on the release that **empties** the
+set. See "Resting-order holds" below. An already-**filled** position is left to
+run to its own SL/TP (pause is not a close). Before that fix a pause blocked only
+*new* placements, so an order already resting sat through the event and filled on
+the news spike; the EUR/USD `strategy-v2` fixture cells record the old −1.00R
+behaviour in their git history.
 
 - **CLOSE** — close **one open position**, but **do not** block future
   entries; the **trade lives** and may re-enter. This is the
@@ -223,6 +239,99 @@ as the operator emergency-flatten, so the basenames keep the word
 "close" (it's correct); the internal engine kind was renamed
 `PerTradeExit` → `PerPositionClose` (2026-07-19) to match — "close",
 scoped per-position not per-trade.
+
+### Resting-order holds are a REFCOUNT, not a boolean
+
+Several independent conditions can each want a resting (unfilled) entry order
+pulled off the broker. As of **v120** they all go through one shared refcount —
+`core::hold::{HoldReason, Holders}`, stored on `HeldTradeRecord.holders` —
+rather than each cancelling and restoring on its own:
+
+| `HoldReason` | holds while | releases when |
+|---|---|---|
+| `SpreadHour` | `is_spread_hour(instrument, now)` (baked mask + 30-min lead) | baked hour ended **or** live spread recovered (≤4p) |
+| `NewsPause` | a `pause` row is armed for the trade | no pause row for the trade |
+
+**Reasons overlap and lift independently, and only the last one out restores.**
+The motivating case: a spread hour running 06:30–08:00 with a news pause from
+07:00. At 08:00 `SpreadHour` releases but `NewsPause` still holds, so the order
+stays pulled. `pending_lifecycle::release_satisfied` returns
+`Release::Emptied` only on the release that **empties** the set — a *transition*,
+so the restore fires exactly once per hold episode and a tick that merely observes
+an empty set re-places nothing.
+
+Things a refactorer must preserve:
+
+- **Named holders, NOT a bare counter.** The cron re-evaluates the same conditions
+  every ~5s. An incrementing `count += 1` would reach the hundreds within an hour
+  and never return to zero, so the order would never be restored. `Holders::hold`
+  is **idempotent**; the "count" is `holders.len()`. Test:
+  `overlap_repeated_ticks_do_not_inflate_the_holder_set`.
+- **One derivation each side.** `hold_reasons` (ON) and `release_satisfied` (OFF)
+  are the only places the reason set is computed. This replaced two hand-written
+  OR expressions that had to agree by hand — an out-of-sync pair cancels an order
+  and re-places it on the next tick, back into the window it was pulled from.
+  Adding a `HoldReason` variant is a **compile error** in `release_satisfied`
+  until its release condition is written. Don't reintroduce an inline
+  `is_spread_hour(..) || pause_active(..)` at a call site.
+- **The record is `HeldTradeRecord` (table `held_trade_record`), renamed from
+`SpreadBlackoutRecord` in v122** — it began as a spread-hour recovery record but its
+holders now include a news pause. Migration `0001` still *creates* it under the old
+name (sqlx checksums applied migrations, so that file must never be edited) and
+`0005` renames it, preserving rows. Don't confuse it with `SpreadBlackoutWindow` (a
+global singleton) or the per-instrument `blackout_windows` table — those are
+genuinely spread/market-hours concepts and keep their names.
+
+**`applied` is NOT the holder set.** `applied` means "this record mutated
+  something at the broker" and is load-bearing for **System 2** (widened
+  open-position stops, `trade-control-cron/src/blackout_apply.rs`). `holders`
+  answers the different question "which reasons still want the order pulled".
+  Collapsing them breaks System 2's idempotency guard.
+- **The 12h backstop ignores holders** (rail 5) and must keep doing so, or a stuck
+  holder row — or an unreadable store, since `pause_active` fails *closed* — would
+  strand an order forever. Test: `backstop_restores_even_while_paused`.
+- **No `Unknown(String)` holder variant.** Nothing builds a reason from a runtime
+  string, so an unrecognised reason in a stored body is a **loud decode error** on
+  that record, never a silently-dropped holder (which would restore the order
+  blind). Test: `unknown_reason_is_a_loud_decode_error_not_a_silent_drop`.
+- **Pre-v120 rows are healed at read time, not in serde.** A v119 row has
+  `applied: true` and no `holders`; `effective_holders` reads that as
+  `{SpreadHour}` so it re-derives instead of restoring blind on the first tick
+  after deploy. Deliberately not a serde default — the stored body stays a
+  faithful record of what was written.
+
+No SQL migration: the record persists as one `jsonb` body, so the new field is a
+`#[serde(default)]`.
+
+**Only `pending_lifecycle` talks to the broker about resting orders.** There is
+exactly one `list_pending_orders` call on the live path (`cancel_pass`). Spread
+hours and news pauses are *not* subsystems with their own broker access — they are
+`HoldReason` variants. Anything new that wants to hold resting orders belongs there
+as a variant, never as a second place that enumerates or cancels broker orders.
+
+**Per-instrument and per-trade reasons coexist on a per-trade record.**
+`SpreadHour` is per-instrument, `NewsPause` is per-trade, and the holder set lives
+on a per-trade record — which composes because `cancel_pass` iterates *every*
+resting order and derives the reasons per order. An instrument-scoped reason is
+**fanned out** to each affected trade (three EUR/USD trades in one spread hour ⇒
+three records, each holding `SpreadHour`), and release re-evaluates against each
+record's own `instrument`. Consequence: a hold is **trade-wide, never per-order**,
+so there is deliberately no per-order query API.
+
+**A failed cancel is classified, not swallowed (v121).** `CancelError` folds
+"already gone" in with a network blip, so when `cancel_order` errors the lifecycle
+re-looks-up via `Broker::lookup_attempt_state` — the re-lookup that error's own docs
+call for — and records a `CancelOutcome`:
+
+- `Vanished(why)` — filled, cancelled upstream, or not found ⇒ the `CancelledOrder`
+  is **pruned from the record**, because the OFF side would otherwise re-place an
+  entry whose original already filled.
+- `StillResting` — genuinely still there ⇒ entry kept, cancel retries next tick.
+- `Unresolved` — the lookup failed too ⇒ treated as still-resting (conservative),
+  reported distinctly so an outage doesn't masquerade as live orders.
+
+Every outcome lands in `LifecycleReport.cancel_failed`. Before this, a failed cancel
+appeared in *none* of the report's lists — invisible to the caller.
 
 ### "retry" / `max_retries` does NOT mean retrying failed placements
 
