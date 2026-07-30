@@ -50,9 +50,9 @@ cut a fresh `staging` from `main` carrying the week's accumulated changes.
 | part | version | deployed (Brisbane) | notes |
 |---|---|---|---|
 | pine | `v2.5` (study title `Candle Signals v25`) | — | manual republish; sends `open` for M/W body logic. `tv-arm-dev` bakes this study title (`ENV_PINE_NAME`) — rename the chart study to match. |
-| tv-arm | `0.1.0` | 2026-06-30 | installed as `tv-arm-dev` (dev URL + `Candle Signals v25` baked) |
-| trade-control | `0.2.0` | 2026-06-30 | installed as `trade-control-dev` (dev URL baked) |
-| backend | `main` @ `73794a9` | 2026-06-30 | Version `c5eda72c`. Activates **break-even stop** + **spread-blackout widen** (previously dormant) on the amend path now demo-verified (TN **v0.11.0** no-TP fix). Also carries the close-on-reversal / news-close / strategy-v2 fixes merged to `main` since the last dev deploy. |
+| tv-arm | `0.1.0` | 2026-07-30 | installed as `tv-arm-dev` (dev URL + `Candle Signals v25` baked) |
+| trade-control | `0.2.0` | 2026-07-30 | installed as `trade-control-dev` (dev URL baked) |
+| backend | `main` @ `ab96b20` (`v122`) | 2026-07-30 | Version `v122`. **v119** news pause now pulls resting orders (was: blocked new entries only, so pendings filled on the news spike). **v120** those reasons became a shared refcount of named holders (`core::hold`) so a spread hour and a news pause overlap and lift independently. **v121** a failed `cancel_order` is classified via `lookup_attempt_state` instead of swallowed — a vanished (filled) order is pruned so the OFF side can't re-place it. **v122** `SpreadBlackoutRecord` → `HeldTradeRecord`; **DB migration `0005`** renames the table (rows preserved, no data migration). |
 | contract | `v3` | — | unchanged by v24/v25 (`open` is optional) |
 
 ### staging
@@ -60,9 +60,9 @@ cut a fresh `staging` from `main` carrying the week's accumulated changes.
 | part | version | deployed (Brisbane) | notes |
 |---|---|---|---|
 | pine | `v2.4` (study title `Candle Signals v24`) | — | pinned to the pre-`open` version; chart **unchanged** this deploy. v25 worker degrades gracefully when `open` is absent (rides baked geometry). `tv-arm-staging` bakes this study title. |
-| tv-arm | `0.1.0` | 2026-06-15 | installed as `tv-arm-staging` (staging URL + `Candle Signals v24` baked) |
-| trade-control | `0.2.0` | 2026-06-15 | installed as `trade-control-staging` (staging URL baked) |
-| backend | `v25` | 2026-06-15 | M/W real-time arming (v24) + dynamic geometry / `open` (v25). Version `ed4f04ff`. **Promotion-gate week restarts from this deploy.** |
+| tv-arm | `0.1.0` | 2026-07-30 | installed as `tv-arm-staging` (staging URL + `Candle Signals v24` baked) |
+| trade-control | `0.2.0` | 2026-07-30 | installed as `trade-control-staging` (staging URL baked) |
+| backend | `staging` @ `bef262a` (`v122-1`) | 2026-07-30 | Merged `main` v119–v122: news pause pulls resting orders; shared hold refcount; failed-cancel classification; `HeldTradeRecord` rename. **DB migration `0005` applied** — table renamed in place, all 12 live plan states / 4 pauses / 3 order bodies survived the restart (hold table was empty, so nothing in flight to preserve). **Promotion-gate week restarts from this deploy.** |
 | contract | `v3` | — | unchanged by v23 (recording is observe-only) |
 
 ### prod
