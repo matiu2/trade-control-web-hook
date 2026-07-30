@@ -15,6 +15,7 @@ pub mod candle_gate;
 pub mod control_event;
 pub mod dispatch;
 pub mod dispatch_config;
+pub mod hold;
 pub mod incoming;
 pub mod intent;
 pub mod ny_clock;

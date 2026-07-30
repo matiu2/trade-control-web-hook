@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::blackout_widen::{clamp_widen, spread_hour_widen_size, widened_stop};
 use trade_control_core::broker::{AmendError, Broker, OpenPosition};
+use trade_control_core::hold::{HoldReason, Holders};
 use trade_control_core::ny_clock::is_ny_close_edge;
 use trade_control_core::spread_blackout::{
     NY_CLOSE_WINDOW_MARKER_TTL_SECONDS, spread_hour_widen_frac, widen_frac_to_pips,
@@ -318,6 +319,15 @@ async fn widen_one<S: StateStore>(
         instrument: position.instrument.clone(),
         account: account.map(|s| s.to_string()),
         applied: true,
+        // System 2 (widening an open position's stop) is driven by spread hours
+        // only, so the record it creates is held by that one reason. Stated
+        // explicitly rather than left empty: an empty set on an `applied` record
+        // means "pre-refcount row" to the OFF side, and this is not one.
+        holders: {
+            let mut h = Holders::new();
+            h.hold(HoldReason::SpreadHour);
+            h
+        },
         opened_at: now,
         expires_at: now + Duration::seconds(ttl as i64),
         pip_size,

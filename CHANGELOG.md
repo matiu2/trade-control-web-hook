@@ -1,5 +1,71 @@
 # Changelog
 
+## v120 — 2026-07-30 — Resting-order holds become a shared refcount
+
+**Why.** v119 added the news pause as a second reason to pull a resting order, but
+did it as an **ad-hoc OR written twice** — once in the cancel path, once in
+`off_now`. Two problems. The pair has to be kept in agreement by hand: add a third
+reason to one side only and you get cancel-then-immediately-restore, re-placing the
+order on the next ~5s tick straight back into the window it was pulled from. And
+nothing recorded *why* an order was held, so overlapping reasons couldn't lift
+independently. The case that exposed it (operator): a spread hour running
+06:30–08:00 with a news pause from 07:00 — at 08:00 the spread lifts while the
+standoff is still live.
+
+**What changed.** One shared system: `core::hold::{HoldReason, Holders}`, a
+refcount of **named** holders stored on `SpreadBlackoutRecord.holders`. Reasons
+`hold` and `release`; the order is re-placed on the release that **empties** the
+set (`Release::Emptied` — a *transition*, so the restore is exactly-once per hold
+episode and a tick that merely observes an empty set re-places nothing).
+
+- `HoldReason::SpreadHour` — releases on baked-hour-end **or** live-spread
+  recovery. The documented ON/OFF asymmetry is carried verbatim, now as this
+  reason's release condition (`spread_hour_released`).
+- `HoldReason::NewsPause` — releases when no pause row remains for the trade.
+- `hold_reasons` (ON) and `release_satisfied` (OFF) are the only places the set is
+  derived. Adding a variant is a **compile error** in `release_satisfied` until its
+  release condition is written — the two sides can no longer drift apart.
+- A partial release is **persisted** (the narrowed set is written back), so a
+  reason that already lifted isn't re-derived as held after a restart.
+
+**A typed key, and a set rather than a counter.** `HoldReason` is a closed enum:
+`hold("spread-hour")` paired with `release("spread_hour")` would be a typo that
+strands an order until the 12h backstop. And a bare integer is unsafe here because
+the cron re-evaluates the same conditions every ~5s — `count += 1` reaches the
+hundreds within an hour and never returns to zero. `Holders::hold` is idempotent;
+the count is `holders.len()`.
+
+**Breaking.** `SpreadBlackoutRecord` gains `holders`; `merge_cancelled_order` takes
+a `&Holders`. `off_now` is replaced by `release_satisfied` (returns the surviving
+set plus the emptied flag). **No SQL migration** — the record persists as one
+`jsonb` body, so the field is a `#[serde(default)]`.
+
+**Deploy safety.** A v119 row in flight has `applied: true` and no holders. Read
+naively that means "nothing holds it", which would re-place every such order into
+still-live windows on the first tick after deploy. `effective_holders` reads it as
+`{SpreadHour}` so it re-derives instead. Healing is at read time, not a serde
+default, so the stored body stays faithful to what was written.
+
+**Preserved.** `applied` stays distinct from `holders` — it means "this record
+mutated something at the broker" and is load-bearing for System 2 (widened stops,
+`blackout_apply.rs`), which System 2's idempotency guard reads. Rail 5's 12h
+backstop still ignores holders, so a stuck holder (or an unreadable store, since
+`pause_active` fails closed) can't strand an order.
+
+**Tests.** 15 new: 8 on `Holders` itself, plus the overlap matrix — spread lifts
+first / pause clears first (with the quote still blown, since a narrow quote
+legitimately releases `SpreadHour`) / both lift / second reason unions onto an
+existing record / 50 repeated ticks don't inflate the set — and the two
+pre-refcount deploy cases. The store conformance suite now round-trips a two-holder
+record and a partial release through every backend. Verified by **mutation**:
+`release` always reporting `Emptied`, a non-idempotent `hold`, and a disabled
+pre-v120 heal each turn tests red. All 52 workspace suites green, including the two
+EUR/USD golden cells v119 moved — the refactor is behaviour-preserving.
+
+**Follow-up.** `SpreadBlackoutRecord` is now a misleading name (it carries news-pause
+holds too); a rename to something like `RestingOrderHoldRecord` is worth doing when
+something else touches that type.
+
 ## v119 — 2026-07-30 — A news pause cancels resting orders, like a spread hour
 
 **Why.** A news pause only blocked *new* entries — the `423 trade paused`
