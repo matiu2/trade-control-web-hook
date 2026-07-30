@@ -162,6 +162,19 @@ Now the three scoped actions, by the two axes:
 | **CLOSE** | **closes it** | **left open** | one position | reversal-close (`Action::Close`, `06-/07-close-on-…`) |
 | **VETO / INVALIDATE** | **left alone** | **blocked** | trade | `Action::Veto`/`Invalidate` at `StopNextEntry` → `Phase::Done` (pcl-exhausted) |
 | **CLOSE-VETO** | **closes it** | **blocked** | trade | `Action::Veto` at `ClosePositions` — thesis-death (structure invalidation) + `trade-expiry` |
+| **PAUSE** | **left alone** (but a *resting order* is pulled) | **blocked while armed** | trade | `Action::Pause`/`Resume` — news standoff; non-terminal, reversible |
+
+⚠️ **PAUSE is not a veto** — it's a *reversible* standoff, and it is the only
+concept here that touches **resting (unfilled) orders** without touching a
+**filled position**. While armed it (a) rejects new entries with `423 trade
+paused` at the head of `run_enter`, and (b) since 2026-07-30 **cancels any
+resting entry order for that trade** via the shared
+`core::pending_lifecycle::pending_order_lifecycle`, re-placing it once the pause
+lifts — exactly as a spread hour does. An already-**filled** position is left to
+run to its own SL/TP (pause is not a close). Before that fix a pause blocked only
+*new* placements, so an order already resting sat through the event and filled on
+the news spike; the EUR/USD `strategy-v2` fixture cells record the old −1.00R
+behaviour in their git history.
 
 - **CLOSE** — close **one open position**, but **do not** block future
   entries; the **trade lives** and may re-enter. This is the

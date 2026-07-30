@@ -4,7 +4,7 @@
   "source": "oanda",
   "start": "2026-07-22T20:00:00Z",
   "end": "2026-07-24T13:00:00Z",
-  "message": "19.5-pip iH&S armed ~70% up the pattern: the pcl-exhausted abort (too-high, a fib level at 1.14328) sits only 3.9 pips under TP and fires INTRABAR, so a single 03:00Z wick (high 1.14358, close 1.1429) retires the plan ~32h before expiry. All six cells abort on that same wick. This cell: the QM leg enters 02:00Z @1.14276, also ahead of the abort.",
+  "message": "19.5-pip iH&S armed ~70% up the pattern: the pcl-exhausted abort (too-high, a fib level at 1.14328) sits only 3.9 pips under TP and fires INTRABAR, so a single 03:00Z wick (high 1.14358, close 1.1429) retires the plan ~32h before expiry. All six cells abort on that same wick. This cell: the QM leg enters 02:00Z @1.14276, also ahead of the abort. Re-blessed 2026-07-30 (news-pause cancels resting orders): the 02:00Z QM placement was still RESTING when the 03:00Z pause fired (window 04:15Z-12:45Z), so the shared pending_order_lifecycle now cancels it instead of letting it fill at 08:00Z mid-standoff. Was -1.00R (filled 08:00Z, stopped out 11:00Z, both inside the news window); now no leg, 0.00R. The fires are unchanged - only the fill is.",
   "arm": {
     "entry_rule": "strategy-v2",
     "skip_calendar_bars": true,
