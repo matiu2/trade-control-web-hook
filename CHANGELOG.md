@@ -1,5 +1,64 @@
 # Changelog
 
+## v119 — 2026-07-30 — A news pause cancels resting orders, like a spread hour
+
+**Why.** A news pause only blocked *new* entries — the `423 trade paused`
+rejection at the head of `run_enter`. An entry order **already resting** at the
+broker when the standoff opened was left untouched, so it sat through the event
+and filled on the news spike. That is precisely the trade the pause exists to
+avoid: an entry we refuse to *place* during a standoff is one we must not leave
+*resting* through one either. Caught on a live trade (2026-07-30) where a pending
+order filled mid-blackout.
+
+**What changed.** The resting-order cancel/re-place machinery already existed for
+spread hours, so the pause becomes a **second ON reason** on that one shared
+lifecycle instead of a parallel path:
+
+- `pending_lifecycle::pause_active` — is a `pause` armed for this trade? Pauses
+  are keyed `(trade_id, blackout_id)` and carry **no instrument** (deliberate — a
+  pause targets one setup, not the whole pair), so it is reached via the trade_id
+  both call sites already hold. **Fails closed**: a store error reads as paused
+  rather than exposing the order to a standoff we can't currently see.
+- **ON** — the trigger moves from `cancel_pass` into `try_cancel_one`, because the
+  trade_id only exists after the `VerifiedSource` recovery. The cheap
+  instrument-only `is_spread_hour` test still short-circuits first, so a
+  spread-hour cancel costs no extra store read.
+- **OFF** — `off_now` gains the same pause veto, so the order is not re-placed
+  while the standoff is still live. Without it the cancel would be undone on the
+  next cron tick, straight back into the window it was pulled from.
+
+A **filled** position is still left to run to its own SL/TP — a pause is not a
+close. See the PAUSE row added to the vocabulary table in `CLAUDE.md`.
+
+**Replay == live, structurally.** All of it lands in `core`, generic over the
+existing `Broker` + `StateStore` seams, so the live worker and the offline replay
+both pick it up from the single shared `pending_order_lifecycle` with no
+per-side code — the replay already writes pause rows via `pause_gate::apply_pause`
+and calls that same function.
+
+**Safety.** Rail 5 is preserved and now *tested*: the 12h backstop force-restores
+even while a pause is armed, so a stuck pause row — or an unreadable store, given
+`pause_active` fails closed — cannot strand an order forever.
+
+**Fixtures.** Two golden cells moved, both the same setup and both the bug
+reproducing: EUR/USD `strategy-v2` news-off/-on had a 02:00Z placement still
+resting when the 03:00Z pause fired (window 04:15Z–12:45Z), filling at 08:00Z and
+stopping out at 11:00Z — both inside the standoff. Now no leg: **−1.00R → 0.00R**,
+with identical fires. Re-blessed, reason recorded in each `meta.json`. Worth
+noting the second cell was **masked** by the fixture test panicking on the first
+mismatch.
+
+**Tests.** 6 new: ON cancel on a clean bar, trade-scoping negative (another
+trade's pause must not pull this order), OFF held while paused, OFF once cleared,
+no cancel-then-restore within one pass, and backstop-over-pause. Verified by
+**mutation** — disabling either half of the trigger, or gating the backstop behind
+the pause, each turns them red.
+
+**Breaking / Config.** None. No wire, schema, or CLI change.
+
+**Follow-up.** The `news-off` fixture cells still carry a pause rule despite
+`skip_calendar_bars: true` — a pre-existing corpus quirk, unrelated to this fix.
+
 ## v118 — 2026-07-30 — Fixed stop-loss from an `sl` chart Note
 
 **Why.** The H&S / iH&S stop was always anchored to the pattern extreme
