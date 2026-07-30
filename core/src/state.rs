@@ -439,6 +439,20 @@ pub struct SpreadBlackoutRecord {
     /// "never-touch-what-you-didn't-apply" safety rule. Sub-plan 2
     /// never sets this true; it only honours it.
     pub applied: bool,
+    /// **Why** this trade's resting orders are currently held — the shared
+    /// refcount ([`crate::hold`]). Distinct from `applied`, which means "this
+    /// record mutated something at the broker" and is also load-bearing for
+    /// System 2 (widened stops). `holders` answers the different question "which
+    /// reasons still want the order pulled", so overlapping reasons (a spread
+    /// hour and a news pause) can lift independently and only the last one out
+    /// triggers the re-place.
+    ///
+    /// `#[serde(default)]` so pre-v120 rows decode to an empty set — the stored
+    /// body is one `jsonb`, so no SQL migration. See
+    /// [`crate::pending_lifecycle`] for how an in-flight pre-v120 row (which has
+    /// `applied: true` but no holders) is kept from restoring blind.
+    #[serde(default)]
+    pub holders: crate::hold::Holders,
     pub opened_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     /// Pip size for the trade's instrument, baked on at apply time (Cron 1
@@ -3050,6 +3064,7 @@ mod tests {
                 instrument: "EUR_NZD".into(),
                 account: Some("reversals".into()),
                 applied: true,
+                holders: crate::hold::Holders::new(),
                 opened_at: ts("2026-05-14T11:00:00Z"),
                 expires_at: ts("2026-05-14T14:00:00Z"),
                 pip_size: 0.0001,
@@ -3612,6 +3627,12 @@ mod tests {
             instrument: "EUR_NZD".into(),
             account: Some("reversals".into()),
             applied: true,
+            holders: {
+                let mut h = crate::hold::Holders::new();
+                h.hold(crate::hold::HoldReason::SpreadHour);
+                h.hold(crate::hold::HoldReason::NewsPause);
+                h
+            },
             opened_at: ts("2026-03-12T21:05:00Z"),
             expires_at: ts("2026-03-13T00:05:00Z"),
             pip_size: 0.0001,
@@ -3628,6 +3649,11 @@ mod tests {
         let parsed: SpreadBlackoutRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, record);
         assert_eq!(parsed.pip_size, 0.0001);
+        // The holder refcount survives the body round-trip. A dropped holder here
+        // would restore an order into a window that still holds it.
+        assert_eq!(parsed.holders.len(), 2);
+        assert!(parsed.holders.contains(crate::hold::HoldReason::SpreadHour));
+        assert!(parsed.holders.contains(crate::hold::HoldReason::NewsPause));
     }
 
     /// A Sub-plan-2-era record (no apply-side payload written yet)
@@ -3649,6 +3675,14 @@ mod tests {
         assert_eq!(parsed.pip_size, 0.0, "old rows decode pip_size to 0.0");
         assert!(parsed.original_stops.is_empty());
         assert!(parsed.cancelled_orders.is_empty());
+        // A pre-refcount row has no `holders` key. It decodes EMPTY here — the
+        // healing to `{SpreadHour}` for an `applied` row lives in
+        // `pending_lifecycle::effective_holders`, deliberately not in serde, so
+        // the stored body stays a faithful record of what was written.
+        assert!(
+            parsed.holders.is_empty(),
+            "absent `holders` decodes empty; healing happens at read-time, not in serde"
+        );
     }
 
     /// A minimal rules-empty plan, built off JSON so the test doesn't have to

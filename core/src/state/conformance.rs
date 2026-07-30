@@ -895,6 +895,15 @@ fn sample_record(trade_id: &str, account: Option<&str>, instrument: &str) -> Spr
         instrument: instrument.into(),
         account: account.map(|s| s.to_string()),
         applied: true,
+        // Two holders, so the conformance round-trip proves the `jsonb` body
+        // carries the whole refcount (not just an empty default) through every
+        // backend — a partial release must survive a restart.
+        holders: {
+            let mut h = crate::hold::Holders::new();
+            h.hold(crate::hold::HoldReason::SpreadHour);
+            h.hold(crate::hold::HoldReason::NewsPause);
+            h
+        },
         opened_at: now,
         expires_at: now + chrono::Duration::hours(6),
         pip_size: 0.0001,
@@ -932,6 +941,35 @@ pub async fn spread_blackout_record(store: &impl StateStore, tag: &str) {
     assert_eq!(got.instrument, instr);
     assert_eq!(got.account.as_deref(), Some("reversals"));
     assert!(got.applied);
+    // The holder refcount survives the round-trip intact. If this backend dropped
+    // it, a partial release would be lost on restart and the order would be
+    // re-placed into a window that still holds it.
+    assert_eq!(
+        got.holders, rec.holders,
+        "the whole holder set must round-trip"
+    );
+    assert_eq!(got.holders.len(), 2);
+
+    // A PARTIAL release persists — the case the refcount exists for (one reason
+    // lifted, another still holding).
+    let mut partial = rec.clone();
+    assert_eq!(
+        partial.holders.release(crate::hold::HoldReason::SpreadHour),
+        crate::hold::Release::StillHeld,
+        "releasing one of two must not empty the set"
+    );
+    store
+        .upsert_spread_blackout_record(&partial, 6 * 3600)
+        .await
+        .unwrap();
+    let got = store
+        .get_spread_blackout_record(&tid)
+        .await
+        .unwrap()
+        .expect("record still present");
+    assert_eq!(got.holders.len(), 1, "the narrowed set persisted");
+    assert!(got.holders.contains(crate::hold::HoldReason::NewsPause));
+    assert!(!got.holders.contains(crate::hold::HoldReason::SpreadHour));
 
     // Upsert overwrites (flip applied false, change pip).
     let mut revised = rec.clone();

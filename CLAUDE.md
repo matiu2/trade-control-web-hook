@@ -170,7 +170,10 @@ concept here that touches **resting (unfilled) orders** without touching a
 paused` at the head of `run_enter`, and (b) since 2026-07-30 **cancels any
 resting entry order for that trade** via the shared
 `core::pending_lifecycle::pending_order_lifecycle`, re-placing it once the pause
-lifts — exactly as a spread hour does. An already-**filled** position is left to
+lifts — exactly as a spread hour does. Both reasons go through one **refcount of
+named holders** (`core::hold::{HoldReason, Holders}`, v120): they overlap and lift
+independently, and the order is re-placed only on the release that **empties** the
+set. See "Resting-order holds" below. An already-**filled** position is left to
 run to its own SL/TP (pause is not a close). Before that fix a pause blocked only
 *new* placements, so an order already resting sat through the event and filled on
 the news spike; the EUR/USD `strategy-v2` fixture cells record the old −1.00R
@@ -236,6 +239,61 @@ as the operator emergency-flatten, so the basenames keep the word
 "close" (it's correct); the internal engine kind was renamed
 `PerTradeExit` → `PerPositionClose` (2026-07-19) to match — "close",
 scoped per-position not per-trade.
+
+### Resting-order holds are a REFCOUNT, not a boolean
+
+Several independent conditions can each want a resting (unfilled) entry order
+pulled off the broker. As of **v120** they all go through one shared refcount —
+`core::hold::{HoldReason, Holders}`, stored on `SpreadBlackoutRecord.holders` —
+rather than each cancelling and restoring on its own:
+
+| `HoldReason` | holds while | releases when |
+|---|---|---|
+| `SpreadHour` | `is_spread_hour(instrument, now)` (baked mask + 30-min lead) | baked hour ended **or** live spread recovered (≤4p) |
+| `NewsPause` | a `pause` row is armed for the trade | no pause row for the trade |
+
+**Reasons overlap and lift independently, and only the last one out restores.**
+The motivating case: a spread hour running 06:30–08:00 with a news pause from
+07:00. At 08:00 `SpreadHour` releases but `NewsPause` still holds, so the order
+stays pulled. `pending_lifecycle::release_satisfied` returns
+`Release::Emptied` only on the release that **empties** the set — a *transition*,
+so the restore fires exactly once per hold episode and a tick that merely observes
+an empty set re-places nothing.
+
+Things a refactorer must preserve:
+
+- **Named holders, NOT a bare counter.** The cron re-evaluates the same conditions
+  every ~5s. An incrementing `count += 1` would reach the hundreds within an hour
+  and never return to zero, so the order would never be restored. `Holders::hold`
+  is **idempotent**; the "count" is `holders.len()`. Test:
+  `overlap_repeated_ticks_do_not_inflate_the_holder_set`.
+- **One derivation each side.** `hold_reasons` (ON) and `release_satisfied` (OFF)
+  are the only places the reason set is computed. This replaced two hand-written
+  OR expressions that had to agree by hand — an out-of-sync pair cancels an order
+  and re-places it on the next tick, back into the window it was pulled from.
+  Adding a `HoldReason` variant is a **compile error** in `release_satisfied`
+  until its release condition is written. Don't reintroduce an inline
+  `is_spread_hour(..) || pause_active(..)` at a call site.
+- **`applied` is NOT the holder set.** `applied` means "this record mutated
+  something at the broker" and is load-bearing for **System 2** (widened
+  open-position stops, `trade-control-cron/src/blackout_apply.rs`). `holders`
+  answers the different question "which reasons still want the order pulled".
+  Collapsing them breaks System 2's idempotency guard.
+- **The 12h backstop ignores holders** (rail 5) and must keep doing so, or a stuck
+  holder row — or an unreadable store, since `pause_active` fails *closed* — would
+  strand an order forever. Test: `backstop_restores_even_while_paused`.
+- **No `Unknown(String)` holder variant.** Nothing builds a reason from a runtime
+  string, so an unrecognised reason in a stored body is a **loud decode error** on
+  that record, never a silently-dropped holder (which would restore the order
+  blind). Test: `unknown_reason_is_a_loud_decode_error_not_a_silent_drop`.
+- **Pre-v120 rows are healed at read time, not in serde.** A v119 row has
+  `applied: true` and no `holders`; `effective_holders` reads that as
+  `{SpreadHour}` so it re-derives instead of restoring blind on the first tick
+  after deploy. Deliberately not a serde default — the stored body stays a
+  faithful record of what was written.
+
+No SQL migration: the record persists as one `jsonb` body, so the new field is a
+`#[serde(default)]`.
 
 ### "retry" / `max_retries` does NOT mean retrying failed placements
 
