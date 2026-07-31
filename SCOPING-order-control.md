@@ -137,6 +137,65 @@ Note the flag statistic is p75 (`FLAG_PERCENTILE`) and the widen is p90
 changes no flagging behaviour. Per-broker-symbol keying stays (LOCKED: OANDA
 EUR/USD 21:00 peak 1.81× vs TN 5.58×).
 
+### 4b-i. The SL floor becomes a `max`, and the gate becomes a synthetic pre-check
+
+**This is what actually retires the boolean gate.** Two pieces:
+
+**(1) The floor is a `max` over three terms** — every candle, every instrument:
+
+```
+sl_distance = max(
+    SL_MIN_SPREAD_MULTIPLE × last_candle_spread,   // reactive  (today's rule)
+    SL_MIN_SPREAD_MULTIPLE × expected_hour_spread, // FORWARD-LOOKING (new)
+    desired_sl_distance,                           // never tighter than drawn
+)
+```
+
+The middle term is the point. Today's floor reads a **5-bar trailing mean**
+(`DEFAULT_SPREAD_WINDOW = 5`), so it only reacts *after* the spread has widened.
+The expected-hour term sizes the stop for the spike **before it arrives** — which is
+precisely the protection `SPREAD_HOUR_LEAD_MINUTES` was providing via a clock proxy.
+
+**This is what makes §4c's lead removal safe.** Dropping the `SpreadHour` hold stops
+being a trade-off, because the lead is recovered *structurally* rather than by a
+30-minute timer.
+
+Degrades cleanly: an instrument with no baked hourly row contributes `0.0` to the
+middle term and falls back to exactly today's behaviour.
+
+⚠️ **Which hour?** A stop resting at 20:55 can fill at 21:05, inside the spike. So
+the expected term must cover the hour the order might **fill** in, not just the
+current one — realistically `max` over the current and next hour (and, for a Stored
+order being promoted, the hour it would be placed into). Get this right in
+implementation; it is the `max` doing the lead's job.
+
+**(2) The gate becomes a synthetic pre-check — which PARKS, it does not prevent.**
+
+Run the *same* `sl_target` function against the **expected** spread instead of the
+**measured** one. That yields a synthetic R for the trade as it would be at the
+coming hour's spread:
+
+- **≥ min_r** → place now, stop already sized for the coming hour
+- **< min_r** → **Stored**, re-checked next candle (§4.2). Not rejected.
+
+Same function, different input — **no second code path**, so replay/live parity is
+structural and there is nothing new to keep in sync.
+
+Why this beats a boolean gate: "nobody trades this instrument at 21:00Z" cannot
+express the distinction that actually matters. A wide-stop setup with a distant TP
+may clear 1R comfortably *through* a spread hour and should trade straight through
+it; a tight scalp on the same instrument at the same minute should not. The
+synthetic check asks the question per-trade instead of per-instrument-hour.
+
+⚠️ **What this does NOT replace: rubbish-candle suppression.** The synthetic check
+answers *"is this trade still worth taking at the expected spread?"* — a
+**risk/sizing** question. Suppression answers *"is this bar's OHLC a real move or a
+spread artefact?"* — a **signal-validity** question. Concretely: a 21:00Z bar whose
+low is a spread wick. The synthetic check may well say "≥1R, place it" and you enter
+off a break-and-close **that never happened** — correctly sized, fictional signal. No
+sizing arithmetic can detect that, because the input candle itself is untrustworthy.
+See §4c.
+
 ### 4c. What happens to `is_spread_hour`
 
 **It leaves order control entirely, and survives only as a signal-quality gate.**
@@ -155,12 +214,16 @@ Two distinct jobs are hiding behind one predicate:
   stage from sizing — it stops the signal being *read*, where 1R runs after a signal
   has already fired. **The 1R filter cannot replace this. Keep it.**
 
-⚠️ **Deliberate trade-off to accept explicitly:** dropping the `SpreadHour` hold
-also drops the **30-min pre-emptive lead** (`SPREAD_HOUR_LEAD_MINUTES`), which
-exists so we are flat *before* the spread blows out — reacting after means reacting
-at a bad price. §4b's pre-widening covers this (the stop is already sized for the
-expected spread when the hour arrives), but it is a real behaviour change, not a
-free simplification.
+**The 30-min lead is recovered, not lost.** An earlier draft of this doc listed
+dropping `SPREAD_HOUR_LEAD_MINUTES` as a deliberate trade-off — reacting *after* a
+spike means reacting at a bad price. §4b-i removes that concern: the
+**expected-hour term in the SL `max`** sizes the stop for the coming hour before it
+arrives, and the **synthetic pre-check** parks a trade that wouldn't clear 1R at that
+spread. Both are forward-looking, so the protection survives the clock proxy's
+removal — and applies per-trade rather than per-instrument-hour.
+
+What genuinely changes: protection becomes **continuous** (every hour carries an
+expected spread) instead of a 30-minute step function around flagged hours only.
 
 Also retired by this: the `mask_active_with_lead` / `spread_hour_widen_for`
 structural twins (`spread_blackout.rs:466` / `:327`), kept in sync by hand today.
@@ -220,6 +283,23 @@ incompatible widen implementations (§3.4), and how B ended up able to clobber F
 unit-testable without a broker, and mutation-testable (a flipped sign must turn a
 test red — green refcount/SL tests prove very little on their own).
 
+It is also what makes §4b-i's synthetic pre-check free: running the *same* function
+against the **expected** spread instead of the **measured** one yields the synthetic
+R, with no second code path to keep in sync between replay and live. Its signature
+carries both spreads and returns the `max`:
+
+```rust
+pub struct SpreadInputs {
+    pub last_candle: f64,        // reactive
+    pub expected_this_hour: f64, // forward-looking; 0.0 when un-baked
+    pub expected_next_hour: f64, // an order resting at 20:55 can fill at 21:05
+}
+pub fn sl_target(
+    spreads: SpreadInputs, original_sl_distance: f64,
+    entry: f64, tp: f64, price: f64, min_r: f64,
+) -> SlTarget;   // { desired_sl, r, action: Widen | Shrink | Hold | BelowMinR }
+```
+
 ---
 
 ## 7. Schema
@@ -249,15 +329,20 @@ Each ships green, with its own tests and fixture check.
 | # | slice | resolves | risk |
 |---|---|---|---|
 | **1** | **Stored orders** — rules 1, 2, 4, 5, 7-partial, + supersede | the sgdjpy 0R loss | low: net-new; existing paths untouched |
-| **2** | **Un-gate hourly spread** — split mask from forecast, re-bake | rule 4b | low: data + one `Option` split |
-| **3** | **`sl_target` + `live.rs`** — merge B and F | §3.1 B-undoes-F, §3.2 dup join, §3.4 two widens | **high: live money path** |
-| **4** | **Pending SL adjust + resize** — rules 6, 7 for Pending | — | medium |
-| **5** | **`HoldReason::MarketHours`** — fold the sweep's cancel in | §3.3 third cancel path | medium |
-| **6** | **Retire `is_spread_hour` from order control** | §4c | medium: behaviour change (lead) |
+| **2** | **Un-gate hourly spread** — split mask from forecast, re-bake | §4b | low: data + one `Option` split |
+| **3** | **`sl_target` + the `max` floor + synthetic pre-check** | §4b-i; unifies A's and B's two widen rules | medium: changes entry sizing |
+| **4** | **`live.rs`** — merge B and F behind `sl_target` | §3.1 B-undoes-F, §3.2 dup join | **high: live money path** |
+| **5** | **Pending SL adjust + resize** — rules 6, 7 for Pending | — | medium |
+| **6** | **`HoldReason::MarketHours`** — fold the sweep's cancel in | §3.3 third cancel path | medium |
+| **7** | **Retire `is_spread_hour` from order control** | §4c | low **once 2+3 land** — the lead is already recovered |
 
-Slice 3 is where the existing bug lives, so there's an argument for doing it first.
-Recommendation is still 1-first: it's additive, it pays for itself immediately, and
-it builds the vocabulary the later slices are expressed in.
+Ordering note: slice 7 is only safe **after** 2 and 3, because those are what
+recover the pre-emptive lead (§4b-i). Retiring the clock proxy before the
+forward-looking floor exists would leave a real protection gap.
+
+Slice 4 is where the existing B-undoes-F bug lives, so there's an argument for
+pulling it forward. Recommendation is still 1-first: it's additive, it pays for
+itself immediately, and it builds the vocabulary the later slices are expressed in.
 
 ---
 
