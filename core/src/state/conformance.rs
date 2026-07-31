@@ -909,6 +909,17 @@ fn sample_record(trade_id: &str, account: Option<&str>, instrument: &str) -> Hel
         pip_size: 0.0001,
         original_stops: Vec::new(),
         cancelled_orders: Vec::new(),
+        // A parked order too, so the round-trip proves the `jsonb` body carries
+        // Stored orders through every backend. Losing one on a restart would
+        // silently discard a setup the operator is still waiting on.
+        stored_orders: vec![crate::order_control::StoredOrder {
+            signed_intent: "{\"stored\":true}".into(),
+            reason: crate::order_control::StoredReason::BelowMinRForecast,
+            original_sl_distance: 0.0020,
+            stored_at: now,
+            drop_at: now + chrono::Duration::hours(3),
+            shell_time: now,
+        }],
     }
 }
 

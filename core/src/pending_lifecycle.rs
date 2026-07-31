@@ -693,6 +693,11 @@ fn merge_cancelled_order(
         pip_size,
         original_stops: Vec::new(),
         cancelled_orders: Vec::new(),
+        // A cancelled resting order is a different thing from a Stored one:
+        // this order existed at the broker and was pulled, so it restores. A
+        // Stored order never reached the broker. Parking is done by the entry
+        // path, never here.
+        stored_orders: Vec::new(),
     });
     record.applied = true;
     // Union, not replace — see the fn doc. `hold` is idempotent, so a reason that
@@ -1524,6 +1529,7 @@ mod tests {
             pip_size: 0.0001,
             original_stops: Vec::new(),
             cancelled_orders: Vec::new(),
+            stored_orders: Vec::new(),
         }
     }
 

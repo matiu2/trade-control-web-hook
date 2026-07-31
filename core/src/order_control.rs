@@ -35,6 +35,11 @@
 //! without a broker, and mutation-testable); the effectful ones carry only
 //! plumbing.
 //!
+//! - [`park`] — **effectful.** Persisting a Stored order on the trade's record:
+//!   park (replacing any stale one), read back, clear on promote/drop.
+//! - [`stored`] — **pure.** The Stored state itself: park an intended order
+//!   instead of discarding it, promote when it clears its R-floor, drop 3 bars
+//!   before expiry.
 //! - [`sl_target`] — **pure.** *"What should this stop be right now?"* The one
 //!   place widen-vs-shrink is decided, and the home of the forward-looking
 //!   spread `max`. Unifies the two rival widen implementations.
@@ -42,8 +47,12 @@
 //!   another system (break-even) moved it since? Prevents a restore silently
 //!   reverting a locked-in break-even.
 
+mod park;
 mod restore;
 mod sl_target;
+mod stored;
 
+pub use park::*;
 pub use restore::*;
 pub use sl_target::*;
+pub use stored::*;

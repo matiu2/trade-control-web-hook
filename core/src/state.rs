@@ -494,6 +494,20 @@ pub struct HeldTradeRecord {
     /// signed intent, to re-drive on recovery. Empty until then.
     #[serde(default)]
     pub cancelled_orders: Vec<CancelledOrder>,
+    /// **Stored** orders — intended but never sent to the broker, parked here
+    /// instead of discarded, and re-checked every candle for promotion.
+    ///
+    /// Distinct from [`Self::cancelled_orders`], which holds orders that *were*
+    /// placed and have since been pulled: those are restored, these have never
+    /// existed at the broker. Distinct again from an [`EntryAttempt`], whose
+    /// `broker_order_id` is non-`Option` precisely because it records a real
+    /// placement — which is why a rejected entry previously had nowhere to live
+    /// and was simply lost. See [`crate::order_control::stored`].
+    ///
+    /// Lives on the record as one `jsonb` body, so `#[serde(default)]` and **no
+    /// SQL migration** — the same pattern `holders` used in v120.
+    #[serde(default)]
+    pub stored_orders: Vec<crate::order_control::StoredOrder>,
 }
 
 impl HasExpiry for HeldTradeRecord {
@@ -3087,6 +3101,7 @@ mod tests {
                 pip_size: 0.0001,
                 original_stops: Vec::new(),
                 cancelled_orders: Vec::new(),
+                stored_orders: Vec::new(),
             }],
             spread_blackout_window: Some(SpreadBlackoutWindow {
                 opened_at: ts("2026-05-14T11:00:00Z"),
@@ -3661,11 +3676,27 @@ mod tests {
                 order_id: "ord-9".into(),
                 signed_intent: "{\"x\":1}".into(),
             }],
+            stored_orders: vec![crate::order_control::StoredOrder {
+                signed_intent: "{\"y\":2}".into(),
+                reason: crate::order_control::StoredReason::BelowMinR,
+                original_sl_distance: 0.0020,
+                stored_at: ts("2026-03-12T21:05:00Z"),
+                drop_at: ts("2026-03-12T23:05:00Z"),
+                shell_time: ts("2026-03-12T21:00:00Z"),
+            }],
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: HeldTradeRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, record);
         assert_eq!(parsed.pip_size, 0.0001);
+        // A Stored order survives the body round-trip. Losing one here would
+        // silently discard a parked setup — the exact failure this state was
+        // added to prevent.
+        assert_eq!(parsed.stored_orders.len(), 1);
+        assert_eq!(
+            parsed.stored_orders[0].reason,
+            crate::order_control::StoredReason::BelowMinR
+        );
         // The holder refcount survives the body round-trip. A dropped holder here
         // would restore an order into a window that still holds it.
         assert_eq!(parsed.holders.len(), 2);

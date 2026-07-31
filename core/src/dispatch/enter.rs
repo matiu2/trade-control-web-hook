@@ -783,8 +783,32 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 // omitted: it is always `10 × spread` (redundant with the level
                 // + spread), and `body` keeps the fuller "widening to 10x
                 // spread" sentence.
+                // PARK, don't discard. Before stored orders existed this
+                // returned a terminal 422 and the setup was gone: a rejection
+                // left no trace (`EntryAttempt.broker_order_id` is non-`Option`,
+                // written only on `Ok`), so a later fire re-derived the same
+                // verdict from scratch and died the same way. That is the
+                // `sgdjpy-spread-floor-min-r-block` 0R loss — three fires over
+                // 17h, each independently rejected, plan dead at expiry.
+                //
+                // The spread being wide *now* is a reason not to place *now*,
+                // not a reason to throw the setup away. Parking keeps the
+                // signed body and the drawn geometry so the trade is re-checked
+                // every candle and placed the moment it clears its R-floor.
+                // Still rejected (nothing was placed) — but recoverable.
+                let parked = park_stored_entry(
+                    store,
+                    verified,
+                    trade_id,
+                    &resolved.instrument,
+                    sl_distance,
+                    raw_body,
+                    enter_granularity,
+                    now,
+                )
+                .await;
                 let outcome = format!(
-                    "rejected: sl-widen-below-min-r (spread={spread_str} widened_sl_lvl={widened_lvl_str} r_at_widen={r_at_widen:.2} < min_r={min_r:.2})",
+                    "rejected: sl-widen-below-min-r (spread={spread_str} widened_sl_lvl={widened_lvl_str} r_at_widen={r_at_widen:.2} < min_r={min_r:.2}{parked})",
                 );
                 return ActionResult::Rejected {
                     status: 422,
@@ -918,6 +942,93 @@ pub async fn run_enter<B: Broker, S: StateStore>(
             let outcome = recover_entry::outcome_for_entry_error(&err);
             tracing::error!("entry failed: {err} ({outcome})");
             ActionResult::Failed(outcome)
+        }
+    }
+}
+
+/// Park an entry the spread floor wouldn't let us place, so a later candle can
+/// promote it instead of the setup being lost.
+///
+/// Returns a short suffix for the reject `outcome` line — the offline replay
+/// surfaces `outcome` verbatim, so the operator can see at a glance whether the
+/// setup was parked or genuinely gone.
+///
+/// **Best-effort.** A store failure costs the park, never the (already-decided)
+/// rejection, so it is logged and swallowed — exactly the discipline
+/// `put_order_body` uses on the placement path above.
+///
+/// Requires the signed body: without it there is nothing to re-drive later, so
+/// a park would be a promise we couldn't keep.
+#[allow(clippy::too_many_arguments)]
+async fn park_stored_entry<S: StateStore>(
+    store: &S,
+    verified: &incoming::Verified,
+    trade_id: &str,
+    instrument: &str,
+    original_sl_distance: f64,
+    raw_body: Option<&str>,
+    enter_granularity: Option<crate::broker::Granularity>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    // Prefer the exact signed bytes; fall back to re-serialising the verified
+    // intent. The engine path (and the offline replay) build `Verified` from a
+    // registered plan rather than from signed YAML, so they have no `raw_body` —
+    // but the intent in hand is the same one that was just verified, so
+    // re-serialising it loses nothing a promotion needs. Without this fallback
+    // the park would silently never happen on the plan-driven path, which is
+    // every trade the engine fires.
+    let body = match raw_body {
+        Some(b) => b.to_string(),
+        None => match serde_yaml::to_string(&verified.intent) {
+            Ok(yaml) => yaml,
+            Err(err) => {
+                tracing::error!(
+                    "stored-order: cannot serialise intent for trade={trade_id}: {err} — not \
+                     parking (nothing to re-drive later)",
+                );
+                return String::new();
+            }
+        },
+    };
+    // Three bars before the alert window closes: promoting into the last moments
+    // leaves no runway for the thesis to play out.
+    // No plan granularity in hand (webhook / restore re-drive) → assume H1, the
+    // most common timeframe. A wrong guess only shifts the drop deadline by a
+    // few bars; it never places or blocks a trade on its own.
+    let bar_seconds = enter_granularity.map_or(3600, crate::broker::Granularity::seconds);
+    let drop_at = crate::order_control::drop_at(verified.intent.not_after, bar_seconds, now);
+    let order = crate::order_control::StoredOrder {
+        signed_intent: body,
+        reason: crate::order_control::StoredReason::BelowMinR,
+        original_sl_distance,
+        stored_at: now,
+        drop_at,
+        shell_time: verified.shell.time,
+    };
+    match crate::order_control::park_order(
+        store,
+        trade_id,
+        instrument,
+        verified.intent.account.as_deref(),
+        order,
+        verified.intent.not_after,
+        now,
+    )
+    .await
+    {
+        Ok(()) => {
+            tracing::info!(
+                "stored-order: PARKED trade={trade_id} instrument={instrument} \
+                 original_sl_distance={original_sl_distance} drop_at={drop_at} — will be \
+                 re-checked each candle and placed when the spread allows",
+            );
+            format!(" stored until {drop_at}")
+        }
+        Err(err) => {
+            tracing::error!(
+                "stored-order: park FAILED for trade={trade_id}: {err} — setup is lost as before",
+            );
+            String::new()
         }
     }
 }
