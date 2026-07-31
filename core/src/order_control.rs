@@ -35,10 +35,15 @@
 //! without a broker, and mutation-testable); the effectful ones carry only
 //! plumbing.
 //!
+//! - [`sl_target`] — **pure.** *"What should this stop be right now?"* The one
+//!   place widen-vs-shrink is decided, and the home of the forward-looking
+//!   spread `max`. Unifies the two rival widen implementations.
 //! - [`restore`] — **pure.** May a remembered widened stop be given back, or has
 //!   another system (break-even) moved it since? Prevents a restore silently
 //!   reverting a locked-in break-even.
 
 mod restore;
+mod sl_target;
 
 pub use restore::*;
+pub use sl_target::*;
