@@ -78,6 +78,7 @@ use candle_model::{BidAskCandle, Candle, Granularity};
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use oanda_client::{OandaClient, data_source::OandaDataSource};
 use trade_control_core::spread_blackout::is_spread_hour;
+use tradenation_api::TradeNationClient;
 
 /// Bars of trailing context used for the volatility control. 24 on H1 = a day.
 const ATR_PERIOD: usize = 24;
@@ -270,6 +271,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1460); // ~4 years, the OANDA H1 depth
     let json_out = arg(&args, "--json");
+    // TN is a market-maker and its spreads behave very differently from OANDA's
+    // (LOCKED note in SCOPING-candle-derived-spread-baseline.md: TN EUR/USD peaks
+    // 5.58x at 21:00 vs OANDA's 1.81x), so the study must be runnable per-broker.
+    let broker = arg(&args, "--broker").unwrap_or_else(|| "oanda".into());
+    if broker != "oanda" && broker != "tradenation" {
+        return Err(format!("--broker must be oanda|tradenation, got {broker}").into());
+    }
 
     let gran = match granularity.as_str() {
         "h1" => Granularity::OneHour,
@@ -280,9 +288,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Only instruments with a baked elevated hour can contribute a flagged
     // population; the rest would be all-control and just add noise.
-    let instruments = flagged_instruments(max_instruments);
+    let instruments = flagged_instruments(&broker, max_instruments);
     eprintln!(
-        "spread-hour candle study: {} instruments, {granularity}, {days}d lookback",
+        "spread-hour candle study: broker={broker}, {} instruments, {granularity}, {days}d lookback",
         instruments.len()
     );
     eprintln!(
@@ -290,15 +298,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
            populations: flagged = is_spread_hour(instrument, bar.time); control = same instrument, other hours\n"
     );
 
-    let cache_dir = dirs_next_cache().join("candle_cache_oanda");
-    let config = CacheConfig::default().with_cache_dir(cache_dir);
-    let client = CacheClient::new(config, oanda_source()?).await?;
-
     let to = Utc::now();
     let from = to - Duration::days(days);
-    let mut results = Vec::new();
 
-    for instrument in &instruments {
+    // `CacheClient` is generic over its `DataSource`, so the two brokers yield
+    // different concrete types and can't share one binding — each arm runs the
+    // whole pass and hands back the results.
+    let results = if broker == "oanda" {
+        let dir = dirs_next_cache().join("candle_cache_oanda");
+        let client =
+            CacheClient::new(CacheConfig::default().with_cache_dir(dir), oanda_source()?).await?;
+        collect(&client, &instruments, gran, from, to).await
+    } else {
+        let dir = dirs_next_cache().join("candle_cache_tradenation");
+        let client = CacheClient::new(
+            CacheConfig::default().with_cache_dir(dir),
+            TradeNationClient::new_demo(),
+        )
+        .await?;
+        collect(&client, &instruments, gran, from, to).await
+    };
+
+    report(&broker, &results);
+    if let Some(path) = json_out {
+        write_json(&path, &results)?;
+        eprintln!("\nwrote {path}");
+    }
+    Ok(())
+}
+
+/// Walk every instrument, split its bars into the two populations, accumulate.
+/// Generic over the cache's `DataSource` so both brokers share one code path.
+async fn collect<D>(
+    client: &CacheClient<D>,
+    instruments: &[String],
+    gran: Granularity,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Vec<InstrumentResult>
+where
+    D: candle_cache::BidAskDataSource,
+{
+    let mut results = Vec::new();
+    for instrument in instruments {
         let series = match client
             .get_candles_range_bid_ask(instrument, fx(from), fx(to), gran)
             .await
@@ -341,7 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         eprintln!(
-            "  {instrument:<12} bars={:<7} flagged={:<6} control={:<7}",
+            "  {instrument:<14} bars={:<7} flagged={:<6} control={:<7}",
             bars.len(),
             flagged.bars,
             control.bars
@@ -352,21 +394,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             control,
         });
     }
-
-    report(&results);
-    if let Some(path) = json_out {
-        write_json(&path, &results)?;
-        eprintln!("\nwrote {path}");
-    }
-    Ok(())
+    results
 }
 
 /// Print the flagged-vs-control comparison, per instrument and pooled.
 ///
 /// Everything is a **ratio to the same instrument's control population**, so a
 /// value of 1.00 means "indistinguishable from a normal hour for this pair".
-fn report(results: &[InstrumentResult]) {
-    println!("\n=== flagged-hour bars vs the SAME instrument's other hours ===");
+fn report(broker: &str, results: &[InstrumentResult]) {
+    println!("\n=== [{broker}] flagged-hour bars vs the SAME instrument's other hours ===");
     println!(
         "(ratio to control; 1.00 = no different. persist<1 and r/spread<1 support the folklore)\n"
     );
@@ -463,12 +499,13 @@ fn metrics_json(m: &Metrics) -> String {
 /// directly — it is a checked-in static file, and reading it here keeps the study
 /// pinned to exactly the rows the engine flags. Cross-checked below against the
 /// public `is_spread_hour`, which is the real oracle.
-fn flagged_instruments(max: usize) -> Vec<String> {
+fn flagged_instruments(broker: &str, max: usize) -> Vec<String> {
     const TABLE: &str = include_str!("../../core/src/spread_baseline_candle.rs");
+    let prefix = format!("(\"{broker}\"");
     let mut out = Vec::new();
     for line in TABLE.lines() {
         let line = line.trim();
-        if !line.starts_with("(\"oanda\"") {
+        if !line.starts_with(&prefix) {
             continue;
         }
         // ("oanda", "EUR_USD", "ny", true, 131072, [...], ...)

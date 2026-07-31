@@ -1,9 +1,10 @@
 # EXPERIMENT — is a spread-hour candle actually "rubbish"?
 
-**Run:** 2026-07-31 · OANDA H1 · 4 years (2022-07 → 2026-07)
-**Sample:** 66 instruments · **71,351 flagged bars** vs **1,564,202 control bars**
-**Tool:** `cli/examples/spread_hour_candle_stats.rs`
-**Raw:** `/tmp/claude-1000/spread-hour-stats.json`
+**Run:** 2026-07-31 · OANDA + TradeNation H1
+**Sample:** OANDA 66 instruments / **71,351** flagged vs **1,564,202** control bars (4y)
+· TradeNation 32 instruments / **20,638** flagged vs **375,956** control bars (3.3y)
+**Tool:** `cli/examples/spread_hour_candle_stats.rs` (`--broker oanda|tradenation`)
+**Raw:** `/tmp/claude-1000/spread-hour-stats.json`, `/tmp/claude-1000/tn-stats.json`
 
 ---
 
@@ -15,7 +16,7 @@ The engine suppresses signals on spread-hour bars at 5 sites in
 provider, so the OHLC is an artefact of who was quoting.
 
 That claim predicts the move **should not stick**. Measured against the same
-instrument's other hours:
+instrument's other hours (OANDA figures; TradeNation in the next section agrees):
 
 | metric | median ratio | folklore predicts | verdict |
 |---|---|---|---|
@@ -37,11 +38,13 @@ evidence — until you ask *which side of the ratio moved*. Since
 `0.76 / 0.16`:
 
 ```
-spread multiple during the flagged hour:  median 4.47×   (min 1.54×, max 9.07×)
+spread multiple during the flagged hour:
+  OANDA        median  4.45×   (max  9.07×)
+  TradeNation  median 11.01×   (max 18.09×)   <- market-maker, far worse
 ```
 
-So the ratio collapsed because **the spread widened ~4.5×**, not because the
-range shrank. That is a restatement of the thing the hour was flagged for in the
+So the ratio collapsed because **the spread widened** (4.5× on OANDA, 11× on TN),
+not because the range shrank. That is a restatement of the thing the hour was flagged for in the
 first place — it is not independent evidence about candle quality.
 
 **Nothing left standing.** Persistence is flat-to-higher, ranges are *smaller*
@@ -49,17 +52,51 @@ first place — it is not independent evidence about candle quality.
 
 ---
 
+## Both brokers agree — TradeNation just costs 2.5× more
+
+The operator flagged TN as having "humungous spreads at 7am" (= 17:00 NY, the
+same flagged hour). Confirmed, and then some:
+
+| metric (median ratio vs same instrument's other hours) | OANDA | TradeNation |
+|---|---|---|
+| `persist1` — move alive 1 bar later | 0.98 | **0.94** |
+| `persist3` — alive 3 bars later | 1.11 | **1.09** |
+| `retrace1` | 1.24 | 1.12 |
+| `wick_share` | 1.12 | 1.15 |
+| `range_over_spread` | 0.156 | **0.082** |
+| `range_over_atr` | 0.76 | **0.88** |
+| **implied spread multiple** | **4.45×** | **11.01×** |
+
+Worst TN offenders: EUR/GBP **18.1×**, EUR/JPY 14.8×, GBP/AUD 13.2×, AUD/USD
+13.2×, USD/CAD 13.0×, EUR/AUD 12.9×.
+
+**The qualitative conclusion is unchanged, and TN strengthens it.** Persistence
+is flat on both brokers (0.94 / 1.09 on TN — moves stick just as well), and TN's
+ranges are *closer* to normal than OANDA's (0.88 vs 0.76 × ATR). The entire
+difference between the brokers is **execution cost**: TN's spread blows out 2.5×
+harder than OANDA's at the same hour.
+
+That is precisely the split the `max` SL floor is built for. An 11× spread is a
+sizing input, not a reason to disbelieve the candle — and because the floor is
+per-instrument and per-broker (the baked table is keyed
+`(broker, symbol)`), EUR/GBP on TN at 18× is automatically treated far more
+conservatively than the same pair on OANDA, with no separate rule.
+
+A boolean gate cannot express that. It suppresses both identically, despite one
+being 2.5× more expensive than the other.
+
 ## What the data actually says the hour is
 
 Not fake — **quiet and expensive**:
 
 - **smaller ranges** (0.76× normal ATR)
-- **~4.5× wider spreads**
+- **4.5× (OANDA) to 11× (TN) wider spreads**
 - moves that **persist as well as any other hour** (0.98 / 1.11)
 
 That is a liquidity thinning, and it has a precise cost signature: the *spread*
 is the problem, not the *print*. A trade entered on such a bar pays ~4.5× the
-normal round-trip on a bar with ~0.76× the normal room to work with.
+normal round-trip — 11× on TradeNation — on a bar with less room than usual to
+work with.
 
 ---
 
@@ -96,9 +133,8 @@ The A/B is the confirming test.
 
 ### Caveats
 
-- **OANDA H1 only.** TradeNation has a much bigger corpus (54M H1 rows) and
-  spreads behave differently there (LOCKED note: OANDA EUR/USD 21:00 peak 1.81×
-  vs TN 5.58×). Worth re-running per-broker before acting.
+- ~~OANDA H1 only~~ — **both brokers now measured** (see above). TN is 2.5×
+  more expensive but qualitatively identical; the conclusion holds on both.
 - **92 of 98 flagged instruments carry a single mask bit** (local hour 17, NY
   close), so this is overwhelmingly a study *of the NY close*. The 5 multi-hour
   outliers are unexamined.
@@ -131,8 +167,12 @@ a silent zero that would bias a mean toward the hypothesis.
 Reproduce:
 
 ```sh
+# OANDA
 cargo run -p trade-control-cli --example spread_hour_candle_stats --release -- \
-    --granularity h1 --max-instruments 100 --days 1460 --json /tmp/stats.json
+    --broker oanda --granularity h1 --max-instruments 100 --days 1460 --json /tmp/oanda.json
+# TradeNation (needs a demo session; reads the TN cache)
+cargo run -p trade-control-cli --example spread_hour_candle_stats --release -- \
+    --broker tradenation --granularity h1 --max-instruments 40 --days 1200 --json /tmp/tn.json
 ```
 
 ## Still to run
@@ -145,8 +185,7 @@ cargo run -p trade-control-cli --example spread_hour_candle_stats --release -- \
    — news-on cells re-read the calendar and aren't reproducible.
    Power is weak: 31 fixtures, 1-bit masks ⇒ 1–2 suppressed bars each. It will show
    *which trades flip*, not whether the policy is net-positive.
-2. **Re-run on TradeNation** (54M H1 rows), where the spread behaviour differs.
-3. **News windows as a third population** — the operator's hypothesis is that news
+2. **News windows as a third population** — the operator's hypothesis is that news
    bars are genuinely more volatile than spread-hour bars, which would justify
    keeping a real blackout for news while spread hours only need sizing. This study
    supports the second half; the first half is untested.
