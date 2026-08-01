@@ -710,6 +710,12 @@ pub async fn run_enter<B: Broker, S: StateStore>(
             }
         },
     };
+    // The stop as DRAWN, before the floor below may widen it. `resolved.stop_loss`
+    // is mutated in place by the widen, so this is the only point the operator's
+    // own level is still available — and a later shrink has nothing to shrink
+    // *toward* without it. Snapshotted onto the attempt row via
+    // `OrderControlSnapshot::original_stop_loss`.
+    let drawn_stop_loss = resolved.stop_loss;
     if let Some(spread_price) = effective_spread {
         let entry_price = entry_reference_price(&resolved.entry);
         let sl_distance = (entry_price - resolved.stop_loss).abs();
@@ -802,6 +808,8 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                     trade_id,
                     &resolved.instrument,
                     sl_distance,
+                    (entry_price - resolved.take_profit).abs(),
+                    min_r,
                     raw_body,
                     enter_granularity,
                     now,
@@ -899,6 +907,17 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                         }),
                         _ => None,
                     };
+                    // The geometry the every-candle order-control re-check needs
+                    // (rule 7). `original_stop_loss` is the DRAWN level captured
+                    // before the spread floor may have widened
+                    // `resolved.stop_loss` in place — a shrink must never tighten
+                    // past it.
+                    let order_control = Some(crate::state::OrderControlSnapshot {
+                        original_stop_loss: drawn_stop_loss,
+                        take_profit_price: resolved.take_profit,
+                        min_r: resolved.min_r,
+                        bar_seconds: enter_granularity.map(crate::broker::Granularity::seconds),
+                    });
                     crate::retry_gate::record_placement(
                         store,
                         &verified.intent,
@@ -911,6 +930,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                         resolved.stop_loss,
                         cancel_at,
                         breakeven_snapshot,
+                        order_control,
                     )
                     .await;
                 }
@@ -966,6 +986,8 @@ async fn park_stored_entry<S: StateStore>(
     trade_id: &str,
     instrument: &str,
     original_sl_distance: f64,
+    tp_distance: f64,
+    min_r: f64,
     raw_body: Option<&str>,
     enter_granularity: Option<crate::broker::Granularity>,
     now: chrono::DateTime<chrono::Utc>,
@@ -1001,6 +1023,11 @@ async fn park_stored_entry<S: StateStore>(
         signed_intent: body,
         reason: crate::order_control::StoredReason::BelowMinR,
         original_sl_distance,
+        // The R numerator + threshold the promotion re-check re-tests every
+        // candle. Captured here because the cron has no intent in hand, and
+        // because `min_r` may be a per-trade override rather than the floor.
+        tp_distance,
+        min_r,
         stored_at: now,
         drop_at,
         shell_time: verified.shell.time,

@@ -257,6 +257,8 @@ async fn park_below_min_r<S: StateStore>(
             reason: StoredReason::BelowMinR,
             // Sized at promotion time against the spread then — see the fn doc.
             original_sl_distance: 0.0,
+            tp_distance: 0.0200,
+            min_r: 1.0,
             stored_at: now,
             drop_at: drop_at(expires_at, bar_seconds, now),
             shell_time,

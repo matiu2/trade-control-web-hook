@@ -43,6 +43,12 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Serde default for [`StoredOrder::min_r`] — see the field docs for why this is
+/// the R-floor and not `0.0`.
+fn default_min_r() -> f64 {
+    crate::intent::MIN_R_FLOOR
+}
+
 /// How many bars before a trade's expiry a stored order stops being promotable.
 ///
 /// A setup promoted into the last moments of its own window has no room left to
@@ -70,6 +76,27 @@ pub struct StoredOrder {
     /// not a computed one. Kept separately from whatever widened distance the
     /// floor currently demands, which moves with the spread.
     pub original_sl_distance: f64,
+    /// Take-profit distance from entry, in price units — the numerator of the
+    /// R the promotion re-check tests every candle.
+    ///
+    /// Defaults to `0.0` on a body written before this field existed. Paired
+    /// with the `min_r` default below, that yields `R = 0.0 < 1.0` ⇒
+    /// [`SlAction::BelowMinR`](super::SlAction::BelowMinR), so a legacy park
+    /// **stays parked** and drops at its own deadline rather than being placed
+    /// on geometry we can't read.
+    #[serde(default)]
+    pub tp_distance: f64,
+    /// The trade's effective R-floor, so promotion applies the same threshold
+    /// the entry gate rejected it against rather than a hardcoded 1.0.
+    ///
+    /// ⚠️ Defaults to [`MIN_R_FLOOR`], **not** to `0.0`. A `0.0` default is
+    /// the tempting one and it fails *open*: with a legacy body's
+    /// `tp_distance: 0.0` it gives `0.0 < 0.0 == false`, so `sl_target` reports
+    /// the order as clearing its floor and the first tick after deploy promotes
+    /// every parked order on unknown geometry. Pinned by
+    /// `a_legacy_park_stays_parked_rather_than_promoting_blind`.
+    #[serde(default = "default_min_r")]
+    pub min_r: f64,
     /// When this was first parked. Distinct from the trade's own clocks so a
     /// long park is visible in `status`.
     pub stored_at: DateTime<Utc>,
@@ -176,6 +203,8 @@ mod tests {
             signed_intent: "{}".to_string(),
             reason: StoredReason::BelowMinR,
             original_sl_distance: 0.0020,
+            tp_distance: 0.0200,
+            min_r: 1.0,
             stored_at: at(stored_at),
             drop_at: at(drop_at),
             shell_time: at(stored_at),
@@ -263,5 +292,50 @@ mod tests {
         let json = serde_json::to_string(&o).expect("serialise");
         let back: StoredOrder = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(o, back);
+    }
+
+    /// BACK-COMPAT, and the reason `min_r` does **not** default to `0.0`.
+    ///
+    /// A body parked by the previous build carries neither `tp_distance` nor
+    /// `min_r`. With a `0.0` default for both, `sl_target` computes `R = 0.0`
+    /// and tests `0.0 < 0.0 == false` — so it reports the order as CLEARING its
+    /// floor, and the first tick after deploy promotes every parked order on
+    /// geometry it cannot actually read. Defaulting `min_r` to the R-floor makes
+    /// the same body read as `0.0 < 1.0` ⇒ `BelowMinR`: it stays parked and
+    /// drops at its own deadline.
+    ///
+    /// Mutation check: change the default back to `0.0` and this goes red.
+    #[test]
+    fn a_legacy_park_stays_parked_rather_than_promoting_blind() {
+        // Exactly the fields the previous build wrote — no tp_distance, no min_r.
+        let legacy = r#"{
+            "signed_intent": "body",
+            "reason": "below-min-r",
+            "original_sl_distance": 0.0020,
+            "stored_at": "2026-07-22T13:30:00Z",
+            "drop_at": "2026-07-23T21:00:00Z",
+            "shell_time": "2026-07-22T13:30:00Z"
+        }"#;
+        let o: StoredOrder = serde_json::from_str(legacy).expect("a legacy body must still decode");
+        assert_eq!(o.tp_distance, 0.0, "no TP known");
+        assert!(
+            (o.min_r - crate::intent::MIN_R_FLOOR).abs() < 1e-12,
+            "min_r must default to the R-floor, not 0.0 — got {}",
+            o.min_r,
+        );
+
+        // ...and the verdict that follows from those defaults: do not promote.
+        let verdict = crate::order_control::sl_target(
+            crate::order_control::SpreadInputs::measured_only(0.0001),
+            o.original_sl_distance,
+            o.original_sl_distance,
+            o.tp_distance,
+            o.min_r,
+        );
+        assert_eq!(
+            verdict.action,
+            crate::order_control::SlAction::BelowMinR,
+            "a park whose geometry we can't read must NOT be placed",
+        );
     }
 }

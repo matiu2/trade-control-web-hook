@@ -309,6 +309,7 @@ mod tests {
             pip_size: Some(0.0001),
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
             breakeven: snap,
+            order_control: None,
         }
     }
 

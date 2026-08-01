@@ -180,6 +180,8 @@ mod tests {
                 signed_intent: "body".into(),
                 reason: StoredReason::BelowMinR,
                 original_sl_distance: 0.0020,
+                tp_distance: 0.0200,
+                min_r: 1.0,
                 stored_at: now,
                 drop_at: at(drop_at),
                 shell_time: now,

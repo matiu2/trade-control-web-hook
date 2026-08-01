@@ -627,6 +627,7 @@ fn sample_attempt(
         pip_size: None,
         blackout_close: BlackoutCloseAction::default(),
         breakeven: None,
+        order_control: None,
     }
 }
 
@@ -916,6 +917,8 @@ fn sample_record(trade_id: &str, account: Option<&str>, instrument: &str) -> Hel
             signed_intent: "{\"stored\":true}".into(),
             reason: crate::order_control::StoredReason::BelowMinRForecast,
             original_sl_distance: 0.0020,
+            tp_distance: 0.0200,
+            min_r: 1.0,
             stored_at: now,
             drop_at: now + chrono::Duration::hours(3),
             shell_time: now,

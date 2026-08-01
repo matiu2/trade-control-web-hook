@@ -517,6 +517,7 @@ mod tests {
             pip_size,
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
             breakeven: None,
+            order_control: None,
         }
     }
 

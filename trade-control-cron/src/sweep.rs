@@ -336,6 +336,7 @@ mod tests {
             pip_size: Some(0.0001),
             blackout_close,
             breakeven: None,
+            order_control: None,
         }
     }
 

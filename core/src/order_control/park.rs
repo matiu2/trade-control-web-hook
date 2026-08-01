@@ -120,6 +120,8 @@ mod tests {
             signed_intent: format!("{{\"shell\":\"{shell}\"}}"),
             reason: StoredReason::BelowMinR,
             original_sl_distance: sl,
+            tp_distance: 0.0200,
+            min_r: 1.0,
             stored_at: at(shell),
             drop_at: at("2026-07-23T21:00:00Z"),
             shell_time: at(shell),
