@@ -242,7 +242,10 @@ fn report(cells: &[Bucket], json_out: Option<&str>) -> Result<(), Box<dyn std::e
          instrument+hour\n",
         cells.len(),
     );
-    println!("{:<10} {:>8} {:>8} {:>8} {:>9}", "weekday", "median", "p25", "p75", "buckets");
+    println!(
+        "{:<10} {:>8} {:>8} {:>8} {:>9}",
+        "weekday", "median", "p25", "p75", "buckets"
+    );
 
     let order: [(u32, &str); 7] = [
         (0, "Mon"),
@@ -255,7 +258,9 @@ fn report(cells: &[Bucket], json_out: Option<&str>) -> Result<(), Box<dyn std::e
     ];
     let mut rows = Vec::new();
     for (wd_num, wd) in order {
-        let Some(v) = ratios.get(&wd_num) else { continue };
+        let Some(v) = ratios.get(&wd_num) else {
+            continue;
+        };
         let mut v = v.clone();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let q = |f: f64| v[((v.len() as f64 - 1.0) * f).round() as usize];
@@ -334,7 +339,9 @@ fn universe(broker: &str, max: usize) -> Vec<String> {
             continue;
         }
         let fields: Vec<&str> = line.trim_start_matches('(').split(',').collect();
-        let Some(symbol) = fields.get(1) else { continue };
+        let Some(symbol) = fields.get(1) else {
+            continue;
+        };
         out.push(symbol.trim().trim_matches('"').to_string());
         if out.len() >= max {
             break;

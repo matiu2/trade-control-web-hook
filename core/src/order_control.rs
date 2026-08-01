@@ -50,17 +50,28 @@
 //! - [`restore`] — **pure.** May a remembered widened stop be given back, or has
 //!   another system (break-even) moved it since? Prevents a restore silently
 //!   reverting a locked-in break-even.
+//! - [`pending`] — **pure.** What to do with a *resting* order: adjust the stop
+//!   **and the stake together**, or demote it to Stored when it drops below its
+//!   R-floor. The state where shrinking needs no profit gate and re-sizing is
+//!   mandatory.
+//! - [`reprice`] — **effectful.** Carries out a [`PendingAction`]: cancel and
+//!   re-place through the shared entry path, since the `Broker` trait has no
+//!   resize.
 
 mod join;
 mod park;
+mod pending;
 mod promote;
+mod reprice;
 mod restore;
 mod sl_target;
 mod stored;
 
 pub use join::*;
 pub use park::*;
+pub use pending::*;
 pub use promote::*;
+pub use reprice::*;
 pub use restore::*;
 pub use sl_target::*;
 pub use stored::*;
