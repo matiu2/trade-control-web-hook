@@ -37,6 +37,8 @@
 //!
 //! - [`park`] — **effectful.** Persisting a Stored order on the trade's record:
 //!   park (replacing any stale one), read back, clear on promote/drop.
+//! - [`promote`] — **effectful.** The every-candle re-check: place a parked
+//!   order once it clears its R-floor, drop it 3 bars before expiry.
 //! - [`stored`] — **pure.** The Stored state itself: park an intended order
 //!   instead of discarding it, promote when it clears its R-floor, drop 3 bars
 //!   before expiry.
@@ -48,11 +50,13 @@
 //!   reverting a locked-in break-even.
 
 mod park;
+mod promote;
 mod restore;
 mod sl_target;
 mod stored;
 
 pub use park::*;
+pub use promote::*;
 pub use restore::*;
 pub use sl_target::*;
 pub use stored::*;

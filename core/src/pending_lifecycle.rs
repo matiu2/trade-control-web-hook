@@ -170,22 +170,38 @@ pub enum Recovered {
 ///   already (`ArmedPlacement`) — which is exactly what `parse_and_verify`
 ///   *produces* — so it needs no signing round-trip and no stored body.
 ///
-/// `recover` is asked once per order id; the impl owns where the payload comes
+/// `recover` is asked once per key; the impl owns where the payload comes
 /// from (store read vs armed map), so RAIL 2 ("no recoverable payload ⇒ never
 /// cancel") is expressed uniformly as [`Recovered::Unrecoverable`].
+///
+/// # The key is a correlation handle, NOT a broker id
+///
+/// `key` is whatever identifies this payload to the impl. For a resting order
+/// that is the broker's `order_id`; for a **Stored** order — parked in our DB
+/// and never sent to a broker — there is no broker id at all, so the caller
+/// passes our own [`Intent::id`](crate::intent::Intent::id) (`{trade_id}-enter`),
+/// which exists from arm time.
+///
+/// Keying this on the broker's id was what made a not-yet-placed order
+/// unaddressable: the identifier only came into existence at placement, which is
+/// precisely the moment a Stored order hasn't reached. The live impl never used
+/// the key anyway (it authenticates the body); only the replay's armed-map
+/// lookup does.
+///
+/// Note the key is a **lookup handle only**. Authenticity comes from the HMAC
+/// over `signed_body` — a keyed check verified *against* specific bytes, never
+/// searched — so the two concerns stay separate and no id scheme can weaken
+/// verification.
 #[allow(async_fn_in_trait)]
 pub trait VerifiedSource {
-    /// Recover the `Verified` behind `order_id`. `signed_body` is the payload the
-    /// caller has on hand for this order (the store's `order:{id}` row on the
-    /// cancel side, or the `CancelledOrder.signed_intent` on the re-drive side);
+    /// Recover the `Verified` behind `key` — a broker `order_id` for a resting
+    /// order, or our own `Intent::id` for a Stored one (see the trait docs).
+    /// `signed_body` is the payload the caller has on hand (the store's
+    /// `order:{id}` row on the cancel side, the `CancelledOrder.signed_intent`
+    /// on the re-drive side, or the `StoredOrder.signed_intent` on promotion);
     /// the live impl verifies it, the replay impl ignores it in favour of its
-    /// armed map keyed by `order_id`.
-    async fn recover(
-        &self,
-        order_id: &str,
-        signed_body: Option<&str>,
-        now: DateTime<Utc>,
-    ) -> Recovered;
+    /// armed map.
+    async fn recover(&self, key: &str, signed_body: Option<&str>, now: DateTime<Utc>) -> Recovered;
 }
 
 /// The live [`VerifiedSource`]: `parse_and_verify` the stored HMAC body with the
@@ -198,7 +214,7 @@ pub struct SignedBodySource<'k> {
 impl VerifiedSource for SignedBodySource<'_> {
     async fn recover(
         &self,
-        _order_id: &str,
+        _key: &str,
         signed_body: Option<&str>,
         now: DateTime<Utc>,
     ) -> Recovered {
