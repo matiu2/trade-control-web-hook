@@ -318,9 +318,18 @@ pub fn baked_baseline(instrument: &str) -> Option<(f64, f64, f64)> {
         .iter()
         .find(|(_broker, symbol, ..)| *symbol == instrument)
         .map(
-            |(_broker, _symbol, _schedule, _reviewed, _mask, _widen, median, low, high)| {
-                (*low, *high, *median)
-            },
+            |(
+                _broker,
+                _symbol,
+                _schedule,
+                _reviewed,
+                _mask,
+                _widen,
+                median,
+                low,
+                high,
+                _forecast,
+            )| { (*low, *high, *median) },
         )
         .filter(|(_low, _high, median)| *median > 0.0)
 }
@@ -787,11 +796,17 @@ mod tests {
         // returns 5× it. Until the regen lands this test is vacuously satisfied
         // by the fallback branch below — which is itself an assertion that the
         // placeholder era behaves exactly like the flat fallback.
-        let with_median = baseline_candle::SPREAD_BASELINE_CANDLE
-            .iter()
-            .find(|(.., median, _low, _high)| *median > 0.0);
+        // Bind EVERY column explicitly. A trailing `(.., median, _low, _high)`
+        // means "the last three", which silently re-binds the moment a column is
+        // appended — exactly what happened when `hour_p90_frac` landed: `median`
+        // captured `low` (1.0 instead of 3.2) and the assertion compared the
+        // wrong number. A positional pattern anchored to the END of a growing
+        // tuple is a trap; anchor to the start and name everything.
+        let with_median = baseline_candle::SPREAD_BASELINE_CANDLE.iter().find(
+            |(_b, _sym, _sched, _rev, _mask, _widen, median, _low, _high, _forecast)| *median > 0.0,
+        );
         match with_median {
-            Some((_b, symbol, .., median, _low, _high)) => {
+            Some((_b, symbol, _sched, _rev, _mask, _widen, median, _low, _high, _forecast)) => {
                 assert!(
                     (elevated_threshold_pips(symbol) - median * SPREAD_REJECT_MULTIPLE).abs()
                         < 1e-9,
@@ -1399,6 +1414,147 @@ mod tests {
         assert!(
             spread_block_window(inst, ts("2026-03-12T10:00:00Z")).is_none(),
             "a clean hour is not a spread block"
+        );
+    }
+}
+
+/// The **ungated** per-hour spread forecast (`spread/mid` fraction) for
+/// `instrument` at `now` and at the following hour, as
+/// `(this_hour, next_hour)`.
+///
+/// # Not the same question as [`spread_hour_widen_frac`]
+///
+/// [`spread_hour_widen_frac`] answers *"is this a flagged spread hour, and if so
+/// how far do we widen an open stop?"* — its `Option` **is** the gate, and it is
+/// `None` at 23 of 24 hours. This answers *"what spread do I expect here?"* for
+/// **every** hour, flagged or not. Keeping them apart is the point: a
+/// forward-looking stop floor needs a forecast at every hour, while suppression
+/// and the widen still key on elevation.
+///
+/// # Why the next hour too
+///
+/// A stop resting at 20:55 can fill at 21:05, inside the coming hour's spike.
+/// Sizing off only the current hour re-opens exactly the gap the 30-minute
+/// `SPREAD_HOUR_LEAD_MINUTES` proxy existed to close — silently, since nothing
+/// errors. The caller feeds both into
+/// [`SpreadInputs`](crate::order_control::SpreadInputs), which takes the worse.
+///
+/// Returns `(0.0, 0.0)` for an instrument with no baked row or no resolvable
+/// schedule timezone, which makes the forecast term vanish from the SL `max` and
+/// degrades cleanly to today's purely-reactive behaviour.
+pub fn spread_forecast_frac(instrument: &str, now: chrono::DateTime<chrono::Utc>) -> (f64, f64) {
+    let Some((schedule, _mask, _widen, forecast)) = baked_forecast_row(instrument) else {
+        return (0.0, 0.0);
+    };
+    let Some(tz) = schedule_tz(schedule) else {
+        return (0.0, 0.0);
+    };
+    use chrono::Timelike;
+    // The forecast is indexed by the schedule-LOCAL hour, like the mask — that
+    // is what keeps it DST-invariant (the NY-close spike stays at local 17
+    // year-round rather than smearing across two UTC hours).
+    let local = now.with_timezone(&tz);
+    let h = local.hour() as usize;
+    let next = (h + 1) % 24;
+    (forecast[h], forecast[next])
+}
+
+/// The baked `(schedule, mask, widen, forecast)` row for `instrument`, or `None`
+/// when it isn't in the candle table. The forecast column is the ungated p90 —
+/// see [`spread_forecast_frac`].
+fn baked_forecast_row(
+    instrument: &str,
+) -> Option<(&'static str, u32, &'static [f64; 24], &'static [f64; 24])> {
+    baseline_candle::SPREAD_BASELINE_CANDLE
+        .iter()
+        .find(|(_broker, symbol, ..)| *symbol == instrument)
+        .map(
+            |(_broker, _symbol, schedule, _reviewed, mask, widen, _m, _l, _h, forecast)| {
+                (*schedule, *mask, widen, forecast)
+            },
+        )
+}
+
+#[cfg(test)]
+mod forecast_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// The headline property: the forecast is populated at hours the MASK does
+    /// not flag. If this ever reads 0.0 at an ordinary hour, the column has been
+    /// re-gated and the forward-looking floor silently degrades to reactive-only.
+    #[test]
+    fn forecast_is_populated_at_unflagged_hours() {
+        // 09:00 UTC — an ordinary hour for EUR/USD, nowhere near the NY close.
+        let quiet = chrono::Utc.with_ymd_and_hms(2026, 3, 12, 9, 0, 0).unwrap();
+        let (this_hour, _next) = spread_forecast_frac("EUR_USD", quiet);
+        assert!(
+            this_hour > 0.0,
+            "the forecast must exist at an UNFLAGGED hour — that is the whole \
+             reason it is separate from the gated widen column",
+        );
+        // ...and the gated column is indeed silent there.
+        assert!(
+            spread_hour_widen_frac("EUR_USD", quiet).is_none(),
+            "sanity: 09:00 UTC is not a flagged spread hour for EUR_USD",
+        );
+    }
+
+    /// The flagged hour must forecast a materially WIDER spread than a quiet
+    /// one — otherwise the column carries no signal and the `max` gains nothing.
+    #[test]
+    fn the_flagged_hour_forecasts_a_wider_spread() {
+        // 21:00 UTC in March = 17:00 New York = the flagged local hour.
+        let spike = chrono::Utc.with_ymd_and_hms(2026, 3, 12, 21, 0, 0).unwrap();
+        let quiet = chrono::Utc.with_ymd_and_hms(2026, 3, 12, 9, 0, 0).unwrap();
+        let (at_spike, _) = spread_forecast_frac("EUR_USD", spike);
+        let (at_quiet, _) = spread_forecast_frac("EUR_USD", quiet);
+        assert!(
+            at_spike > at_quiet * 2.0,
+            "flagged-hour forecast {at_spike} should be well above the quiet \
+             {at_quiet} (measured ~4.3x)",
+        );
+    }
+
+    /// The next-hour term is what covers an order resting at 20:55 that fills at
+    /// 21:05. At 20:xx the *next* slot must already carry the spike.
+    #[test]
+    fn next_hour_sees_the_coming_spike() {
+        // 20:30 UTC in March = 16:30 New York — the hour BEFORE the spike.
+        let before = chrono::Utc
+            .with_ymd_and_hms(2026, 3, 12, 20, 30, 0)
+            .unwrap();
+        let (this_hour, next_hour) = spread_forecast_frac("EUR_USD", before);
+        assert!(
+            next_hour > this_hour * 2.0,
+            "at 20:30 the NEXT hour ({next_hour}) must already show the spike \
+             vs this hour ({this_hour}) — this is what replaces the 30-min lead",
+        );
+    }
+
+    /// An unknown instrument degrades to zeros, so the term vanishes from the
+    /// `max` rather than poisoning it.
+    #[test]
+    fn unknown_instrument_degrades_to_zero() {
+        let t = chrono::Utc.with_ymd_and_hms(2026, 3, 12, 9, 0, 0).unwrap();
+        assert_eq!(spread_forecast_frac("NOT_A_REAL_PAIR", t), (0.0, 0.0));
+    }
+
+    /// DST-invariance: the flagged local hour is 17:00 New York year-round, so
+    /// the forecast peak must follow the clock change (21:00 UTC in summer,
+    /// 22:00 UTC in winter) rather than staying pinned to one UTC hour.
+    #[test]
+    fn forecast_follows_new_york_dst() {
+        // July: 17:00 EDT = 21:00 UTC.
+        let jul = chrono::Utc.with_ymd_and_hms(2026, 7, 15, 21, 0, 0).unwrap();
+        // January: 17:00 EST = 22:00 UTC.
+        let jan = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 22, 0, 0).unwrap();
+        let (summer, _) = spread_forecast_frac("EUR_USD", jul);
+        let (winter, _) = spread_forecast_frac("EUR_USD", jan);
+        assert!(
+            (summer - winter).abs() < 1e-12,
+            "the same LOCAL hour must yield the same forecast either side of a \
+             DST change ({summer} vs {winter})",
         );
     }
 }
