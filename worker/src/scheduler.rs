@@ -160,6 +160,18 @@ fn skip_interval(period: Duration) -> tokio::time::Interval {
 /// the job as a `spawn_local` task contains the unwind to that task; the
 /// `JoinError` is logged and the loop's next interval tick proceeds normally.
 ///
+/// **Every** cron loop is wrapped, not just the engine tick. The blast radius is
+/// the shared thread, not the panicking job, so partial coverage bought nothing:
+/// an unisolated panic in the sweep or the break-even watch would take the
+/// engine tick down with it just as surely as the reverse. The engine tick was
+/// wrapped first only because it is where the 2026-07-14 panic happened.
+///
+/// A wrapped loop keeps ticking after a panic, so a genuinely-broken job retries
+/// on its next interval. That is deliberate: a transient bad input (one
+/// malformed plan, one unparseable row) recovers on its own, and a persistent
+/// one logs on every tick rather than going silent. The `ERROR` line is the
+/// alarm — a repeating panic must not be mistaken for healthy operation.
+///
 /// `job` is a labelled name for the log line; `fut` is the iteration's future.
 async fn run_isolated<F>(job: &str, fut: F)
 where
@@ -224,7 +236,11 @@ async fn breakeven_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Durat
     loop {
         interval.tick().await;
         let now = chrono::Utc::now();
-        breakeven_watch(&state.store, &cron, now).await;
+        let (state, cron) = (state.clone(), cron.clone());
+        run_isolated("breakeven_watch", async move {
+            breakeven_watch(&state.store, &cron, now).await;
+        })
+        .await;
     }
 }
 
@@ -244,7 +260,11 @@ async fn blackout_watch_loop(state: Arc<AppState>, cron: NativeCronEnv, period: 
     loop {
         interval.tick().await;
         let now = chrono::Utc::now();
-        watch_recovery(&state.store, &cron, now).await;
+        let (state, cron) = (state.clone(), cron.clone());
+        run_isolated("blackout_watch", async move {
+            watch_recovery(&state.store, &cron, now).await;
+        })
+        .await;
     }
 }
 
@@ -269,8 +289,12 @@ async fn blackout_apply_loop(state: Arc<AppState>, cron: NativeCronEnv, period: 
         // System 2 — per-instrument spread-hour widen, every tick (self-gates
         // per-instrument on the baked mask). System 1 window + System 3 cancel
         // stay NY-close-edge-gated inside `apply_if_ny_close_edge`.
-        widen_open_stops_for_spread_hours(&state.store, &cron, now).await;
-        apply_if_ny_close_edge(&state.store, &cron, now).await;
+        let (state, cron) = (state.clone(), cron.clone());
+        run_isolated("blackout_apply", async move {
+            widen_open_stops_for_spread_hours(&state.store, &cron, now).await;
+            apply_if_ny_close_edge(&state.store, &cron, now).await;
+        })
+        .await;
     }
 }
 
@@ -288,7 +312,11 @@ async fn sweep_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Duration)
     loop {
         interval.tick().await;
         let now = chrono::Utc::now();
-        sweep_pending_orders(&state.store, &cron, now).await;
+        let (state, cron) = (state.clone(), cron.clone());
+        run_isolated("sweep", async move {
+            sweep_pending_orders(&state.store, &cron, now).await;
+        })
+        .await;
     }
 }
 
@@ -306,9 +334,114 @@ async fn expiry_gc_loop(state: Arc<AppState>, period: Duration) {
 
     loop {
         interval.tick().await;
-        match state.store.gc_expired().await {
-            Ok(deleted) => tracing::info!("scheduler: expired-row GC deleted {deleted} row(s)"),
-            Err(err) => tracing::error!("scheduler: expired-row GC failed: {err}"),
-        }
+        let state = state.clone();
+        run_isolated("expiry_gc", async move {
+            match state.store.gc_expired().await {
+                Ok(deleted) => tracing::info!("scheduler: expired-row GC deleted {deleted} row(s)"),
+                Err(err) => tracing::error!("scheduler: expired-row GC failed: {err}"),
+            }
+        })
+        .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// The property the 2026-07-14 incident is about: a panicking job must not
+    /// stop the work that follows it on the same thread.
+    ///
+    /// Verified by MUTATION rather than by trusting the wrapper: the same
+    /// sequence is run once through `run_isolated` (panic contained, the second
+    /// job runs) and once by awaiting the future directly (panic escapes). If
+    /// `run_isolated` ever stopped containing, the first half would fail exactly
+    /// as the second half is shown to.
+    #[test]
+    fn a_panicking_job_does_not_stop_the_next_one() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let local = tokio::task::LocalSet::new();
+
+        let ran_after = Rc::new(Cell::new(false));
+        let flag = ran_after.clone();
+        local.block_on(&rt, async move {
+            run_isolated("panicky", async {
+                panic!("the bad plan");
+            })
+            .await;
+            // Reached only if the panic above was contained.
+            run_isolated("after", async move {
+                flag.set(true);
+            })
+            .await;
+        });
+
+        assert!(
+            ran_after.get(),
+            "a panic in one cron job must not prevent the next from running — \
+             this is the 17h-freeze failure mode",
+        );
+    }
+
+    /// The other half of the mutation: awaiting a job future DIRECTLY (what
+    /// five of the six loops used to do) lets the panic escape. This is what
+    /// makes the test above meaningful rather than vacuous.
+    #[test]
+    fn an_unisolated_panic_escapes_to_the_caller() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let local = tokio::task::LocalSet::new();
+
+        let escaped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local.block_on(&rt, async {
+                // No `run_isolated` — the pre-fix shape.
+                let fut = async { panic!("the bad plan") };
+                fut.await;
+            });
+        }));
+
+        assert!(
+            escaped.is_err(),
+            "without isolation the panic must escape — if this ever passes, the \
+             first test proves nothing",
+        );
+    }
+
+    /// A contained panic must not poison the wrapper: the same job name can
+    /// panic repeatedly and each following tick still runs, so a persistently
+    /// broken job degrades to "logs every tick" rather than "silently stops".
+    #[test]
+    fn repeated_panics_keep_the_loop_alive() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let local = tokio::task::LocalSet::new();
+
+        let completed = Rc::new(Cell::new(0u32));
+        let counter = completed.clone();
+        local.block_on(&rt, async move {
+            for _ in 0..3 {
+                run_isolated("flaky", async {
+                    panic!("still broken");
+                })
+                .await;
+                let c = counter.clone();
+                run_isolated("healthy", async move {
+                    c.set(c.get() + 1);
+                })
+                .await;
+            }
+        });
+
+        assert_eq!(
+            completed.get(),
+            3,
+            "every tick after a panic must still run its work",
+        );
     }
 }
