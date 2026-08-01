@@ -58,7 +58,7 @@ use trade_control_core::broker::{Broker, PendingOrder};
 use trade_control_core::dispatch_config::DispatchConfig;
 use trade_control_core::incoming::Verified;
 use trade_control_core::order_control::{
-    PendingAction, RiskBudget, SlAction, SpreadInputs, pending_action, promote_stored_order,
+    PendingAction, PromoteScope, RiskBudget, SpreadInputs, pending_action, promote_due_orders,
     reprice_pending_order, sl_target,
 };
 use trade_control_core::pending_lifecycle::{
@@ -161,7 +161,10 @@ async fn run_both<B, S, P, V>(
     V: VerifiedSource,
 {
     let mut quotes = QuoteCache::default();
-    promote_pass(broker, store, cfg, src, account, &mut quotes, now).await;
+    // Scope this pass to the account whose broker we just acquired — a `None`
+    // fan-out entry means the worker-global rows, NOT every account's.
+    let scope = account.map_or(PromoteScope::Global, PromoteScope::Account);
+    promote_due_orders(broker, store, cfg, src, scope, now).await;
     reprice_pass(broker, store, cfg, src, account, &mut quotes, now).await;
 }
 
@@ -213,59 +216,10 @@ async fn spread_inputs<B: Broker>(
 }
 
 // --- promote: Stored → Pending ------------------------------------------------
-
-/// Re-ask every parked order whether it now clears its R-floor.
-async fn promote_pass<B, S, P, V>(
-    broker: &B,
-    store: &S,
-    cfg: &P,
-    src: &V,
-    account: Option<&str>,
-    quotes: &mut QuoteCache,
-    now: DateTime<Utc>,
-) where
-    B: Broker,
-    S: StateStore,
-    P: EnterConfigProvider,
-    V: VerifiedSource,
-{
-    let records = match store.list_all_held_trade_records().await {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::error!("order-control promote: list records: {err}");
-            return;
-        }
-    };
-    for record in records
-        .iter()
-        .filter(|r| r.account.as_deref() == account && !r.stored_orders.is_empty())
-    {
-        let Some(parked) = record.stored_orders.first() else {
-            continue;
-        };
-        let spreads = spread_inputs(broker, quotes, &record.instrument, now).await;
-        // A parked order has no stop distinct from its drawn one — it was never
-        // placed — so the drawn distance is both the original and the current.
-        let target = sl_target(
-            spreads,
-            parked.original_sl_distance,
-            parked.original_sl_distance,
-            parked.tp_distance,
-            parked.min_r,
-        );
-        let clears_min_r = target.action != SlAction::BelowMinR;
-        match promote_stored_order(broker, store, cfg, src, &record.trade_id, clears_min_r, now)
-            .await
-        {
-            Ok(outcome) => tracing::debug!(
-                "order-control promote[{}]: {outcome:?} (r={:.3}, clears={clears_min_r})",
-                record.trade_id,
-                target.r,
-            ),
-            Err(err) => tracing::error!("order-control promote[{}]: {err}", record.trade_id),
-        }
-    }
-}
+//
+// The decision lives in `core::order_control::promote_due_orders` so the offline
+// replay runs the SAME pass — see that module's docs. Nothing to do here but
+// hand it the account's broker.
 
 // --- re-price: an already-resting order ---------------------------------------
 

@@ -57,6 +57,9 @@
 //! - [`reprice`] — **effectful.** Carries out a [`PendingAction`]: cancel and
 //!   re-place through the shared entry path, since the `Broker` trait has no
 //!   resize.
+//! - [`tick`] — **effectful.** The every-candle promote pass, shared by the live
+//!   cron and the offline replay so a parked order cannot promote in one and not
+//!   the other.
 
 mod join;
 mod park;
@@ -66,6 +69,7 @@ mod reprice;
 mod restore;
 mod sl_target;
 mod stored;
+mod tick;
 
 pub use join::*;
 pub use park::*;
@@ -75,3 +79,4 @@ pub use reprice::*;
 pub use restore::*;
 pub use sl_target::*;
 pub use stored::*;
+pub use tick::*;

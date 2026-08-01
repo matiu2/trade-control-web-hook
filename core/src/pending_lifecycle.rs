@@ -1182,7 +1182,41 @@ async fn cleanup_body<S: StateStore>(store: &S, order_id: &str) {
 }
 
 /// Clear the record after restore. Returns `true` on success (for the report).
+///
+/// ⚠️ **Clears only what System 3 owns.** The record is a shared row: since v123
+/// it also carries `stored_orders`, which belong to
+/// [`order_control`](crate::order_control) and have nothing to do with a
+/// resting-order hold. Deleting the whole row here destroyed a parked entry as
+/// collateral damage — the park survived the enter that created it, then vanished
+/// on the next lifecycle pass, so nothing was ever left to promote. (Symptom: the
+/// `sgdjpy` fixture logged three successful parks and still booked 0R.)
+///
+/// So a record another subsystem still needs is **preserved with System 3's own
+/// fields cleared**, and only an otherwise-empty record is deleted outright —
+/// the same discipline
+/// [`clear_stored_order`](crate::order_control::clear_stored_order) already
+/// follows from the other side.
 async fn clear<S: StateStore>(store: &S, record: &HeldTradeRecord) -> bool {
+    // A park is the only foreign state on the record that outlives a restore:
+    // `holders` and `cancelled_orders` are System 3's own and are exactly what
+    // this clear is retiring.
+    if !record.stored_orders.is_empty() {
+        let mut kept = record.clone();
+        kept.holders = Holders::new();
+        kept.cancelled_orders.clear();
+        kept.applied = false;
+        let ttl = (kept.expires_at - kept.opened_at).num_seconds().max(0) as u64;
+        return match store.upsert_held_trade_record(&kept, ttl).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::error!(
+                    "pending-lifecycle: clear({}) preserve-park failed: {err}",
+                    record.trade_id
+                );
+                false
+            }
+        };
+    }
     match store.clear_held_trade_record(&record.trade_id).await {
         Ok(()) => true,
         Err(err) => {
@@ -2308,6 +2342,71 @@ mod tests {
         }
         assert_eq!(rec.holders.len(), 1, "50 ticks must not accumulate holders");
         assert_eq!(rec.cancelled_orders.len(), 1, "nor duplicate the order");
+    }
+
+    /// REGRESSION: a System-3 restore must not destroy a PARKED order.
+    ///
+    /// The record is a shared row — since v123 it also carries `stored_orders`,
+    /// owned by `order_control`. `finish_recover` deleted the whole row, so a
+    /// park created by an enter vanished on the next lifecycle pass and there
+    /// was never anything left to promote. The `sgdjpy` fixture logged three
+    /// successful parks and still booked 0R because of exactly this.
+    ///
+    /// Mutation check: restore the unconditional `clear_held_trade_record` and
+    /// this goes red.
+    #[test]
+    fn clearing_a_restored_record_preserves_a_parked_order() {
+        let store = MemStateStore::new();
+        let now = ts("2026-07-08T21:05:00Z");
+        store.set_clock(now);
+        let mut rec = applied_record("AUD/CHF", "2026-07-08T21:05:00Z");
+        rec.stored_orders = vec![crate::order_control::StoredOrder {
+            signed_intent: "body".into(),
+            reason: crate::order_control::StoredReason::BelowMinR,
+            original_sl_distance: 0.0020,
+            tp_distance: 0.0200,
+            min_r: 1.0,
+            stored_at: now,
+            drop_at: ts("2026-07-09T21:00:00Z"),
+            shell_time: now,
+        }];
+
+        assert!(run(clear(&store, &rec)), "clear reports success");
+
+        let after = run(store.get_held_trade_record("t-off"))
+            .expect("get")
+            .expect("the record must SURVIVE — it still carries a park");
+        assert_eq!(
+            after.stored_orders.len(),
+            1,
+            "the parked order belongs to another subsystem and must not be collateral damage",
+        );
+        // ...but System 3's own state IS retired, which is what the clear is for.
+        assert!(after.holders.is_empty(), "holders cleared");
+        assert!(
+            after.cancelled_orders.is_empty(),
+            "cancelled orders cleared"
+        );
+        assert!(!after.applied, "no longer mutating anything at the broker");
+    }
+
+    /// The twin: with no park on it, the record is still deleted outright, so
+    /// the fix doesn't leave husks behind for every restored trade.
+    #[test]
+    fn clearing_a_record_with_no_park_still_deletes_it() {
+        let store = MemStateStore::new();
+        let now = ts("2026-07-08T21:05:00Z");
+        store.set_clock(now);
+        let rec = applied_record("AUD/CHF", "2026-07-08T21:05:00Z");
+        assert!(rec.stored_orders.is_empty(), "precondition");
+
+        assert!(run(clear(&store, &rec)));
+        assert!(
+            run(store.get_held_trade_record("t-off"))
+                .expect("get")
+                .is_none(),
+            "nothing else owns this row, so it goes",
+        );
     }
 
     // --- HoldReason::MarketHours (v123) --------------------------------------
