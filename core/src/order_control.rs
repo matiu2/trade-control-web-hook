@@ -35,6 +35,8 @@
 //! without a broker, and mutation-testable); the effectful ones carry only
 //! plumbing.
 //!
+//! - [`join`] — **pure.** Match a broker position back to the `EntryAttempt`
+//!   that opened it. De-duplicated from two byte-identical cron copies.
 //! - [`park`] — **effectful.** Persisting a Stored order on the trade's record:
 //!   park (replacing any stale one), read back, clear on promote/drop.
 //! - [`promote`] — **effectful.** The every-candle re-check: place a parked
@@ -49,12 +51,14 @@
 //!   another system (break-even) moved it since? Prevents a restore silently
 //!   reverting a locked-in break-even.
 
+mod join;
 mod park;
 mod promote;
 mod restore;
 mod sl_target;
 mod stored;
 
+pub use join::*;
 pub use park::*;
 pub use promote::*;
 pub use restore::*;

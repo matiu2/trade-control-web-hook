@@ -45,6 +45,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::{AmendError, Broker, Candle, Granularity, OpenPosition};
+use trade_control_core::order_control::join_position_to_attempt;
 use trade_control_core::state::{BreakevenSnapshot, EntryAttempt, StateStore};
 
 use crate::broker_handle::BrokerHandle;
@@ -276,24 +277,6 @@ async fn amend(
 /// `blackout_apply::join_position_to_attempt`: exact on the snapshotted
 /// `broker_trade_id == position_id`, else `instrument + direction + account`.
 /// Pure & unit-testable.
-fn join_position_to_attempt<'a>(
-    position: &OpenPosition,
-    account: Option<&str>,
-    attempts: &'a [EntryAttempt],
-) -> Option<&'a EntryAttempt> {
-    if let Some(hit) = attempts
-        .iter()
-        .find(|a| a.broker_trade_id.as_deref() == Some(position.position_id.as_str()))
-    {
-        return Some(hit);
-    }
-    attempts.iter().find(|a| {
-        a.instrument == position.instrument
-            && a.direction == position.direction
-            && a.account.as_deref() == account
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

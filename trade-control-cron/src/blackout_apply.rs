@@ -32,6 +32,7 @@ use trade_control_core::blackout_widen::{clamp_widen, spread_hour_widen_size, wi
 use trade_control_core::broker::{AmendError, Broker, OpenPosition};
 use trade_control_core::hold::{HoldReason, Holders};
 use trade_control_core::ny_clock::is_ny_close_edge;
+use trade_control_core::order_control::join_position_to_attempt;
 use trade_control_core::spread_blackout::{
     NY_CLOSE_WINDOW_MARKER_TTL_SECONDS, spread_hour_widen_frac, widen_frac_to_pips,
 };
@@ -336,6 +337,9 @@ async fn widen_one<S: StateStore>(
             original_stop: original_sl,
         }],
         cancelled_orders: Vec::new(),
+        // System 2 widens an OPEN position's stop; it never parks an entry.
+        // Stored orders are written only by the entry path.
+        stored_orders: Vec::new(),
     };
     if let Err(err) = store.upsert_held_trade_record(&record, ttl).await {
         tracing::error!(
@@ -441,26 +445,6 @@ async fn amend(
 /// affected thin crosses (one setup per instrument is the common case), but
 /// real. A fully unambiguous join would need a synthetic per-`position_id`
 /// record when nothing correlates. Noted in TODO.md.
-fn join_position_to_attempt<'a>(
-    position: &OpenPosition,
-    account: Option<&str>,
-    attempts: &'a [EntryAttempt],
-) -> Option<&'a EntryAttempt> {
-    // 1. Exact: snapshotted broker_trade_id == position_id.
-    if let Some(hit) = attempts
-        .iter()
-        .find(|a| a.broker_trade_id.as_deref() == Some(position.position_id.as_str()))
-    {
-        return Some(hit);
-    }
-    // 2. Coarse fallback: instrument + direction + account.
-    attempts.iter().find(|a| {
-        a.instrument == position.instrument
-            && a.direction == position.direction
-            && a.account.as_deref() == account
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
