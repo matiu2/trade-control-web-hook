@@ -7,7 +7,8 @@
 //! [`tokio::time::interval`] timers** (one per cron job — currently the engine
 //! tick, the break-even watcher, the daily market-hours blackout refresh, the
 //! spread-recovery watcher, the NY-close-edge spread-blackout apply, the order
-//! sweep, and the Postgres expired-row GC), each re-arming itself via
+//! sweep, the order-control re-check, and the Postgres expired-row GC), each
+//! re-arming itself via
 //! `.tick().await`. It is emphatically **not** a per-plan / per-request timer
 //! fan-out.
 //!
@@ -61,8 +62,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use trade_control_cron::{
-    apply_if_ny_close_edge, breakeven_watch, run_engine_tick, sweep_pending_orders, watch_recovery,
-    widen_open_stops_for_spread_hours,
+    apply_if_ny_close_edge, breakeven_watch, order_control_tick, run_engine_tick,
+    sweep_pending_orders, watch_recovery, widen_open_stops_for_spread_hours,
 };
 
 use crate::SchedulerConfig;
@@ -103,6 +104,7 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
     // on every 15-min cron tick). The expired-row GC is the native-only TTL
     // housekeeping, hourly by default.
     let sweep_period = intervals.upkeep_interval();
+    let order_control_period = intervals.upkeep_interval();
     let expiry_gc_period = intervals.expiry_sweep_interval();
 
     std::thread::Builder::new()
@@ -128,6 +130,7 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
                     blackout_watch_loop(state.clone(), cron.clone(), blackout_watch_period),
                     blackout_apply_loop(state.clone(), cron.clone(), blackout_apply_period),
                     sweep_loop(state.clone(), cron.clone(), sweep_period),
+                    order_control_loop(state.clone(), cron.clone(), order_control_period),
                     expiry_gc_loop(state, expiry_gc_period),
                 );
             });
@@ -315,6 +318,35 @@ async fn sweep_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Duration)
         let (state, cron) = (state.clone(), cron.clone());
         run_isolated("sweep", async move {
             sweep_pending_orders(&state.store, &cron, now).await;
+        })
+        .await;
+    }
+}
+
+/// The every-candle order-control re-check (rule 7): promote parked orders that
+/// now clear their R-floor, and re-price resting orders whose stop target has
+/// moved. Runs at the frequent upkeep cadence — "every candle" is the intent,
+/// and ticking faster than the bar costs only a cached quote per instrument
+/// while catching a spread that moves mid-bar.
+///
+/// Runs AFTER the sweep in declaration order, though `join!` drives them
+/// concurrently: they touch disjoint things (the sweep retires dead rows, this
+/// re-prices live ones), and a row the sweep is about to delete is one this pass
+/// leaves alone anyway once its clocks have passed.
+async fn order_control_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Duration) {
+    let mut interval = skip_interval(period);
+
+    tracing::info!(
+        "scheduler: order-control re-check every {}s",
+        period.as_secs()
+    );
+
+    loop {
+        interval.tick().await;
+        let now = chrono::Utc::now();
+        let (state, cron) = (state.clone(), cron.clone());
+        run_isolated("order_control", async move {
+            order_control_tick(&state.store, &cron, now).await;
         })
         .await;
     }
