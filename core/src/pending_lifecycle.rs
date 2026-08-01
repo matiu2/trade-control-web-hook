@@ -132,6 +132,7 @@ use crate::spread_blackout::{
     spread_block_ttl_seconds,
 };
 use crate::state::{CancelledOrder, HeldTradeRecord, StateStore};
+use crate::sweep_gate::market_blackout_due_symbol;
 
 /// The one backend seam this function still needs: resolve the per-enter
 /// [`DispatchConfig`] (risk caps, pip/tick fallback, per-account caps) at the
@@ -414,8 +415,8 @@ async fn cancel_pass<B: Broker, S: StateStore, V: VerifiedSource>(
 /// be written. Adding a `HoldReason` variant without extending this fn is a
 /// non-exhaustive `match` — a compile error.
 ///
-/// The cheap instrument-only spread-hour test is evaluated first, but note both
-/// reasons are always computed: the OFF side needs the *full* set to know whether
+/// The cheap instrument-only spread-hour test is evaluated first, but note every
+/// reason is always computed: the OFF side needs the *full* set to know whether
 /// anything still holds, not just whether one reason fired.
 async fn hold_reasons<S: StateStore>(
     store: &S,
@@ -433,6 +434,12 @@ async fn hold_reasons<S: StateStore>(
     // NewsPause — a standoff armed for THIS trade.
     if pause_active(store, trade_id).await {
         holders.hold(HoldReason::NewsPause);
+    }
+    // MarketHours — the instrument's session is closed (daily gap or weekend).
+    // The baked mask, the same predicate the replay's fill-sim reads, so the two
+    // cannot disagree about when a market is shut.
+    if market_blackout_due_symbol(instrument, now) {
+        holders.hold(HoldReason::MarketHours);
     }
     holders
 }
@@ -979,6 +986,11 @@ async fn release_satisfied<B: Broker, S: StateStore>(
         let released = match reason {
             HoldReason::SpreadHour => spread_hour_released(broker, record, now).await,
             HoldReason::NewsPause => !pause_active(store, &record.trade_id).await,
+            // Purely the baked mask, mirroring the ON side. No live-quote
+            // early-release analogue to `spread_hour_released`: a closed market
+            // has no quote to recover, and a broker that returns a stale
+            // last-traded price through the gap must not be read as "reopened".
+            HoldReason::MarketHours => !market_blackout_due_symbol(&record.instrument, now),
         };
         if released && holders.release(reason) == Release::Emptied {
             emptied = true;
@@ -2296,6 +2308,107 @@ mod tests {
         }
         assert_eq!(rec.holders.len(), 1, "50 ticks must not accumulate holders");
         assert_eq!(rec.cancelled_orders.len(), 1, "nor duplicate the order");
+    }
+
+    // --- HoldReason::MarketHours (v123) --------------------------------------
+
+    /// A closed market HOLDS the order — it does not sweep it away. Before this
+    /// the sweep cancelled the resting order *and deleted its row*, so a setup
+    /// resting over the weekend was gone by Monday rather than paused.
+    ///
+    /// Weekend times are the real baked mask for AUD/CHF, not invented ones:
+    /// Sat 2026-07-11 12:00Z is inside the universal halt.
+    #[test]
+    fn a_closed_market_holds_the_resting_order() {
+        let store = MemStateStore::new();
+        let closed = ts("2026-07-11T12:00:00Z"); // Saturday
+        store.set_clock(closed);
+        let holders = run(hold_reasons(&store, "AUD/CHF", "t-mh", closed));
+        assert!(
+            holders.contains(HoldReason::MarketHours),
+            "a closed session must hold the order, got {holders:?}",
+        );
+    }
+
+    /// ...and releases it when the session reopens, which is the whole reason
+    /// this is a hold rather than a sweep: the setup survives the weekend.
+    ///
+    /// Mutation check: invert the `!` in the `MarketHours` release arm and this
+    /// goes red (the order would be stranded until the 12h backstop).
+    #[test]
+    fn the_hold_releases_when_the_market_reopens() {
+        let broker = MockBroker::default();
+        let store = MemStateStore::new();
+        let mut rec = applied_record("AUD/CHF", "2026-07-10T21:30:00Z");
+        rec.holders = held_by(HoldReason::MarketHours);
+        let open = ts("2026-07-08T12:00:00Z"); // Wednesday midday — market open
+        store.set_clock(open);
+        let (surviving, emptied) = run(release_satisfied(&broker, &store, &rec, open));
+        assert!(emptied, "the reopen must be the transition that re-places");
+        assert!(surviving.is_empty());
+    }
+
+    /// ...but must NOT release while the market is still shut.
+    #[test]
+    fn the_hold_survives_while_the_market_is_still_shut() {
+        let broker = MockBroker::default();
+        let store = MemStateStore::new();
+        let mut rec = applied_record("AUD/CHF", "2026-07-10T21:30:00Z");
+        rec.holders = held_by(HoldReason::MarketHours);
+        let closed = ts("2026-07-11T12:00:00Z"); // still Saturday
+        store.set_clock(closed);
+        let (surviving, emptied) = run(release_satisfied(&broker, &store, &rec, closed));
+        assert!(!emptied, "the market has not reopened");
+        assert!(surviving.contains(HoldReason::MarketHours));
+    }
+
+    /// The point of sharing the refcount: market hours and a news pause overlap
+    /// and lift INDEPENDENTLY. A market that reopens while a pause is still
+    /// armed must not re-place the order — which is exactly the bug a
+    /// second, separate cancel path would have reintroduced.
+    #[test]
+    fn a_reopening_market_does_not_restore_past_a_live_pause() {
+        let broker = MockBroker::default();
+        let store = MemStateStore::new();
+        let open = ts("2026-07-08T12:00:00Z"); // market open again
+        store.set_clock(open);
+
+        let mut rec = applied_record("AUD/CHF", "2026-07-08T11:00:00Z");
+        rec.holders = Holders::new();
+        rec.holders.hold(HoldReason::MarketHours);
+        rec.holders.hold(HoldReason::NewsPause);
+
+        let (surviving, emptied) = run(async {
+            store
+                .set_pause(&rec.trade_id, "cal-cpi-pause", None, open, 3600)
+                .await
+                .expect("set pause");
+            release_satisfied(&broker, &store, &rec, open).await
+        });
+        assert!(
+            !emptied,
+            "the pause still holds it — only the LAST release re-places",
+        );
+        assert!(surviving.contains(HoldReason::NewsPause));
+        assert!(
+            !surviving.contains(HoldReason::MarketHours),
+            "...but the market-hours reason itself must have lifted",
+        );
+    }
+
+    /// An uncatalogued symbol fails OPEN — it is not held. Matching the reject
+    /// gate: a missing catalog entry must not silently freeze an instrument's
+    /// orders forever, since nothing would ever release them.
+    #[test]
+    fn an_uncatalogued_symbol_is_not_held() {
+        let store = MemStateStore::new();
+        let closed = ts("2026-07-11T12:00:00Z"); // Saturday
+        store.set_clock(closed);
+        let holders = run(hold_reasons(&store, "US 500", "t-mh", closed));
+        assert!(
+            !holders.contains(HoldReason::MarketHours),
+            "an uncatalogued symbol must fail open, not freeze",
+        );
     }
 
     /// BACK-COMPAT — a pre-refcount (v119) row in flight during the deploy has

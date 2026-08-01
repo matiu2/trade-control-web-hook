@@ -12,3 +12,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["serde", "a
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 trade-control-core = { version = "0.1.0", path = "../core" }
 trade-control-engine = { version = "0.1.0", path = "../engine" }
+
+[dev-dependencies]
+pollster = "1.0.1"
+trade-control-core = { path = "../core", features = ["test-support"] }

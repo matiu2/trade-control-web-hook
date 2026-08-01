@@ -3,10 +3,10 @@
 //!
 //! Several independent conditions can each want a resting entry order pulled off
 //! the broker: an instrument's baked spread-hour trough, a news standoff for the
-//! trade. They **overlap** and they **lift independently** — a spread hour running
-//! 06:30–08:00 with a news pause from 07:00 leaves the pause still armed when the
-//! spread lifts at 08:00. Whoever restores the order has to know the other holder
-//! is still there.
+//! trade, the instrument's market being closed. They **overlap** and they **lift
+//! independently** — a spread hour running 06:30–08:00 with a news pause from
+//! 07:00 leaves the pause still armed when the spread lifts at 08:00. Whoever
+//! restores the order has to know the other holder is still there.
 //!
 //! So a reason does not directly cancel or restore. It **holds** and **releases**,
 //! and the order is re-placed on the [`Holders::release`] that empties the set.
@@ -54,6 +54,20 @@ pub enum HoldReason {
     ///
     /// Releases when no pause row remains for the trade.
     NewsPause,
+    /// The instrument's market is closed — the daily close→open gap, or the
+    /// weekend halt. Instrument-scoped, read from the baked
+    /// [`WeekMask`](crate::intent::WeekMask).
+    ///
+    /// Held rather than cancelled-and-deleted because **a closed market always
+    /// reopens**. The order must come off the broker (leaving it to rest is the
+    /// reopen-gap incident: it triggers on the opening gap, at a price nobody
+    /// chose) — but the *setup* is still valid, so it is restored when the
+    /// session resumes. The sweep's other three reasons (`expired`,
+    /// `bar-expiry`, `sl-breached`) are genuinely terminal and stay as
+    /// cancel-and-delete; this one never was.
+    ///
+    /// Releases when the baked mask says the market has reopened.
+    MarketHours,
 }
 
 impl HoldReason {
@@ -63,6 +77,7 @@ impl HoldReason {
         match self {
             Self::SpreadHour => "spread-hour",
             Self::NewsPause => "news-pause",
+            Self::MarketHours => "market-hours",
         }
     }
 }
