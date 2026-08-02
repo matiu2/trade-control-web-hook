@@ -59,6 +59,9 @@ mod baseline_candle {
     include!("spread_baseline_candle.rs");
 }
 
+mod coverage;
+pub use coverage::*;
+
 /// Resolve a spread-schedule FK **name** (as stored in the baked table's
 /// `schedule` column) to its IANA timezone. The table stores the compact FK
 /// name (`"ny"`), not the tz string, so this map is the single source of truth
@@ -1538,6 +1541,48 @@ mod forecast_tests {
     fn unknown_instrument_degrades_to_zero() {
         let t = chrono::Utc.with_ymd_and_hms(2026, 3, 12, 9, 0, 0).unwrap();
         assert_eq!(spread_forecast_frac("NOT_A_REAL_PAIR", t), (0.0, 0.0));
+    }
+
+    /// **Every** reviewed row that carries a widen must carry a forecast — not
+    /// just the one symbol the other tests spot-check.
+    ///
+    /// `forecast_is_populated_at_unflagged_hours` asserts this invariant for
+    /// `EUR_USD` alone, which is an OANDA symbol. When the forecast column was
+    /// introduced the 35 TradeNation rows were carried forward with a zero
+    /// forecast ("reactive-only until re-baked"), and that test still passed —
+    /// so every TN instrument silently lost the forward-looking half of the SL
+    /// floor while the guard reported green.
+    ///
+    /// The contradiction this pins is internal to a row, so it needs no fresh
+    /// candles: a row saying `reviewed = true` with a **populated widen** has,
+    /// by construction, computed a per-hour p90 (`apply_gates` copies the widen
+    /// out of `hour_p90`). A forecast that is nevertheless all-zero cannot have
+    /// come from that computation — it means the column was dropped or the row
+    /// predates it.
+    #[test]
+    fn every_reviewed_row_with_a_widen_also_has_a_forecast() {
+        let stale: Vec<&str> = baseline_candle::SPREAD_BASELINE_CANDLE
+            .iter()
+            .filter(
+                |(_b, _s, _sched, reviewed, _mask, widen, _m, _l, _h, forecast)| {
+                    *reviewed
+                        && widen.iter().any(|w| *w > 0.0)
+                        && forecast.iter().all(|f| *f <= 0.0)
+                },
+            )
+            .map(|(broker, symbol, ..)| {
+                // Leak-free: both are &'static str from the generated table.
+                let _ = broker;
+                *symbol
+            })
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "{} row(s) are reviewed and carry a widen but have an ALL-ZERO \
+             forecast, so the forward-looking SL floor silently degrades to \
+             reactive-only for them — re-bake these: {stale:?}",
+            stale.len(),
+        );
     }
 
     /// DST-invariance: the flagged local hour is 17:00 New York year-round, so
