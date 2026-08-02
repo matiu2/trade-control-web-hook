@@ -1,5 +1,108 @@
 # Changelog
 
+## v123 — 2026-08-02 — `order_control`: one home for stored/pending/live order state
+
+**Why.** Two rival answers to *"what should this stop be right now?"* had drifted
+apart: `intent::sl_spread_floor` worked in **price units** off a windowed mean of
+the last 5 candles, `blackout_widen` in **pips** off the baked hour mask, with
+different constants and different sampling. Nothing reconciled them, so which one
+moved your stop depended on which code path reached it first. Separately, an entry
+whose R fell below its floor was **discarded** — a setup starved by a transient
+spread was gone for good, even if the spread calmed two bars later.
+
+**What changed.** A new `core/src/order_control/` module, one idea per file, all
+generic over `Broker` + `StateStore` so the live worker and the offline replay share
+one implementation (`[[strategy_changes_in_both_replayer_and_worker]]`).
+
+The primary split is **Stored / Pending / Live** — where the order lives and whether
+it is at risk — *not* widen-vs-shrink. Widen and shrink are the same question
+differing by a sign; splitting on them first is exactly how the two implementations
+above drifted.
+
+| state | where it lives | at risk? |
+|---|---|---|
+| **Stored** | our DB only, never sent to the broker | no |
+| **Pending** | resting at the broker, not yet triggered | no |
+| **Live** | filled; it is a position | **yes** |
+
+- **`sl_target`** (pure) — the single stop-sizing decision, and the one place the
+  spread floor is computed. The floor became a **max** over three inputs: the
+  measured last-candle spread and the baked forecast for **this hour and the next**.
+  Forward-looking, so a stop placed at 06:55 is sized for the 07:00 spread it will
+  actually live through.
+- **`stored`** / **`park`** / **`promote`** / **`tick`** — a sub-floor entry is now
+  **parked** rather than discarded, re-checked every candle, and **promoted** into a
+  real order once it clears its R-floor. Dropped 3 bars before expiry.
+- **`pending`** / **`reprice`** — a *resting* order gets its stop **and stake
+  adjusted together** (`PendingAction::Adjust` carries both, so a stop change without
+  a matching re-size is unrepresentable). Two of the four Live rules invert here:
+  shrinking needs no `in_profit` gate (nothing is at risk yet) and re-sizing is
+  mandatory (there is no partial close to pay for it). Sub-1R **demotes** back to
+  Stored. Cancel-and-replace, chosen over amend-in-place, so risk stays exactly 1%.
+- **`restore`** (pure) — a remembered widened stop is only given back if nothing else
+  moved it since, so a restore can no longer silently revert a locked-in break-even.
+- **`join`** (pure) — one position↔`EntryAttempt` join, de-duplicated from two
+  byte-identical cron copies.
+
+**Also fixed, both replay↔live divergences:**
+
+- **A closed market now HOLDS a resting order instead of deleting it.**
+  `HoldReason::MarketHours` joins `SpreadHour` and `NewsPause` in the v120 refcount.
+  The sweep's old branch cancelled the order *and* deleted its `EntryAttempt` row —
+  and it could never actually fire, because `set_blackout_windows` has no production
+  caller, so `get_blackout_windows` always returned empty. The replay's fill-sim read
+  the **baked mask** and did block. Both now read the baked mask through the hold.
+  `CancelAndClose` stays in the sweep: it is a signed operator opt-in that flattens a
+  **filled position**, and holds never touch positions.
+- **A restore no longer destroys a parked order.** `pending_lifecycle::clear()`
+  deleted the whole shared `HeldTradeRecord`, taking `stored_orders` — owned by a
+  different subsystem — with it, so parks vanished on the next lifecycle pass. It now
+  clears only its own fields when another subsystem still has state on the record.
+- **The promote pass moved into `core`** (`order_control::tick`). Written in
+  `trade-control-cron` first, it was out of the replay's reach: a parked order would
+  have promoted live and never in a fixture.
+
+**Breaking.** `record_placement` takes a 12th argument (`order_control:
+Option<OrderControlSnapshot>`); `park_stored_entry` takes `tp_distance` + `min_r`.
+`HoldReason` gained a variant — by design a **compile error** in `release_satisfied`
+until its release condition is written.
+
+**Config.** No new operator knobs, and **no SQL migration** — the new state rides in
+the existing `jsonb` bodies as `#[serde(default)]` fields: `EntryAttempt.order_control`
+(a new `OrderControlSnapshot` carrying the **drawn** stop pre-widen, the TP, `min_r`
+and the bar length) and `StoredOrder.{tp_distance, min_r}`.
+
+⚠️ **`StoredOrder.min_r` defaults to `MIN_R_FLOOR`, never `0.0`.** A legacy row
+decodes with `tp_distance: 0.0`, and `sl_target` tests `r < min_r` — so a `0.0`
+default makes `0.0 < 0.0` false, i.e. every pre-v123 parked order reads as *clearing*
+its floor and promotes blind on the first tick after deploy.
+
+**Scope is an explicit `PromoteScope`, not an `Option<&str>`.** Overloading `None`
+is silent in **both** directions: the replay passes no account while its records carry
+one, so `== None` matched nothing and the pass did nothing every bar; reading `None`
+as "all accounts" instead would let the cron's global fan-out entry promote *every*
+account's parks through the global broker.
+
+**Tests.** 2,603 passing (+~150), 19/19 replay fixtures matching with no golden
+drift. New decision modules are unit-tested without a broker and
+**mutation-verified** per `[[verify_new_analysis_code_by_mutation]]` — including the
+`min_r` default above, where the mutation is what caught the wrong value. First test
+module in `trade-control-cron/src/sweep.rs`, with a `NoBrokerEnv` whose
+`acquire_broker` panics, so a market-hours hold that reaches for a broker fails loudly.
+
+**Follow-up.**
+
+- **Slice 7 is NOT done** — `HoldReason::SpreadHour` and the structural twins
+  `mask_active_with_lead` / `spread_hour_widen_for` still stand. Retiring them needs a
+  fixture A/B first. (`suppress_on_spread_hour` is a *different* stage — signal
+  quality, not sizing — and stays either way.)
+- **No fixture demonstrates a promotion end to end.** The headline feature is
+  untested at fixture level. `sgdjpy` provably cannot show one: its measured spread
+  (0.017–0.018) against a 10× floor gives a stop of 0.17+ versus a TP distance of
+  0.105–0.135, so R peaks at 0.79 and never reaches the 1.0 floor at any spread in
+  that window. The setup was never viable, so the park is a correct verdict — but a
+  fixture that actually promotes still needs building before trusting this live.
+
 ## v122 — 2026-07-30 — `SpreadBlackoutRecord` → `HeldTradeRecord`
 
 **Why.** The type long outgrew its name. It began as a spread-hour recovery record;

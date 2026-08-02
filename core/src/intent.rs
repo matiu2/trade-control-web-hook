@@ -29,7 +29,11 @@ pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
 pub use mw_resolution::mw_static_prices;
 pub use mw_state::{MwAnchors, MwUpdate, effective_mw_params, plan_mw_update};
 pub use prep_req::{PrepReq, PrepReqSliceExt, SlotOutcome, resolve_slot};
-#[cfg(feature = "cli")]
+// Ungated: a plain `f64` constant with no cli-only dependency. It sat behind
+// `feature = "cli"` only because the CLI was its first consumer;
+// `order_control::StoredOrder` now needs the same floor as its serde default in
+// the worker build, and a second hardcoded 1.0 is exactly the drift this
+// re-export exists to prevent.
 pub use resolution::MIN_R_FLOOR;
 pub use resolution::{ResolveError, Resolved, ResolvedEntry, ResolvedRecoverEntry, RiskBudget};
 pub use sl_spread_floor::{

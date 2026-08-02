@@ -233,6 +233,55 @@ pub struct EntryAttempt {
     /// `None` via `#[serde(default)]`). See [`BreakevenSnapshot`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub breakeven: Option<BreakevenSnapshot>,
+    /// The geometry the every-candle order-control re-check judges this order
+    /// against (rule 7). `None` = the row predates the field, or was written by
+    /// a path with no intent in hand (admin `adopt-trade`); the re-check skips
+    /// such a row rather than guessing. See [`OrderControlSnapshot`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_control: Option<OrderControlSnapshot>,
+}
+
+/// What a resting order must be re-judged against, snapshotted at placement.
+///
+/// # Why a struct and not four loose `Option<f64>`s
+///
+/// They are only useful **together**: deciding what a stop should be needs the
+/// drawn distance, the TP, and the R-floor at once, and a re-size needs all
+/// three plus the bar clock. Four independent options would make five partial
+/// states representable that no consumer can act on, and every reader would
+/// re-derive the same "do I have enough?" check. One `Option` means one
+/// question — *do we know this order's geometry?* — asked in one place.
+///
+/// # Why snapshot at all
+///
+/// The crons have **no intent in hand** — they find a resting order at the
+/// broker and must work backwards. Same reason `pip_size`, `blackout_close` and
+/// `breakeven` are snapshotted on this row. Re-resolving the intent per tick
+/// would also re-run `PriceRef::resolve` against a *different* shell, so a
+/// price-relative stop would drift every tick.
+///
+/// Stored as one `jsonb` body like the rest of the row, so this needed **no SQL
+/// migration**.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrderControlSnapshot {
+    /// The **drawn** stop-loss price — before the entry spread-floor widened it.
+    ///
+    /// Load-bearing and easy to get wrong: `run_enter` *mutates*
+    /// `resolved.stop_loss` in place when the floor widens it, so by the time
+    /// the attempt row is written the drawn level is gone. Without capturing it
+    /// here, a later shrink has nothing to shrink *toward* and would tighten
+    /// past the level the operator actually drew.
+    pub original_stop_loss: f64,
+    /// Resolved absolute take-profit price at placement, for the R calculation.
+    pub take_profit_price: f64,
+    /// The trade's effective R-floor, so the re-check applies the same threshold
+    /// the entry gate did rather than a hardcoded 1.0.
+    pub min_r: f64,
+    /// Seconds per bar at the enter's granularity — the clock a Stored order's
+    /// "drop 3 bars before expiry" deadline is measured in. `None` on the
+    /// webhook path, which has no plan granularity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bar_seconds: Option<i64>,
 }
 
 /// Skip-serializing predicate for [`EntryAttempt::blackout_close`] — mirrors
@@ -494,6 +543,20 @@ pub struct HeldTradeRecord {
     /// signed intent, to re-drive on recovery. Empty until then.
     #[serde(default)]
     pub cancelled_orders: Vec<CancelledOrder>,
+    /// **Stored** orders — intended but never sent to the broker, parked here
+    /// instead of discarded, and re-checked every candle for promotion.
+    ///
+    /// Distinct from [`Self::cancelled_orders`], which holds orders that *were*
+    /// placed and have since been pulled: those are restored, these have never
+    /// existed at the broker. Distinct again from an [`EntryAttempt`], whose
+    /// `broker_order_id` is non-`Option` precisely because it records a real
+    /// placement — which is why a rejected entry previously had nowhere to live
+    /// and was simply lost. See [`crate::order_control::stored`].
+    ///
+    /// Lives on the record as one `jsonb` body, so `#[serde(default)]` and **no
+    /// SQL migration** — the same pattern `holders` used in v120.
+    #[serde(default)]
+    pub stored_orders: Vec<crate::order_control::StoredOrder>,
 }
 
 impl HasExpiry for HeldTradeRecord {
@@ -3087,6 +3150,7 @@ mod tests {
                 pip_size: 0.0001,
                 original_stops: Vec::new(),
                 cancelled_orders: Vec::new(),
+                stored_orders: Vec::new(),
             }],
             spread_blackout_window: Some(SpreadBlackoutWindow {
                 opened_at: ts("2026-05-14T11:00:00Z"),
@@ -3203,6 +3267,7 @@ mod tests {
             pip_size: None,
             blackout_close: BlackoutCloseAction::default(),
             breakeven: None,
+            order_control: None,
         }
     }
 
@@ -3337,10 +3402,51 @@ mod tests {
             // Non-default so the round-trip proves the field survives the wire.
             blackout_close: BlackoutCloseAction::CancelAndClose,
             breakeven: None,
+            // Likewise populated, not `None`: a `None` here would round-trip
+            // trivially and prove nothing about the new field.
+            order_control: Some(OrderControlSnapshot {
+                original_stop_loss: 1.0520,
+                take_profit_price: 1.0700,
+                min_r: 1.5,
+                bar_seconds: Some(3600),
+            }),
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         let parsed: EntryAttempt = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed, a);
+        // The drawn stop is the whole reason this snapshot exists: it must
+        // survive as its own value, distinct from the (possibly widened)
+        // `stop_loss_price` beside it.
+        let snap = parsed.order_control.expect("snapshot survives the wire");
+        assert!((snap.original_stop_loss - 1.0520).abs() < 1e-12);
+        assert!(
+            (snap.original_stop_loss - parsed.stop_loss_price.unwrap_or_default()).abs() > 1e-9,
+            "the drawn stop and the placed stop are different values by design",
+        );
+    }
+
+    /// BACK-COMPAT: a row written before `order_control` existed must decode
+    /// with `None` rather than failing, so the order-control re-check skips it
+    /// instead of the whole row becoming unreadable.
+    #[test]
+    fn entry_attempt_decodes_pre_order_control_json() {
+        let json = r#"{
+            "trade_id":"eurusd-long-mr",
+            "account":"acct-a",
+            "instrument":"EUR_USD",
+            "attempt_no":1,
+            "broker_order_id":"ord-1",
+            "direction":"long",
+            "placed_at":"2026-05-20T10:00:00Z",
+            "shell_time":"2026-05-20T10:00:00Z",
+            "expires_at":"2026-05-21T10:00:00Z",
+            "stop_loss_price":1.0500
+        }"#;
+        let attempt: EntryAttempt = serde_json::from_str(json).expect("legacy row must decode");
+        assert_eq!(
+            attempt.order_control, None,
+            "no geometry known ⇒ the re-check skips this row rather than guessing",
+        );
     }
 
     #[test]
@@ -3393,6 +3499,7 @@ mod tests {
             pip_size: None,
             blackout_close: BlackoutCloseAction::default(),
             breakeven: None,
+            order_control: None,
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         assert!(!yaml.contains("broker_trade_id"));
@@ -3661,11 +3768,29 @@ mod tests {
                 order_id: "ord-9".into(),
                 signed_intent: "{\"x\":1}".into(),
             }],
+            stored_orders: vec![crate::order_control::StoredOrder {
+                signed_intent: "{\"y\":2}".into(),
+                reason: crate::order_control::StoredReason::BelowMinR,
+                original_sl_distance: 0.0020,
+                tp_distance: 0.0200,
+                min_r: 1.0,
+                stored_at: ts("2026-03-12T21:05:00Z"),
+                drop_at: ts("2026-03-12T23:05:00Z"),
+                shell_time: ts("2026-03-12T21:00:00Z"),
+            }],
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: HeldTradeRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, record);
         assert_eq!(parsed.pip_size, 0.0001);
+        // A Stored order survives the body round-trip. Losing one here would
+        // silently discard a parked setup — the exact failure this state was
+        // added to prevent.
+        assert_eq!(parsed.stored_orders.len(), 1);
+        assert_eq!(
+            parsed.stored_orders[0].reason,
+            crate::order_control::StoredReason::BelowMinR
+        );
         // The holder refcount survives the body round-trip. A dropped holder here
         // would restore an order into a window that still holds it.
         assert_eq!(parsed.holders.len(), 2);

@@ -5,10 +5,27 @@
 //! * its `expires_at` has passed → cancel + delete (the alert window
 //!   itself is dead, so the still-pending order should be too); or
 //! * its `cancel_at` (bar-based expiry) has passed → cancel + delete; or
-//! * the instrument's market-hours blackout window has opened → cancel
-//!   (and optionally close) per the row's `blackout_close` policy; or
 //! * its `stop_loss_price` has been overtaken by current price → the
 //!   setup is invalidated before it ever filled, cancel + delete.
+//!
+//! Each of those is **terminal**: the setup is dead and the row goes with it.
+//!
+//! # Market hours are a hold, not a sweep reason (v123)
+//!
+//! A fourth reason used to live here — the instrument's market-hours blackout —
+//! and it cancelled + deleted the row like the rest. But a closed market always
+//! reopens, so it is the one reason that is *temporary*, and deleting the row
+//! turned a nightly pause into a nightly loss of the setup.
+//!
+//! It is now [`HoldReason::MarketHours`](trade_control_core::hold::HoldReason),
+//! which pulls the resting order and re-places it when the session resumes —
+//! sharing the refcount with spread hours and news pauses so overlapping reasons
+//! lift independently. This module keeps only the half a hold cannot do:
+//! `CancelAndClose`, which flattens an already-filled position.
+//!
+//! (It had also been silently dead: it read the per-instrument
+//! `blackout_windows` KV table, which has had no production writer since the
+//! window deriver was retired.)
 //!
 //! Errors per-row are logged and skipped — the sweep MUST NOT abort
 //! on a single account's failure, or one stale account would jam the
@@ -31,7 +48,7 @@ use trade_control_core::state::{EntryAttempt, StateStore};
 
 // The pure sweep predicates live in `core` so the offline replay can share them
 // (the `[[strategy_changes_in_both_replayer_and_worker]]` rule).
-use trade_control_core::sweep_gate::{bar_expiry_due, breach_detected, market_blackout_due};
+use trade_control_core::sweep_gate::{bar_expiry_due, breach_detected, market_blackout_due_symbol};
 
 use crate::broker_handle::BrokerHandle;
 use crate::seam::CronEnv;
@@ -90,24 +107,32 @@ where
         // (no current-price fetch needed) but with a distinct reason so
         // it's greppable apart from the alert-window `expired` case.
         cancel_and_delete(store, cron, attempt, "bar-expiry").await
-    } else if market_blackout_due(
-        &store
-            .get_blackout_windows(&attempt.instrument)
-            .await
-            .unwrap_or_default(),
-        now,
-    ) {
-        // Market-hours blackout: this order is still resting as the
-        // instrument's daily close→open gap opens. Leaving it to rest is
-        // exactly the incident — it would trigger on the reopen gap. Pull
-        // it now, per the operator's `blackout_close` policy. Runs BEFORE
-        // the SL-breach branch: across a closed session the last-traded
-        // price is stale, so we must not let a stale-price SL check (or its
-        // absence) decide; the closed market itself is the trigger.
+    } else if market_blackout_due_symbol(&attempt.instrument, now) {
+        // Market-hours blackout. The RESTING order is not swept — it is held.
         //
-        // A KV read error fails open (`unwrap_or_default` ⇒ empty ⇒ not
-        // due), matching the reject gate — a transient hiccup must not pull
-        // a legitimate resting order.
+        // A closed market always reopens, so this reason is temporary in a way
+        // the sweep's other three are not: `expired`, `bar-expiry` and
+        // `sl-breached` all mean the setup is dead, and cancel-and-delete is
+        // right for them. A closed session means only "not now", so
+        // `HoldReason::MarketHours` (v123) pulls the order and re-places it when
+        // the session resumes. Deleting the `EntryAttempt` row here would
+        // destroy the state that restore needs, and the operator would lose a
+        // live setup every night rather than have it paused.
+        //
+        // What this branch still owns is the `CancelAndClose` half: flattening
+        // an already-FILLED position over the closed session. That is a signed,
+        // opt-in operator choice and the hold refcount deliberately never does
+        // it — holds touch resting orders only, never a position.
+        //
+        // Taking this branch also stops the SL-breach check below from reading a
+        // *stale* last-traded price across the gap.
+        //
+        // The predicate changed with this slice: it read the per-instrument
+        // `blackout_windows` KV table, which has had no production writer since
+        // the window deriver was retired — so `get_blackout_windows` always
+        // returned empty and this branch could never fire, while the replay's
+        // fill-sim read the baked mask and *did* block. Both sides read the
+        // baked mask now (`[[strategy_changes_in_both_replayer_and_worker]]`).
         market_blackout_act(store, cron, attempt).await
     } else if let Some(sl) = attempt.stop_loss_price {
         // Only acquire a broker when there's a chance we'll need to
@@ -171,57 +196,57 @@ async fn cancel_and_delete<S: StateStore, C: CronEnv>(
     Ok(())
 }
 
-/// Act on a resting order caught inside the market-hours blackout window,
-/// per the row's `blackout_close` policy:
+/// Act on an attempt caught inside the market-hours blackout, per the row's
+/// signed `blackout_close` policy.
 ///
-/// * [`BlackoutCloseAction::CancelResting`] (default, the incident fix) —
-///   cancel the unfilled resting order only. NEVER closes a position: if the
-///   order already filled, the cancel is a no-op on the broker and the filled
-///   position is left untouched (its SL is the only thing that should ever
-///   close it — see the `[[veto_close_only_when_thesis_invalidated]]` rule).
-/// * [`BlackoutCloseAction::CancelAndClose`] — also market-close any open
-///   position on the instrument. Opt-in only; the operator chose this at arm
-///   time because a partly-formed setup carried through a closed session is
-///   not worth the reopen-gap risk.
+/// **The resting order is not touched here** — [`HoldReason::MarketHours`] owns
+/// it, and pulls/re-places it around the closed session. What remains is the one
+/// thing a hold deliberately cannot do:
 ///
-/// Either way the row is deleted afterwards so the next sweep doesn't
-/// re-process it. The cancel reason string is distinct (`market-blackout`)
-/// so it's greppable in CF logs apart from `expired` / `bar-expiry` /
-/// `sl-breached`.
+/// * [`BlackoutCloseAction::CancelResting`] (the default) — nothing. The hold
+///   pulls the unfilled order; a *filled* position is left alone, because its SL
+///   is the only thing that should ever close it (the
+///   `[[veto_close_only_when_thesis_invalidated]]` rule).
+/// * [`BlackoutCloseAction::CancelAndClose`] — market-close any open position on
+///   the instrument. Opt-in only; the operator chose this at arm time because a
+///   partly-formed setup carried through a closed session is not worth the
+///   reopen-gap risk.
+///
+/// **The row is NOT deleted.** It was, when this branch also cancelled the
+/// resting order — but the hold needs the row to restore from. Deleting it would
+/// turn a nightly pause into a nightly loss of the setup. The row still retires
+/// on its own clocks (`expires_at` / `cancel_at`), which the branches above this
+/// one handle.
 async fn market_blackout_act<S: StateStore, C: CronEnv>(
-    store: &S,
+    _store: &S,
     cron: &C,
     attempt: &EntryAttempt,
 ) -> Result<(), String> {
+    // CancelResting is the default and now means "the hold handles it" — so
+    // there is nothing to do, and no reason to pay for a broker handle.
+    if !matches!(attempt.blackout_close, BlackoutCloseAction::CancelAndClose) {
+        return Ok(());
+    }
     match cron.acquire_broker(attempt.account.as_deref()).await {
-        Some(BrokerHandle::Oanda(b)) => blackout_cancel_close(&b, attempt).await,
-        Some(BrokerHandle::TradeNation(b)) => blackout_cancel_close(&b, attempt).await,
+        Some(BrokerHandle::Oanda(b)) => blackout_close_position(&b, attempt).await,
+        Some(BrokerHandle::TradeNation(b)) => blackout_close_position(&b, attempt).await,
         None => return Err("broker acquisition failed".into()),
     }
-    delete_row(store, attempt).await;
     Ok(())
 }
 
-/// Generic-over-broker body for [`market_blackout_act`]. Always cancels the
-/// resting order; additionally closes positions only on `CancelAndClose`.
-async fn blackout_cancel_close<B: Broker>(broker: &B, attempt: &EntryAttempt) {
-    // Always cancel the resting order first.
-    cancel_with_broker(broker, attempt, "market-blackout", f64::NAN).await;
-
-    // CancelAndClose additionally flattens any open position on the
-    // instrument. CancelResting (the default) stops here — it must never
-    // close a position.
-    if matches!(attempt.blackout_close, BlackoutCloseAction::CancelAndClose) {
-        let closed = broker.close_positions(&attempt.instrument).await;
-        tracing::info!(
-            "cron sweep market-blackout close: account={} trade_id={} attempt_no={} \
-             instrument={} closed_any={closed}",
-            attempt.account.as_deref().unwrap_or("<global>"),
-            attempt.trade_id,
-            attempt.attempt_no,
-            attempt.instrument,
-        );
-    }
+/// Generic-over-broker body for [`market_blackout_act`]'s `CancelAndClose` arm:
+/// flatten any open position on the instrument over the closed session.
+async fn blackout_close_position<B: Broker>(broker: &B, attempt: &EntryAttempt) {
+    let closed = broker.close_positions(&attempt.instrument).await;
+    tracing::info!(
+        "cron sweep market-blackout close: account={} trade_id={} attempt_no={} \
+         instrument={} closed_any={closed}",
+        attempt.account.as_deref().unwrap_or("<global>"),
+        attempt.trade_id,
+        attempt.attempt_no,
+        attempt.instrument,
+    );
 }
 
 /// Wrap `Broker::cancel_order` with a single log line so per-row
@@ -275,5 +300,124 @@ async fn delete_row<S: StateStore>(store: &S, attempt: &EntryAttempt) {
 }
 
 // The pure predicate unit tests (`breach_detected`, `bar_expiry_due`,
-// `market_blackout_due`, `now_utc_minute_of_day`) live with the predicates in
-// `trade_control_core::sweep_gate` — see its `#[cfg(test)] mod tests`.
+// `market_blackout_due_symbol`, `now_utc_minute_of_day`) live with the
+// predicates in `trade_control_core::sweep_gate` — see its `#[cfg(test)] mod
+// tests`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trade_control_core::dispatch_config::DispatchConfig;
+    use trade_control_core::incoming::Verified;
+    use trade_control_core::intent::Direction;
+    use trade_control_core::state::MemStateStore;
+    use trade_control_core::tick_bundle::TickBundle;
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        s.parse().expect("valid rfc3339 fixture")
+    }
+
+    /// A resting attempt on AUD/CHF whose own clocks are far in the future, so
+    /// the only branch that can fire is the market-hours one.
+    fn attempt(blackout_close: BlackoutCloseAction) -> EntryAttempt {
+        EntryAttempt {
+            trade_id: "t-mh".into(),
+            account: None,
+            instrument: "AUD/CHF".into(),
+            attempt_no: 1,
+            broker_order_id: "ord-1".into(),
+            broker_trade_id: None,
+            direction: Direction::Long,
+            placed_at: ts("2026-07-10T20:00:00Z"),
+            shell_time: ts("2026-07-10T20:00:00Z"),
+            expires_at: ts("2026-07-20T00:00:00Z"),
+            stop_loss_price: Some(0.5000),
+            cancel_at: None,
+            pip_size: Some(0.0001),
+            blackout_close,
+            breakeven: None,
+            order_control: None,
+        }
+    }
+
+    /// A `CronEnv` that PANICS on broker acquisition. Any branch that reaches a
+    /// broker fails loudly rather than quietly exercising a stub — which is what
+    /// makes "the sweep does nothing here" a real assertion rather than an
+    /// absence of one.
+    struct NoBrokerEnv;
+
+    impl CronEnv for NoBrokerEnv {
+        async fn acquire_broker(&self, _account: Option<&str>) -> Option<BrokerHandle> {
+            panic!("the sweep must not reach a broker on this path")
+        }
+        async fn dispatch_config(&self, _verified: &Verified) -> DispatchConfig {
+            unreachable!("not used by the sweep")
+        }
+        fn record_tick(&self, _bundle: TickBundle) {}
+        fn signing_key(&self) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    /// Saturday: AUD/CHF's market is shut (the real baked weekend halt).
+    const MARKET_CLOSED: &str = "2026-07-11T12:00:00Z";
+
+    /// THE SLICE-6 BEHAVIOUR: over a closed market the sweep does nothing — no
+    /// broker call, and critically **the row survives**.
+    ///
+    /// The row is what `HoldReason::MarketHours` restores from on Monday.
+    /// Deleting it (which this branch used to do) turns a weekend pause into a
+    /// permanently lost setup.
+    ///
+    /// Mutation check: restore the `delete_row` call and this goes red; restore
+    /// the `cancel_with_broker` call and `NoBrokerEnv` panics.
+    #[test]
+    fn a_closed_market_neither_cancels_nor_deletes_the_row() {
+        let store = MemStateStore::new();
+        let a = attempt(BlackoutCloseAction::CancelResting);
+        pollster::block_on(async {
+            store
+                .record_entry_attempt(a.clone())
+                .await
+                .expect("seed the attempt");
+            sweep_one(&store, &NoBrokerEnv, &a, ts(MARKET_CLOSED))
+                .await
+                .expect("a closed market is not an error");
+            let rows = store
+                .list_all_entry_attempts()
+                .await
+                .expect("list attempts");
+            assert_eq!(
+                rows.len(),
+                1,
+                "the row must survive — the hold restores from it when the market reopens",
+            );
+        });
+    }
+
+    /// The `CancelAndClose` opt-in still reaches a broker: flattening an
+    /// already-FILLED position is the one thing a hold cannot do, so this half
+    /// had to stay behind in the sweep.
+    ///
+    /// Asserted via the panic — a broker was acquired, which is the observable
+    /// difference from the default path above.
+    #[test]
+    #[should_panic(expected = "must not reach a broker")]
+    fn cancel_and_close_still_flattens_an_open_position() {
+        let store = MemStateStore::new();
+        let a = attempt(BlackoutCloseAction::CancelAndClose);
+        pollster::block_on(sweep_one(&store, &NoBrokerEnv, &a, ts(MARKET_CLOSED))).ok();
+    }
+
+    /// Guard against over-correction: the sweep's genuinely TERMINAL reasons
+    /// must still act. An expired row is dead — the hold has nothing to restore
+    /// — so it still cancels and deletes, reaching a broker to do it.
+    #[test]
+    #[should_panic(expected = "must not reach a broker")]
+    fn an_expired_row_is_still_swept() {
+        let store = MemStateStore::new();
+        let mut a = attempt(BlackoutCloseAction::CancelResting);
+        a.expires_at = ts("2026-07-11T00:00:00Z"); // before MARKET_CLOSED
+        pollster::block_on(sweep_one(&store, &NoBrokerEnv, &a, ts(MARKET_CLOSED))).ok();
+    }
+}
