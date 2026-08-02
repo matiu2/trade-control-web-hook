@@ -60,6 +60,15 @@
 //! - [`tick`] — **effectful.** The every-candle promote pass, shared by the live
 //!   cron and the offline replay so a parked order cannot promote in one and not
 //!   the other.
+//! - [`widen_episodes`] — **pure.** Which widened stop is in force on a given
+//!   bar, across **every** spread-hour episode a position lives through. A
+//!   sequence, not an `Option`, because "widened, restored, widened again" was
+//!   previously unrepresentable — and the replay silently under-protected as a
+//!   result.
+//! - [`widen_restore`] — **pure.** May the 12h safety backstop put a widened stop
+//!   back *here*? The timer alone is not enough: a bar inside a spread hour can
+//!   never be the restore bar. The replay lacked that gate and force-restored
+//!   into an active spike.
 
 mod join;
 mod park;
@@ -70,6 +79,8 @@ mod restore;
 mod sl_target;
 mod stored;
 mod tick;
+mod widen_episodes;
+mod widen_restore;
 
 pub use join::*;
 pub use park::*;
@@ -80,3 +91,5 @@ pub use restore::*;
 pub use sl_target::*;
 pub use stored::*;
 pub use tick::*;
+pub use widen_episodes::*;
+pub use widen_restore::*;
