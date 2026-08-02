@@ -69,6 +69,9 @@
 //!   back *here*? The timer alone is not enough: a bar inside a spread hour can
 //!   never be the restore bar. The replay lacked that gate and force-restored
 //!   into an active spike.
+//! - [`spread_window`] — **pure.** How far back to reach for the SL floor's
+//!   spread sample, counted in **bars of market** rather than hours of
+//!   wall-clock, so a weekend can't silently shrink the sample.
 
 mod join;
 mod park;
@@ -77,6 +80,7 @@ mod promote;
 mod reprice;
 mod restore;
 mod sl_target;
+mod spread_window;
 mod stored;
 mod tick;
 mod widen_episodes;
@@ -89,6 +93,7 @@ pub use promote::*;
 pub use reprice::*;
 pub use restore::*;
 pub use sl_target::*;
+pub use spread_window::*;
 pub use stored::*;
 pub use tick::*;
 pub use widen_episodes::*;
