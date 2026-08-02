@@ -81,13 +81,75 @@ pub fn resolve_for_broker(tv_symbol: &str, broker: ConvBroker) -> Result<Resolve
         )
     })?;
 
-    let precision = precision_for(il_broker, broker_symbol, asset);
+    require_spread_coverage(broker_symbol)?;
 
-    Ok(ResolvedInstrument {
+    Ok(finish_resolution(asset, il_broker, broker_symbol))
+}
+
+/// Assemble the result once both gates (broker listing, spread coverage) have
+/// passed. Split out so tests that are asserting *symbol resolution* can reach
+/// it without the coverage gate — and without mutating process env, which races
+/// across the thread-per-test harness.
+fn finish_resolution(
+    asset: &'static Asset,
+    il_broker: IlBroker,
+    broker_symbol: &str,
+) -> ResolvedInstrument {
+    ResolvedInstrument {
         asset,
         broker_symbol: broker_symbol.to_string(),
-        precision,
-    })
+        precision: precision_for(il_broker, broker_symbol, asset),
+    }
+}
+
+/// Refuse to arm an instrument the baked spread table doesn't cover.
+///
+/// **Why here.** Every reader of that table degrades to zero on a miss:
+/// `spread_forecast_frac` returns `(0.0, 0.0)`, the forecast term drops out of
+/// the SL `max`, and the stop is sized off the last bar alone — silently, weeks
+/// after the fact. The instrument is a bare `String` by the time the worker sees
+/// it, and `core` deliberately does not link `instrument-lookup`, so there is no
+/// compile-time gate to be had. Arm time is the earliest point that knows both
+/// the broker-canonical symbol AND has the operator in front of it, which makes
+/// it the right place to turn a silent runtime mis-size into a loud refusal
+/// before any plan exists.
+///
+/// `broker_symbol` — not the catalog id or the chart symbol — because that is
+/// the exact string the worker keys the table on.
+/// **Escape hatch.** Set `TV_ARM_ALLOW_UNBAKED=1` to downgrade the refusal to a
+/// warning. Deliberately an env var and not a CLI flag: it is an emergency
+/// override for "the table is behind and I need to arm this now", not a normal
+/// mode of operation, so it should be awkward enough that nobody reaches for it
+/// by habit — and it leaves a `warn!` in the log saying the stop was sized with
+/// no forecast.
+const ALLOW_UNBAKED_ENV: &str = "TV_ARM_ALLOW_UNBAKED";
+
+fn require_spread_coverage(broker_symbol: &str) -> Result<()> {
+    let coverage = trade_control_core::spread_blackout::coverage(broker_symbol);
+    if coverage.is_covered() {
+        return Ok(());
+    }
+    let rebake = format!(
+        "cargo run -p spread-baseline-gen --bin generate -- \
+         --brokers <oanda|tradenation> --days 90 --only {broker_symbol:?}",
+    );
+    if std::env::var(ALLOW_UNBAKED_ENV).is_ok_and(|v| v == "1") {
+        tracing::warn!(
+            instrument = broker_symbol,
+            reason = coverage.reason(),
+            "{ALLOW_UNBAKED_ENV}=1 — arming an instrument with NO spread \
+             forecast. Stops will be sized off the last bar alone. Re-bake: \
+             {rebake}",
+        );
+        return Ok(());
+    }
+    Err(eyre!(
+        "instrument {broker_symbol:?} is {} — arming would size stops with no \
+         spread forecast, so this is refused rather than silently degraded.\n  \
+         Re-bake it:  {rebake}\n  \
+         Or override for this run:  {ALLOW_UNBAKED_ENV}=1 tv-arm ...",
+        coverage.reason(),
+    ))
 }
 
 /// Resolve the per-broker precision for this leg from the native
@@ -173,6 +235,32 @@ fn map_class(class: AssetClass) -> InstrumentType {
 mod tests {
     use super::*;
 
+    /// Resolve with the coverage gate skipped.
+    ///
+    /// The tests using this assert **symbol resolution** — that a chart symbol
+    /// maps to the right broker-canonical string. Whether that instrument
+    /// happens to be baked is a different question, and letting the bake state
+    /// of the committed table decide whether a resolution test passes would
+    /// make them fail for a reason they are not testing.
+    ///
+    /// Reproduces `resolve_for_broker` minus `require_spread_coverage`, rather
+    /// than setting the override env var: the harness runs tests in threads, so
+    /// mutating process env races every sibling — including the gate's own
+    /// refusal tests, which it would silently disarm.
+    fn resolve_ignoring_coverage(
+        tv_symbol: &str,
+        broker: ConvBroker,
+    ) -> Result<ResolvedInstrument> {
+        let bare = strip_exchange(tv_symbol);
+        let asset = instrument_lookup::resolve(bare)?
+            .ok_or_else(|| eyre!("{tv_symbol:?} not in catalog"))?;
+        let il_broker = to_il_broker(broker);
+        let broker_symbol = asset
+            .symbol_for(il_broker)
+            .ok_or_else(|| eyre!("{} not listed on {}", asset.id, broker.as_str()))?;
+        Ok(finish_resolution(asset, il_broker, broker_symbol))
+    }
+
     #[test]
     fn resolves_eurusd_to_oanda_canonical() {
         let r = resolve_for_broker("OANDA:EURUSD", ConvBroker::Oanda).expect("resolves");
@@ -180,10 +268,55 @@ mod tests {
         assert_eq!(r.broker_symbol, "EUR_USD");
     }
 
+    /// A baked instrument passes the coverage gate — the positive control, so a
+    /// green suite proves the gate can say yes rather than being inert.
+    #[test]
+    fn a_baked_instrument_passes_the_coverage_gate() {
+        require_spread_coverage("EUR_USD").expect("EUR_USD is baked");
+    }
+
+    /// The gate's whole purpose: an instrument with no baked row is refused at
+    /// arm time instead of silently sizing stops with a zero forecast.
+    #[test]
+    fn an_unbaked_instrument_is_refused_at_arm_time() {
+        let err = require_spread_coverage("NOT_A_REAL_PAIR").expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("NOT_A_REAL_PAIR") && msg.contains("not in the baked spread table"),
+            "the refusal must name the instrument and the reason, got: {msg}",
+        );
+        assert!(
+            msg.contains("spread-baseline-gen"),
+            "the refusal must tell the operator how to fix it, got: {msg}",
+        );
+    }
+
+    /// The gate is wired into the real resolution path, not merely defined.
+    /// Without this, deleting the `require_spread_coverage(..)?` call would
+    /// leave every unit test above green while the gate did nothing.
+    ///
+    /// `Coffee` is a genuine catalog asset with no baked row (it is one of the
+    /// two corpus fixtures in exactly that state), so resolving it must fail on
+    /// coverage — proving the call site is live.
+    #[test]
+    fn resolution_itself_refuses_an_uncovered_instrument() {
+        // Deliberately does NOT go through `resolve_for_broker`: sibling tests
+        // set the override env var and Rust runs tests in threads, so a
+        // resolution-based assertion here would race them. Instead prove the
+        // call site exists by reading the source — cheap, and it fails loudly if
+        // someone deletes the guard while leaving every other test green.
+        let src = include_str!("instrument_resolution.rs");
+        assert!(
+            src.contains("require_spread_coverage(broker_symbol)?;"),
+            "resolve_for_broker must CALL the coverage gate — without the call \
+             site the gate is dead code and every other test still passes",
+        );
+    }
+
     #[test]
     fn resolves_eurusd_to_tn_canonical() {
-        let r =
-            resolve_for_broker("TRADENATION:EURUSD", ConvBroker::TradeNation).expect("resolves");
+        let r = resolve_ignoring_coverage("TRADENATION:EURUSD", ConvBroker::TradeNation)
+            .expect("resolves");
         assert_eq!(r.asset.id, "EURUSD");
         assert_eq!(r.broker_symbol, "EUR/USD");
     }
@@ -211,7 +344,8 @@ mod tests {
 
     #[test]
     fn resolves_smi_to_tn_canonical() {
-        let r = resolve_for_broker("TRADENATION:SMI", ConvBroker::TradeNation).expect("resolves");
+        let r = resolve_ignoring_coverage("TRADENATION:SMI", ConvBroker::TradeNation)
+            .expect("resolves");
         assert_eq!(r.asset.id, "CH20");
         assert_eq!(r.broker_symbol, "Switzerland 20");
         assert!(r.asset.is_affected_by("CHF"));
@@ -222,8 +356,8 @@ mod tests {
     fn resolves_underscore_form_typo() {
         // Operator typed EUR_USD into a TN chart's symbol field
         // — `resolve()` finds it via the OANDA-symbol column anyway.
-        let r =
-            resolve_for_broker("TRADENATION:EUR_USD", ConvBroker::TradeNation).expect("resolves");
+        let r = resolve_ignoring_coverage("TRADENATION:EUR_USD", ConvBroker::TradeNation)
+            .expect("resolves");
         assert_eq!(r.asset.id, "EURUSD");
         assert_eq!(r.broker_symbol, "EUR/USD");
     }

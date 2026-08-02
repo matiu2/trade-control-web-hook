@@ -738,9 +738,18 @@ fn render_fire(
     ) {
         events.push(EntryEvent {
             at: widen.at,
+            // Report the distance the stop actually MOVED, not the measured bar
+            // spread. On the baked path those differ by design: the widen is
+            // sized from the instrument's baked p90 for the hour, while
+            // `widen_spread_pips` records what the widen bar itself was quoting.
+            // Printing the latter next to a stop that moved by the former reads
+            // as an arithmetic error (an 18.1-pip move labelled "1.5p"), so show
+            // both and say which is which.
             note: format!(
-                "{ev} SL widened → {} (spread blackout System 2, transient, {:.1}p; from {})",
+                "{ev} SL widened → {} (spread blackout System 2, transient, \
+                 moved {:.1}p, bar spread {:.1}p; from {})",
                 fmt_price(widen.widened_stop, plan.pip_size),
+                (widen.widened_stop - widen.original_stop).abs() / plan.pip_size,
                 widen.widen_spread_pips,
                 fmt_price(widen.original_stop, plan.pip_size),
             ),
