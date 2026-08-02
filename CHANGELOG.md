@@ -1,5 +1,86 @@
 # Changelog
 
+## v126 — 2026-08-02 — the TradeNation spread forecast was all zeros; reject uncovered instruments at arm time
+
+**Why.** The baked forecast for OANDA `AUD_NZD` reads ~2.5p at ordinary hours,
+but the AUD/NZD replay fixture measured 1.8p — at the SL floor's 10x multiple,
+~7 pips added to every stop. The generator was the suspect.
+
+**The generator was innocent.** Re-measuring OANDA `AUD_NZD` over its own 90d
+window, both the generator's population (all M1 minutes) and an H1-close
+reconstruction (`:59` minutes only) give p90 = **2.80p**. The "p90 of minutes vs
+p90 of closes" theory is dead; the baked value is faithful, if slightly
+conservative.
+
+**The real bug.** The fixture is `source: tradenation`; the 2.5p is the **OANDA**
+row. Under the locked per-broker principle those are different instruments, and
+the TN row that should have applied was all zeros — as was *every* TN row (35/35,
+all `reviewed = true`, 32 carrying a populated widen while the forecast was
+empty). Documented in `b13f34e` ("carried forward with a zero forecast
+(reactive-only until re-baked)") but silently degrading: `spread_forecast_frac`
+returned `(0.0, 0.0)`, the term dropped out of the SL `max`, and every TN
+instrument sized parked-order stops reactively from v123 onward.
+
+Re-baked, TN `AUD/NZD` reads **1.37–1.64p** ordinary / **16.38p** at the spike —
+matching the fixture. TN is tighter than OANDA on every pair checked
+(0.31–0.67x), so the substituted row inflated the floor by ~1p ≈ 10 pips of stop.
+This does not contradict `EXPERIMENT-rubbish-candle.md`'s "TN costs 2.5x more":
+that measures the **spike** relative to a broker's own other hours, this the
+**baseline** level. TN is tighter most of the time and blows out harder at the NY
+close.
+
+**Why the guard missed it.** `forecast_is_populated_at_unflagged_hours` asserts on
+`EUR_USD` — an OANDA symbol — so 35 TN rows sailed past a green test. A guard that
+spot-checks one hand-picked symbol does not guard a *table*.
+
+**What changed.**
+
+- `spread_blackout::coverage` — one predicate: `Covered` / `Missing` /
+  `NoSchedule` / `StaleForecast`. "No row" and "a row of zeros" both produced
+  `(0.0, 0.0)`, which is exactly how the staleness hid; these are now distinct.
+- `every_reviewed_row_with_a_widen_also_has_a_forecast` — whole-table invariant,
+  no network (the contradiction is internal to a row).
+- **tv-arm refuses to arm an instrument the table doesn't cover.** No
+  compile-time gate is possible: the instrument is a `String` on `Intent` arriving
+  from a signed alert at runtime, and `core` deliberately does not link
+  `instrument-lookup`. Arm time is the earliest point knowing the broker-canonical
+  symbol with the operator present. `TV_ARM_ALLOW_UNBAKED=1` overrides with a
+  `warn!` so a lagging table cannot strand a live plan.
+- All 35 TN rows re-baked; 160/160 rows now `Covered`. OANDA rows byte-identical.
+- Replay's widen line printed the measured bar spread beside a stop that moved by
+  the baked p90 — an 18.1-pip move labelled "1.5p". Now prints both, labelled.
+
+**Corpus impact: none — and the corpus cannot measure this.**
+`spread_forecast_frac` has two callers, both on the live cron path
+(`order_control::tick`, `trade-control-cron::order_control_tick`). The offline
+replay never runs that tick. Verified by mutation rather than assumed: 10x on
+every TN forecast **and** widen moved 0 of 39 fixtures, net R unchanged at 15.62.
+A "nothing changed" result from a harness blind to the input is not evidence of
+neutrality.
+
+**Also settled: AUD/NZD is pegged to New York, not Sydney** — measured, not
+assumed. Re-bucketing the same minutes per zone over a window straddling both DST
+transitions: NY **82.1%** concentration vs Sydney 66.4%. The spike is the NY 5pm
+rollover, which happens on New York's clock whatever the pair. Control: AU200
+picks Sydney (31.5% vs NY 26.7%), so the probe discriminates. Caveat: a window
+inside one DST season for both zones scores 84.3% for *every* zone — no power; it
+must straddle a transition.
+
+**DST needs no cron.** The table stores a schedule-**local** hour and chrono-tz
+resolves it at read time, so a NY 17:00 bit is 21:00 UTC in summer and 22:00 in
+winter automatically. Baking more often would not help; encoding transition rules
+ourselves would be strictly worse (US moves 8 Mar 2026, EU 29 Mar — they disagree
+for three weeks every year). A cron job's value would be **freshness**, which is
+what the new invariant now makes loud.
+
+**Follow-up.** The generator hangs on a large fan-out (no error, no timeout, 0
+fetches in 3h) while batches of 8 complete reliably — noted in `b13f34e`, still
+unfixed. Any automated re-bake must stay batched until it has a fetch timeout.
+The 125 OANDA rows are re-baking separately.
+
+**Tests.** core 1057, tv-arm 389. Mutation-verified: collapsing `StaleForecast`
+into `Missing` turns `classify_agrees_with_coverage_on_the_real_table` red.
+
 ## v125 — 2026-08-02 — the spread window is counted in bars of market, not wall-clock
 
 **Why.** The entry SL floor means the spread over the last `window` closed bars.
