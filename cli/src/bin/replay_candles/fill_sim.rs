@@ -419,7 +419,20 @@ pub fn simulate_fill_resolved_zoom(
     // break-even-managed `active_stop` applies.
     let widen_trigger =
         trade_control_core::spread_blackout::elevated_threshold_pips(&intent.instrument);
-    let widen = widened_stop_at_resolved(resolved, intent, shell, pip_size, candles, widen_trigger);
+    // EVERY widen episode, not just the first: a position open for days crosses
+    // several spread hours and the live cron widens at each. Scoring the exit off
+    // one episode left later spread hours bare and booked stop-outs the live
+    // worker would have carried (AUD/NZD 2026-06-11: −1.00R vs +1.18R).
+    let widen_episodes = trade_control_core::order_control::WidenEpisodes::new(
+        widen_episodes_at_resolved(resolved, intent, shell, pip_size, candles, widen_trigger)
+            .into_iter()
+            .map(|w| trade_control_core::order_control::WidenEpisode {
+                effective_from: w.effective_from,
+                restored_at: w.restored_at,
+                widened_stop: w.widened_stop,
+            })
+            .collect(),
+    );
 
     // The parent-bar length, to bound each bar's sub-window `[c.time, c.time +
     // bar_len)` when we zoom. Inferred from the exit-window spacing (the smallest
@@ -432,12 +445,7 @@ pub fn simulate_fill_resolved_zoom(
         // transient widen is active (`[effective_from, restored_at)`), else the
         // break-even-managed stop. The widen moves the stop AWAY from price, so it
         // can only ever protect (loosen) — it never fabricates a tighter exit.
-        let effective_stop = match widen {
-            Some(w) if w.effective_from <= c.time && w.restored_at.is_none_or(|r| c.time < r) => {
-                w.widened_stop
-            }
-            _ => active_stop,
-        };
+        let effective_stop = widen_episodes.stop_on_bar(c.time, active_stop);
         let hit_sl = book_reaches(c, exit_book, effective_stop, stop_approach(dir));
         let hit_tp = book_reaches(c, exit_book, resolved.take_profit, tp_approach(dir));
         match (hit_sl, hit_tp) {
@@ -1078,11 +1086,50 @@ pub fn widened_stop_at_resolved(
     candles: &[BidAskCandle],
     widen_trigger_pips: f64,
 ) -> Option<SpreadWiden> {
+    widen_episodes_at_resolved(
+        resolved,
+        intent,
+        shell,
+        pip_size,
+        candles,
+        widen_trigger_pips,
+    )
+    .into_iter()
+    .next()
+}
+
+/// **Every** widen→restore episode the open position lives through, in order.
+///
+/// [`widened_stop_at_resolved`] is this function's first element, kept for the
+/// journal line that reports "the widen" — but scoring an exit off that single
+/// episode is the bug this function exists to fix. A position open for days
+/// crosses several spread hours, and the live cron widens at each of them: it
+/// clears its `applied` record on restore (`blackout_watch`), which frees the
+/// next hour to widen again. This reconstruction used to `return` after the
+/// first and leave every later spread hour bare.
+///
+/// Measured cost of the old shape on AUD/NZD 2026-06-11: the second spread hour
+/// (06-14T21:00Z, 18-pip spread) went unshielded, `bid_l = 1.20645` took out the
+/// narrow 1.20733 stop for −1.00R, and the widened level 1.20552 was never
+/// touched by any bar in the window — the trade ran to TP for +1.18R with it.
+///
+/// Feeds [`trade_control_core::order_control::WidenEpisodes`], which owns the
+/// "which stop is in force on this bar" question for both halves.
+pub fn widen_episodes_at_resolved(
+    resolved: &Resolved,
+    intent: &Intent,
+    shell: &Shell,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+    widen_trigger_pips: f64,
+) -> Vec<SpreadWiden> {
     if !pip_size.is_finite() || pip_size <= 0.0 {
-        return None;
+        return Vec::new();
     }
     let dir = resolved.direction;
-    let fill = find_fill(resolved, intent, shell, dir, candles)?;
+    let Some(fill) = find_fill(resolved, intent, shell, dir, candles) else {
+        return Vec::new();
+    };
     let exit_book = book_for(Leg::Exit, dir);
     let original_stop = resolved.stop_loss;
 
@@ -1095,13 +1142,38 @@ pub fn widened_stop_at_resolved(
     // would actually fire it, not snapped to a bar boundary.
     let bar_seconds = bar_seconds_of(candles);
 
+    // Episodes collected so far. The scan continues past each one — a position
+    // open for days crosses several spread hours and the live cron widens at
+    // every one of them.
+    let mut episodes: Vec<SpreadWiden> = Vec::new();
+
     for (i, c) in fill.rest.iter().enumerate() {
-        // The original stop is still the live one until a widen fires, so an
-        // exit (SL/TP) before any qualifying spread bar means no widen applied.
-        if book_reaches(c, exit_book, original_stop, stop_approach(dir))
+        // Stop scanning once the position is gone: no later spread hour can
+        // shield a position that has already exited.
+        //
+        // The SL test uses the stop **in force on this bar**, not `original_stop`.
+        // Testing the original would end the scan at a level the broker was not
+        // actually holding — the widen exists precisely so that touch does not
+        // close the trade — and every subsequent episode would be lost. That is
+        // the same one-shot failure in a second disguise.
+        let in_force = episodes
+            .iter()
+            .find(|w| c.time >= w.effective_from && w.restored_at.is_none_or(|r| c.time < r))
+            .map_or(original_stop, |w| w.widened_stop);
+        if book_reaches(c, exit_book, in_force, stop_approach(dir))
             || book_reaches(c, exit_book, resolved.take_profit, tp_approach(dir))
         {
-            return None;
+            break;
+        }
+        // One widen per episode: while an earlier widen is still in force, the
+        // live cron's `applied` guard refuses to widen again (and would re-capture
+        // an already-widened stop as "original" if it did). Only once the restore
+        // has cleared that record can the next spread hour widen.
+        if episodes
+            .last()
+            .is_some_and(|w| w.restored_at.is_none_or(|r| c.time < r))
+        {
+            continue;
         }
         // Per-instrument spread-hour gate — mirror the live cron's System 2
         // (`widen_open_stops_for_spread_hours`). `spread_hour_widen_instant`
@@ -1163,8 +1235,8 @@ pub fn widened_stop_at_resolved(
         // bar open. Restore detection walks the *following bars*, so it's still
         // anchored to the bar time.
         let widen_at = widen_instant.map(|(at, _frac)| at).unwrap_or(c.time);
-        let restored_at = restore_bar(&fill.rest[i + 1..], c.time, pip_size);
-        return Some(SpreadWiden {
+        let restored_at = restore_bar(&fill.rest[i + 1..], c.time, pip_size, &intent.instrument);
+        episodes.push(SpreadWiden {
             at: widen_at,
             effective_from: c.time,
             original_stop,
@@ -1173,7 +1245,7 @@ pub fn widened_stop_at_resolved(
             restored_at,
         });
     }
-    None
+    episodes
 }
 
 /// When the live recovery watcher (`blackout_watch::watch_recovery`) would
@@ -1192,6 +1264,7 @@ fn restore_bar(
     bars: &[BidAskCandle],
     widen_at: chrono::DateTime<chrono::Utc>,
     pip_size: f64,
+    instrument: &str,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let recovered_cutoff = trade_control_core::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS;
     let safety_secs = trade_control_core::spread_blackout::SAFETY_FORCE_RESTORE_SECONDS;
@@ -1202,8 +1275,18 @@ fn restore_bar(
         if spread_pips.is_finite() && spread_pips <= recovered_cutoff {
             return Some(c.time);
         }
-        // Safety force-restore: this bar is at/after the 12h last-resort ceiling.
-        if c.time >= safety_at {
+        // Safety force-restore: at/after the 12h ceiling AND not inside a spread
+        // hour. The clock half alone is not enough — see
+        // `order_control::backstop_restore_allowed`, the same gate the live call
+        // site applies. Without it a weekend gap (12h of wall-clock, zero bars of
+        // market) let the backstop restore the narrow stop onto the NY-close spike
+        // itself: AUD/NZD 2026-06-11 booked −1.00R on a trade whose widened stop
+        // was never touched and which ran to TP for +1.18R.
+        if trade_control_core::order_control::backstop_restore_allowed(
+            instrument,
+            c.time,
+            c.time >= safety_at,
+        ) {
             return Some(c.time);
         }
     }
