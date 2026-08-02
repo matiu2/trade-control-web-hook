@@ -636,6 +636,31 @@ pub async fn run(
         )
         .await;
 
+        // The every-candle order-control re-check — the SAME `core` pass the
+        // live cron runs (`order_control_tick`). Without this a sub-1R entry
+        // parks identically on both sides but only ever *promotes* live, so a
+        // fixture would quietly book 0R for a trade production takes
+        // (`[[strategy_changes_in_both_replayer_and_worker]]`).
+        //
+        // Runs AFTER the lifecycle so an order the lifecycle just re-placed is
+        // already resting, and a promotion this bar is visible to the next bar's
+        // fill simulation — the same ordering the live scheduler gets from
+        // running the sweep and this pass on the same cadence.
+        //
+        // `Every`, not the lifecycle's `None`: this pass enumerates RECORDS,
+        // which carry the plan's real account (`m-and-w` in the sgdjpy fixture),
+        // so an account-equality filter would match nothing offline. The replay
+        // has one broker and one plan, so every record is in scope.
+        trade_control_core::order_control::promote_due_orders(
+            &replay_broker,
+            &store,
+            &lifecycle_cfg,
+            &src,
+            trade_control_core::order_control::PromoteScope::Every,
+            now,
+        )
+        .await;
+
         if eval.done {
             done = true;
             break;

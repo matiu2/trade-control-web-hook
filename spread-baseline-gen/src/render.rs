@@ -6,7 +6,8 @@
 //! change. Row tuple:
 //!
 //! `(broker, symbol, schedule, reviewed, elevated_hours_mask, hour_widen_frac[24],
-//!   baseline_median_pips, baseline_low_pips, baseline_high_pips)`
+//!   baseline_median_pips, baseline_low_pips, baseline_high_pips,
+//!   hour_p90_frac[24])`
 //!
 //! sorted by `(broker, symbol)` so the gate can binary-search. The widen is a
 //! **spread fraction** (`spread/mid`), not pips — a scale-free unit that works
@@ -15,6 +16,28 @@
 //! reject-threshold source the live gate reads (`median × SPREAD_REJECT_MULTIPLE`);
 //! `median` is placed first as the primary field. They are appended at the END
 //! so existing column positions stay stable.
+//!
+//! # `hour_widen_frac` vs `hour_p90_frac` — two different questions
+//!
+//! These look alike and are easy to confuse; keeping them apart is the point of
+//! the second column.
+//!
+//! - **`hour_widen_frac[h]`** — GATED. Non-zero only for hours in
+//!   `elevated_hours_mask`; zero at the other 23. It answers *"is this a flagged
+//!   spread hour, and if so how far do we widen an open stop?"* The presence of a
+//!   value **is** the gate.
+//! - **`hour_p90_frac[h]`** — UNGATED. The p90 spread fraction for **every**
+//!   hour that had enough samples, flagged or not. It answers *"what spread do I
+//!   expect at hour h?"* — a forecast, with no notion of elevation.
+//!
+//! The forecast is what the forward-looking SL floor consumes
+//! (`max(10×last_candle_spread, 10×expected_hour_spread, desired_sl)`), so a stop
+//! is sized for the spread it will actually meet rather than for a clock proxy.
+//! The generator has always computed p90 for all 24 hours; it was simply never
+//! emitted, because `apply_gates` copies it into `hour_widen_frac` only inside
+//! the flag branch. Nothing about flagging changes here: the flag statistic is
+//! p75 (`FLAG_PERCENTILE`) and the widen is p90 (`WIDEN_PERCENTILE`), so emitting
+//! the ungated p90 alongside leaves every existing consumer byte-identical.
 
 use crate::BaselineRow;
 
@@ -66,34 +89,47 @@ pub fn render_table(rows: &[BaselineRow]) -> String {
          data, mask is 0,\n// gate should fall back to its NY-close-edge \
          default.\n",
     );
+    s.push_str(
+        "// `hour_widen_frac` is GATED (zero outside the mask — its presence IS the \
+         gate);\n// `hour_p90_frac` is the UNGATED per-hour spread FORECAST for all 24 \
+         hours.\n// Don't conflate them: one asks \"is this an elevated hour?\", the other \
+         \"what\n// spread do I expect here?\". See the module docs.\n",
+    );
     s.push_str("#[allow(clippy::type_complexity)]\n");
     s.push_str(
         "pub static SPREAD_BASELINE_CANDLE: &[(&str, &str, &str, bool, u32, [f64; 24], \
-         f64, f64, f64)] = &[\n",
+         f64, f64, f64, [f64; 24])] = &[\n",
     );
     for r in &sorted {
         let sym = escape(&r.symbol);
         let sched = escape(&r.spread_schedule);
         let reviewed = matches!(r.profile.review, crate::compute::ReviewStatus::Reviewed);
-        let widen = r
-            .profile
-            .hour_widen_frac
-            .iter()
-            .map(|f| format!("{f:?}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let widen = render_hours(&r.profile.hour_widen_frac);
+        let forecast = render_hours(&r.profile.hour_p90_frac);
         let median_pips = r.profile.baseline_median_pips;
         let low_pips = r.profile.baseline_low_pips;
         let high_pips = r.profile.baseline_high_pips;
         s.push_str(&format!(
             "    (\"{}\", \"{sym}\", \"{sched}\", {reviewed}, {}, [{widen}], \
-             {median_pips:?}, {low_pips:?}, {high_pips:?}),\n",
+             {median_pips:?}, {low_pips:?}, {high_pips:?}, [{forecast}]),\n",
             r.broker.as_str(),
             r.profile.elevated_hours,
         ));
     }
     s.push_str("];\n");
     s
+}
+
+/// Render a 24-hour fraction array as the body of a Rust array literal.
+///
+/// `{:?}` (not `{}`) so a float round-trips exactly — `1e-5` formats as `1e-5`
+/// rather than `0.00001`, and the value parses back bit-identical.
+fn render_hours(hours: &[f64; 24]) -> String {
+    hours
+        .iter()
+        .map(|f| format!("{f:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Escape a symbol for a Rust string literal. Broker symbols contain spaces,
@@ -156,13 +192,73 @@ mod tests {
             profile,
         }];
         let out = render_table(&rows);
-        // The three pips columns render (median, low, high) after the widen array.
+        // The three pips columns render (median, low, high) between the widen
+        // array and the trailing forecast array — column POSITION is the
+        // contract, since consumers destructure the tuple positionally.
         assert!(
-            out.contains("], 2.5, 1.0, 6.0),"),
-            "median/low/high pips must trail the widen array, got:\n{out}"
+            out.contains("], 2.5, 1.0, 6.0, ["),
+            "median/low/high pips must sit between the widen and forecast arrays, got:\n{out}"
         );
-        // The type signature grew three f64 columns.
-        assert!(out.contains("[f64; 24], f64, f64, f64)"));
+        // The type signature: three f64 columns, then the forecast array.
+        assert!(out.contains("[f64; 24], f64, f64, f64, [f64; 24])"));
+    }
+
+    /// The forecast column must be **ungated**: populated for every hour that
+    /// had samples, including hours absent from `elevated_hours`. This is the
+    /// whole point of the second array — the gated `hour_widen_frac` is zero at
+    /// those hours, so a forward-looking floor reading it would size every calm
+    /// hour off 0.0 and silently degrade to today's reactive-only behaviour.
+    #[test]
+    fn forecast_column_is_ungated_where_widen_is_gated() {
+        let mut profile = SpreadProfile::empty(1000);
+        profile.review = ReviewStatus::Reviewed;
+        // Hour 21 is flagged; hour 3 is a perfectly ordinary hour.
+        profile.elevated_hours = 1 << 21;
+        profile.hour_widen_frac[21] = 0.00042;
+        // The forecast knows BOTH hours — that's the ungated data.
+        profile.hour_p90_frac[21] = 0.00042;
+        profile.hour_p90_frac[3] = 0.00007;
+        let rows = vec![BaselineRow {
+            broker: Broker::Oanda,
+            symbol: "EUR_USD".to_string(),
+            display_name: "EUR_USD".to_string(),
+            spread_schedule: "ny".to_string(),
+            profile,
+        }];
+        let out = render_table(&rows);
+
+        // Parse the two arrays back out rather than substring-matching, so the
+        // test proves the VALUES land in the right columns.
+        let arrays: Vec<Vec<f64>> = out
+            .lines()
+            .find(|l| l.contains("\"EUR_USD\""))
+            .map(|line| {
+                line.match_indices('[')
+                    .filter_map(|(i, _)| {
+                        let rest = &line[i + 1..];
+                        rest.find(']').map(|end| {
+                            rest[..end]
+                                .split(',')
+                                .filter_map(|t| t.trim().parse::<f64>().ok())
+                                .collect()
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(arrays.len(), 2, "expected widen + forecast arrays:\n{out}");
+        let (widen, forecast) = (&arrays[0], &arrays[1]);
+
+        // The GATED column: hour 3 is zeroed because it isn't flagged.
+        assert_eq!(widen[3], 0.0, "widen must stay gated at an unflagged hour");
+        assert_eq!(widen[21], 0.00042);
+        // The UNGATED column: hour 3 carries its real forecast.
+        assert_eq!(
+            forecast[3], 0.00007,
+            "forecast must be populated at an UNFLAGGED hour — that is the \
+             entire reason this column exists"
+        );
+        assert_eq!(forecast[21], 0.00042);
     }
 
     #[test]

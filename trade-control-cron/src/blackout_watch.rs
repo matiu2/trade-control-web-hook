@@ -34,6 +34,9 @@
 
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{AmendError, Broker};
+use trade_control_core::order_control::{
+    CurrentStop, OriginalStop, RestoreDecision, restore_decision,
+};
 use trade_control_core::pending_lifecycle::ClearPolicy;
 use trade_control_core::state::{HeldTradeRecord, StateStore};
 
@@ -166,6 +169,15 @@ where
 /// logged and skipped so the clear still proceeds; a closed position yields
 /// `AmendError::NotFound` and is treated as benign (nothing to restore).
 /// System 2 only ever moves a stop — it never closes or tightens.
+///
+/// **Guarded against a second writer.** Verbatim restore is only safe while
+/// System 2 is the sole owner of the stop, and it isn't: `breakeven_watch`
+/// (System F) amends the same handle on the same cadence. Restoring blindly
+/// would revert a locked-in break-even to a real-money level. So each stop is
+/// read back from the broker and put through the pure
+/// [`restore_decision`](trade_control_core::order_control::restore_decision) —
+/// a stop that has moved *tighter* than the remembered original belongs to
+/// whoever moved it, and is left alone. See `core::order_control::restore`.
 async fn restore_remembered_stops<C: CronEnv>(cron: &C, record: &HeldTradeRecord) {
     if record.original_stops.is_empty() {
         return;
@@ -180,45 +192,93 @@ async fn restore_remembered_stops<C: CronEnv>(cron: &C, record: &HeldTradeRecord
         return;
     };
     let account = record.account.as_deref().unwrap_or("");
+
+    // Read the stops back as they ACTUALLY are at the broker. The whole failure
+    // mode is another system having moved one, so a believed level is no use.
+    // A lookup failure is fail-CLOSED: with no way to tell a widened stop from a
+    // break-even one, leaving it widened risks a wider loss, while restoring
+    // blindly risks giving back a locked-in win. We keep the protection.
+    let positions = match &broker {
+        BrokerHandle::Oanda(b) => b.list_open_positions(account).await,
+        BrokerHandle::TradeNation(b) => b.list_open_positions(account).await,
+    };
+    let positions = match positions {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::error!(
+                "blackout restore[{}]: list_open_positions FAILED ({err}) — cannot tell a widened \
+                 stop from a break-even one, so {} stop(s) left WIDENED (fail-closed; retried next \
+                 tick, backstop TTL is the final net)",
+                record.trade_id,
+                record.original_stops.len(),
+            );
+            return;
+        }
+    };
+
     for remembered in &record.original_stops {
-        let result = match &broker {
-            BrokerHandle::Oanda(b) => {
-                b.amend_stop(
-                    account,
-                    &remembered.position_or_order_id,
-                    remembered.original_stop,
-                )
-                .await
-            }
-            BrokerHandle::TradeNation(b) => {
-                b.amend_stop(
-                    account,
-                    &remembered.position_or_order_id,
-                    remembered.original_stop,
-                )
-                .await
-            }
+        let id = &remembered.position_or_order_id;
+        // Match on either handle: `order_id` is the documented TN amend key that
+        // the widen stored, but OANDA callers may hold the trade id.
+        let Some(position) = positions
+            .iter()
+            .find(|p| p.order_id == *id || p.position_id == *id)
+        else {
+            tracing::info!(
+                "blackout restore[{}]: id={id} not in open positions (closed during window) — \
+                 benign, nothing to restore",
+                record.trade_id,
+            );
+            continue;
         };
-        match result {
-            Ok(()) => tracing::info!(
-                "blackout restore[{}]: amend_stop ok id={} -> original {} (verbatim, no recompute)",
+        let Some(current_stop) = position.stop_loss else {
+            tracing::warn!(
+                "blackout restore[{}]: id={id} has NO stop attached — not restoring (a stop we \
+                 widened should still exist; re-attaching one here could contradict whatever \
+                 removed it)",
                 record.trade_id,
-                remembered.position_or_order_id,
-                remembered.original_stop,
-            ),
-            Err(AmendError::NotFound) => tracing::info!(
-                "blackout restore[{}]: id={} gone (closed during window) — benign, nothing to \
-                 restore",
-                record.trade_id,
-                remembered.position_or_order_id,
-            ),
-            Err(err) => tracing::error!(
-                "blackout restore[{}]: amend_stop id={} -> {} FAILED ({err}) — stop left WIDENED, \
-                 operator must restore manually",
-                record.trade_id,
-                remembered.position_or_order_id,
-                remembered.original_stop,
-            ),
+            );
+            continue;
+        };
+
+        match restore_decision(
+            position.direction,
+            CurrentStop(current_stop),
+            OriginalStop(remembered.original_stop),
+        ) {
+            RestoreDecision::Skip(reason) => {
+                tracing::info!(
+                    "blackout restore[{}]: id={id} SKIPPED ({reason:?}) — current {current_stop} \
+                     vs remembered original {} (dir={:?}); leaving the tighter stop in place",
+                    record.trade_id,
+                    remembered.original_stop,
+                    position.direction,
+                );
+                continue;
+            }
+            RestoreDecision::RestoreTo(level) => {
+                let result = match &broker {
+                    BrokerHandle::Oanda(b) => b.amend_stop(account, id, level).await,
+                    BrokerHandle::TradeNation(b) => b.amend_stop(account, id, level).await,
+                };
+                match result {
+                    Ok(()) => tracing::info!(
+                        "blackout restore[{}]: amend_stop ok id={id} {current_stop} -> original \
+                         {level} (verbatim, no recompute)",
+                        record.trade_id,
+                    ),
+                    Err(AmendError::NotFound) => tracing::info!(
+                        "blackout restore[{}]: id={id} gone (closed during window) — benign, \
+                         nothing to restore",
+                        record.trade_id,
+                    ),
+                    Err(err) => tracing::error!(
+                        "blackout restore[{}]: amend_stop id={id} -> {level} FAILED ({err}) — stop \
+                         left WIDENED, operator must restore manually",
+                        record.trade_id,
+                    ),
+                }
+            }
         }
     }
 }

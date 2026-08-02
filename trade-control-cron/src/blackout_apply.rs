@@ -32,6 +32,7 @@ use trade_control_core::blackout_widen::{clamp_widen, spread_hour_widen_size, wi
 use trade_control_core::broker::{AmendError, Broker, OpenPosition};
 use trade_control_core::hold::{HoldReason, Holders};
 use trade_control_core::ny_clock::is_ny_close_edge;
+use trade_control_core::order_control::{join_position_to_attempt, may_widen};
 use trade_control_core::spread_blackout::{
     NY_CLOSE_WINDOW_MARKER_TTL_SECONDS, spread_hour_widen_frac, widen_frac_to_pips,
 };
@@ -103,10 +104,27 @@ where
 ///
 /// Fires on **every** tick (the caller does not gate it) because the lead
 /// window straddles the top of the hour — the per-instrument mask check is
-/// cheap and no-ops when no open position is in a spread hour. Applies to
-/// **all** open positions including breakeven-locked ones (a breakeven stop
-/// sits exactly at entry and is the *most* spread-vulnerable — see the
-/// widen decision in `widen_one`).
+/// cheap and no-ops when no open position is in a spread hour.
+///
+/// # Break-even positions are NOT widened
+///
+/// An earlier version applied to every open position *including* break-even
+/// ones, on the reasoning that a stop sitting exactly at entry is the most
+/// spread-vulnerable. That reasoning ignored what widening such a stop costs:
+/// it moves the stop back **past break-even**, re-exposing a trade whose risk
+/// the operator had already banked, and it records the break-even level as the
+/// "original" this system later restores to — silently redefining the trade's
+/// original stop.
+///
+/// A spread hour is a reason to give a stop more room against its **original**
+/// risk, never a reason to re-introduce risk that was eliminated. `widen_one`
+/// now consults `order_control::may_widen`; paired with the `restore_decision`
+/// guard on the restore side, the two systems are commutative — whichever runs
+/// first, a locked-in break-even survives.
+///
+/// The trade-off is accepted deliberately: a break-even stop clipped by a
+/// spread spike exits at ~0R, which is the outcome break-even was chosen to
+/// guarantee. Widening past it risks a real loss instead.
 pub async fn widen_open_stops_for_spread_hours<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
 where
     S: StateStore,
@@ -306,6 +324,28 @@ async fn widen_one<S: StateStore>(
         Some(p90) => spread_hour_widen_size(p90, spread_pips),
         None => clamp_widen(spread_pips),
     };
+    // Don't widen a stop break-even has already secured. `original_sl` is the
+    // LIVE stop, so if System F moved it to entry first, widening would (a)
+    // push it back past break-even, re-exposing a trade whose risk had been
+    // eliminated, and (b) record break-even as the "original" this system later
+    // restores to — silently redefining the trade's original stop.
+    //
+    // A spread hour is a reason to give a stop more room against its ORIGINAL
+    // risk, never a reason to re-introduce risk the operator already banked.
+    // Paired with the `restore_decision` guard on the restore side, this makes
+    // the two systems commutative: whichever runs first, break-even survives.
+    if let Some(be) = attempt.breakeven.as_ref()
+        && !may_widen(position.direction, original_sl, be.entry_price)
+    {
+        tracing::info!(
+            "blackout widen[{}]: trade {trade_id} stop {original_sl} is at/past break-even \
+             (entry={}); NOT widening — a spread hour must not re-expose a secured trade",
+            account.unwrap_or("<global>"),
+            be.entry_price,
+        );
+        return;
+    }
+
     let new_sl = widened_stop(position.direction, original_sl, widen_pips, pip_size);
 
     // RECORD FIRST (crash-safe), then amend. `order_id` is the documented
@@ -336,6 +376,9 @@ async fn widen_one<S: StateStore>(
             original_stop: original_sl,
         }],
         cancelled_orders: Vec::new(),
+        // System 2 widens an OPEN position's stop; it never parks an entry.
+        // Stored orders are written only by the entry path.
+        stored_orders: Vec::new(),
     };
     if let Err(err) = store.upsert_held_trade_record(&record, ttl).await {
         tracing::error!(
@@ -441,26 +484,6 @@ async fn amend(
 /// affected thin crosses (one setup per instrument is the common case), but
 /// real. A fully unambiguous join would need a synthetic per-`position_id`
 /// record when nothing correlates. Noted in TODO.md.
-fn join_position_to_attempt<'a>(
-    position: &OpenPosition,
-    account: Option<&str>,
-    attempts: &'a [EntryAttempt],
-) -> Option<&'a EntryAttempt> {
-    // 1. Exact: snapshotted broker_trade_id == position_id.
-    if let Some(hit) = attempts
-        .iter()
-        .find(|a| a.broker_trade_id.as_deref() == Some(position.position_id.as_str()))
-    {
-        return Some(hit);
-    }
-    // 2. Coarse fallback: instrument + direction + account.
-    attempts.iter().find(|a| {
-        a.instrument == position.instrument
-            && a.direction == position.direction
-            && a.account.as_deref() == account
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +517,7 @@ mod tests {
             pip_size,
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
             breakeven: None,
+            order_control: None,
         }
     }
 
