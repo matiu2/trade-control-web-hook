@@ -1422,8 +1422,13 @@ async fn windowed_entry_spread<B: Broker>(
         .spread_window
         .unwrap_or(crate::intent::DEFAULT_SPREAD_WINDOW)
         .max(1);
-    // Count-back with slack so >= `window` closed bars land in the range.
-    let lookback_bars = (window as i64) + 2;
+    // Count-back in BARS OF MARKET, not hours of wall-clock. A fixed `+2` bars of
+    // slack cannot clear a weekend: a Monday fire looking back 7h for 5 H1 bars
+    // reaches into the Friday-close..Sunday-open hole and gets two or three, so
+    // the floor is sized off a sample that is both too small (one spike dominates
+    // it) and discontinuous. Over-fetching is free — `trailing_spread_mean` keeps
+    // only the tail — so the padding is deliberately generous.
+    let lookback_bars = crate::order_control::lookback_bars(window, granularity.seconds());
     let since = now - chrono::Duration::seconds(granularity.seconds() * lookback_bars);
     let candles = match broker
         .get_bidask_candles(instrument, granularity, since, now)

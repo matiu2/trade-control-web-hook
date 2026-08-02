@@ -1,5 +1,49 @@
 # Changelog
 
+## v125 — 2026-08-02 — the spread window is counted in bars of market, not wall-clock
+
+**Why.** The entry SL floor means the spread over the last `window` closed bars.
+To fetch them it asked the broker for `now − (window + 2) × bar_seconds` — pure
+wall-clock arithmetic, on the assumption that N bars occupy N × bar_seconds.
+
+**FX does not trade continuously.** A Monday-morning fire looking back 7h to
+collect 5 H1 bars reaches into the Friday-close..Sunday-open hole and finds two
+or three. The floor is then sized off a sample that is both **too small** (so one
+spike dominates it) and **discontinuous** (bars either side of a two-day gap are
+not a trailing window of anything). Fewer samples is exactly backwards: the
+window exists *so that* a single spiky bar can't dominate.
+
+Seen on AUD/NZD 2026-06-11 entry #3, whose "last 5 H1 bars" spanned
+06-12T19:00Z → 06-14T23:00Z: two Friday bars, a two-day hole, then Sunday's
+reopen including the 18-pip NY-close bar.
+
+**What changed.** `order_control::spread_window::lookback_bars` pads the
+count-back by a **calendar-aware** multiple — the bars needed to step over a ~50h
+weekend at that granularity — instead of a fixed `+2`. It scales with timeframe
+(~50 extra bars on H1, ~3 on D1). Over-fetching is free, since
+`trailing_spread_mean` keeps only the tail; under-fetching silently shrinks the
+sample.
+
+Same wall-clock-vs-market-time confusion as the widen backstop in **v124**, in a
+different place. Both treat a duration as if it measured trading activity.
+
+**Breaking.** None. **Config.** None. No migration.
+
+**Replay-neutral.** The offline replay slices its own recorded series rather than
+calling this fetch, so all 39 fixtures are unchanged (the 4 known AUD/NZD golden
+mismatches are v124's, still pending re-bless).
+
+**Tests.** 2,620 passing (+6). Mutation-verified: forcing the weekend padding to
+0 (the old fixed slack) turns the three weekend tests red.
+
+**Follow-up — the statistic itself is still a mean.** Widening the fetch fixes
+*which* bars are sampled, not how they're reduced. One 18-pip NY-close bar still
+drags a 1.5–1.8p reality to a 4.9p mean and floors the stop to 49 pips when the
+live spread is under 2p — which is what parked AUD/NZD entry #1 at R=0.97, one
+hundredth below its floor. A **median** would read 1.8p there and the trade would
+enter. Deliberately NOT changed here: it alters entry sizing on every instrument
+and deserves its own corpus A/B, not a ride-along with a bug fix.
+
 ## v124 — 2026-08-02 — the 12h widen backstop must not restore into a spread hour
 
 **Why.** System 2 widens an open position's stop away from price through a
