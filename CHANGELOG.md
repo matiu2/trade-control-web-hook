@@ -1,5 +1,73 @@
 # Changelog
 
+## v124 — 2026-08-02 — the 12h widen backstop must not restore into a spread hour
+
+**Why.** System 2 widens an open position's stop away from price through a
+learned spread hour, then restores it. Two things trigger the restore: **recovery**
+(the spread came back to normal) and a **12h safety backstop** (last resort, for a
+record that got stuck). The replay's reconstruction checked only the clock half of
+the backstop — `bar.time >= widen + 12h` — with no gate on *where* that bar lands.
+
+**Wall-clock is the trap.** Twelve hours of wall-clock is not twelve hours of
+market. Across a weekend the candle path jumps Friday → Sunday, so the next bar
+after a widen can satisfy a 12h timer while being the *immediately following bar*
+in market time. If that bar is the NY-close spread hour, the backstop hands the
+stop back **into the very spike the widen existed to absorb** — and because the
+widen interval is half-open, the restore bar itself runs on the narrow stop.
+
+**Measured.** AUD/NZD 2026-06-11: widen 06-12T20:00Z, `safety_at` 06-13T08:00Z,
+next bar **06-14T21:00Z carrying an 18-pip spread**. The restore landed there,
+`bid_l = 1.20645` took out the narrow 1.20733, and the fixture booked **−1.00R**.
+The widened level 1.20552 is **not reached by any bar in the window** — held one
+bar longer the trade runs to TP. The four AUD/NZD cells move **−1.00R → +3.52R**;
+**35 of 39 fixtures are byte-identical**.
+
+**The live side never had this bug.** `pending_lifecycle` gates the backstop on
+`!is_spread_hour` and says so in its own docs ("it cannot force-restore into an
+active block the way the old 3h ceiling did"). Only the replay was missing the
+gate — a **replay↔live divergence** in the direction where fixtures book stop-outs
+the live worker would have carried, i.e. the corpus was quietly understating the
+strategy.
+
+**What changed.**
+
+- **`order_control::widen_restore::backstop_restore_allowed`** — the gate as one
+  named predicate both halves ask, rather than a condition each side re-derives.
+  Timer-due is **necessary, not sufficient**: a bar inside a spread hour can never
+  be the restore bar. A stuck record now waits out the block and clears on the
+  first bar past it, which is strictly better than a narrow stop mid-spike.
+- **`order_control::widen_episodes::WidenEpisodes`** — a *sequence* of
+  widen→restore episodes with `stop_on_bar(bar, unshielded)`. An
+  `Option<SpreadWiden>` could not express "widened, restored, widened again", so a
+  position open across several spread hours was shielded only on the first. The
+  live cron clears its `applied` record on restore and therefore widens at each
+  one; the replay could not.
+- The exit sim's scan collects **every** episode instead of returning after the
+  first, and its exit-bail now tests the stop **in force** rather than the
+  original. (Testing the original would end the scan at a level the broker was not
+  holding — the widen exists precisely so that touch does not close the trade —
+  losing every later episode.)
+
+**Breaking.** `restore_bar` takes an `instrument` argument (replay-internal).
+
+**Config.** None. No migration.
+
+**Tests.** 2,614 passing (+11). Both new predicates are **mutation-verified**:
+dropping the gate turns `the_backstop_may_not_restore_onto_a_spread_hour_bar` red
+*and* moves the strategy-v2 cell back to −1.00R end-to-end; collapsing
+`stop_on_bar` to first-only turns the second-episode tests red. A pair of
+constant-comparison asserts flagged by clippy were replaced with the assertion
+that actually discriminates — where the restore *lands* — since comparing two
+literals can never fail.
+
+**Follow-up.** The **four AUD/NZD goldens still encode the old −1.00R** and must
+be re-blessed; until then `--check` reports 4 of 39 failing. That is the fix
+showing up, not a regression. Also note the replay's **+3.53R is arm-dependent**
+and not the journal's +1.18R for the same trade: the journal's entry was the QM
+leg at 1.20935, this run fills a limit at 1.20883 with a floored stop, so the same
+price move scores against a smaller denominator. The loss→win flip is the result;
+the magnitude is not a headline number.
+
 ## v123 — 2026-08-02 — `order_control`: one home for stored/pending/live order state
 
 **Why.** Two rival answers to *"what should this stop be right now?"* had drifted
