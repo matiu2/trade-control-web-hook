@@ -50,9 +50,9 @@ cut a fresh `staging` from `main` carrying the week's accumulated changes.
 | part | version | deployed (Brisbane) | notes |
 |---|---|---|---|
 | pine | `v2.5` (study title `Candle Signals v25`) | — | manual republish; sends `open` for M/W body logic. `tv-arm-dev` bakes this study title (`ENV_PINE_NAME`) — rename the chart study to match. |
-| tv-arm | `0.1.0` | 2026-07-30 | installed as `tv-arm-dev` (dev URL + `Candle Signals v25` baked) |
-| trade-control | `0.2.0` | 2026-07-30 | installed as `trade-control-dev` (dev URL baked) |
-| backend | `main` @ `ab96b20` (`v122`) | 2026-07-30 | Version `v122`. **v119** news pause now pulls resting orders (was: blocked new entries only, so pendings filled on the news spike). **v120** those reasons became a shared refcount of named holders (`core::hold`) so a spread hour and a news pause overlap and lift independently. **v121** a failed `cancel_order` is classified via `lookup_attempt_state` instead of swallowed — a vanished (filled) order is pruned so the OFF side can't re-place it. **v122** `SpreadBlackoutRecord` → `HeldTradeRecord`; **DB migration `0005`** renames the table (rows preserved, no data migration). |
+| tv-arm | `0.1.0` | 2026-08-02 | installed as `tv-arm-dev` (dev URL + `Candle Signals v25` baked) |
+| trade-control | `0.2.0` | 2026-08-02 | installed as `trade-control-dev` (dev URL baked) |
+| backend | `main` @ `91a4b6d` (`v123`) | 2026-08-02 | Version **`v123` — `order_control`**: one home for stored/pending/live order state. Kept in lockstep with staging (same code, one merge commit behind). See the staging row for what landed. Pre-existing on dev and **not** caused by this deploy: a `<global>`-scope row with no registered account makes every cron subsystem log `broker acquisition failed` each tick (35× in the 2h before this deploy) — the new order-control tick now logs alongside them. It degrades correctly (`skipping account`), but dev's account registration is worth fixing so real failures aren't buried. |
 | contract | `v3` | — | unchanged by v24/v25 (`open` is optional) |
 
 ### staging
@@ -60,9 +60,9 @@ cut a fresh `staging` from `main` carrying the week's accumulated changes.
 | part | version | deployed (Brisbane) | notes |
 |---|---|---|---|
 | pine | `v2.4` (study title `Candle Signals v24`) | — | pinned to the pre-`open` version; chart **unchanged** this deploy. v25 worker degrades gracefully when `open` is absent (rides baked geometry). `tv-arm-staging` bakes this study title. |
-| tv-arm | `0.1.0` | 2026-07-30 | installed as `tv-arm-staging` (staging URL + `Candle Signals v24` baked) |
-| trade-control | `0.2.0` | 2026-07-30 | installed as `trade-control-staging` (staging URL baked) |
-| backend | `staging` @ `bef262a` (`v122-1`) | 2026-07-30 | Merged `main` v119–v122: news pause pulls resting orders; shared hold refcount; failed-cancel classification; `HeldTradeRecord` rename. **DB migration `0005` applied** — table renamed in place, all 12 live plan states / 4 pauses / 3 order bodies survived the restart (hold table was empty, so nothing in flight to preserve). **Promotion-gate week restarts from this deploy.** Also registered the **`not-taken`** account (tradenation/demo) — it existed on dev and in the TN enc store but was missing from staging's `accounts` table, so `hs-cad-chf-92c281e5` failed broker acquisition on every cron tick. No restart needed (the cron looks accounts up live per tick). |
+| tv-arm | `0.1.0` | 2026-08-02 | installed as `tv-arm-staging` (staging URL + `Candle Signals v24` baked) |
+| trade-control | `0.2.0` | 2026-08-02 | installed as `trade-control-staging` (staging URL baked) |
+| backend | `staging` @ `5d71577` (`v123-4`) | 2026-08-02 | Merged `main` **v123 — `order_control`**: one home for stored/pending/live order state. A sub-floor entry is now **parked** and re-checked every candle instead of discarded (worker registers `order-control re-check every 900s`); the spread floor became a forward-looking **max** over measured + this-hour + next-hour; a resting order's stop and stake move **together** via cancel-and-replace; a closed market **holds** a resting order (`HoldReason::MarketHours`) rather than deleting it and its `EntryAttempt` row. Also fixed a restore that destroyed parked orders by clearing the whole shared `HeldTradeRecord`. **No DB migration** — new state rides existing `jsonb` bodies (`EntryAttempt.order_control`, `StoredOrder.{tp_distance,min_r}`). Plan states / preps / vetos survived the restart; new PID clean, no errors or panics. ⚠️ **Two gaps carried into this deploy:** slice 7 (retire `is_spread_hour` from order control) is **not** done, and **no fixture demonstrates a promotion end to end** — the parked-order promote is untested at fixture level. **Promotion-gate week restarts from this deploy.** |
 | contract | `v3` | — | unchanged by v23 (recording is observe-only) |
 
 ### prod
