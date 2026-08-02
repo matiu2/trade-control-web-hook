@@ -1077,6 +1077,67 @@ Two consumers honour it identically, sharing one pure helper in
 > intended amend is still logged prominently first. Both the break-even cron and
 > the blackout widen are **cleared for live** on the amend path.
 
+## Order control — stored / pending / live
+
+Break-even above is one stop move on a **filled** position. `order_control` is the
+general answer to *"what should this order's stop be right now?"*, and it applies at
+three different stages of an order's life. Which stage an order is in decides what may
+be done to it:
+
+| state | where it lives | at risk? | what order control does |
+|---|---|---|---|
+| **Stored** | our DB only, never sent to the broker | no | re-check every candle; **promote** when it clears its R-floor |
+| **Pending** | resting at the broker, not yet triggered | no | adjust stop **and stake together**; **demote** if it drops sub-1R |
+| **Live** | filled; it is a position | **yes** | widen / break-even, gated on profit |
+
+### A starved entry is parked, not discarded
+
+An entry whose R falls below its floor used to be thrown away — a setup starved by a
+transient spread was gone even if the spread calmed two bars later. It is now
+**stored**: kept in our DB, never sent to the broker, and re-checked every candle. If
+it clears its floor it is **promoted** into a real order through the normal entry
+path. If it doesn't, it is dropped 3 bars before expiry.
+
+You'll see this in a replay as an entry decline that later turns into a placement,
+and in the worker logs as `order-control promote[<trade_id>]`.
+
+### The spread floor is a forward-looking max
+
+The stop floor is the **maximum** of three spreads, not just the one measured now:
+
+1. the measured last-candle spread,
+2. the baked forecast for **this** hour,
+3. the baked forecast for the **next** hour.
+
+Including the next hour matters because a stop placed at 06:55 has to survive the
+07:00 spread, not the 06:55 one. This replaced two rival implementations that had
+drifted apart — one working in price units off a windowed mean, the other in pips off
+the hour mask — with different constants and different sampling.
+
+### A resting order's stake moves with its stop
+
+Changing a resting order's stop without re-sizing it silently changes your risk. So
+`PendingAction::Adjust` carries the new stop distance **and** the new stake together —
+a stop change without a matching re-size can't be expressed. This is done by
+**cancel-and-replace** rather than amend-in-place, which keeps risk exactly 1% at the
+cost of a brief unguarded gap.
+
+Two rules invert relative to the Live state, because a resting order has nothing at
+risk yet: **shrinking needs no profit gate**, and **re-sizing is mandatory** (there's
+no partial close to pay for it).
+
+### A closed market holds an order; it doesn't delete it
+
+Market hours are a `HoldReason` alongside `SpreadHour` and `NewsPause`, so a closed
+market pulls the resting order off the broker and puts it back when the market
+reopens. Reasons are a **refcount of named holders**, so they overlap and lift
+independently — a spread hour ending while a news pause is still armed keeps the
+order pulled, and only the release that empties the set puts it back. It does
+**not** delete the order, which is what the old sweep did.
+
+`CancelAndClose` is unaffected: that's a signed operator opt-in that flattens a
+**filled position**, and holds never touch positions.
+
 ## Using `expiry_bars`
 
 `expiry_bars` cancels a resting **entry** order if it hasn't filled
