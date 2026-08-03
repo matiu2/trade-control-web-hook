@@ -600,6 +600,32 @@ fn render_fire(
                     fmt_price(signed.stop_loss, plan.pip_size),
                 ));
             }
+            // Name the spread that produced that floor. "Floored to 10× spread"
+            // says the multiple but not the input, so a 49-pip stop over a 40-pip
+            // drawn one looked arbitrary — this answers "10× WHICH spread?".
+            // The measured reading is the fire bar's close spread, which is what
+            // `apply_entry_spread_floor` sizes off when the caller supplies no
+            // trailing window (`entry_spread_price`).
+            // `fire.forward.first()` is the fire bar — the SAME bar
+            // `apply_entry_spread_floor` reads via `candles.first()`, so the
+            // number shown is the number the floor used, not a re-derivation
+            // that could drift from it.
+            if let Some(line) = fire
+                .forward
+                .first()
+                .map(|bar| {
+                    super::spread_breakdown::Breakdown::for_entry(
+                        &intent.instrument,
+                        bar.close_spread() / plan.pip_size,
+                        resolved.entry.reference_price(),
+                        plan.pip_size,
+                        candle.time,
+                    )
+                })
+                .and_then(|b| b.render())
+            {
+                note.push_str(&format!("\n      {line}"));
+            }
             note
         }
         None => format!("{ev} placed — order UNRESOLVED"),

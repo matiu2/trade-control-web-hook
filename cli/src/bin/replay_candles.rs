@@ -56,6 +56,7 @@ mod replay_candles {
     pub mod replay_broker;
     pub mod report;
     pub mod sentiment;
+    pub mod spread_breakdown;
     pub mod tv;
     pub mod verbose;
 }
