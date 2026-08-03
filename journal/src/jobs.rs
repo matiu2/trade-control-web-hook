@@ -58,8 +58,10 @@ pub enum JobOutcome {
     },
     /// The replay report text.
     Replay(String),
-    /// TradingView annotate finished (no payload — the draw is a side effect).
-    LoadTv,
+    /// TradingView chart is on this plan. `already_there` is true when the chart
+    /// was **already** on the right symbol+timeframe and nothing was changed —
+    /// worth telling the operator, since it means their scroll position survived.
+    LoadTv { already_there: bool },
     /// The fixture-capture report text (tv-arm's per-cell summary).
     SaveFixture(String),
     /// The job failed; the string is the error to surface in the footer.
@@ -123,6 +125,10 @@ pub fn spawn_save_fixture(
 /// for this plan. The operator scrolls/zooms to the setup manually; no
 /// scroll-to-anchor, no range, no drawing. `instrument`/`granularity` come from
 /// the plan row; `broker` from the fetched detail (drives the exchange prefix).
+///
+/// Cheap when the chart is already right: `load_chart` reads the chart first and
+/// no-ops if it matches (see `tv`'s module doc), so this stays a background job
+/// mainly for the miss case.
 pub fn spawn_load_tv(
     tx: Sender<JobResult>,
     trade_id: String,
@@ -131,8 +137,8 @@ pub fn spawn_load_tv(
     granularity: String,
 ) {
     spawn(tx, trade_id, JobKind::LoadTv, move || {
-        crate::tv::load_chart(&instrument, &broker, &granularity)?;
-        Ok(JobOutcome::LoadTv)
+        let already_there = crate::tv::load_chart(&instrument, &broker, &granularity)?;
+        Ok(JobOutcome::LoadTv { already_there })
     });
 }
 

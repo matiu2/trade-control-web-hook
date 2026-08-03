@@ -47,6 +47,21 @@ popup, and `←`-unwind all work. 13 tests (incl. 2 TestBackend render tests).
     clamped/loosened by TV (a plan armed a few days ago with data through *now*
     shows a wider span). Historical/archived plans (the journalling norm) centre
     cleanly. Not worth tightening unless it annoys.
+  - **Already-there short-circuit (2026-08-04)**: `load_chart` now READS the
+    chart first (`tv state`) and returns early if the symbol + resolution already
+    match, so `l` / replay / `s` are idempotent. Measured live: an already-there
+    hit is **~75-150ms vs ~13s** for a real load (node spawns + TV settling
+    dominate, not the 1s sleep). The bigger win is that setting the symbol
+    **resets the operator's scroll position** — re-loading a correct chart threw
+    away exactly what they'd navigated to. `tv state` returns the symbol
+    fully-qualified (`TRADENATION:EURCAD`) and the resolution in TV form (`240`),
+    i.e. the same forms `tv_symbol`/`tv_resolution` emit, so it's plain string
+    equality with no second mapping to drift. **Any doubt → load**: `success:
+    false`, a missing field, unparseable JSON or a spawn failure all fall through,
+    because a needless load is slow-but-recoverable while a wrong skip strands
+    tv-arm on the wrong chart (a wrong answer). `JobOutcome::LoadTv` carries
+    `already_there` so the footer says which happened. 9 tv tests (13 total),
+    mutation-checked three ways.
 
 **Remaining / v2:**
 - **Deploy** — installed manually (bake + copy); `deploy-staging.sh` now lists

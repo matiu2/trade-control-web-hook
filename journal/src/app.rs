@@ -493,9 +493,15 @@ impl App {
                 self.data.entry(trade_id.clone()).or_default().replay_report = Some(report);
                 self.status = Status::info(format!("{trade_id}: replay done"));
             }
-            JobOutcome::LoadTv => {
+            JobOutcome::LoadTv { already_there } => {
                 self.data.entry(trade_id.clone()).or_default().tv_loaded = true;
-                self.status = Status::info(format!("{trade_id}: loaded in TradingView"));
+                // Distinguish the two, so the operator knows whether their
+                // scroll position was preserved (already-there) or reset (load).
+                self.status = Status::info(if already_there {
+                    format!("{trade_id}: already on this chart")
+                } else {
+                    format!("{trade_id}: loaded in TradingView")
+                });
                 // Replay re-arms from the now-loaded chart. If we're waiting on
                 // Replay/Compare for this plan, kick it now that the chart is up.
                 let is_open = self
