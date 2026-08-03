@@ -425,12 +425,24 @@ async fn hold_reasons<S: StateStore>(
     now: DateTime<Utc>,
 ) -> Holders {
     let mut holders = Holders::new();
-    // SpreadHour — the pure baked clock, incl. the 30-min lead + NY-close
-    // fallback. NO live quote (the ON/OFF asymmetry: the quote only ever
-    // *releases* this reason early, in `spread_hour_released`).
-    if is_spread_hour(instrument, now) {
-        holders.hold(HoldReason::SpreadHour);
-    }
+    // NOTE: `SpreadHour` is deliberately NOT derived here any more (slice 7,
+    // SCOPING-order-control.md §4c). It was a baked-CLOCK proxy for "the spread
+    // is bad right now", and order control has since gained a direct measurement
+    // of the actual thing: the forward-looking SL floor sizes every stop against
+    // `max(last bar, forecast this hour, forecast next hour)`, and the synthetic
+    // pre-check PARKS a trade that wouldn't clear min-R at the coming hour's
+    // spread. The proxy held a calm 21:00Z bar for nothing and let a blown
+    // 09:00Z spread sail through; the measurement does neither.
+    //
+    // The 30-minute lead is recovered structurally rather than lost: the
+    // next-hour term in that `max` covers an order resting at 20:55 that fills
+    // at 21:05. Protection is now continuous (every hour carries an expected
+    // spread) instead of a step function around flagged hours only, and it is
+    // per-trade rather than per-instrument-hour.
+    //
+    // The variant itself survives for decoding pre-slice-7 rows — see
+    // `release_satisfied`, which still releases it.
+    //
     // NewsPause — a standoff armed for THIS trade.
     if pause_active(store, trade_id).await {
         holders.hold(HoldReason::NewsPause);
@@ -1011,6 +1023,15 @@ async fn release_satisfied<B: Broker, S: StateStore>(
 ///
 /// Only reachable during the deploy window (holder rows are TTL'd, minutes to
 /// hours), but the failure mode it prevents is placing live orders into a blackout.
+///
+/// **Still correct after slice 7**, though the reasoning changed. `hold_reasons`
+/// no longer *derives* `SpreadHour`, so nothing re-applies it — but
+/// [`release_satisfied`] still *releases* it, via [`spread_hour_released`]. A
+/// healed legacy row therefore drains at the baked hour's end (or earlier, on a
+/// live-quote recovery) and its order is restored exactly once, instead of being
+/// stranded held forever. Keeping the heal is the conservative direction across
+/// the deploy boundary: at worst a legacy order waits out the hour it was
+/// already waiting out.
 fn effective_holders(record: &HeldTradeRecord) -> Holders {
     if record.applied && record.holders.is_empty() {
         let mut healed = Holders::new();
@@ -1877,6 +1898,10 @@ mod tests {
 
         let now = ts("2026-07-08T21:00:00Z"); // AUD/CHF baked spread hour
         store.set_clock(now);
+        // Slice 7 retired the spread-hour ON trigger; a news pause is now the
+        // cancel driver. This test is about CANCEL MECHANICS, not about which
+        // reason drove it, so any live HoldReason serves.
+        run(pause_trade(&store, now));
         let report = run(pending_order_lifecycle(
             &broker,
             &store,
@@ -1906,20 +1931,24 @@ mod tests {
         });
     }
 
-    /// PR-2 TRIGGER DELTA (characterisation): the ON-side cancel now fires on the
-    /// pure baked clock (`is_spread_hour`) and DOES NOT read the live quote. The
-    /// old live-cron cancel sampled `get_quote` and cancelled only when
-    /// `spread_pips > elevated_threshold` (~5× the instrument's median, e.g.
-    /// ~4.5p for AUD/CHF). This test pins the NEW behaviour: inside a baked spread
-    /// hour the order is cancelled EVEN WITH A NARROW live spread (2p, well under
-    /// the old ~4.5p threshold) — proving the quote no longer gates the cancel.
-    /// Replaces the deleted `current_cancel_trigger_uses_5x_median_threshold_for_aud_chf`.
+    /// **Slice 7: a spread hour NO LONGER cancels a resting order.**
+    ///
+    /// This is the inverse of the test it replaces
+    /// (`cancel_trigger_is_baked_clock_not_live_quote`), which asserted the baked
+    /// clock drove the cancel. `hold_reasons` no longer derives
+    /// `HoldReason::SpreadHour`: the clock was a *proxy* for "the spread is bad",
+    /// and order control now measures the thing itself via the forward-looking SL
+    /// floor and the synthetic min-R pre-check (SCOPING-order-control.md §4c).
+    ///
+    /// The bar here is a genuine AUD/CHF baked spread hour with **no pause armed**,
+    /// so if anything still cancels, the proxy has been reintroduced.
     #[test]
-    fn cancel_trigger_is_baked_clock_not_live_quote() {
+    fn a_spread_hour_alone_no_longer_cancels_a_resting_order() {
         let broker = MockBroker::with_pending(pending("t-enter-o1", "AUD/CHF"));
-        // A NARROW live spread (2p) — the old 5×-median live-quote gate (~4.5p)
-        // would have left this order resting. The baked clock ignores it.
-        broker.set_quote(0.5600, 0.5602);
+        // A WIDE live spread too — proving neither the clock nor the quote
+        // cancels: order control's answer to a bad spread is to size and park,
+        // not to pull a resting order.
+        broker.set_quote(0.5600, 0.5650);
         let store = MemStateStore::new();
         let mut armed = std::collections::HashMap::new();
         armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
@@ -1927,6 +1956,12 @@ mod tests {
 
         let now = ts("2026-07-08T21:00:00Z"); // AUD/CHF baked spread hour
         store.set_clock(now);
+        // Precondition: this really IS a baked spread hour, or the test is vacuous.
+        assert!(
+            crate::spread_blackout::is_spread_hour("AUD/CHF", now),
+            "precondition: 21:00Z must be an AUD/CHF spread hour",
+        );
+
         let report = run(pending_order_lifecycle(
             &broker,
             &store,
@@ -1936,10 +1971,10 @@ mod tests {
             now,
             ClearPolicy::ClearRecord,
         ));
-        assert_eq!(
+        assert!(
+            report.cancelled.is_empty(),
+            "a spread hour must no longer pull a resting order (slice 7), got {:?}",
             report.cancelled,
-            vec!["t-enter-o1".to_string()],
-            "baked-clock ON trigger cancels in a spread hour regardless of a narrow live spread"
         );
     }
 
@@ -2588,8 +2623,12 @@ mod tests {
         let mut armed = std::collections::HashMap::new();
         armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
         let source = ArmedSource { armed };
-        let now = ts("2026-07-08T21:00:00Z"); // AUD/CHF baked spread hour
+        let now = ts("2026-07-08T21:00:00Z");
         store.set_clock(now);
+        // Slice 7 retired the spread-hour ON trigger, so a news pause is what
+        // drives the cancel now. These tests are about how a FAILED cancel is
+        // classified, not about which reason asked for it.
+        run(pause_trade(&store, now));
         let report = run(pending_order_lifecycle(
             &broker,
             &store,
@@ -2719,6 +2758,10 @@ mod tests {
         let source = ArmedSource { armed };
         let now = ts("2026-07-08T21:00:00Z");
         store.set_clock(now);
+        // Slice 7 retired the spread-hour ON trigger; a news pause is now the
+        // cancel driver. This test is about CANCEL MECHANICS, not about which
+        // reason drove it, so any live HoldReason serves.
+        run(pause_trade(&store, now));
         let report = run(pending_order_lifecycle(
             &broker,
             &store,
