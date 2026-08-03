@@ -1,5 +1,51 @@
 # Changelog
 
+## v127 — 2026-08-03 — slice 7: the spread-hour proxy leaves order control
+
+**Why.** `hold_reasons` derived `HoldReason::SpreadHour` from the baked clock — a
+*proxy* for "the spread is bad right now". Order control now measures the actual
+thing: the SL floor sizes every stop against `max(last bar, forecast this hour,
+forecast next hour)`, and the synthetic pre-check **parks** a trade that wouldn't
+clear min-R at the coming hour's spread. The proxy held a calm 21:00Z bar for
+nothing and let a blown 09:00Z spread sail through.
+
+**The 30-minute lead is recovered, not lost.** The next-hour term in that `max`
+covers an order resting at 20:55 that fills at 21:05, so protection becomes
+*continuous* — every hour carries an expected spread — instead of a step function
+around flagged hours only, and it applies per-trade rather than
+per-instrument-hour. This is why slice 7 was ordered after slices 2 and 3.
+
+**Kept: `suppress_on_spread_hour` in the engine (5 sites).** A different question
+at a different stage — "this bar's OHLC is untrustworthy **as a signal**", so a
+break-and-close or retest read off it is a lie. The min-R filter runs *after* a
+signal has fired and cannot replace it.
+
+**The variant survives** for decoding pre-slice-7 rows. `release_satisfied` still
+releases it, so a healed legacy row drains at the baked hour's end and restores
+its order exactly once instead of being stranded held forever.
+
+**Corpus: 0 of 39 fixtures changed, net R 15.62 unchanged — and this time that is
+a finding, not a blind spot.** Two separate null results this week turned out to
+be harnesses that could not see the variable under test, so sensitivity was
+verified first: forcing `hold_reasons` to hold ALWAYS moves **10 fixtures** and
+drops net R to **8.72**. The harness sees this subsystem.
+
+Independently supporting the low risk: `core/examples/mask_vs_ny_close` found
+**155 of 160** instruments agree with the old NY-close rule at every hour of the
+year, and none of the 5 that disagree are in the corpus.
+
+**Also in this release** — the full spread-table re-bake completed (125 OANDA rows,
+16/16 batches, after 35 TN rows in v126). Forecast values drifted on 119/125 rows
+from a fresher 90d window, but **masks changed on 0/125**: spread-hour detection is
+bit-identical, so the med3 + peak-frac gates are stable across a two-month shift in
+the sample window.
+
+**Tests.** core 1057, cron 25, tv-arm 389. Seven `pending_lifecycle` tests used a
+spread hour merely as a vehicle to trigger a cancel and now arm a news pause
+instead. One test asserted the *opposite* of the new behaviour and was replaced by
+its inverse, with a precondition assert so it cannot pass vacuously.
+Mutation-verified: reintroducing the hold turns it red.
+
 ## v126 — 2026-08-02 — the TradeNation spread forecast was all zeros; reject uncovered instruments at arm time
 
 **Why.** The baked forecast for OANDA `AUD_NZD` reads ~2.5p at ordinary hours,
