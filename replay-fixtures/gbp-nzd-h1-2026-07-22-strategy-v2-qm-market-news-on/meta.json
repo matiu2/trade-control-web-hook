@@ -1,0 +1,17 @@
+{
+  "instrument": "GBP_NZD",
+  "granularity": "h1",
+  "source": "oanda",
+  "start": "2026-07-22T20:00:00Z",
+  "end": "2026-07-27T22:00:00Z",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "skip_reversals": false,
+    "candle_source": "oanda",
+    "chart_symbol": "OANDA:GBPNZD",
+    "tv_arm_version": "v127-4-g2d87736",
+    "engine_version": "v127-3-g1c95727"
+  }
+}

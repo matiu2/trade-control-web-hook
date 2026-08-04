@@ -1,5 +1,5 @@
 {
-  "trade_id": "ihs-eur-usd-3542cd22",
+  "trade_id": "ihs-eur-usd-4ff8c358",
   "instrument": "EUR_USD",
   "direction": "long",
   "granularity": "h1",
@@ -16,16 +16,16 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-usd-3542cd22-too-low",
+        "id": "ihs-eur-usd-4ff8c358-too-low",
         "not_after": "2026-07-24T13:30:00Z",
         "action": "veto",
         "instrument": "EUR_USD",
         "broker": "oanda",
         "account": "m-and-w",
         "name": "too-low",
-        "ttl_hours": 1,
+        "ttl_hours": 42,
         "level": "close-positions",
-        "trade_id": "ihs-eur-usd-3542cd22"
+        "trade_id": "ihs-eur-usd-4ff8c358"
       },
       "kind": "setup_invalidation"
     },
@@ -40,16 +40,16 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-usd-3542cd22-too-high",
+        "id": "ihs-eur-usd-4ff8c358-too-high",
         "not_after": "2026-07-24T13:30:00Z",
         "action": "veto",
         "instrument": "EUR_USD",
         "broker": "oanda",
         "account": "m-and-w",
         "name": "too-high",
-        "ttl_hours": 1,
+        "ttl_hours": 42,
         "level": "stop-next-entry",
-        "trade_id": "ihs-eur-usd-3542cd22"
+        "trade_id": "ihs-eur-usd-4ff8c358"
       },
       "kind": "setup_invalidation"
     },
@@ -62,7 +62,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-usd-3542cd22-trade-expiry",
+        "id": "ihs-eur-usd-4ff8c358-trade-expiry",
         "not_before": "2026-07-24T13:00:00Z",
         "not_after": "2026-07-24T13:30:00Z",
         "action": "veto",
@@ -70,9 +70,9 @@
         "broker": "oanda",
         "account": "m-and-w",
         "name": "trade-expiry",
-        "ttl_hours": 1,
+        "ttl_hours": 42,
         "level": "close-positions",
-        "trade_id": "ihs-eur-usd-3542cd22"
+        "trade_id": "ihs-eur-usd-4ff8c358"
       },
       "kind": "setup_invalidation"
     },
@@ -96,7 +96,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-usd-3542cd22-break-and-close",
+        "id": "ihs-eur-usd-4ff8c358-break-and-close",
         "not_after": "2026-07-24T13:00:00Z",
         "action": "prep",
         "instrument": "EUR_USD",
@@ -107,7 +107,7 @@
         "clears": [
           "retest"
         ],
-        "trade_id": "ihs-eur-usd-3542cd22"
+        "trade_id": "ihs-eur-usd-4ff8c358"
       },
       "kind": "prep_break_and_close"
     },
@@ -131,7 +131,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-usd-3542cd22-retest",
+        "id": "ihs-eur-usd-4ff8c358-retest",
         "not_after": "2026-07-24T13:00:00Z",
         "action": "prep",
         "instrument": "EUR_USD",
@@ -139,7 +139,7 @@
         "account": "m-and-w",
         "step": "retest",
         "ttl_hours": 876000,
-        "trade_id": "ihs-eur-usd-3542cd22"
+        "trade_id": "ihs-eur-usd-4ff8c358"
       },
       "kind": "prep_retest"
     },
@@ -152,8 +152,8 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-usd-3542cd22-enter",
-        "not_after": "2026-07-25T10:25:23.968905008Z",
+        "id": "ihs-eur-usd-4ff8c358-enter",
+        "not_after": "2026-07-24T04:48:00Z",
         "action": "enter",
         "instrument": "EUR_USD",
         "direction": "long",
@@ -197,7 +197,7 @@
         "breakeven": {
           "threshold": 0.5
         },
-        "trade_id": "ihs-eur-usd-3542cd22",
+        "trade_id": "ihs-eur-usd-4ff8c358",
         "max_retries": 5,
         "needs_golden": true,
         "pip_size": 0.0001,
@@ -214,13 +214,13 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-usd-3542cd22-close-on-sr-reversal",
+        "id": "ihs-eur-usd-4ff8c358-close-on-sr-reversal",
         "not_after": "2026-07-24T13:00:00Z",
         "action": "close",
         "instrument": "EUR_USD",
         "broker": "oanda",
         "account": "m-and-w",
-        "trade_id": "ihs-eur-usd-3542cd22",
+        "trade_id": "ihs-eur-usd-4ff8c358",
         "needs_golden": true,
         "inside_window": [
           "price"
@@ -252,13 +252,13 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-usd-3542cd22-close-on-reversal",
+        "id": "ihs-eur-usd-4ff8c358-close-on-reversal",
         "not_after": "2026-07-24T13:00:00Z",
         "action": "close",
         "instrument": "EUR_USD",
         "broker": "oanda",
         "account": "m-and-w",
-        "trade_id": "ihs-eur-usd-3542cd22",
+        "trade_id": "ihs-eur-usd-4ff8c358",
         "needs_golden": true,
         "inside_window": [
           "news"
@@ -276,13 +276,13 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-usd-3542cd22-pause-1784780100-1784810700",
+        "id": "ihs-eur-usd-4ff8c358-pause-1784780100-1784810700",
         "not_after": "2026-07-23T12:45:00Z",
         "action": "pause",
         "instrument": "EUR_USD",
         "broker": "oanda",
         "account": "m-and-w",
-        "trade_id": "ihs-eur-usd-3542cd22",
+        "trade_id": "ihs-eur-usd-4ff8c358",
         "blackout_id": "1784780100-1784810700",
         "reason": "news:EUR_USD-2026-07-23T04:15:00+00:00"
       },
@@ -297,13 +297,13 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-usd-3542cd22-resume-1784780100-1784810700",
+        "id": "ihs-eur-usd-4ff8c358-resume-1784780100-1784810700",
         "not_after": "2026-07-23T13:15:00Z",
         "action": "resume",
         "instrument": "EUR_USD",
         "broker": "oanda",
         "account": "m-and-w",
-        "trade_id": "ihs-eur-usd-3542cd22",
+        "trade_id": "ihs-eur-usd-4ff8c358",
         "blackout_id": "1784780100-1784810700",
         "reason": "news:EUR_USD-2026-07-23T04:15:00+00:00"
       },
@@ -318,13 +318,13 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-usd-3542cd22-news-start-1784810700-1784814300",
+        "id": "ihs-eur-usd-4ff8c358-news-start-1784810700-1784814300",
         "not_after": "2026-07-23T13:45:00Z",
         "action": "news-start",
         "instrument": "EUR_USD",
         "broker": "oanda",
         "account": "m-and-w",
-        "trade_id": "ihs-eur-usd-3542cd22",
+        "trade_id": "ihs-eur-usd-4ff8c358",
         "news_id": "1784810700-1784814300",
         "reason": "news:EUR_USD-2026-07-23T12:45:00+00:00"
       },
@@ -339,13 +339,13 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-usd-3542cd22-news-end-1784810700-1784814300",
+        "id": "ihs-eur-usd-4ff8c358-news-end-1784810700-1784814300",
         "not_after": "2026-07-23T14:15:00Z",
         "action": "news-end",
         "instrument": "EUR_USD",
         "broker": "oanda",
         "account": "m-and-w",
-        "trade_id": "ihs-eur-usd-3542cd22",
+        "trade_id": "ihs-eur-usd-4ff8c358",
         "news_id": "1784810700-1784814300",
         "reason": "news:EUR_USD-2026-07-23T12:45:00+00:00"
       },

@@ -1,5 +1,5 @@
 {
-  "trade_id": "ihs-gbp-nzd-4dce9ec2",
+  "trade_id": "ihs-gbp-nzd-09b6fd58",
   "instrument": "GBP_NZD",
   "direction": "long",
   "granularity": "h1",
@@ -16,16 +16,16 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-gbp-nzd-4dce9ec2-too-low",
+        "id": "ihs-gbp-nzd-09b6fd58-too-low",
         "not_after": "2026-07-27T22:30:00Z",
         "action": "veto",
         "instrument": "GBP_NZD",
         "broker": "oanda",
         "account": "m-and-w",
         "name": "too-low",
-        "ttl_hours": 1,
+        "ttl_hours": 123,
         "level": "close-positions",
-        "trade_id": "ihs-gbp-nzd-4dce9ec2"
+        "trade_id": "ihs-gbp-nzd-09b6fd58"
       },
       "kind": "setup_invalidation"
     },
@@ -40,16 +40,16 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-gbp-nzd-4dce9ec2-too-high",
+        "id": "ihs-gbp-nzd-09b6fd58-too-high",
         "not_after": "2026-07-27T22:30:00Z",
         "action": "veto",
         "instrument": "GBP_NZD",
         "broker": "oanda",
         "account": "m-and-w",
         "name": "too-high",
-        "ttl_hours": 1,
+        "ttl_hours": 123,
         "level": "stop-next-entry",
-        "trade_id": "ihs-gbp-nzd-4dce9ec2"
+        "trade_id": "ihs-gbp-nzd-09b6fd58"
       },
       "kind": "setup_invalidation"
     },
@@ -62,7 +62,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-gbp-nzd-4dce9ec2-trade-expiry",
+        "id": "ihs-gbp-nzd-09b6fd58-trade-expiry",
         "not_before": "2026-07-27T22:00:00Z",
         "not_after": "2026-07-27T22:30:00Z",
         "action": "veto",
@@ -70,9 +70,9 @@
         "broker": "oanda",
         "account": "m-and-w",
         "name": "trade-expiry",
-        "ttl_hours": 1,
+        "ttl_hours": 123,
         "level": "close-positions",
-        "trade_id": "ihs-gbp-nzd-4dce9ec2"
+        "trade_id": "ihs-gbp-nzd-09b6fd58"
       },
       "kind": "setup_invalidation"
     },
@@ -85,8 +85,8 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-gbp-nzd-4dce9ec2-enter",
-        "not_after": "2026-07-28T06:55:23.567766125Z",
+        "id": "ihs-gbp-nzd-09b6fd58-enter",
+        "not_after": "2026-07-26T21:36:00Z",
         "action": "enter",
         "instrument": "GBP_NZD",
         "direction": "long",
@@ -126,7 +126,7 @@
         "breakeven": {
           "threshold": 0.5
         },
-        "trade_id": "ihs-gbp-nzd-4dce9ec2",
+        "trade_id": "ihs-gbp-nzd-09b6fd58",
         "max_retries": 5,
         "needs_golden": true,
         "pip_size": 0.0001,
@@ -143,13 +143,13 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-gbp-nzd-4dce9ec2-close-on-sr-reversal",
+        "id": "ihs-gbp-nzd-09b6fd58-close-on-sr-reversal",
         "not_after": "2026-07-27T22:00:00Z",
         "action": "close",
         "instrument": "GBP_NZD",
         "broker": "oanda",
         "account": "m-and-w",
-        "trade_id": "ihs-gbp-nzd-4dce9ec2",
+        "trade_id": "ihs-gbp-nzd-09b6fd58",
         "needs_golden": true,
         "inside_window": [
           "price"

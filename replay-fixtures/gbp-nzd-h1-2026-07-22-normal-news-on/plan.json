@@ -1,5 +1,5 @@
 {
-  "trade_id": "ihs-gbp-nzd-93aac3e7",
+  "trade_id": "ihs-gbp-nzd-61d1aff2",
   "instrument": "GBP_NZD",
   "direction": "long",
   "granularity": "h1",
@@ -16,16 +16,16 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-gbp-nzd-93aac3e7-too-low",
+        "id": "ihs-gbp-nzd-61d1aff2-too-low",
         "not_after": "2026-07-27T22:30:00Z",
         "action": "veto",
         "instrument": "GBP_NZD",
         "broker": "oanda",
         "account": "m-and-w",
         "name": "too-low",
-        "ttl_hours": 1,
+        "ttl_hours": 123,
         "level": "close-positions",
-        "trade_id": "ihs-gbp-nzd-93aac3e7"
+        "trade_id": "ihs-gbp-nzd-61d1aff2"
       },
       "kind": "setup_invalidation"
     },
@@ -40,16 +40,16 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-gbp-nzd-93aac3e7-too-high",
+        "id": "ihs-gbp-nzd-61d1aff2-too-high",
         "not_after": "2026-07-27T22:30:00Z",
         "action": "veto",
         "instrument": "GBP_NZD",
         "broker": "oanda",
         "account": "m-and-w",
         "name": "too-high",
-        "ttl_hours": 1,
+        "ttl_hours": 123,
         "level": "stop-next-entry",
-        "trade_id": "ihs-gbp-nzd-93aac3e7"
+        "trade_id": "ihs-gbp-nzd-61d1aff2"
       },
       "kind": "setup_invalidation"
     },
@@ -62,7 +62,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-gbp-nzd-93aac3e7-trade-expiry",
+        "id": "ihs-gbp-nzd-61d1aff2-trade-expiry",
         "not_before": "2026-07-27T22:00:00Z",
         "not_after": "2026-07-27T22:30:00Z",
         "action": "veto",
@@ -70,9 +70,9 @@
         "broker": "oanda",
         "account": "m-and-w",
         "name": "trade-expiry",
-        "ttl_hours": 1,
+        "ttl_hours": 123,
         "level": "close-positions",
-        "trade_id": "ihs-gbp-nzd-93aac3e7"
+        "trade_id": "ihs-gbp-nzd-61d1aff2"
       },
       "kind": "setup_invalidation"
     },
@@ -96,7 +96,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-gbp-nzd-93aac3e7-break-and-close",
+        "id": "ihs-gbp-nzd-61d1aff2-break-and-close",
         "not_after": "2026-07-27T22:00:00Z",
         "action": "prep",
         "instrument": "GBP_NZD",
@@ -107,7 +107,7 @@
         "clears": [
           "retest"
         ],
-        "trade_id": "ihs-gbp-nzd-93aac3e7"
+        "trade_id": "ihs-gbp-nzd-61d1aff2"
       },
       "kind": "prep_break_and_close"
     },
@@ -131,7 +131,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-gbp-nzd-93aac3e7-retest",
+        "id": "ihs-gbp-nzd-61d1aff2-retest",
         "not_after": "2026-07-27T22:00:00Z",
         "action": "prep",
         "instrument": "GBP_NZD",
@@ -139,7 +139,7 @@
         "account": "m-and-w",
         "step": "retest",
         "ttl_hours": 876000,
-        "trade_id": "ihs-gbp-nzd-93aac3e7"
+        "trade_id": "ihs-gbp-nzd-61d1aff2"
       },
       "kind": "prep_retest"
     },
@@ -152,8 +152,8 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-gbp-nzd-93aac3e7-enter",
-        "not_after": "2026-07-28T06:55:18.731071696Z",
+        "id": "ihs-gbp-nzd-61d1aff2-enter",
+        "not_after": "2026-07-26T21:36:00Z",
         "action": "enter",
         "instrument": "GBP_NZD",
         "direction": "long",
@@ -197,7 +197,7 @@
         "breakeven": {
           "threshold": 0.5
         },
-        "trade_id": "ihs-gbp-nzd-93aac3e7",
+        "trade_id": "ihs-gbp-nzd-61d1aff2",
         "max_retries": 5,
         "needs_golden": true,
         "pip_size": 0.0001,
@@ -214,13 +214,13 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-gbp-nzd-93aac3e7-close-on-sr-reversal",
+        "id": "ihs-gbp-nzd-61d1aff2-close-on-sr-reversal",
         "not_after": "2026-07-27T22:00:00Z",
         "action": "close",
         "instrument": "GBP_NZD",
         "broker": "oanda",
         "account": "m-and-w",
-        "trade_id": "ihs-gbp-nzd-93aac3e7",
+        "trade_id": "ihs-gbp-nzd-61d1aff2",
         "needs_golden": true,
         "inside_window": [
           "price"
