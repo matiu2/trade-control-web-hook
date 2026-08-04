@@ -1,4 +1,36 @@
-# TODO: lazy two-pass sub-bar zoom (ACTIVE)
+# TODO: fixture sub-bar storage (step 2) — DONE
+
+`--save` now freezes `sub_bars.json`: exactly the finer candles the zoom
+consulted, and nothing more. No ambiguous bar ⇒ no file (byte-identical to a
+pre-feature fixture). A fixture whose verdict needed a zoom now reproduces it
+offline instead of degrading to the pessimistic stop.
+
+Stale fixtures **refetch** rather than degrade: `lazy_zoom::FixtureSubBars`
+reports a window outside the saved extent as a miss, and `run_frozen` refetches
+just that window. Verified: deleting `sub_bars.json` refetched 2 windows / 103
+bars and reproduced the identical −2.00R verdict.
+
+Coverage is judged by the saved candles' **extent**, not per-candle — an illiquid
+cross legitimately has minutes with no candle, and splitting the span at each one
+would refetch it forever. Known tradeoff (gap between two distant saved windows
+reads as covered) is pinned by a named test; it fails conservatively.
+
+The corpus unit test stays **fully offline** (serves saved sub-bars, never
+refetches) so `cargo test` needs no credentials; only `--test-mode` refetches.
+
+Sizing that drove this: whole-window M1 ≈ 416 MB for the corpus, "after the right
+shoulder" ≈ 111 MB, what the zoom can actually consume ≈ **1.1 MB**.
+
+- [x] `sub_bars.json` (optional, absent when empty; stale file removed on re-save)
+- [x] `FixtureSubBars` — serves saved bars, records uncovered windows
+- [x] `run_frozen` refetches misses; corpus test stays offline
+- [x] 271 tests green; 19/19 fixtures `--check`; clippy clean; fmt
+- [x] Mutation-checked (one mutation initially SURVIVED and exposed a weak test
+      + a real coverage bug — both fixed)
+
+---
+
+# TODO: lazy two-pass sub-bar zoom (step 1) — DONE, deployed to staging as v128
 
 ## Why
 

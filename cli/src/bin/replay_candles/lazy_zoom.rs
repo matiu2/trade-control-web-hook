@@ -43,23 +43,24 @@
 //! the sub-bars. A provider can only change what happens *after* the window is
 //! requested. `zoom_requests_are_invariant_to_the_provider` pins that down.
 //!
-//! # Fixtures do NOT store the finer bars — and must not start, naively
+//! # Fixtures store the sub-bars the zoom actually looked at
 //!
-//! `fixture::save` freezes the plan, the **coarse** candle window, meta, and the
-//! expected outcome. The finer series has never been persisted: a frozen fixture
-//! replays with NO zoom provider at all (`replay::run(.., None)`), so an
-//! ambiguous bar keeps the pessimistic stop, which is how its `expected.json`
-//! was computed. The eager pull used to fetch ~22k M1 bars during a `--save` run
-//! and then discard every one of them.
+//! `fixture::save` freezes the plan, the coarse candle window, meta, the expected
+//! outcome — and, when the run had an ambiguous bar, `sub_bars.json`: exactly the
+//! finer candles this module fetched. So a fixture whose verdict depended on a
+//! zoom reproduces that verdict offline instead of degrading to the pessimistic
+//! stop. A fixture with no ambiguous bar (the common case) writes no such file
+//! and is byte-identical to one saved before sub-bars existed.
 //!
-//! If sub-bar support is ever added to fixtures, do NOT freeze whatever this
-//! module happened to fetch. The recorded windows are a function of the CURRENT
-//! strategy, bracket and widen state — change any of them and different bars go
-//! ambiguous, so a saved narrow series would be missing exactly the bars the new
-//! run asks for, and the zoom would silently degrade to the pessimistic stop on
-//! a fixture that looks complete. A fixture that wants offline zoom needs the
-//! finer bars for the whole window (an explicit, deliberately larger artifact),
-//! not the lazy subset.
+//! Deliberately the *lazy subset*, not the whole finer window: M1 across every
+//! fixture's span would be ~416 MB for this corpus versus ~1 MB for the bars the
+//! zoom can actually consume.
+//!
+//! **The stored set is a function of the strategy that saved it.** Change the
+//! bracket, widen, or entry rule and a *different* bar can go ambiguous — one the
+//! fixture has no bars for. [`FixtureSubBars`] detects that (it reports windows
+//! outside the saved extent as misses) and the fixture path refetches them, so a
+//! stale fixture recovers instead of silently scoring those bars as stops.
 
 use chrono::{DateTime, Utc};
 use std::cell::RefCell;
@@ -155,6 +156,90 @@ impl SubBars for WindowSubBars {
             .filter(|c| c.time >= start && c.time < end)
             .cloned()
             .collect()
+    }
+}
+
+/// A [`SubBars`] provider over a fixture's SAVED finer candles, which also
+/// records any window it could not cover.
+///
+/// A frozen fixture stores only the windows the zoom asked for on the run that
+/// saved it. Change the strategy (bracket, widen, entry rule) and a *different*
+/// bar can go ambiguous — one the fixture has no bars for. Serving an empty slice
+/// there would silently degrade that bar to the pessimistic stop, on a fixture
+/// that looks complete.
+///
+/// So this distinguishes the two cases that both "look empty":
+///
+/// - the window is **covered** (it lies inside a stored window's span) and simply
+///   has no ticks ⇒ a legitimate empty answer, no miss recorded;
+/// - the window is **not covered** at all ⇒ recorded as a miss, so the caller can
+///   fetch it and re-run.
+///
+/// Coverage is judged against the stored windows' spans rather than "did any
+/// candle come back", because an illiquid cross legitimately has minutes with no
+/// candle at all — the exact case that must NOT be mistaken for missing data.
+#[derive(Debug)]
+pub struct FixtureSubBars {
+    inner: WindowSubBars,
+    /// Spans the saved candles are known to cover, ascending and disjoint.
+    covered: Vec<ZoomWindow>,
+    missed: RefCell<Vec<ZoomWindow>>,
+}
+
+impl FixtureSubBars {
+    /// Build from a fixture's saved finer candles.
+    ///
+    /// Coverage spans the saved candles' **extent** — first stored candle to last
+    /// (plus one finer bar) — NOT each candle individually.
+    ///
+    /// The distinction matters and is the whole point of this type. A saved
+    /// window legitimately contains minutes with no candle: an illiquid cross
+    /// simply doesn't tick every minute (CAD/SGD lost 200 of 1440 on a normal
+    /// day). Deriving coverage per-candle would split the span at every such
+    /// minute and report it as missing — the exact false-miss that would refetch
+    /// those minutes on every run, which is the candle-cache pathology this whole
+    /// change exists to stop paying.
+    ///
+    /// Using the extent means a window inside the saved range is "covered" even
+    /// when empty, while a window outside it is a genuine miss. That's the only
+    /// question the caller needs answered.
+    pub fn new(candles: Vec<BidAskCandle>, bar_len: chrono::Duration) -> Self {
+        let inner = WindowSubBars::new(candles);
+        let covered = match (inner.candles.first(), inner.candles.last()) {
+            (Some(first), Some(last)) => vec![ZoomWindow {
+                start: first.time,
+                end: last.time + bar_len,
+            }],
+            // Nothing stored ⇒ nothing covered ⇒ every window asked for is a miss.
+            _ => Vec::new(),
+        };
+        Self {
+            inner,
+            covered,
+            missed: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Windows the sim asked for that the saved candles don't cover, deduped and
+    /// ascending. Empty ⇒ the fixture had everything the zoom needed.
+    pub fn missed(&self) -> Vec<ZoomWindow> {
+        let mut out = self.missed.borrow().clone();
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+impl SubBars for FixtureSubBars {
+    fn sub_bars(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<BidAskCandle> {
+        let covered = self
+            .covered
+            .iter()
+            .any(|w| start >= w.start && end <= w.end);
+        if !covered {
+            self.missed.borrow_mut().push(ZoomWindow { start, end });
+        }
+        self.inner.sub_bars(start, end)
     }
 }
 
@@ -288,5 +373,139 @@ mod tests {
                 w("2026-06-17T19:00:00Z", "2026-06-17T20:00:00Z"),
             ]
         );
+    }
+
+    // --- FixtureSubBars: saved bars, and knowing when they're NOT enough -----
+
+    fn m1(time: &str) -> BidAskCandle {
+        let t = ts(time);
+        BidAskCandle {
+            time: t,
+            o: 1.0,
+            h: 1.0,
+            l: 1.0,
+            c: 1.0,
+            bid_o: 1.0,
+            bid_h: 1.0,
+            bid_l: 1.0,
+            bid_c: 1.0,
+            ask_o: 1.0,
+            ask_h: 1.0,
+            ask_l: 1.0,
+            ask_c: 1.0,
+        }
+    }
+
+    const MIN: chrono::Duration = chrono::Duration::minutes(1);
+
+    #[test]
+    fn fixture_sub_bars_serves_a_covered_window_and_records_no_miss() {
+        // Saved M1 bars spanning 13:00..13:03.
+        let f = FixtureSubBars::new(
+            vec![
+                m1("2026-06-17T13:00:00Z"),
+                m1("2026-06-17T13:01:00Z"),
+                m1("2026-06-17T13:02:00Z"),
+            ],
+            MIN,
+        );
+        let got = f.sub_bars(ts("2026-06-17T13:00:00Z"), ts("2026-06-17T13:03:00Z"));
+        assert_eq!(got.len(), 3);
+        assert!(f.missed().is_empty(), "missed: {:?}", f.missed());
+    }
+
+    #[test]
+    fn fixture_sub_bars_records_an_uncovered_window_as_a_miss() {
+        // The fixture saved 13:00..13:03, but the strategy changed and a bar at
+        // 19:00 is now ambiguous. That must be reported, not silently served as
+        // "no finer data" (which would degrade it to the pessimistic stop on a
+        // fixture that looks complete).
+        let f = FixtureSubBars::new(vec![m1("2026-06-17T13:00:00Z")], MIN);
+        let got = f.sub_bars(ts("2026-06-17T19:00:00Z"), ts("2026-06-17T20:00:00Z"));
+        assert!(got.is_empty());
+        assert_eq!(
+            f.missed(),
+            vec![w("2026-06-17T19:00:00Z", "2026-06-17T20:00:00Z")]
+        );
+    }
+
+    /// The distinction the whole design turns on: a covered window that happens
+    /// to contain NO candles is a legitimate answer (an illiquid cross has
+    /// minutes that never ticked), NOT missing data. Judging coverage by "did any
+    /// candle come back" would re-fetch those forever — the exact candle-cache
+    /// pathology this work exists to stop paying.
+    #[test]
+    fn a_covered_but_empty_window_is_not_a_miss() {
+        // A CONTIGUOUS run 13:00..13:04 (four M1 bars) — one covered span — with
+        // one minute deliberately absent inside it: 13:02 never ticked, exactly
+        // as an illiquid cross behaves (CAD/SGD lost 200 of 1440 minutes on a
+        // normal trading day). The saved fixture is complete; that minute simply
+        // has no candle to store.
+        let f = FixtureSubBars::new(
+            vec![
+                m1("2026-06-17T13:00:00Z"),
+                m1("2026-06-17T13:01:00Z"),
+                // 13:02 — no tick, no candle
+                m1("2026-06-17T13:03:00Z"),
+            ],
+            MIN,
+        );
+
+        // Asking about the absent minute returns nothing — and that must NOT be
+        // recorded as a miss. It lies inside the covered span, so the answer
+        // "there is no candle here" is the truth, not missing data. Judging
+        // coverage by "did candles come back" gets this wrong and would refetch
+        // that minute on every single run, forever.
+        let got = f.sub_bars(ts("2026-06-17T13:02:00Z"), ts("2026-06-17T13:03:00Z"));
+        assert!(got.is_empty(), "13:02 has no candle by construction");
+        assert!(
+            f.missed().is_empty(),
+            "a covered-but-empty window must not be a miss — got {:?}",
+            f.missed()
+        );
+
+        // A window PAST the covered span is a genuine miss.
+        f.sub_bars(ts("2026-06-17T19:00:00Z"), ts("2026-06-17T19:01:00Z"));
+        assert_eq!(
+            f.missed(),
+            vec![w("2026-06-17T19:00:00Z", "2026-06-17T19:01:00Z")]
+        );
+    }
+
+    /// Known, deliberate limitation of using the saved candles' EXTENT as the
+    /// covered span: a fixture that saved two widely-separated windows counts
+    /// the gap between them as covered, so a newly-ambiguous bar landing in that
+    /// gap is served empty (pessimistic stop) instead of being refetched.
+    ///
+    /// Accepted because the alternative is strictly worse. Distinguishing "gap
+    /// between two fetched windows" from "minute that never ticked" is not
+    /// possible from the candles alone, and treating absent minutes as missing
+    /// would refetch them on every run — the pathology this change exists to fix.
+    /// The failure here is conservative (an over-pessimistic bar on a stale
+    /// fixture); the other way round is an unbounded refetch loop.
+    ///
+    /// If this ever bites, the fix is to store the fetched WINDOWS alongside the
+    /// candles rather than inferring them.
+    #[test]
+    fn a_gap_between_two_saved_windows_reads_as_covered_known_limitation() {
+        let f = FixtureSubBars::new(
+            vec![m1("2026-06-17T13:00:00Z"), m1("2026-06-17T19:00:00Z")],
+            MIN,
+        );
+        f.sub_bars(ts("2026-06-17T16:00:00Z"), ts("2026-06-17T16:01:00Z"));
+        assert!(
+            f.missed().is_empty(),
+            "documenting current behaviour: the extent spans the gap, so this is \
+             NOT reported as a miss"
+        );
+    }
+
+    #[test]
+    fn a_fixture_with_no_saved_sub_bars_misses_every_window_it_is_asked_for() {
+        // The pre-sub-bar case: nothing stored. Any ambiguous bar is a miss, so
+        // the caller re-fetches rather than assuming the pessimistic stop.
+        let f = FixtureSubBars::new(Vec::new(), MIN);
+        f.sub_bars(ts("2026-06-17T13:00:00Z"), ts("2026-06-17T14:00:00Z"));
+        assert_eq!(f.missed().len(), 1);
     }
 }

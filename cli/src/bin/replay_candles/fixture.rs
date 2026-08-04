@@ -10,7 +10,31 @@
 //! candles.json   — the pulled window, frozen so the fixture needs no broker
 //! meta.json      — resolved scalars (instrument, granularity, source, window)
 //! expected.json  — the golden ReplayOutcome snapshot: fires + what it EARNED
+//! sub_bars.json  — OPTIONAL: the finer (e.g. M1) candles the sub-bar zoom
+//!                  actually consulted on this run. Absent when the run had no
+//!                  ambiguous SL/TP bar, which is the common case.
 //! ```
+//!
+//! ## `sub_bars.json` — only the bars the zoom actually looked at
+//!
+//! An ambiguous exit bar (one whose range sweeps BOTH the stop and the target)
+//! can only be resolved by finer candles. The live replay fetches those lazily
+//! (see `super::lazy_zoom`): it runs the sim once serving nothing to learn WHICH
+//! bars are ambiguous, fetches only those windows, then re-runs. `--save` freezes
+//! exactly that fetched subset here, so the fixture reproduces its own verdict
+//! offline instead of silently degrading to the pessimistic stop.
+//!
+//! Deliberately NOT the whole finer window: storing M1 across every fixture's
+//! span would be ~416 MB for this corpus, versus ~1 MB for the bars the zoom can
+//! actually consume (the exit loop returns on the first ambiguous bar, so each
+//! entry zooms at most once).
+//!
+//! **The stored set is a function of the strategy that saved it.** Change the
+//! bracket, the widen behaviour, or the entry rule and a *different* bar may go
+//! ambiguous — one this fixture has no bars for. `lazy_zoom::FixtureSubBars`
+//! detects that (a window outside the saved extent is a *miss*) and `run_frozen`
+//! re-fetches it from the broker/candle-cache rather than silently scoring that
+//! bar as a stop; a re-save then re-freezes the new set.
 //!
 //! The snapshot schema ([`ReplayOutcome`]) is owned here, not in the engine — it
 //! captures exactly what the test should assert (each fire's decision and the
@@ -207,22 +231,42 @@ const PLAN_FILE: &str = "plan.json";
 const CANDLES_FILE: &str = "candles.json";
 const META_FILE: &str = "meta.json";
 const EXPECTED_FILE: &str = "expected.json";
+const SUB_BARS_FILE: &str = "sub_bars.json";
 
 /// Write a complete fixture to `dir` (created if absent): the plan, the frozen
 /// candle window, the resolved meta, and the expected outcome — each as
 /// pretty-printed JSON for readable diffs.
+///
+/// `sub_bars` is the finer series the zoom actually consulted (see the module
+/// docs). It is written **only when non-empty**, so a fixture with no ambiguous
+/// bar — the common case — keeps exactly the four files it always had and stays
+/// byte-identical to one saved before sub-bar support existed.
 pub fn save(
     dir: &Path,
     plan: &TradePlan,
     candles: &[EngineCandle],
     meta: &FixtureMeta,
     expected: &ReplayOutcome,
+    sub_bars: &[EngineCandle],
 ) -> Result<()> {
     fs::create_dir_all(dir).wrap_err_with(|| format!("create fixture dir {}", dir.display()))?;
     write_json(&dir.join(PLAN_FILE), plan)?;
     write_json(&dir.join(CANDLES_FILE), &candles.to_vec())?;
     write_json(&dir.join(META_FILE), meta)?;
     write_json(&dir.join(EXPECTED_FILE), expected)?;
+    let sub_bars_path = dir.join(SUB_BARS_FILE);
+    if sub_bars.is_empty() {
+        // Re-saving a fixture that used to have an ambiguous bar but no longer
+        // does must not leave the old file behind — it would serve bars for a
+        // window this run never asks about, and diverge from what `--save` says
+        // it wrote.
+        if sub_bars_path.exists() {
+            fs::remove_file(&sub_bars_path)
+                .wrap_err_with(|| format!("remove stale {}", sub_bars_path.display()))?;
+        }
+    } else {
+        write_json(&sub_bars_path, &sub_bars.to_vec())?;
+    }
     Ok(())
 }
 
@@ -231,15 +275,30 @@ pub struct FixtureInputs {
     pub plan: TradePlan,
     pub candles: Vec<EngineCandle>,
     pub meta: FixtureMeta,
+    /// The finer candles the zoom consulted when this fixture was saved. Empty
+    /// for a fixture with no ambiguous bar, and for every fixture saved before
+    /// `sub_bars.json` existed — both of which replay exactly as they did then.
+    pub sub_bars: Vec<EngineCandle>,
 }
 
-/// Read a fixture's inputs (plan + candles + meta) from `dir`. The expected
-/// outcome is read separately by the caller that needs it ([`load_expected`]).
+/// Read a fixture's inputs (plan + candles + meta + any saved sub-bars). The
+/// expected outcome is read separately by the caller that needs it
+/// ([`load_expected`]).
 pub fn load(dir: &Path) -> Result<FixtureInputs> {
+    let sub_bars_path = dir.join(SUB_BARS_FILE);
     Ok(FixtureInputs {
         plan: read_json(&dir.join(PLAN_FILE))?,
         candles: read_json(&dir.join(CANDLES_FILE))?,
         meta: read_json(&dir.join(META_FILE))?,
+        // Absent is normal (no ambiguous bar / pre-sub-bar fixture), so it maps
+        // to "none stored" — but a file that EXISTS and won't parse is a real
+        // error, not an empty set. Silently treating corrupt sub-bars as absent
+        // would degrade the zoom to the pessimistic stop with no signal.
+        sub_bars: if sub_bars_path.exists() {
+            read_json(&sub_bars_path)?
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -400,10 +459,21 @@ mod tests {
                 inputs.meta.start,
                 expires_at,
                 mark_cfg,
-                // No finer series for a frozen fixture (only its saved coarse
-                // candles), so the sub-bar zoom is inactive → pessimistic stop on
-                // an ambiguous SL/TP bar, exactly as the saved outcome expects.
-                None,
+                // The fixture's OWN saved finer candles (`sub_bars.json`), so a
+                // fixture whose verdict needed a zoom reproduces it here. Empty
+                // for a fixture with no ambiguous bar — the common case, and
+                // every fixture saved before sub-bars existed — which replays
+                // exactly as it always did (pessimistic stop).
+                //
+                // Deliberately NOT `FixtureSubBars` + refetch: this test runs
+                // under `cargo test` with no credentials and no warm cache, so it
+                // must stay fully offline. A fixture missing bars it now needs
+                // shows up as a diverged golden here, which is the signal to
+                // re-save it; the binary's `--test-mode` path is the one that
+                // refetches.
+                Some(Box::new(super::super::lazy_zoom::WindowSubBars::new(
+                    inputs.sub_bars.clone(),
+                ))),
             )
             .await;
             // Fixtures are saved from `--simulate` runs (the default), so the
@@ -895,12 +965,8 @@ mod tests {
         );
     }
 
-    /// `save` then `load` reproduces the inputs; `load_expected` reproduces the
-    /// snapshot. Uses a unique temp dir so the test is hermetic.
-    #[test]
-    fn save_then_load_round_trips() {
-        let dir = std::env::temp_dir().join(format!("replay-fixture-test-{}", std::process::id()));
-        let plan: TradePlan = serde_json::from_str(
+    fn sample_plan() -> TradePlan {
+        serde_json::from_str(
             r#"{
                 "trade_id": "rt-1",
                 "instrument": "EUR_USD",
@@ -910,8 +976,11 @@ mod tests {
                 "rules": []
             }"#,
         )
-        .unwrap();
-        let candles = vec![EngineCandle {
+        .expect("sample plan parses")
+    }
+
+    fn sample_candle() -> EngineCandle {
+        EngineCandle {
             time: Utc.with_ymd_and_hms(2026, 6, 18, 11, 0, 0).unwrap(),
             o: 1.0,
             h: 1.5,
@@ -925,11 +994,20 @@ mod tests {
             ask_h: 1.5,
             ask_l: 0.9,
             ask_c: 1.2,
-        }];
+        }
+    }
+
+    /// `save` then `load` reproduces the inputs; `load_expected` reproduces the
+    /// snapshot. Uses a unique temp dir so the test is hermetic.
+    #[test]
+    fn save_then_load_round_trips() {
+        let dir = std::env::temp_dir().join(format!("replay-fixture-test-{}", std::process::id()));
+        let plan = sample_plan();
+        let candles = vec![sample_candle()];
         let meta = sample_meta();
         let expected = sample_outcome();
 
-        save(&dir, &plan, &candles, &meta, &expected).unwrap();
+        save(&dir, &plan, &candles, &meta, &expected, &[]).unwrap();
         let inputs = load(&dir).unwrap();
         let loaded_expected = load_expected(&dir).unwrap();
 
@@ -941,7 +1019,86 @@ mod tests {
             serde_json::to_value(&plan).unwrap()
         );
         assert_eq!(loaded_expected, expected);
+        // No ambiguous bar ⇒ no sub-bars stored, and NO file written: a fixture
+        // saved today is byte-identical on disk to one saved before sub-bar
+        // support existed.
+        assert!(inputs.sub_bars.is_empty());
+        assert!(!dir.join(SUB_BARS_FILE).exists());
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sub_bars_round_trip_when_the_zoom_consulted_some() {
+        let dir = std::env::temp_dir().join(format!(
+            "fixture-subbars-{}",
+            std::process::id() as u64 + 991_001
+        ));
+        fs::remove_dir_all(&dir).ok();
+        let plan = sample_plan();
+        let candles = vec![sample_candle()];
+        let subs = vec![sample_candle()];
+
+        save(
+            &dir,
+            &plan,
+            &candles,
+            &sample_meta(),
+            &sample_outcome(),
+            &subs,
+        )
+        .unwrap();
+        assert!(
+            dir.join(SUB_BARS_FILE).exists(),
+            "sub_bars.json not written"
+        );
+        assert_eq!(load(&dir).unwrap().sub_bars, subs);
+
+        // Re-saving with none must REMOVE the stale file, not leave bars behind
+        // for a window this run never asks about.
+        save(
+            &dir,
+            &plan,
+            &candles,
+            &sample_meta(),
+            &sample_outcome(),
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !dir.join(SUB_BARS_FILE).exists(),
+            "stale sub_bars.json survived a re-save with no sub-bars"
+        );
+        assert!(load(&dir).unwrap().sub_bars.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fixture directory with no `sub_bars.json` — every fixture saved before
+    /// this feature — must load as "none stored" rather than erroring.
+    #[test]
+    fn a_fixture_without_sub_bars_json_still_loads() {
+        let dir = std::env::temp_dir().join(format!(
+            "fixture-nosubbars-{}",
+            std::process::id() as u64 + 991_002
+        ));
+        fs::remove_dir_all(&dir).ok();
+        save(
+            &dir,
+            &sample_plan(),
+            &[sample_candle()],
+            &sample_meta(),
+            &sample_outcome(),
+            &[],
+        )
+        .unwrap();
+        assert!(!dir.join(SUB_BARS_FILE).exists());
+        assert!(
+            load(&dir)
+                .expect("loads without sub_bars.json")
+                .sub_bars
+                .is_empty()
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

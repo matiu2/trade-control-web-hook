@@ -1,5 +1,55 @@
 # Changelog
 
+## v129 — 2026-08-04 — fixtures store the sub-bars the zoom actually looked at
+
+**Why.** v128 made the sub-bar zoom fetch lazily. But a frozen fixture replayed
+with **no zoom at all**, so a fixture whose verdict depended on disambiguating an
+SL/TP bar could never reproduce that verdict offline — it silently fell back to
+the pessimistic stop. The finer candles the live run fetched were thrown away.
+
+**What changed.** `--save` now writes `sub_bars.json`: exactly the finer candles
+the zoom consulted on that run, and nothing more. A run with no ambiguous bar —
+the common case, and every fixture in the corpus today — writes **no file at
+all**, so those fixtures stay byte-identical to ones saved before this existed.
+
+Deliberately the lazy subset rather than the whole finer window: M1 across every
+fixture's span would be ~416 MB for this corpus, versus ~1 MB for the bars the
+zoom can actually consume (the exit loop returns on the first ambiguous bar, so
+each entry zooms at most once). Storing "everything after the right shoulder"
+would still be ~111 MB to serve ~1 MB of it.
+
+**Stale fixtures refetch instead of degrading.** The stored set is a function of
+the strategy that saved it — change the bracket, widen, or entry rule and a
+*different* bar can go ambiguous, one the fixture has no bars for. The new
+`lazy_zoom::FixtureSubBars` reports any window outside the saved extent as a
+*miss*, and `run_frozen` refetches just those windows from the
+broker/candle-cache, logging that it did. Verified end-to-end: deleting a
+fixture's `sub_bars.json` refetched 2 windows / 103 bars and reproduced the
+identical verdict (−2.00R).
+
+**Coverage is judged by the saved candles' EXTENT, not per-candle.** An illiquid
+cross legitimately has minutes with no candle (CAD/SGD lost 200 of 1440 on a
+normal day). Splitting the covered span at each absent minute would report it as
+missing and refetch it every run — the exact candle-cache pathology v128 exists
+to stop paying. The tradeoff (a gap between two widely-separated saved windows
+reads as covered) is documented and pinned by
+`a_gap_between_two_saved_windows_reads_as_covered_known_limitation`; it fails
+conservatively, toward an over-pessimistic bar rather than an unbounded refetch.
+
+**The offline guarantee is kept where it matters.** The corpus unit test
+(`all_fixtures_match_expected`, run under `cargo test` with no credentials)
+serves the fixture's saved sub-bars but never refetches — a fixture missing bars
+it now needs surfaces as a diverged golden, which is the prompt to re-save. Only
+the binary's `--test-mode` path refetches.
+
+**Tests.** 271 green (was 264); 19/19 fixtures `--check` green. Mutation-checked:
+serving-but-not-writing `sub_bars.json`, and judging coverage by emptiness rather
+than extent, each turn tests red. The emptiness mutation initially **survived** —
+the first version of the covered-but-empty test asked about a window that did
+contain a candle, so it proved nothing; it was rewritten to omit a minute inside
+a contiguous run, which then caught both the mutation and a real bug in the
+first coverage implementation.
+
 ## v128 — 2026-08-04 — the sub-bar zoom fetches lazily (two-pass)
 
 **Why.** The sub-bar zoom pulled a FINER series (M1 under an H1 plan) across the

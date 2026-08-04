@@ -1661,6 +1661,16 @@ pulling 22,393 M1 bars, then consulted none of them. Same verdict, 0.05 s. If yo
 used to see long scrolls of `Successfully fetched and cached N bid/ask candles`
 during a replay or a `--save`, that is what they were.
 
+`--save` freezes those same finer candles into the fixture as `sub_bars.json`
+(v129) — only the ones the zoom actually consulted, so a fixture with no
+ambiguous bar writes no such file and stays byte-identical to one saved before
+this existed. A fixture that *did* need a zoom now reproduces its verdict
+offline, instead of silently degrading to the pessimistic stop the way frozen
+fixtures always used to. If a later strategy change makes a *different* bar
+ambiguous — one the fixture has no bars for — the replay refetches just that
+window from the broker/candle-cache and says so, rather than scoring it as a
+stop; re-save to re-freeze the new set.
+
 **Seeing the engine's silent state changes (`--verbose` / `--all-events`).**
 The normal report lists only *fires* — intents the engine emits. But the engine
 also advances state per bar that fires nothing: the spine phase

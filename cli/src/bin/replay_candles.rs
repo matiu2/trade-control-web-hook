@@ -304,6 +304,10 @@ async fn run() -> Result<()> {
 
     let zoom_windows = recorder.windows();
 
+    // The finer candles the zoom actually consulted, kept so `--save` can freeze
+    // exactly them into the fixture (and nothing more).
+    let mut zoom_bars: Vec<EngineCandle> = Vec::new();
+
     // No ambiguous bar ⇒ no finer candles can change the outcome ⇒ pass 1 IS the
     // answer and we fetch nothing at all. This is the common case.
     let replay = if zoom_windows.is_empty() {
@@ -342,6 +346,7 @@ async fn run() -> Result<()> {
                         bars = fetched.len(),
                         "sub-bar zoom: fetched finer candles for the ambiguous bars only"
                     );
+                    zoom_bars = fetched.clone();
                     // PASS 2: same plan, same coarse candles, same seed — the only
                     // difference is that ambiguous bars can now be resolved.
                     replay::run(
@@ -404,8 +409,16 @@ async fn run() -> Result<()> {
         };
         let expected = ReplayOutcome::compute(&replay, simulate, Some(&rendered.economics));
         let dir = fixtures_dir(&args).join(name);
-        fixture::save(&dir, &plan, &candles, &meta, &expected)?;
-        tracing::info!(dir = %dir.display(), "saved fixture");
+        // Freeze the finer candles the zoom actually consulted (empty for the
+        // common no-ambiguous-bar case, which writes no `sub_bars.json` at all),
+        // so the fixture can reproduce its own verdict instead of degrading to
+        // the pessimistic stop offline.
+        fixture::save(&dir, &plan, &candles, &meta, &expected, &zoom_bars)?;
+        tracing::info!(
+            dir = %dir.display(),
+            sub_bars = zoom_bars.len(),
+            "saved fixture"
+        );
     }
 
     Ok(())
@@ -919,12 +932,23 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
         args.candle_detector_golden,
         inputs.plan.direction,
     );
+    // A fixture whose saved sub-bars don't cover a now-ambiguous bar refetches
+    // the missing window from the broker/candle-cache rather than silently
+    // scoring it as a stop. The fixture's own `meta` says which source and symbol
+    // it came from, so the refetch targets the same feed that produced it.
+    let refetch = FixtureRefetch {
+        source: inputs.meta.source,
+        symbol: &inputs.meta.instrument,
+        cache_dir: args.cache_dir.clone(),
+    };
     let replay = run_frozen(
         &inputs.plan,
         &inputs.candles,
         inputs.meta.granularity,
         inputs.meta.start,
         mark_cfg,
+        &inputs.sub_bars,
+        Some(&refetch),
     )
     .await;
 
@@ -1012,6 +1036,14 @@ async fn run_frozen(
     gran: Granularity,
     live_start: DateTime<Utc>,
     mark_cfg: DetectorMarkConfig,
+    // The fixture's saved finer candles (`sub_bars.json`), empty when it has
+    // none — either because the saving run had no ambiguous bar, or because the
+    // fixture predates `sub_bars.json`.
+    saved_sub_bars: &[EngineCandle],
+    // Where to re-fetch from when the saved bars don't cover a window the sim
+    // asks about. `None` keeps the replay fully offline (the pessimistic stop
+    // stands, with a warning).
+    refetch: Option<&FixtureRefetch<'_>>,
 ) -> replay::Replay {
     let expires_at = candles.last().map(|c| c.time).unwrap_or_else(Utc::now) + Duration::days(365);
     // The market-hours gate reads the baked mask keyed on the instrument, so a
@@ -1019,10 +1051,100 @@ async fn run_frozen(
     // spread-blackout gate still self-seeds per-bar on `is_ny_close_edge` inside
     // `run` off the frozen candle's own spread.
     //
-    // No finer series — a frozen fixture only has its saved coarse candles, so the
-    // sub-bar zoom (PR-2) is inactive and an ambiguous SL/TP bar keeps the
-    // pessimistic stop, exactly as the fixture's saved `expected.json` was computed.
-    replay::run(plan, candles, gran, live_start, expires_at, mark_cfg, None).await
+    // The sub-bar zoom is served from the fixture's OWN saved finer candles, so a
+    // fixture whose verdict depended on a zoom reproduces it offline instead of
+    // degrading to the pessimistic stop. `FixtureSubBars` also records any window
+    // the saved bars don't cover — which happens when the strategy changed since
+    // the fixture was saved and a *different* bar is now ambiguous.
+    let finer_bar = granularity::finer(gran)
+        .map(|f| Duration::seconds(f.engine().seconds()))
+        .unwrap_or_else(|| Duration::minutes(1));
+    let provider = std::rc::Rc::new(lazy_zoom::FixtureSubBars::new(
+        saved_sub_bars.to_vec(),
+        finer_bar,
+    ));
+    let first = replay::run(
+        plan,
+        candles,
+        gran,
+        live_start,
+        expires_at,
+        mark_cfg,
+        Some(Box::new(std::rc::Rc::clone(&provider))),
+    )
+    .await;
+
+    let missed = provider.missed();
+    if missed.is_empty() {
+        return first;
+    }
+
+    // The fixture is missing finer bars for a bar that is ambiguous NOW. Refetch
+    // when we're allowed to, so a strategy change doesn't silently score those
+    // bars as stops on a fixture that looks complete.
+    let Some(refetch) = refetch else {
+        tracing::warn!(
+            windows = missed.len(),
+            first = %missed[0].start,
+            "fixture has no saved sub-bars for {} ambiguous window(s) — keeping the \
+             pessimistic stop. Re-save the fixture (or allow a refetch) to score \
+             these bars properly.",
+            missed.len()
+        );
+        return first;
+    };
+
+    let Some(finer_gran) = granularity::finer(gran) else {
+        return first;
+    };
+    let fetched = lazy_zoom::fetch_windows(
+        refetch.source,
+        refetch.symbol,
+        finer_gran,
+        &missed,
+        refetch.cache_dir.clone(),
+    )
+    .await;
+    if fetched.is_empty() {
+        tracing::warn!(
+            windows = missed.len(),
+            "fixture sub-bar refetch returned nothing — keeping the pessimistic stop"
+        );
+        return first;
+    }
+
+    tracing::info!(
+        windows = missed.len(),
+        bars = fetched.len(),
+        "fixture was missing sub-bars for ambiguous window(s); refetched them"
+    );
+    // Re-run with the saved bars PLUS the refetched ones, so both the windows the
+    // fixture knew about and the newly-ambiguous ones resolve.
+    let mut merged = saved_sub_bars.to_vec();
+    merged.extend(fetched);
+    replay::run(
+        plan,
+        candles,
+        gran,
+        live_start,
+        expires_at,
+        mark_cfg,
+        Some(Box::new(lazy_zoom::WindowSubBars::new(merged))),
+    )
+    .await
+}
+
+/// Where a frozen-fixture replay may refetch finer candles from when its saved
+/// sub-bars don't cover a window the sim asks about.
+///
+/// Passing `None` instead keeps a fixture replay fully offline. That matters
+/// because `--test-mode` is otherwise a no-broker path (the corpus test runs it
+/// under `cargo test` with no credentials), so reaching the network is opt-in
+/// per call site rather than assumed.
+struct FixtureRefetch<'a> {
+    source: CandleSource,
+    symbol: &'a str,
+    cache_dir: Option<PathBuf>,
 }
 
 /// Build a readable diff error when a fixture's computed outcome diverges from
