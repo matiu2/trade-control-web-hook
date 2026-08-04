@@ -19,7 +19,7 @@
 //!
 //! ## The axes
 //!
-//! Four entry rules × news on/off = eight cells:
+//! Four entry rules × news on/off × reversals on/off = sixteen cells:
 //!
 //! | | news-on | news-off |
 //! |---|---|---|
@@ -28,12 +28,22 @@
 //! | **strategy-v2** | QM **limit** leg + confirming candle | " |
 //! | **strategy-v2-qm-market** | QM **market** leg + confirming candle | " |
 //!
-//! The last two differ only in the QM leg's order type, and they answer
-//! different questions: the limit leg asks *"does waiting for the pullback pay
-//! for the fills it misses?"*, the market leg *"is the confirmation candle
-//! alone enough?"*. They are separate columns rather than one because folding
-//! them together would average a fill-rate difference into a returns
+//! …each of those eight armed twice, once with the reversal-closes on and once
+//! with `--skip-reversals`.
+//!
+//! The last two entry rules differ only in the QM leg's order type, and they
+//! answer different questions: the limit leg asks *"does waiting for the
+//! pullback pay for the fills it misses?"*, the market leg *"is the confirmation
+//! candle alone enough?"*. They are separate columns rather than one because
+//! folding them together would average a fill-rate difference into a returns
 //! difference and hide both.
+//!
+//! The reversal axis asks a different *kind* of question from the other two.
+//! Entry rule and news gate decide **whether to open**; the reversal-close
+//! decides **when to bail out of something already open**. That is why it is an
+//! axis crossing every column rather than another column: the same early exit
+//! that banks a partial win on one entry rule can cut a runner on another, and
+//! only a paired on/off twin of each column separates those.
 //!
 //! The cell names match [`EntryRule::label`] in the replay side's `arm_record`,
 //! because a batch tool groups on exactly that string. Renaming one without the
@@ -66,22 +76,33 @@ pub struct Variant {
     pub qm_entry: Option<crate::args::QmEntry>,
     /// Skip the news calendar entirely (`--skip-calendar-bars`).
     pub skip_calendar_bars: bool,
+    /// Drop both reversal-closes (`--skip-reversals`).
+    pub skip_reversals: bool,
 }
 
 impl Variant {
-    /// `<entry-rule>-<news-on|news-off>` — the fixture directory name.
+    /// `<entry-rule>-<news-on|news-off>[-rev-off]` — the fixture directory name.
     ///
-    /// Both axes are in the name deliberately. A convention that omitted the
-    /// news axis would give six cells only three directory names, and the later
-    /// three saves would silently overwrite the first three — a half-empty grid
-    /// that looks complete.
+    /// Every axis is in the name deliberately. A convention that omitted one
+    /// would give distinct cells the same directory name, and the later saves
+    /// would silently overwrite the earlier ones — a half-empty grid that looks
+    /// complete.
+    ///
+    /// The reversal axis is **suffix-only**, matching `ArmRecord::cell_key`:
+    /// reversals-on keeps the historical `<rule>-<news>` name so re-capturing an
+    /// existing trade overwrites its own fixtures in place, and only the
+    /// reversals-off twin gets the extra `-rev-off`. Naming the on-cells
+    /// `-rev-on` would strand every directory already on disk as an orphan while
+    /// the "new" cells captured beside them, doubling the corpus rather than
+    /// extending it.
     pub fn fixture_suffix(&self) -> String {
         let news = if self.skip_calendar_bars {
             "news-off"
         } else {
             "news-on"
         };
-        format!("{}-{news}", self.entry_rule)
+        let rev = if self.skip_reversals { "-rev-off" } else { "" };
+        format!("{}-{news}{rev}", self.entry_rule)
     }
 
     /// Apply this variant's flags to a copy of the operator's args.
@@ -109,17 +130,21 @@ impl Variant {
         args.strategy_v2 = self.strategy_v2;
         args.qm_entry = self.qm_entry;
         args.skip_calendar_bars = self.skip_calendar_bars;
+        // No alias expansion needed: `--skip-reversals` is read directly by
+        // `build_trade_spec`, which forces `close_on_news` false and leaves
+        // `sr_reversal_ranges` empty.
+        args.skip_reversals = self.skip_reversals;
         // The one expansion `apply_aliases` performs for these flags.
         if self.skip_bcr {
             args.skip_break_and_close = true;
             args.skip_retest = true;
         }
         // A matrix run must never write a spec per cell: the whole point is that
-        // all six share ONE frozen setup.
+        // all sixteen share ONE frozen setup.
         args.spec_out = None;
         // Suffix the replay's `--save <name>` so each cell lands in its OWN
-        // fixture directory. Without this all six saves collide on one name and
-        // the last cell silently overwrites the other five.
+        // fixture directory. Without this all sixteen saves collide on one name
+        // and the last cell silently overwrites the other fifteen.
         if let Some(crate::args::Command::Replay { args: replay }) = args.command.as_mut() {
             suffix_save_name(replay, &self.fixture_suffix());
         }
@@ -157,14 +182,20 @@ fn suffix_save_name(argv: &mut [String], suffix: &str) {
     }
 }
 
-/// The eight cells, in a stable order so two matrix runs are diffable.
-pub const GRID: [Variant; 8] = [
+/// The eight **reversals-on** cells (entry rule × news), in a stable order so
+/// two matrix runs are diffable.
+///
+/// Not the grid itself — [`GRID`] mirrors these into reversals-off twins. Kept
+/// separate so the twin can never drift from its base: adding a ninth entry-rule
+/// cell here automatically gains its `-rev-off` counterpart.
+const BASE_GRID: [Variant; 8] = [
     Variant {
         entry_rule: "normal",
         skip_bcr: false,
         strategy_v2: false,
         qm_entry: None,
         skip_calendar_bars: false,
+        skip_reversals: false,
     },
     Variant {
         entry_rule: "normal",
@@ -172,6 +203,7 @@ pub const GRID: [Variant; 8] = [
         strategy_v2: false,
         qm_entry: None,
         skip_calendar_bars: true,
+        skip_reversals: false,
     },
     Variant {
         entry_rule: "skip-bcr",
@@ -179,6 +211,7 @@ pub const GRID: [Variant; 8] = [
         strategy_v2: false,
         qm_entry: None,
         skip_calendar_bars: false,
+        skip_reversals: false,
     },
     Variant {
         entry_rule: "skip-bcr",
@@ -186,6 +219,7 @@ pub const GRID: [Variant; 8] = [
         strategy_v2: false,
         qm_entry: None,
         skip_calendar_bars: true,
+        skip_reversals: false,
     },
     Variant {
         entry_rule: "strategy-v2",
@@ -196,6 +230,7 @@ pub const GRID: [Variant; 8] = [
         // which is what every fixture captured before `--qm-entry` existed froze.
         qm_entry: None,
         skip_calendar_bars: false,
+        skip_reversals: false,
     },
     Variant {
         entry_rule: "strategy-v2",
@@ -203,6 +238,7 @@ pub const GRID: [Variant; 8] = [
         strategy_v2: true,
         qm_entry: None,
         skip_calendar_bars: true,
+        skip_reversals: false,
     },
     Variant {
         entry_rule: "strategy-v2-qm-market",
@@ -210,6 +246,7 @@ pub const GRID: [Variant; 8] = [
         strategy_v2: true,
         qm_entry: Some(crate::args::QmEntry::Market),
         skip_calendar_bars: false,
+        skip_reversals: false,
     },
     Variant {
         entry_rule: "strategy-v2-qm-market",
@@ -217,8 +254,50 @@ pub const GRID: [Variant; 8] = [
         strategy_v2: true,
         qm_entry: Some(crate::args::QmEntry::Market),
         skip_calendar_bars: true,
+        skip_reversals: false,
     },
 ];
+
+/// The sixteen cells: every [`BASE_GRID`] cell, then the same eight again with
+/// the reversal-closes off.
+///
+/// ## Why a third axis rather than more entry-rule columns
+///
+/// The reversal-close is **orthogonal** to the entry rule. It fires after the
+/// position is already open, so it can flip the outcome of any column — a
+/// `skip-bcr` entry and a `strategy-v2` entry can both be closed early off the
+/// same S/R band. Folding "reversals off" into the entry-rule label would ask
+/// the corpus to compare a `normal` row against a `normal-no-rev` row as if they
+/// were rival *entry* rules, when the question is whether the **exit** earned
+/// its keep given the entry. As a separate axis, every column gets a paired
+/// twin, and the difference between the pair is attributable to the
+/// reversal-close alone.
+///
+/// Reversals-on comes first so the first eight cells (and their fixture names)
+/// are byte-identical to the pre-flag grid, which keeps a re-capture overwriting
+/// its own directories instead of stranding them.
+pub const GRID: [Variant; 16] = build_grid();
+
+/// Mirror [`BASE_GRID`] into on/off pairs.
+///
+/// A `const fn` loop rather than sixteen hand-written literals: the twin differs
+/// from its base by exactly one field, and writing that out by hand is how a
+/// grid quietly ends up with two cells claiming the same flags — which reads as
+/// a completed capture while silently measuring one variant twice.
+const fn build_grid() -> [Variant; 16] {
+    // Seeded with BASE_GRID[0] because `Variant` isn't `Copy`-constructible from
+    // a `Default` in const context; every slot is overwritten below.
+    let mut out = [BASE_GRID[0]; 16];
+    let mut i = 0;
+    while i < BASE_GRID.len() {
+        out[i] = BASE_GRID[i];
+        let mut twin = BASE_GRID[i];
+        twin.skip_reversals = true;
+        out[BASE_GRID.len() + i] = twin;
+        i += 1;
+    }
+    out
+}
 
 /// How one cell turned out.
 #[derive(Debug)]
@@ -263,44 +342,91 @@ mod tests {
         Args::try_parse_from(["tv-arm"]).expect("parse")
     }
 
-    /// Eight cells, eight DISTINCT directory names.
+    /// Sixteen cells, sixteen DISTINCT directory names.
     ///
-    /// A convention that omitted the news axis would map eight cells onto four
-    /// names, and the later saves would overwrite the earlier ones — half the
-    /// grid gone, and it would still look complete.
+    /// A convention that omitted an axis would map several cells onto one name,
+    /// and the later saves would overwrite the earlier ones — part of the grid
+    /// gone, and it would still look complete.
     #[test]
     fn every_cell_has_a_distinct_fixture_name() {
         let names: std::collections::HashSet<String> =
             GRID.iter().map(|v| v.fixture_suffix()).collect();
-        assert_eq!(names.len(), 8, "colliding fixture names: {names:?}");
+        assert_eq!(names.len(), 16, "colliding fixture names: {names:?}");
         assert!(names.contains("normal-news-on"));
         assert!(names.contains("skip-bcr-news-off"));
         assert!(names.contains("strategy-v2-news-on"));
         assert!(names.contains("strategy-v2-qm-market-news-on"));
         assert!(names.contains("strategy-v2-qm-market-news-off"));
+        assert!(names.contains("normal-news-on-rev-off"));
+        assert!(names.contains("strategy-v2-qm-market-news-off-rev-off"));
     }
 
-    /// The grid is exactly the 4×2 product — no duplicates, nothing missing.
+    /// The reversals-**on** cells keep the exact directory names they had before
+    /// the axis existed.
+    ///
+    /// Re-capturing a trade must overwrite its own fixtures in place. If the
+    /// on-cells were renamed (to `-rev-on`), every directory already on disk
+    /// would be orphaned beside a freshly-captured near-duplicate, and the
+    /// corpus would double rather than gain a column.
     #[test]
-    fn the_grid_is_the_full_product_of_both_axes() {
-        let mut seen: Vec<(&str, bool)> = GRID
+    fn reversals_on_cells_keep_their_pre_axis_directory_names() {
+        let on: Vec<String> = GRID
             .iter()
-            .map(|v| (v.entry_rule, v.skip_calendar_bars))
+            .filter(|v| !v.skip_reversals)
+            .map(|v| v.fixture_suffix())
+            .collect();
+        assert_eq!(on.len(), 8);
+        assert!(
+            on.iter().all(|n| !n.contains("rev")),
+            "an on-cell must not mention the reversal axis: {on:?}"
+        );
+        // …and each has exactly one twin, named by appending the suffix.
+        for name in &on {
+            let twin = format!("{name}-rev-off");
+            assert!(
+                GRID.iter().any(|v| v.fixture_suffix() == twin),
+                "missing twin for {name}"
+            );
+        }
+    }
+
+    /// The grid is exactly the 4×2×2 product — no duplicates, nothing missing.
+    #[test]
+    fn the_grid_is_the_full_product_of_all_three_axes() {
+        let mut seen: Vec<(&str, bool, bool)> = GRID
+            .iter()
+            .map(|v| (v.entry_rule, v.skip_calendar_bars, v.skip_reversals))
             .collect();
         seen.sort_unstable();
-        assert_eq!(
-            seen,
-            vec![
-                ("normal", false),
-                ("normal", true),
-                ("skip-bcr", false),
-                ("skip-bcr", true),
-                ("strategy-v2", false),
-                ("strategy-v2", true),
-                ("strategy-v2-qm-market", false),
-                ("strategy-v2-qm-market", true),
-            ]
-        );
+        let mut want = Vec::new();
+        for rule in ["normal", "skip-bcr", "strategy-v2", "strategy-v2-qm-market"] {
+            for news in [false, true] {
+                for rev in [false, true] {
+                    want.push((rule, news, rev));
+                }
+            }
+        }
+        want.sort_unstable();
+        assert_eq!(seen, want);
+    }
+
+    /// Each reversals-off cell differs from its base by **exactly** the one
+    /// field. Anything else drifting means the twin is no longer a controlled
+    /// comparison, and the R difference between the pair stops being
+    /// attributable to the reversal-close.
+    #[test]
+    fn a_twin_differs_from_its_base_by_only_the_reversal_flag() {
+        for base in GRID.iter().filter(|v| !v.skip_reversals) {
+            let expected = Variant {
+                skip_reversals: true,
+                ..*base
+            };
+            assert!(
+                GRID.contains(&expected),
+                "twin of {} must differ only in skip_reversals",
+                base.fixture_suffix()
+            );
+        }
     }
 
     /// Entry-rule labels must match the replay side's `EntryRule::label`, which
@@ -462,7 +588,7 @@ mod tests {
         assert!(!args.skip_calendar_bars, "GRID[0] is normal/news-ON");
     }
 
-    /// A matrix run never writes a spec per cell — all six share one frozen
+    /// A matrix run never writes a spec per cell — all sixteen share one frozen
     /// setup, which is the point.
     #[test]
     fn apply_clears_spec_out() {
@@ -471,7 +597,7 @@ mod tests {
         assert!(GRID[0].apply(&b).spec_out.is_none());
     }
 
-    /// Each cell's `--save` name gets its own suffix, so six cells land in six
+    /// Each cell's `--save` name gets its own suffix, so sixteen cells land in sixteen
     /// directories.
     ///
     /// Without this every cell saves to the SAME name and the last one silently
@@ -501,8 +627,8 @@ mod tests {
 
         assert_eq!(
             names.iter().collect::<std::collections::HashSet<_>>().len(),
-            8,
-            "eight cells must produce eight distinct fixture names: {names:?}"
+            16,
+            "sixteen cells must produce sixteen distinct fixture names: {names:?}"
         );
         assert!(
             names.contains(&"trade-124-normal-news-on".to_string()),
@@ -629,6 +755,6 @@ mod tests {
     fn a_full_sweep_lists_no_failures() {
         let outcomes: Vec<CellOutcome> = (0..GRID.len()).map(|i| cell(i, Ok(0))).collect();
         let s = summarise(&outcomes);
-        assert_eq!(s, "save-matrix: 8/8 cell(s) armed");
+        assert_eq!(s, "save-matrix: 16/16 cell(s) armed");
     }
 }

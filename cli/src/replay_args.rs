@@ -328,6 +328,16 @@ pub struct ReplayArgs {
     #[arg(long, requires = "save")]
     pub arm_skip_golden: bool,
 
+    /// Record that the plan was armed with `--skip-reversals` (both
+    /// reversal-closes dropped) — the grid's **third** axis.
+    ///
+    /// Like `--arm-skip-calendar-bars`, it must be passed explicitly because it
+    /// is **not inferable** from the saved plan: a plan with no
+    /// `07-close-on-sr-reversal` rule could equally mean "reversals were skipped"
+    /// or "the chart had no S/R lines drawn and the TP band was off".
+    #[arg(long, requires = "save")]
+    pub arm_skip_reversals: bool,
+
     /// The `--start` cursor as typed at arm time, stored verbatim so the exact
     /// spelling round-trips for a later re-arm.
     #[arg(long, value_name = "TS", requires = "save")]

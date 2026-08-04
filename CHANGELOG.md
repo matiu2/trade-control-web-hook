@@ -1,5 +1,68 @@
 # Changelog
 
+## v131 — 2026-08-04 — `--skip-reversals`, and the grid gains a third axis
+
+**Why.** A replay armed with `--skip-bcr --skip-calendar-bars` still closed on a
+reversal (AUD/NZD H1, `07-close-on-sr-reversal` flattening the open position at
++0.75R on 2026-07-30). Neither skip flag touches the reversal-close, and there
+was no flag that did — so the standing question "does the reversal-close earn its
+keep, or does it cut runners?" had no way to be measured. The corpus could
+compare entry rules and the news calendar, but not the exit.
+
+**What changed.** A new `tv-arm --skip-reversals` drops **both** reversal-closes:
+`06-close-on-reversal` (the news-window safety flatten) and
+`07-close-on-sr-reversal` (the S/R-band close). It suppresses them at the source
+in `build_trade_spec` — `close_on_news` is forced false and `sr_reversal_ranges`
+is left empty — so `build_trade_from_spec` emits neither alert. That includes the
+default-on take-profit resistance band, which is an S/R band like any other and
+would otherwise keep the S/R close armed on a cell whose name says reversals are
+off.
+
+Exits only: the invalidation caps (`too-high`/`too-low`) and the 80%-to-TP
+`pcl-exhausted` abort are vetos, fire independently, and don't close an open
+position — they are untouched. M/W already hardcodes both fields off, so this is
+an H&S/iH&S lever.
+
+**The grid goes 8 → 16 cells.** `--save-matrix` gains reversals on/off as a third
+axis crossing every existing column, rather than more entry-rule columns. The
+reversal-close is orthogonal to the entry rule — it fires after the position is
+open, so the same early exit can bank a partial win on one entry rule and cut a
+runner on another. As an axis, every column gets a paired twin and the R
+difference within a pair is attributable to the reversal-close alone. `GRID` is
+now derived from a `BASE_GRID` by a `const fn` mirror, so a twin can't drift from
+its base.
+
+**Backward compatible by construction.** The reversal axis is **suffix-only**:
+reversals-on keeps its historical cell key (`normal/news-on`) and directory name,
+and only the off-twin gains `/rev-off` (`-rev-off` on disk). Suffixing both sides
+would rename every key in the existing corpus, so a blessed baseline would find
+no row matching `normal/news-on` and read as a wholesale grid change rather than
+a new column — and every fixture already on disk would be orphaned beside a
+freshly-captured near-duplicate. `ArmRecord.skip_reversals` is
+`#[serde(default)]`, which reads a pre-axis `meta.json` as reversals-**on** —
+historically accurate, since those captures had the closes live.
+
+**Config.** `tv-arm --skip-reversals`; `replay-candles --arm-skip-reversals`
+(requires `--save`, recorded into the fixture's `meta.json`). Like
+`--arm-skip-calendar-bars` it must be passed explicitly — it is not inferable
+from the saved plan, since a plan with no `07-close-on-sr-reversal` could equally
+mean "reversals skipped" or "no S/R lines drawn".
+
+**Tests.** New: both closes vanish from the emitted bundle (asserted on alert
+basenames, with a control proving they're present without the flag); the drawn
+band *and* the TP band both go; reversals-on keeps its pre-axis cell key and
+directory name; a pre-axis `meta.json` reads back as reversals-on; the grid is
+the full 4×2×2 product with 16 distinct keys and names; each twin differs from
+its base by exactly one field; the `--arm-` token is emitted only when the flag
+is set. Verified by mutation — reverting the band-drop, leaking `close_on_news`
+through, and suffixing both sides of the axis each turn the relevant tests red
+(the last also breaks 5 pre-existing grid tests, which is the corpus-compat
+guarantee doing its job).
+
+**Follow-up.** The 16-cell matrix doubles capture time and fixture disk per
+trade; if that bites at corpus scale, the reversal axis is the natural candidate
+for a `--matrix-axes` subset flag.
+
 ## v127 — 2026-08-03 — slice 7: the spread-hour proxy leaves order control
 
 **Why.** `hold_reasons` derived `HoldReason::SpreadHour` from the baked clock — a

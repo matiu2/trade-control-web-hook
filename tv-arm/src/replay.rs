@@ -64,6 +64,10 @@ pub struct ArmContext<'a> {
     pub qm_entry: Option<crate::args::QmEntry>,
     pub skip_calendar_bars: bool,
     pub skip_golden: bool,
+    /// `--skip-reversals` — both reversal-closes dropped. The grid's third axis,
+    /// recorded for the same reason as `skip_calendar_bars`: the replay can't
+    /// tell "reversals skipped" from "nothing drawn to reverse off".
+    pub skip_reversals: bool,
     /// `--start` exactly as the operator typed it.
     pub start: Option<&'a str>,
     /// The broker-qualified TradingView symbol the geometry came from.
@@ -133,6 +137,9 @@ impl ArmContext<'_> {
         }
         if self.skip_golden && !sets_flag(passthrough, "--arm-skip-golden") {
             out.push("--arm-skip-golden".to_string());
+        }
+        if self.skip_reversals && !sets_flag(passthrough, "--arm-skip-reversals") {
+            out.push("--arm-skip-reversals".to_string());
         }
         out
     }
@@ -366,6 +373,34 @@ mod tests {
         assert!(!parsed.annotate);
     }
 
+    /// The reversal axis is recorded only when the flag was actually passed.
+    ///
+    /// A bare `--arm-*` flag emitted unconditionally would stamp `rev-off` onto
+    /// every fixture the matrix saves, collapsing both halves of the axis into
+    /// the reversals-off column — a grid that looks full while measuring one
+    /// variant twice.
+    #[test]
+    fn the_reversal_axis_is_not_recorded_when_the_flag_is_off() {
+        let plan = PathBuf::from("/tmp/p.json");
+        let arm = ArmContext {
+            skip_reversals: false,
+            ..Default::default()
+        };
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &["--save".to_string(), "trade-124".to_string()],
+            arm,
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--arm-skip-reversals"),
+            "reversals ON must not be stamped as off: {argv:?}"
+        );
+        let parsed = ReplayArgs::try_parse_from(&argv).expect("must parse");
+        assert!(!parsed.arm_skip_reversals);
+    }
+
     /// Without `--save` there's no fixture to annotate, so no `--arm-*` tokens
     /// are emitted — they all `requires = "save"` and would be a clap error.
     #[test]
@@ -392,6 +427,7 @@ mod tests {
             skip_bcr: true,
             skip_calendar_bars: true,
             skip_golden: true,
+            skip_reversals: true,
             start: Some("2026-07-17T17:00:00+10:00"),
             chart_symbol: Some("TRADENATION:EURUSD"),
             ..Default::default()
@@ -407,6 +443,10 @@ mod tests {
         assert_eq!(parsed.arm_entry_rule.as_deref(), Some("skip-bcr"));
         assert!(parsed.arm_skip_calendar_bars);
         assert!(parsed.arm_skip_golden);
+        assert!(
+            parsed.arm_skip_reversals,
+            "the reversal axis must reach the fixture's meta.json"
+        );
         assert_eq!(
             parsed.arm_start.as_deref(),
             Some("2026-07-17T17:00:00+10:00")

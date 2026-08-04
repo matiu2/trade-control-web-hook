@@ -323,12 +323,25 @@ pub fn build_trade_spec(
             },
             needs_golden: !args.skip_golden,
             needs_confirmed: args.require_confirmation,
-            close_on_news,
+            // `--skip-reversals` drops the news-window flatten. Forced false
+            // here rather than upstream so the calendar still runs: the news
+            // *pause* windows (which hold resting orders) are unaffected — only
+            // the reversal-close is dropped.
+            close_on_news: close_on_news && !args.skip_reversals,
             // Chart-drawn S/R bands, plus (default-on) a one-sided band pinned
             // to the take-profit so a reversal near TP flattens for a partial win
             // rather than round-tripping to the stop. `07-close-on-sr-reversal`
             // OR-fires across every band. H&S only — see `tp_resistance_band`.
-            sr_reversal_ranges: {
+            //
+            // `--skip-reversals` leaves this empty, which is what suppresses the
+            // alert: `build_trade_from_spec` emits `07-close-on-sr-reversal`
+            // only when the list is non-empty. Skipping the whole block (rather
+            // than filtering after) also drops the TP resistance band, which is
+            // deliberate — it is an S/R band like any other and would otherwise
+            // keep the reversal-close alive on a "reversals off" cell.
+            sr_reversal_ranges: if args.skip_reversals {
+                Vec::new()
+            } else {
                 let mut bands = build_sr_ranges(geom, args.reversal_band_pct);
                 if !args.skip_tp_resistance {
                     bands.push(tp_resistance_band(tp, direction, args.tp_resistance_pct));
@@ -853,6 +866,122 @@ mod tests {
         assert!(
             spec.sr_reversal_ranges.is_empty(),
             "no drawn S/R and band skipped"
+        );
+    }
+
+    /// `--skip-reversals` drops **every** S/R band — the drawn ones and the
+    /// default-on TP resistance band alike.
+    ///
+    /// The TP band is the one that would otherwise survive: it is added
+    /// independently of the drawn lines, so a flag that only filtered
+    /// `build_sr_ranges` would leave a band behind and keep
+    /// `07-close-on-sr-reversal` armed on a cell whose name says reversals are
+    /// off. That is worse than not having the flag — the grid column would be
+    /// mislabelled rather than missing.
+    #[test]
+    fn skip_reversals_drops_drawn_and_tp_bands_alike() {
+        let mut roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        roles.sr_levels = vec![hline("sr", "support", 1.05)];
+        let geom = PlanGeometry::from_roles(&roles);
+
+        // Control: without the flag this same setup has both bands.
+        let (_dir, with) = resolve_hs_trade(
+            &mw_args(&[]),
+            &geom,
+            true,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        )
+        .expect("valid H&S resolves");
+        assert_eq!(with.sr_reversal_ranges.len(), 2, "drawn + auto TP band");
+        assert!(with.close_on_news, "news fact carried through");
+
+        let (_dir, without) = resolve_hs_trade(
+            &mw_args(&["--skip-reversals"]),
+            &geom,
+            true,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        )
+        .expect("valid H&S resolves");
+        assert!(
+            without.sr_reversal_ranges.is_empty(),
+            "both the drawn band and the TP band must go: {:?}",
+            without.sr_reversal_ranges
+        );
+        assert!(
+            !without.close_on_news,
+            "the news-window flatten must go too, even with news present"
+        );
+    }
+
+    /// End-to-end: the flag removes both reversal-close ALERTS from the bundle.
+    ///
+    /// The spec-level assertions above pin the inputs; this pins the output the
+    /// worker actually sees. `build_trade_from_spec` decides on
+    /// `!sr_reversal_ranges.is_empty()` and `close_on_news`, so this is the test
+    /// that would catch a future refactor that keeps the fields but re-derives
+    /// the alerts from somewhere else.
+    #[test]
+    fn skip_reversals_emits_neither_close_alert() {
+        let mut roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        roles.sr_levels = vec![hline("sr", "support", 1.05)];
+        let geom = PlanGeometry::from_roles(&roles);
+
+        let basenames = |flags: &[&str]| -> Vec<String> {
+            let (_dir, spec) = resolve_hs_trade(
+                &mw_args(flags),
+                &geom,
+                true,
+                "EUR_USD",
+                "ms-oanda-1",
+                Broker::Oanda,
+                0.0001,
+                0.0001,
+            )
+            .expect("valid H&S resolves");
+            // Lenient: this test is about which alerts get emitted, not about
+            // the time-sensitive gates the live path adds.
+            cli::build_trade_from_spec(spec, Utc::now(), cli::BuildStrictness::Lenient)
+                .expect("bundle builds")
+                .alerts
+                .iter()
+                .map(|a| a.basename.clone())
+                .collect()
+        };
+
+        // Control: both closes present when the flag is off.
+        let with = basenames(&[]);
+        assert!(
+            with.iter().any(|b| b == "07-close-on-sr-reversal"),
+            "control must have the S/R close: {with:?}"
+        );
+        assert!(
+            with.iter().any(|b| b == "06-close-on-reversal"),
+            "control must have the news close: {with:?}"
+        );
+
+        let without = basenames(&["--skip-reversals"]);
+        assert!(
+            !without.iter().any(|b| b.contains("close-on")),
+            "no reversal-close alert may survive: {without:?}"
+        );
+        // The rest of the bundle is untouched — this drops exits, not entries.
+        assert!(
+            without.iter().any(|b| b == "05-enter"),
+            "the enter must survive: {without:?}"
+        );
+        assert!(
+            without
+                .iter()
+                .any(|b| b.starts_with("02-veto-trade-expiry")),
+            "vetos must survive: {without:?}"
         );
     }
 

@@ -3422,8 +3422,8 @@ human-paced part, and freezing it is what makes every later re-run free.
 
 ### The entry-sensitivity grid: `--save-matrix`
 
-The explicit form. Arms four entry rules × news calendar on/off — eight cells —
-from a **single** chart read:
+The explicit form. Arms four entry rules × news calendar on/off × reversal-closes
+on/off — sixteen cells — from a **single** chart read:
 
 | entry rule | what it arms |
 |---|---|
@@ -3436,7 +3436,32 @@ from a **single** chart read:
 tv-arm --spec-out setups/trade-124.json --save-matrix \
   replay --save trade-124 --simulate true
 # → trade-124-{normal,skip-bcr,strategy-v2,strategy-v2-qm-market}-{news-on,news-off}
+#   …and the same eight again with a -rev-off suffix
 ```
+
+**The reversal axis** (`--skip-reversals`) is the third one, and it asks a
+different *kind* of question from the other two. Entry rule and news gate decide
+**whether to open**; the reversal-close decides **when to bail out of something
+already open** — it flattens the position when a golden opposing candle prints
+during a news window (`06-close-on-reversal`) or off an S/R band
+(`07-close-on-sr-reversal`). Sometimes that banks a partial win the trade would
+otherwise round-trip to its stop; sometimes it cuts a runner that was about to
+reach TP. Since the same early exit can help on one entry rule and hurt on
+another, it crosses every column as an axis rather than sitting beside them as
+one more column — each column gets a paired twin, and the R difference within a
+pair is attributable to the reversal-close alone.
+
+Note `--skip-reversals` drops the **exits** only. The invalidation caps
+(`too-high`/`too-low`) and the 80%-to-TP `pcl-exhausted` abort are vetos, fire on
+their own, and don't close an open position — they are unaffected. It also drops
+the default-on take-profit resistance band, since that is an S/R band like any
+other and would otherwise keep the S/R close armed on a cell whose name says
+reversals are off.
+
+Reversals-**on** cells keep their historical directory names (`…-news-on`, no
+suffix) and only the off-twins gain `-rev-off`, so re-capturing a trade
+overwrites its own fixtures in place instead of orphaning every directory
+already on disk beside a near-duplicate.
 
 The last two differ only in the QM leg's order type, and they answer different
 questions: the limit leg asks *"does waiting for the pullback pay for the fills
@@ -3447,22 +3472,25 @@ leaves `--qm-entry` unset rather than passing `limit` explicitly — limit is
 already the default, and the unset form keeps the cell byte-identical to the
 `strategy-v2` fixtures captured before `--qm-entry` existed.
 
-Reading once matters. Eight separate `tv-arm` invocations would each re-classify
-roles against a chart that may have scrolled and re-read a calendar that may
-have moved, so the cells could differ by more than the flag under test — and the
-grid would be comparing *setups* rather than gates. One read means every cell
-shares byte-identical geometry.
+Reading once matters. Sixteen separate `tv-arm` invocations would each
+re-classify roles against a chart that may have scrolled and re-read a calendar
+that may have moved, so the cells could differ by more than the flag under test —
+and the grid would be comparing *setups* rather than gates. One read means every
+cell shares byte-identical geometry.
 
 It composes with `--spec-in`, which is the actual corpus workflow: confirm once
 on the chart, then regenerate the whole grid offline after any engine change.
 
-Each cell suffixes the replay's `--save` name, so eight cells land in eight
+Each cell suffixes the replay's `--save` name, so sixteen cells land in sixteen
 directories rather than overwriting each other, and records its own
-`arm.entry_rule` label so a batch tool groups columns from **data** rather than
-by parsing directory names. A cell that fails to arm is recorded and the run
-continues (a variant can legitimately be rejected); the summary names what's
-missing, and the exit code is non-zero unless all eight armed — a partial grid
-must not read as complete.
+`arm.entry_rule` / `arm.skip_calendar_bars` / `arm.skip_reversals` values so a
+batch tool groups columns from **data** rather than by parsing directory names.
+(Both `skip_*` flags must be recorded explicitly because neither is inferable
+from the saved plan: a plan with no `07-close-on-sr-reversal` could equally mean
+"reversals were skipped" or "no S/R lines were drawn".) A cell that fails to arm
+is recorded and the run continues (a variant can legitimately be rejected); the
+summary names what's missing, and the exit code is non-zero unless all sixteen
+armed — a partial grid must not read as complete.
 
 ### Gotchas worth knowing
 

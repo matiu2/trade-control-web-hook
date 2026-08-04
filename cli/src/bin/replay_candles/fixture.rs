@@ -854,6 +854,7 @@ mod tests {
                 entry_rule: EntryRule::SkipBcr,
                 skip_calendar_bars: true,
                 skip_golden: false,
+                skip_reversals: false,
                 start: Some("2026-07-17T17:00:00+10:00".into()),
                 candle_source: Some("tradenation".into()),
                 chart_symbol: Some("TRADENATION:EURUSD".into()),

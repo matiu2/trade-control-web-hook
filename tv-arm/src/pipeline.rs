@@ -191,7 +191,7 @@ fn freeze_setup(args: &Args, setup: &SetupInputs, path: &Path) -> Result<()> {
 
 /// Arm every cell of the entry-sensitivity grid from ONE chart read.
 ///
-/// The setup is cloned per cell, so all six share byte-identical geometry — the
+/// The setup is cloned per cell, so all sixteen share byte-identical geometry — the
 /// only difference between the resulting fixtures is the flag under test. Six
 /// separate `tv-arm` runs could not promise that: each would re-classify roles
 /// against a chart that may have scrolled and re-read a calendar that may have
@@ -222,6 +222,7 @@ fn arm_context<'a>(args: &'a Args, chart_symbol: &'a str) -> crate::replay::ArmC
         qm_entry: args.qm_entry,
         skip_calendar_bars: args.skip_calendar_bars,
         skip_golden: args.skip_golden,
+        skip_reversals: args.skip_reversals,
         start: args.start.as_deref(),
         chart_symbol: Some(chart_symbol),
     }
@@ -2195,7 +2196,7 @@ mod tests {
         let setup = crate::setup_inputs::tests::sample();
         let out = expand_save_fixture(sf_args(&["--save-fixture"]), &setup);
 
-        assert!(out.save_matrix, "must arm all six cells");
+        assert!(out.save_matrix, "must arm all sixteen cells");
         assert!(
             out.spec_out.is_some(),
             "must freeze the setup for free re-runs"

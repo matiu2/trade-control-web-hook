@@ -396,6 +396,29 @@ pub struct Args {
     #[arg(long)]
     pub skip_golden: bool,
 
+    /// Drop **both** reversal-closes: no `06-close-on-reversal` (the news-window
+    /// safety flatten) and no `07-close-on-sr-reversal` (the S/R-band close).
+    ///
+    /// A reversal-close flattens an open position when a golden opposing candle
+    /// prints during a news window or off a support/resistance band. It is
+    /// non-terminal — it closes the position but never blocks re-entry (see
+    /// CLAUDE.md's CLOSE vs VETO/INVALIDATE section). Sometimes that early exit
+    /// banks a partial win the trade would otherwise round-trip; sometimes it
+    /// cuts a runner that was about to reach TP. This flag is how the corpus
+    /// answers *which*, by arming the same setup both ways.
+    ///
+    /// Suppresses the alerts at the source — `close_on_news` is forced false and
+    /// `sr_reversal_ranges` is left empty, so `build_trade_from_spec` emits
+    /// neither alert. That covers the chart-drawn S/R bands **and** the
+    /// default-on take-profit resistance band (`--skip-tp-resistance`'s band),
+    /// since both land in the same `sr_reversal_ranges` list.
+    ///
+    /// Note this does **not** touch the invalidation caps (`too-high`/`too-low`)
+    /// or the 80%-to-TP `pcl-exhausted` abort: those are vetos, they fire on
+    /// their own, and they don't close an open position.
+    #[arg(long)]
+    pub skip_reversals: bool,
+
     /// Require a confirmed signal candle on entry. Sets
     /// `needs_confirmed: true` on the enter intent. Independent of the
     /// golden gate (which is on by default; clear it with
@@ -512,24 +535,25 @@ pub struct Args {
     #[arg(long, value_name = "FILE")]
     pub spec_in: Option<PathBuf>,
 
-    /// Arm the **entry-sensitivity grid** from a single chart read: three entry
-    /// rules (normal / skip-bcr / strategy-v2) × news calendar on/off.
+    /// Arm the **entry-sensitivity grid** from a single chart read: four entry
+    /// rules (normal / skip-bcr / strategy-v2 / strategy-v2-qm-market) × news
+    /// calendar on/off × reversal-closes on/off.
     ///
-    /// Reads the chart **once** and re-arms six times from that one setup, so
-    /// every cell shares byte-identical geometry and the only difference between
-    /// fixtures is the flag under test. Six separate `tv-arm` invocations would
-    /// each re-read the chart (and the calendar), so they can differ by more
-    /// than the flag — which would make the grid compare setups rather than
-    /// gates.
+    /// Reads the chart **once** and re-arms sixteen times from that one setup,
+    /// so every cell shares byte-identical geometry and the only difference
+    /// between fixtures is the flag under test. Sixteen separate `tv-arm`
+    /// invocations would each re-read the chart (and the calendar), so they can
+    /// differ by more than the flag — which would make the grid compare setups
+    /// rather than gates.
     ///
     /// Pairs with `replay ... --save`: each cell's fixture is named
-    /// `<your-name>-<entry-rule>-<news-on|news-off>`. A cell that fails to arm
-    /// is recorded and the run continues; the summary names it.
+    /// `<your-name>-<entry-rule>-<news-on|news-off>[-rev-off]`. A cell that
+    /// fails to arm is recorded and the run continues; the summary names it.
     #[arg(long, conflicts_with_all = ["skip_bcr", "strategy_v2", "skip_all", "quasimodo"])]
     pub save_matrix: bool,
 
     /// **The one-flag corpus capture.** Read the chart once and save everything:
-    /// freezes the setup, arms all six grid cells, and writes the fixtures —
+    /// freezes the setup, arms all sixteen grid cells, and writes the fixtures —
     /// choosing the fixture name and the spec path for you.
     ///
     /// Equivalent to spelling out, with `<name>` derived as

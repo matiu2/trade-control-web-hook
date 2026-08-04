@@ -121,6 +121,18 @@ pub struct ArmRecord {
     /// `--skip-golden`: the golden-candle quality gate waived.
     #[serde(default)]
     pub skip_golden: bool,
+    /// `--skip-reversals`: both reversal-closes dropped. The grid's **third**
+    /// axis.
+    ///
+    /// Not inferable from the plan either (see [`Self::skip_calendar_bars`] for
+    /// the same argument): a plan with no `07-close-on-sr-reversal` could mean
+    /// the flag was passed, or simply that no S/R lines were drawn.
+    ///
+    /// `#[serde(default)]` is what keeps the pre-flag corpus readable — every
+    /// fixture captured before this axis existed had reversals **on**, which is
+    /// exactly `false`.
+    #[serde(default)]
+    pub skip_reversals: bool,
     /// The `--start` cursor as the operator typed it, verbatim. Kept as a string
     /// (not parsed) so the exact spelling round-trips for a re-arm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,14 +169,26 @@ pub struct ArmRecord {
 
 impl ArmRecord {
     /// A stable grouping key for batch analysis: one grid **cell** is one
-    /// `(entry_rule, news-on/off)` pair. Two fixtures with the same key are the
-    /// same cell of the same grid and should be directly comparable.
+    /// `(entry_rule, news-on/off, rev-on/off)` triple. Two fixtures with the
+    /// same key are the same cell of the same grid and should be directly
+    /// comparable.
     ///
     /// This is what lets `batch.rs` group fixtures by cell from **data** instead
     /// of parsing filenames — the whole point of recording the arm block.
+    ///
+    /// ## The reversal axis is suffix-only, on purpose
+    ///
+    /// A reversals-**on** cell keeps its historical key verbatim
+    /// (`normal/news-on`), and only the reversals-off twin carries the
+    /// `/rev-off` suffix. Appending `/rev-on` to the majority case would rename
+    /// every key in the existing corpus, so a blessed baseline would compare a
+    /// `normal/news-on` row against nothing and read as a wholesale grid change
+    /// rather than a new column. Same reasoning as the `#[serde(default)]` on
+    /// the field: absent means reversals were on.
     pub fn cell_key(&self) -> String {
         let news = if self.skip_calendar_bars { "off" } else { "on" };
-        format!("{}/news-{news}", self.entry_rule.label())
+        let rev = if self.skip_reversals { "/rev-off" } else { "" };
+        format!("{}/news-{news}{rev}", self.entry_rule.label())
     }
 }
 
@@ -227,9 +251,13 @@ mod tests {
         assert_ne!(rule, EntryRule::Normal);
     }
 
-    /// The eight cells of one trade's grid must produce eight distinct keys.
+    /// The sixteen cells of one trade's grid must produce sixteen distinct keys.
+    ///
+    /// Collisions are the failure that matters: two cells sharing a key means a
+    /// batch tool averages two different variants into one row and reports it as
+    /// a single confident number.
     #[test]
-    fn the_eight_grid_cells_have_distinct_keys() {
+    fn the_sixteen_grid_cells_have_distinct_keys() {
         let mut keys = Vec::new();
         for rule in [
             EntryRule::Normal,
@@ -238,21 +266,70 @@ mod tests {
             EntryRule::StrategyV2QmMarket,
         ] {
             for skip_calendar_bars in [false, true] {
-                keys.push(
-                    ArmRecord {
-                        entry_rule: rule.clone(),
-                        skip_calendar_bars,
-                        ..Default::default()
-                    }
-                    .cell_key(),
-                );
+                for skip_reversals in [false, true] {
+                    keys.push(
+                        ArmRecord {
+                            entry_rule: rule.clone(),
+                            skip_calendar_bars,
+                            skip_reversals,
+                            ..Default::default()
+                        }
+                        .cell_key(),
+                    );
+                }
             }
         }
         let unique: std::collections::HashSet<_> = keys.iter().collect();
-        assert_eq!(unique.len(), 8, "eight cells, eight keys: {keys:?}");
+        assert_eq!(unique.len(), 16, "sixteen cells, sixteen keys: {keys:?}");
         assert!(keys.contains(&"normal/news-on".to_string()));
         assert!(keys.contains(&"strategy-v2/news-off".to_string()));
         assert!(keys.contains(&"strategy-v2-qm-market/news-on".to_string()));
+        assert!(keys.contains(&"normal/news-on/rev-off".to_string()));
+        assert!(keys.contains(&"strategy-v2-qm-market/news-off/rev-off".to_string()));
+    }
+
+    /// A reversals-**on** record keeps the exact key it had before the reversal
+    /// axis existed.
+    ///
+    /// This is the compatibility pin for the whole corpus: every fixture already
+    /// on disk deserialises with `skip_reversals: false` (serde default), and if
+    /// that suffixed its key to `normal/news-on/rev-on` then a blessed baseline
+    /// would find no row matching `normal/news-on` and read the entire grid as
+    /// having changed, rather than gaining a column.
+    #[test]
+    fn reversals_on_keeps_the_pre_axis_cell_key() {
+        let on = ArmRecord {
+            entry_rule: EntryRule::Normal,
+            skip_calendar_bars: false,
+            skip_reversals: false,
+            ..Default::default()
+        };
+        assert_eq!(on.cell_key(), "normal/news-on");
+
+        // …and the twin is a strict suffix of it, so the pair is greppable.
+        let off = ArmRecord {
+            skip_reversals: true,
+            ..on.clone()
+        };
+        assert_eq!(off.cell_key(), "normal/news-on/rev-off");
+        assert!(off.cell_key().starts_with(&on.cell_key()));
+    }
+
+    /// A fixture saved before the reversal axis existed must read back as
+    /// reversals-**on**, not fail to parse and not default to "off".
+    ///
+    /// Those fixtures were captured with the reversal-closes live, so `false` is
+    /// the historically accurate value — reading them as `rev-off` would file
+    /// hundreds of reversal-on results under the reversal-off column.
+    #[test]
+    fn a_pre_axis_meta_json_reads_back_as_reversals_on() {
+        let legacy = r#"{"entry_rule":"skip-bcr","skip_calendar_bars":true}"#;
+        let back: ArmRecord = serde_json::from_str(legacy).expect("legacy meta still parses");
+        assert!(
+            !back.skip_reversals,
+            "absent field means reversals were ON when this was captured"
+        );
+        assert_eq!(back.cell_key(), "skip-bcr/news-off");
     }
 
     /// Round-trips through JSON, and the labels are the stable kebab-case forms a
@@ -263,6 +340,7 @@ mod tests {
             entry_rule: EntryRule::SkipBcr,
             skip_calendar_bars: true,
             skip_golden: false,
+            skip_reversals: false,
             start: Some("2026-07-17T17:00:00+10:00".into()),
             candle_source: Some("tradenation".into()),
             chart_symbol: Some("TRADENATION:EURUSD".into()),
@@ -351,6 +429,7 @@ mod tests {
             entry_rule: EntryRule::Normal,
             skip_calendar_bars: false,
             skip_golden: false,
+            skip_reversals: false,
             start: Some("2026-07-17T17:00:00+10:00".into()),
             candle_source: Some("tradenation".into()),
             chart_symbol: Some("TRADENATION:EURUSD".into()),
@@ -367,7 +446,7 @@ mod tests {
             .filter(|k| {
                 !matches!(
                     k.as_str(),
-                    "entry_rule" | "skip_calendar_bars" | "skip_golden"
+                    "entry_rule" | "skip_calendar_bars" | "skip_golden" | "skip_reversals"
                 )
             })
             .cloned()
