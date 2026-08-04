@@ -948,8 +948,9 @@ mod tests {
         let candles = two_short_engulfers_first_confirms();
         let l = latched_signal_at(&candles, 3, &cfg()).expect("latched");
         assert_eq!(l.direction, Direction::Short);
-        // The latch is the SECOND signal (bar 2): high 112 / low 104.
-        assert!((l.signal_high - 112.0).abs() < 1e-9, "hi {}", l.signal_high);
+        // The latch is the SECOND signal (bar 2). Engulfer extremes span both
+        // covered bars, so its high is bar 1's 117.5 and its low bar 2's 104.
+        assert!((l.signal_high - 117.5).abs() < 1e-9, "hi {}", l.signal_high);
         assert!((l.signal_low - 104.0).abs() < 1e-9, "lo {}", l.signal_low);
     }
 
@@ -974,8 +975,9 @@ mod tests {
         assert_eq!(f.direction, Direction::Short);
         assert!(f.signal_confirmed, "first signal is confirmed");
         assert!(f.fires, "fires on the confirmation bar");
-        // Bar 1's OWN geometry — high 117.5 / low 110 — not the second signal's.
-        assert!((f.signal_high - 117.5).abs() < 1e-9, "hi {}", f.signal_high);
+        // Bar 1's OWN geometry — not the second signal's. Its engulfer spans
+        // bars 0-1, so the high is bar 0's 121.0 and the low bar 1's 110.
+        assert!((f.signal_high - 121.0).abs() < 1e-9, "hi {}", f.signal_high);
         assert!((f.signal_low - 110.0).abs() < 1e-9, "lo {}", f.signal_low);
     }
 
@@ -1235,8 +1237,9 @@ mod tests {
         )
         .expect("A confirmed at bar 3");
         assert!(a.fires, "A fires on its confirmation bar");
+        // A's engulfer spans bars 0-1 → high is bar 0's 121.0, low bar 1's 110.
         assert!(
-            (a.signal_high - 117.5).abs() < 1e-9,
+            (a.signal_high - 121.0).abs() < 1e-9,
             "A hi {}",
             a.signal_high
         );
@@ -1258,7 +1261,8 @@ mod tests {
             None,
         )
         .expect("still A at bar 6");
-        assert!((frozen.signal_high - 117.5).abs() < 1e-9);
+        // Still A, so still A's 2-bar span high (bars 0-1).
+        assert!((frozen.signal_high - 121.0).abs() < 1e-9);
         assert!(
             !frozen.fires,
             "A no longer fires after its confirmation bar"
@@ -1266,7 +1270,12 @@ mod tests {
 
         // With `after` = A's print time, A can no longer win. Before the next
         // signal confirms (bar 3) → None; on the next signal's confirmation bar
-        // (bar 6) → the next short wins and fires.
+        // (bar 4) → the next short wins and fires.
+        //
+        // That next short is the **bar-2** engulfer (print 11:00, span bars 1-2
+        // → high 117.5 / low 109), not the bar-4 one: bar 2 pushes below A's low
+        // and is itself a floating engulfer of bar 1. It confirms one window
+        // (`confirm_bars` = 2) after its own print, i.e. at bar 4.
         assert!(
             fc(
                 &candles,
@@ -1283,7 +1292,7 @@ mod tests {
         );
         let next = fc(
             &candles,
-            6,
+            4,
             &cfg(),
             Direction::Short,
             None,
@@ -1291,17 +1300,22 @@ mod tests {
             None,
             Some(a_watermark),
         )
-        .expect("next confirmed short at bar 6");
+        .expect("next confirmed short at bar 4");
         assert!(
             next.fires,
             "the next short fires on its own confirmation bar"
         );
-        // A DIFFERENT signal than A: the bar-4 engulfer (high 112 / low 108),
-        // printing strictly after A.
+        // A DIFFERENT signal than A: the bar-2 engulfer, spanning bars 1-2 →
+        // high 117.5 / low 109, printing strictly after A.
         assert!(
-            (next.signal_high - 112.0).abs() < 1e-9,
+            (next.signal_high - 117.5).abs() < 1e-9,
             "next hi {}",
             next.signal_high
+        );
+        assert!(
+            (next.signal_low - 109.0).abs() < 1e-9,
+            "next lo {}",
+            next.signal_low
         );
         assert!(
             next.signal_bar_time > a_watermark,

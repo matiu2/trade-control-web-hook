@@ -360,9 +360,22 @@ mod tests {
     use trade_control_cli::replay_args::{DetectorMarkConfig, DirectionFilter, GoldenFilter};
 
     /// The uk-100 multi-shot fixture, which several tests below need
-    /// specifically: it's the one exercising a reversal-close AND a trade-expiry
-    /// flatten on open positions, over three legs.
+    /// specifically: it's the one exercising a **trade-expiry** flatten on an
+    /// open position, over multiple legs.
+    ///
+    /// It used to book a reversal-close on an open position too, which is why
+    /// the test below was originally one test. Since the engulfer 2-bar span fix
+    /// its stops sit wider, the first leg fills later, and both of its
+    /// `close-on-reversal` fires now land while **flat** — they correctly book
+    /// nothing. The reversal half of that coverage moved to
+    /// [`XAU_XAG_REVERSAL`]; don't fold these back together without checking
+    /// that one fixture still exercises both.
     const UK_100: &str = "uk-100-news-blackout-rentry-close-on-reversal";
+
+    /// A reversal-close that lands on a genuinely **open** position and books a
+    /// real leg. Carries the half of the close-booking guarantee that [`UK_100`]
+    /// stopped exercising.
+    const XAU_XAG_REVERSAL: &str = "xau-xag-close-on-reversal";
 
     /// The iH&S long whose `too-low` **invalidation** veto flattened it four days
     /// before the trade-expiry. Paired with [`UK_100`] (a genuine trade-expiry
@@ -510,7 +523,7 @@ mod tests {
     /// rendering is still checked once, to catch a formatting regression that
     /// leaves the numbers right but stops showing them.
     #[tokio::test]
-    async fn stateful_broker_books_reversal_and_expiry_closes_in_the_report() {
+    async fn stateful_broker_books_expiry_closes_in_the_report() {
         let dir = require_fixture(UK_100);
         let inputs = load(&dir).expect("load uk-100 fixture");
         let expires_at = inputs
@@ -538,12 +551,6 @@ mod tests {
             super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
         let econ = &rendered.economics;
 
-        // A reversal-close must book a real position off the held ledger, not sit
-        // at 0R / "still open". Before S5 `close_positions` was a no-op.
-        assert_eq!(
-            econ.reversal_closes, 1,
-            "reversal-close must be booked from the held ledger: {econ:#?}"
-        );
         // The trade-expiry ClosePositions veto must FLATTEN the open position at
         // the expiry candle's close — the operator's original ask. Before S5 the
         // veto left the position open at 0R.
@@ -552,21 +559,19 @@ mod tests {
             "expiry veto must flatten the open position from the held ledger: {econ:#?}"
         );
 
-        // Both closes are booked as legs with a real exit and a signed R — the
-        // half the old `simulate_fill` golden could not represent at all. This is
-        // the assertion that now guards Net R against a silent regression.
+        // The close is booked as a leg with a real exit and a signed R — the half
+        // the old `simulate_fill` golden could not represent at all. This is the
+        // assertion that guards Net R against a silent regression.
         let closed: Vec<_> = econ
             .legs
             .iter()
-            .filter(|l| {
-                matches!(
-                    l.exit_reason,
-                    super::super::economics::ExitReason::Reversal
-                        | super::super::economics::ExitReason::Expiry
-                )
-            })
+            .filter(|l| matches!(l.exit_reason, super::super::economics::ExitReason::Expiry))
             .collect();
-        assert_eq!(closed.len(), 2, "both closes must book legs: {econ:#?}");
+        assert_eq!(
+            closed.len(),
+            1,
+            "the expiry close must book a leg: {econ:#?}"
+        );
         for leg in closed {
             assert!(
                 leg.exit_price.is_some() && leg.exit_time.is_some(),
@@ -578,9 +583,9 @@ mod tests {
             );
         }
 
-        // The rendered text must still SHOW them (formatting regression guard).
+        // The rendered text must still SHOW it (formatting regression guard).
         let text = &rendered.text;
-        for want in ["CLOSED ON REVERSAL", "CLOSED AT TRADE EXPIRY", "EXP: 1"] {
+        for want in ["CLOSED AT TRADE EXPIRY", "EXP: 1"] {
             assert!(text.contains(want), "report must show {want}:\n{text}");
         }
         // uk-100's flatten is the genuine `02-veto-trade-expiry`, so it must stay
@@ -605,6 +610,76 @@ mod tests {
             snapshot.outcome.as_ref(),
             Some(econ),
             "the golden snapshot must record the booked economics verbatim"
+        );
+    }
+
+    /// The reversal half of the close-booking guarantee, on a fixture whose
+    /// reversal-close lands on a genuinely **open** position. A reversal-close
+    /// must book a real position off the held ledger, not sit at 0R / "still
+    /// open" — before S5 `close_positions` was a no-op.
+    ///
+    /// Split out of the uk-100 test when the engulfer 2-bar span fix widened
+    /// uk-100's stops enough that its reversal fires landed while flat (see
+    /// [`UK_100`]). Keeping the assertion pinned to a fixture that still
+    /// exercises it is the point — re-blessing it to `reversal_closes: 0` would
+    /// have retired the coverage silently.
+    #[tokio::test]
+    async fn stateful_broker_books_a_reversal_close_on_an_open_position() {
+        let dir = require_fixture(XAU_XAG_REVERSAL);
+        let inputs = load(&dir).expect("load xau-xag fixture");
+        let expires_at = inputs
+            .candles
+            .last()
+            .map(|c| c.time)
+            .unwrap_or_else(Utc::now)
+            + chrono::Duration::days(365);
+        let mark_cfg = DetectorMarkConfig::new(
+            DirectionFilter::None,
+            GoldenFilter::None,
+            inputs.plan.direction,
+        );
+        let replay = super::super::replay::run(
+            &inputs.plan,
+            &inputs.candles,
+            inputs.meta.granularity,
+            inputs.meta.start,
+            expires_at,
+            mark_cfg,
+            None,
+        )
+        .await;
+        let rendered =
+            super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
+        let econ = &rendered.economics;
+
+        assert_eq!(
+            econ.reversal_closes, 1,
+            "reversal-close must be booked from the held ledger: {econ:#?}"
+        );
+        let closed: Vec<_> = econ
+            .legs
+            .iter()
+            .filter(|l| matches!(l.exit_reason, super::super::economics::ExitReason::Reversal))
+            .collect();
+        assert_eq!(
+            closed.len(),
+            1,
+            "the reversal close must book a leg: {econ:#?}"
+        );
+        for leg in closed {
+            assert!(
+                leg.exit_price.is_some() && leg.exit_time.is_some(),
+                "a flattened position must carry its exit: {leg:#?}"
+            );
+            assert!(
+                leg.r.is_finite() && leg.r != 0.0,
+                "a flattened position must book a signed R, not 0R: {leg:#?}"
+            );
+        }
+        assert!(
+            rendered.text.contains("CLOSED ON REVERSAL"),
+            "report must show CLOSED ON REVERSAL:\n{}",
+            rendered.text
         );
     }
 

@@ -487,6 +487,18 @@ fills it in at fire time. Valid anchors:
   same entry/SL geometry on the break-candle fire and the confirmed
   re-fire. This is the default SL/entry anchor for the H&S/IHS builders.
 
+  The extremes span **every bar the pattern covers**, matching
+  `signal_start_time`: 3 bars for a double-tweezer, 2 for a tweezer or
+  either engulfer kind, 1 for a pinbar. Engulfers used to report the
+  print bar's extremes alone, which put a short's `signal_high`-anchored
+  SL *inside* the pattern whenever bar `N-1`'s high poked above bar
+  `N`'s — most visible on the **floating** engulfer, which has no
+  body-open constraint and so routinely opens below the prior bar's high
+  (EUR/ZAR H&S short, 2026-07-23T00:00). The golden-test `size` is
+  unchanged by that fix: tweezers still sum component ranges, a floating
+  engulfer still uses its (now wider) extreme span, and a **regular**
+  engulfer still sizes off the print bar's own range.
+
 `recent_*` and `signal_*` fall back to the candle's own `high`/`low`
 when an older Pine indicator didn't ship the field.
 

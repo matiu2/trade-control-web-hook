@@ -327,13 +327,27 @@ bearish_signal = show_this_candle and (bearish_double_tweezer or bearish_tweezer
 // and the capture blocks below). Computed unconditionally so they're in scope
 // for the opposing-signal invalidation check during update. Values are only
 // meaningful when the corresponding *_signal flag is true.
-float bull_sig_high = bullish_double_tweezer ? math.max(high, nz(high[1], high), nz(high[2], high)) : bullish_tweezer ? math.max(high, nz(high[1], high)) : high
-float bull_sig_low  = bullish_double_tweezer ? math.min(low, nz(low[1], low), nz(low[2], low)) : bullish_tweezer ? math.min(low, nz(low[1], low)) : low
+// The extremes span EVERY bar the pattern covers, matching signal_start_time:
+// 3 bars for a double-tweezer, 2 for a tweezer or either engulfer kind, 1 for a
+// pinbar. The engulfers used to fall through to a bare `high`/`low` (print bar
+// only) — that placed a short's signal_high-anchored SL *inside* the pattern
+// whenever bar N-1's high poked above bar N's. Most visible on the floating
+// engulfer, which has no body-open constraint and so routinely opens below the
+// prior bar's high (EUR/ZAR H&S short, 2026-07-23T00:00). Mirrors
+// `core/src/signals/detect.rs::build` — replay == live, so change both together.
+bool  bull_engulfer = bullish_regular or bullish_floating
+float bull_sig_high = bullish_double_tweezer ? math.max(high, nz(high[1], high), nz(high[2], high)) : (bullish_tweezer or bull_engulfer) ? math.max(high, nz(high[1], high)) : high
+float bull_sig_low  = bullish_double_tweezer ? math.min(low, nz(low[1], low), nz(low[2], low)) : (bullish_tweezer or bull_engulfer) ? math.min(low, nz(low[1], low)) : low
+// size (the golden test) keeps its per-kind semantics: tweezers sum component
+// ranges, a floating engulfer uses the (now wider) extreme span, everything else
+// — pinbar and REGULAR engulfer — the print bar's own range. Widening the
+// regular's size here would silently promote more of them to golden.
 float bull_sig_size = bullish_double_tweezer ? (candle_range + prev_candle_range + nz(prev2_candle_range, 0)) : bullish_tweezer ? (candle_range + prev_candle_range) : bullish_floating ? (bull_sig_high - bull_sig_low) : candle_range
 bool  bull_sig_golden = bull_sig_size >= atr_value
 
-float bear_sig_high = bearish_double_tweezer ? math.max(high, nz(high[1], high), nz(high[2], high)) : bearish_tweezer ? math.max(high, nz(high[1], high)) : high
-float bear_sig_low  = bearish_double_tweezer ? math.min(low, nz(low[1], low), nz(low[2], low)) : bearish_tweezer ? math.min(low, nz(low[1], low)) : low
+bool  bear_engulfer = bearish_regular or bearish_floating
+float bear_sig_high = bearish_double_tweezer ? math.max(high, nz(high[1], high), nz(high[2], high)) : (bearish_tweezer or bear_engulfer) ? math.max(high, nz(high[1], high)) : high
+float bear_sig_low  = bearish_double_tweezer ? math.min(low, nz(low[1], low), nz(low[2], low)) : (bearish_tweezer or bear_engulfer) ? math.min(low, nz(low[1], low)) : low
 float bear_sig_size = bearish_double_tweezer ? (candle_range + prev_candle_range + nz(prev2_candle_range, 0)) : bearish_tweezer ? (candle_range + prev_candle_range) : bearish_floating ? (bear_sig_high - bear_sig_low) : candle_range
 bool  bear_sig_golden = bear_sig_size >= atr_value
 

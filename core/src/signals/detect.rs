@@ -28,8 +28,9 @@ use crate::intent::{Direction, SignalKind};
 const TWEEZER_WICK_THRESHOLD: f64 = 0.35;
 
 /// The geometry latched when a signal prints — the values Pine writes onto the
-/// `signal_*` plots. Extremes span the bars the pattern covers (1 for
-/// pinbar/floating, 2 for tweezer/regular, 3 for double-tweezer).
+/// `signal_*` plots. Extremes span every bar the pattern covers (1 for a pinbar,
+/// 2 for tweezer / regular engulfer / floating engulfer, 3 for a
+/// double-tweezer) — always agreeing with [`SignalGeometry::start_time`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SignalGeometry {
     pub high: f64,
@@ -61,8 +62,9 @@ pub struct Detected {
     pub geometry: SignalGeometry,
     /// The size compared against ATR for the golden flag. For tweezer /
     /// double-tweezer Pine sums the component candle *ranges* (not the extreme
-    /// span); for a floating engulfer it is the extreme span; otherwise the
-    /// single candle range. Kept separate from [`SignalGeometry::range`] (the
+    /// span); for a floating engulfer it is the extreme span (so it widened with
+    /// the 2-bar span fix); otherwise — pinbar and **regular** engulfer — the
+    /// single print-bar range. Kept separate from [`SignalGeometry::range`] (the
     /// wire `signal_range`) to match Pine exactly.
     pub size: f64,
 }
@@ -379,6 +381,20 @@ fn floating_engulfer(dir: Direction, m: &CandleMetrics, pm: Option<&CandleMetric
 /// Build the [`Detected`] for the winning direction, computing the signal
 /// extremes / size / kind / start-time per the priority order — mirroring the
 /// Pine `bull_sig_*` / `bear_sig_*` precompute and the `f_*_kind()` helpers.
+///
+/// **Extremes span every bar the pattern covers**, matching `start_time`: 3 bars
+/// for a double-tweezer, 2 for tweezer / regular / floating engulfer, 1 for a
+/// pinbar. The engulfers used to take the print bar's extremes alone (both here
+/// and in Pine, which fell through to a bare `high`/`low` for anything that
+/// wasn't a tweezer); that placed a short's `signal_high`-anchored SL *inside*
+/// the pattern whenever bar `N-1`'s high poked above bar `N`'s. Most visible on
+/// the **floating** engulfer, which has no body-open constraint and so routinely
+/// opens below the prior bar's high — EUR/ZAR H&S short, 2026-07-23T00:00.
+///
+/// `size` (the golden test) deliberately did **not** change with that fix: the
+/// regular engulfer still sizes off the print bar's range, the floating engulfer
+/// off its extreme span (now wider). Widening the regular's size would silently
+/// promote more of them to golden.
 #[allow(clippy::too_many_arguments)]
 fn build(
     dir: Direction,
@@ -414,12 +430,20 @@ fn build(
             SignalKind::Tweezer,
         )
     } else if f.floating {
-        // Floating engulfer: extreme span over the current bar only (Pine's
-        // bull_sig_high/low are `high`/`low` for non-tweezer), but the *size*
-        // is the extreme span (high - low). Kind = floating.
-        (m.high, m.low, m.high - m.low, SignalKind::FloatingEngulfer)
+        // Floating engulfer spans N-1..N, so its extremes span both bars. The
+        // *size* (golden test) is that extreme span. See the span note above.
+        let (high, low) = (m.high.max(ph), m.low.min(pl));
+        (high, low, high - low, SignalKind::FloatingEngulfer)
     } else if f.regular {
-        (m.high, m.low, m.range, SignalKind::RegularEngulfer)
+        // Regular engulfer also spans N-1..N for its extremes, but sizes off the
+        // print bar's own range (widening size here would make more of them
+        // golden — a separate behaviour change we're not making).
+        (
+            m.high.max(ph),
+            m.low.min(pl),
+            m.range,
+            SignalKind::RegularEngulfer,
+        )
     } else {
         // Pinbar.
         (m.high, m.low, m.range, SignalKind::Pinbar)
@@ -520,6 +544,84 @@ mod tests {
         assert_eq!(d.geometry.kind, SignalKind::RegularEngulfer);
         // 2-bar kind → start_time is the prior bar.
         assert_eq!(d.geometry.start_time, ts("2026-06-16T10:00:00Z"));
+    }
+
+    /// A **floating** engulfer's extremes must span both covered bars (`N-1`,
+    /// `N`), not just the print bar. Floating has no body-open constraint, so
+    /// the print bar can open below the prior bar's high and leave that high
+    /// sticking out above it — exactly the EUR/ZAR H&S short of 2026-07-23T00:00
+    /// that surfaced this. A short's SL anchors on `signal_high`, so a print-bar
+    /// -only extreme places the stop *inside* the pattern.
+    #[test]
+    fn floating_engulfer_spans_both_bars_when_prior_high_sticks_out() {
+        let candles = [
+            // N-1: bearish (floating needs same-colour prior), and its high
+            // (1.30) is ABOVE the print bar's high (1.12).
+            k("2026-06-16T10:00:00Z", 1.28, 1.30, 1.00, 1.02),
+            // N: bearish, close (0.91) < prior low (1.00), close in bottom
+            // quartile. Its own high is only 1.12. No body-open constraint, so
+            // opening at 1.10 (below the prior high) still detects.
+            k("2026-06-16T11:00:00Z", 1.10, 1.12, 0.90, 0.91),
+        ];
+        let d = detect_at(&candles, 1, &flags()).expect("floating engulfer");
+        assert_eq!(d.geometry.kind, SignalKind::FloatingEngulfer);
+        assert_eq!(d.direction, Direction::Short);
+        // The prior bar's high wins — the pattern's true extreme.
+        assert!((d.geometry.high - 1.30).abs() < 1e-12, "span high");
+        assert!((d.geometry.low - 0.90).abs() < 1e-12, "span low");
+        assert!((d.geometry.range - 0.40).abs() < 1e-12, "span range");
+        // start_time already covered N-1; the extremes now agree with it.
+        assert_eq!(d.geometry.start_time, ts("2026-06-16T10:00:00Z"));
+    }
+
+    /// The same span rule applies to a **regular** engulfer. Its body-open
+    /// constraint (`open >= prior close` for a short) makes a protruding prior
+    /// high rarer than in the floating case, but not impossible: the prior bar
+    /// can close well below its own high.
+    #[test]
+    fn regular_engulfer_spans_both_bars_when_prior_high_sticks_out() {
+        let candles = [
+            // N-1: bullish with a long upper wick — high 1.30, close only 1.08.
+            k("2026-06-16T10:00:00Z", 1.02, 1.30, 1.00, 1.08),
+            // N: open (1.09) >= prior close (1.08), close (0.91) < prior low
+            // (1.00), close in bottom quartile. Own high 1.12 < prior high 1.30.
+            k("2026-06-16T11:00:00Z", 1.09, 1.12, 0.90, 0.91),
+        ];
+        let d = detect_at(&candles, 1, &flags()).expect("regular engulfer");
+        assert_eq!(d.geometry.kind, SignalKind::RegularEngulfer);
+        assert_eq!(d.direction, Direction::Short);
+        assert!((d.geometry.high - 1.30).abs() < 1e-12, "span high");
+        assert!((d.geometry.low - 0.90).abs() < 1e-12, "span low");
+        assert_eq!(d.geometry.start_time, ts("2026-06-16T10:00:00Z"));
+    }
+
+    /// The golden test's `size` is deliberately **unchanged** by the span fix:
+    /// a regular engulfer still sizes off the print bar's own range, and a
+    /// floating engulfer still sizes off the (now wider) extreme span. Widening
+    /// the regular engulfer's size would silently make more of them golden.
+    #[test]
+    fn engulfer_size_semantics_survive_the_span_fix() {
+        // Regular: size == print bar range (1.12 - 0.90 = 0.22), NOT the 0.40
+        // two-bar span.
+        let regular = [
+            k("2026-06-16T10:00:00Z", 1.02, 1.30, 1.00, 1.08),
+            k("2026-06-16T11:00:00Z", 1.09, 1.12, 0.90, 0.91),
+        ];
+        let d = detect_at(&regular, 1, &flags()).expect("regular engulfer");
+        assert_eq!(d.geometry.kind, SignalKind::RegularEngulfer);
+        assert!(
+            (d.size - 0.22).abs() < 1e-12,
+            "regular sizes off print range"
+        );
+
+        // Floating: size == the extreme span, which the fix widens to 0.40.
+        let floating = [
+            k("2026-06-16T10:00:00Z", 1.28, 1.30, 1.00, 1.02),
+            k("2026-06-16T11:00:00Z", 1.10, 1.12, 0.90, 0.91),
+        ];
+        let d = detect_at(&floating, 1, &flags()).expect("floating engulfer");
+        assert_eq!(d.geometry.kind, SignalKind::FloatingEngulfer);
+        assert!((d.size - 0.40).abs() < 1e-12, "floating sizes off the span");
     }
 
     #[test]

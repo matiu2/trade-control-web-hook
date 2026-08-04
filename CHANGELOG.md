@@ -1,5 +1,61 @@
 # Changelog
 
+## v130 — 2026-08-04 — engulfer signal extremes span both covered bars
+
+**Why.** A short's stop-loss anchors on `signal_high` (`PriceAnchor::SignalHigh`),
+which is meant to be the *pattern* extreme. But a regular/floating engulfer
+reported the **print bar's** high/low alone, ignoring the first of its two covered
+bars — so whenever bar `N-1`'s high poked above bar `N`'s, the SL landed *inside*
+the pattern. Most visible on the **floating** engulfer, which has no body-open
+constraint and so routinely opens below the prior bar's high: EUR/ZAR H&S short,
+2026-07-23T00:00, placed its stop at the midnight bar's high rather than the
+two-bar pattern's.
+
+This was an inconsistency *within* the detector, not just against intuition:
+`signal_start_time` and the reversal-close `band_anchor` both already reach back
+to bar `N-1` for engulfers, and tweezers already spanned their bars. Only the
+extremes didn't. Pine had the same shape — `bull_sig_high`/`bear_sig_high` gave
+the multi-bar `math.max` to tweezers only and fell through to a bare `high` for
+engulfers — while its own `sig_start_time` already listed
+`bullish_regular or bullish_floating` in the 2-bar branch.
+
+**What changed.** Engulfer extremes now span both covered bars (`N-1`..`N`), so
+`signal_high`/`signal_low` agree with `signal_start_time` for every pattern kind.
+Applied to **both** the Rust detector (`core/src/signals/detect.rs::build`) and
+the Pine indicator (`pine-scripts/candle-signals-v2.pine`) — the Pine values
+travel in the alert body (`PATTERN_MSG` → `Shell.signal_high`), so a one-sided
+fix would have reintroduced the bug on the live path.
+
+The golden-test `size` deliberately did **not** change semantics: tweezers still
+sum component ranges, a floating engulfer still uses its extreme span (now wider,
+so a few more floating engulfers read golden), and a **regular** engulfer still
+sizes off the print bar's own range. Widening the regular's size would have
+silently promoted more of them to golden — a separate behaviour change.
+
+**Breaking.** None at the API level. Behaviour changes: wider, correctly-placed
+stops on engulfer-triggered entries, which shifts R and therefore min-R gate
+outcomes. Over the 63-cell fixture corpus the net moved **−14.71R → +3.68R**
+(19 cells with changed R); on the 11 committed cells, 3 changed R for **+1.72R**
+net. `sgdjpy-spread-floor-min-r-block` is the clearest illustration — entries
+previously blocked below the 1.0 min-R now pass, and the gate still correctly
+declines the ones that remain under it.
+
+**Tests.** `floating_engulfer_spans_both_bars_when_prior_high_sticks_out` and
+`regular_engulfer_spans_both_bars_when_prior_high_sticks_out` (the protruding
+prior high, per kind); `engulfer_size_semantics_survive_the_span_fix` (pins the
+size split, so a future "consistency" cleanup can't widen the regular's size
+unnoticed). Both fixes verified by mutation — reverting either arm turns the
+matching tests red. The uk-100 close-booking test was **split** rather than
+re-blessed: its reversal fires now land while flat, so
+`stateful_broker_books_a_reversal_close_on_an_open_position` pins that half
+against `xau-xag-close-on-reversal`, which still exercises it, and the uk-100
+test keeps the expiry half. Re-blessing it to `reversal_closes: 0` would have
+retired the coverage silently.
+
+**Follow-up.** The Pine indicator must be re-uploaded to TradingView for the live
+alert path to carry the corrected extremes; until then live `signal_high` still
+reflects the print bar only.
+
 ## v129 — 2026-08-04 — fixtures store the sub-bars the zoom actually looked at
 
 **Why.** v128 made the sub-bar zoom fetch lazily. But a frozen fixture replayed
