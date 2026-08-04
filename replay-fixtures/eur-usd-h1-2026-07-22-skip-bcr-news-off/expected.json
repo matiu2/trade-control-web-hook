@@ -40,6 +40,7 @@
     "sl_hits": 0,
     "reversal_closes": 0,
     "expiry_closes": 0,
+    "invalidation_closes": 0,
     "open_at_end": 0,
     "legs": [
       {
