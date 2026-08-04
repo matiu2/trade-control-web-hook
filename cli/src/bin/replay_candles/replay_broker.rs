@@ -15,6 +15,7 @@
 use std::cell::RefCell;
 
 use super::fill_sim::{SimOutcome, simulate_fill_resolved_zoom};
+use super::report::FillKind;
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{
     AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, EntryError,
@@ -23,9 +24,6 @@ use trade_control_core::broker::{
 use trade_control_core::incoming::Verified;
 use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, RiskBudget, Shell};
 use trade_control_core::spread_blackout::{elevated_threshold_pips, is_spread_hour};
-use trade_control_engine::BidAskCandle as EngineCandle;
-
-use super::report::FillKind;
 
 /// One placed attempt the gate may later ask about, with the geometry needed to
 /// re-simulate it. `order_id` is what [`Broker::place_entry`] handed back (the
@@ -213,27 +211,6 @@ struct ArmedPlacement {
     shell: Shell,
 }
 
-/// A pre-fetched **finer-granularity** bid/ask series the fill sim zooms into
-/// when a coarse exit bar straddles both SL and TP (PR-2 sub-bar zoom). The
-/// replay driver pulls this once (e.g. M1 under an H1 plan) over the same span
-/// and hands it in; the broker filters it to the ambiguous bar's window through
-/// its [`super::fill_sim::SubBars`] impl. Empty ⇒ no zoom (every fill/exit
-/// question degrades to the pessimistic-stop assumption, unchanged from PR-1).
-struct FinerSeries {
-    /// Ascending finer bid/ask candles spanning the same window as `candles`.
-    candles: Vec<EngineCandle>,
-}
-
-impl super::fill_sim::SubBars for FinerSeries {
-    fn sub_bars(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<EngineCandle> {
-        self.candles
-            .iter()
-            .filter(|c| c.time >= start && c.time < end)
-            .cloned()
-            .collect()
-    }
-}
-
 /// Offline broker that resolves prior-attempt state from the candle window.
 pub struct ReplayBroker {
     /// The full pulled bid/ask candle window (warm-up + live), ascending. Each
@@ -249,11 +226,17 @@ pub struct ReplayBroker {
     /// The placement the loop armed for the next `run_enter` (its intent, shell,
     /// and the order id `place_entry` should return). Consumed by `place_entry`.
     armed: RefCell<Option<ArmedPlacement>>,
-    /// The pre-fetched finer series for sub-bar zoom (PR-2), or [`NoZoom`] when
-    /// the driver didn't supply one. Every fill/exit path passes this to
-    /// `simulate_fill_resolved_zoom`, so an ambiguous SL/TP bar is disambiguated
-    /// by finer candles when available and pessimistic-stopped otherwise.
-    finer: Option<FinerSeries>,
+    /// The sub-bar zoom provider (PR-2), or `None` ⇒ [`NoZoom`]. Every fill/exit
+    /// path passes this to `simulate_fill_resolved_zoom`, so an ambiguous SL/TP
+    /// bar is disambiguated by finer candles when available and
+    /// pessimistic-stopped otherwise.
+    ///
+    /// A trait object rather than a concrete series so the driver can inject
+    /// either half of the LAZY two-pass zoom (`super::lazy_zoom`): a
+    /// `RecordingSubBars` on pass 1 (serves nothing, records the windows the sim
+    /// asks for) and a `WindowSubBars` on pass 2 (serves just those windows).
+    /// The broker doesn't care which — it only forwards to the sim.
+    finer: Option<Box<dyn super::fill_sim::SubBars>>,
 
     // --- Stateful held model (S1). Mutated by `advance()` per bar and by
     // `place_entry`/`close_positions`; read by `list_open_positions` /
@@ -298,14 +281,19 @@ impl ReplayBroker {
         *self.close_reason.borrow_mut() = reason;
     }
 
-    /// Attach a pre-fetched finer-granularity bid/ask series for the sub-bar zoom
-    /// (PR-2). The driver pulls this once over the same span as the coarse window
-    /// and calls this before the replay loop; from then on an exit bar that
-    /// straddles both SL and TP is disambiguated by the finer candles instead of
-    /// pessimistically assuming the stop. Empty / not called ⇒ pessimistic stop,
-    /// exactly as PR-1.
-    pub fn with_sub_bars(mut self, finer: Vec<EngineCandle>) -> Self {
-        self.finer = Some(FinerSeries { candles: finer });
+    /// Attach the sub-bar zoom provider (PR-2) — the seam the LAZY two-pass zoom
+    /// uses (`super::lazy_zoom`). Pass 1 injects a `RecordingSubBars` (serves
+    /// nothing, records which windows the sim asked for); pass 2 injects a
+    /// `WindowSubBars` built from the narrow fetch of exactly those windows.
+    /// Not called ⇒ pessimistic stop on an ambiguous bar, exactly as PR-1.
+    ///
+    /// Deliberately takes a provider, not a candle series: the eager
+    /// `with_sub_bars(Vec<EngineCandle>)` it replaced is what made the driver
+    /// pull a finer series across the WHOLE coarse window to disambiguate at most
+    /// one bar per entry. Keeping it would leave a second, wasteful way to do the
+    /// same thing.
+    pub fn with_sub_bars_provider(mut self, finer: Box<dyn super::fill_sim::SubBars>) -> Self {
+        self.finer = Some(finer);
         self
     }
 
@@ -315,7 +303,7 @@ impl ReplayBroker {
     /// site uniform (`simulate_fill_resolved_zoom(.., self.zoom())`).
     fn zoom(&self) -> &dyn super::fill_sim::SubBars {
         match &self.finer {
-            Some(f) => f,
+            Some(f) => f.as_ref(),
             None => &super::fill_sim::NoZoom,
         }
     }

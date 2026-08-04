@@ -1649,6 +1649,18 @@ can't be served (e.g. a broker/granularity combo with no sub-bars), doesn't cove
 the move, or is itself still ambiguous at the finest grain. This only refines the
 tie-break — an unambiguous bar is unaffected. See CHANGELOG "replay sub-bar zoom".
 
+The finer series is fetched **lazily**, and only for the bars that are actually
+ambiguous (v128). The replay runs the sim twice: the first pass serves no finer
+candles (so it behaves exactly as if there were none) but records which bars it
+couldn't resolve; only those windows are fetched; the second pass replays with
+them. Because the exit loop stops at the first ambiguous bar, an entry zooms at
+most once — and most replays have no ambiguous bar at all, so they fetch **no
+finer candles whatsoever**. The old behaviour pulled the finer series across the
+whole window up front: a CAD/SGD H1 replay spent 80 s and 258 broker requests
+pulling 22,393 M1 bars, then consulted none of them. Same verdict, 0.05 s. If you
+used to see long scrolls of `Successfully fetched and cached N bid/ask candles`
+during a replay or a `--save`, that is what they were.
+
 **Seeing the engine's silent state changes (`--verbose` / `--all-events`).**
 The normal report lists only *fires* — intents the engine emits. But the engine
 also advances state per bar that fires nothing: the spine phase

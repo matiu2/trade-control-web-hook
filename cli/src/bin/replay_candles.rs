@@ -50,6 +50,7 @@ mod replay_candles {
     pub mod golden_eq;
     pub mod granularity;
     pub mod instrument;
+    pub mod lazy_zoom;
     pub mod lifecycle;
     pub mod outcome;
     pub mod replay;
@@ -78,8 +79,8 @@ use replay_candles::batch;
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::tv::TvDefaults;
 use replay_candles::{
-    annotate, brisbane, candles, economics, golden_eq, granularity, instrument, outcome, replay,
-    report, sentiment, tv,
+    annotate, brisbane, candles, economics, golden_eq, granularity, instrument, lazy_zoom, outcome,
+    replay, report, sentiment, tv,
 };
 use trade_control_cli::replay_args::{CandleSource, DetectorMarkConfig, ReplayArgs as Args};
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan, Trigger};
@@ -268,60 +269,95 @@ async fn run() -> Result<()> {
     // instrument (`core::intent::market_hours_blocked`), so there is no
     // `market_info` fetch and no store seed in the replay path anymore.
 
-    // Sub-bar zoom (PR-2): pull a FINER-granularity bid/ask series over the SAME
-    // span as the coarse window, so the fill sim can disambiguate an exit bar that
-    // straddles both SL and TP (which level hit first?) instead of pessimistically
-    // assuming the stop. Fail-soft in every direction: no finer granularity (plan
-    // already M1), a broker that can't serve the finer grain, or a pull error all
-    // leave `finer_candles` empty → the sim keeps the pessimistic stop, unchanged
-    // from before this pull existed. Spans the coarse window's actual extent
-    // (`[first bar, pull_end]`) so every coarse bar has finer coverage.
-    let finer_candles: Vec<EngineCandle> = match granularity::finer(gran.engine()) {
-        Some(finer_gran) => {
-            let finer_from = candles.first().map(|c| c.time).unwrap_or(start);
-            match candles::pull(
-                args.source,
-                &symbol,
-                finer_gran,
-                finer_from,
-                pull_end,
-                args.cache_dir.clone(),
-            )
-            .await
-            {
-                Ok(cs) => {
-                    tracing::info!(
-                        finer = granularity::engine_label(finer_gran.engine()),
-                        bars = cs.len(),
-                        "sub-bar zoom: pulled finer series for ambiguous SL/TP bars"
-                    );
-                    cs
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        finer = granularity::engine_label(finer_gran.engine()),
-                        "sub-bar zoom: finer pull failed — falling back to pessimistic stop on ambiguous bars"
-                    );
-                    Vec::new()
-                }
-            }
-        }
-        None => Vec::new(), // plan already at the finest grain — nothing to zoom into
-    };
-
     // Keep the state TTL past the window so nothing expires mid-replay.
     let expires_at = end + Duration::days(365);
-    let replay = replay::run(
+
+    // Sub-bar zoom (PR-2), run LAZILY in two passes (see `lazy_zoom`).
+    //
+    // PASS 1: replay with a recorder that serves no finer candles — behaviourally
+    // identical to `NoZoom`, so this pass keeps the pessimistic stop — while
+    // recording the sub-windows the sim asked for. Those are exactly the bars
+    // that straddle both SL and TP, i.e. the only bars finer candles can change.
+    //
+    // Why not the old eager pull: it fetched a finer series across the WHOLE
+    // coarse window up front, but the exit loop returns on the FIRST ambiguous
+    // bar, so each entry zooms at most once. On the CAD/SGD H1 fixture that was
+    // 11,160 M1 slots pulled to disambiguate at most 2 bars — and a cell with no
+    // entry pulled the same 11k and consulted none of it. Those M1 slots are also
+    // where candle-cache re-fetches every run (an illiquid cross has scattered
+    // minutes that never ticked, which a partial broker response leaves
+    // unrecorded), so the eager pull paid that cost on every replay.
+    // `Rc` so the driver still holds the recorder after `run` takes ownership of
+    // its `SubBars` box (the box is `Rc<RecordingSubBars>`, which impls the trait
+    // by delegation) — that's how the recorded windows come back out.
+    let recorder = std::rc::Rc::new(lazy_zoom::RecordingSubBars::new());
+    let pass1 = replay::run(
         &plan,
         &candles,
         gran.engine(),
         start,
         expires_at,
         mark_cfg,
-        &finer_candles,
+        Some(Box::new(std::rc::Rc::clone(&recorder))),
     )
     .await;
+
+    let zoom_windows = recorder.windows();
+
+    // No ambiguous bar ⇒ no finer candles can change the outcome ⇒ pass 1 IS the
+    // answer and we fetch nothing at all. This is the common case.
+    let replay = if zoom_windows.is_empty() {
+        tracing::info!("sub-bar zoom: no ambiguous SL/TP bars — no finer candles fetched");
+        pass1
+    } else {
+        match granularity::finer(gran.engine()) {
+            // Plan already at the finest grain — nothing to zoom into, so pass 1
+            // stands (its pessimistic stop is the floor).
+            None => pass1,
+            Some(finer_gran) => {
+                // Fetch ONLY the recorded windows, then replay again with them.
+                let fetched = lazy_zoom::fetch_windows(
+                    args.source,
+                    &symbol,
+                    finer_gran,
+                    &zoom_windows,
+                    args.cache_dir.clone(),
+                )
+                .await;
+
+                if fetched.is_empty() {
+                    // Every window failed or served nothing — fail-soft exactly as
+                    // the eager pull did: keep pass 1's pessimistic stop.
+                    tracing::warn!(
+                        finer = granularity::engine_label(finer_gran.engine()),
+                        windows = zoom_windows.len(),
+                        "sub-bar zoom: no finer candles for the ambiguous bars — \
+                         falling back to pessimistic stop"
+                    );
+                    pass1
+                } else {
+                    tracing::info!(
+                        finer = granularity::engine_label(finer_gran.engine()),
+                        windows = zoom_windows.len(),
+                        bars = fetched.len(),
+                        "sub-bar zoom: fetched finer candles for the ambiguous bars only"
+                    );
+                    // PASS 2: same plan, same coarse candles, same seed — the only
+                    // difference is that ambiguous bars can now be resolved.
+                    replay::run(
+                        &plan,
+                        &candles,
+                        gran.engine(),
+                        start,
+                        expires_at,
+                        mark_cfg,
+                        Some(Box::new(lazy_zoom::WindowSubBars::new(fetched))),
+                    )
+                    .await
+                }
+            }
+        }
+    };
 
     // Recompute the news-sentiment verdict for the replay window (same algorithm
     // tv-news / tv-arm use), as of the plan's armed_at or the window start.
@@ -986,7 +1022,7 @@ async fn run_frozen(
     // No finer series — a frozen fixture only has its saved coarse candles, so the
     // sub-bar zoom (PR-2) is inactive and an ambiguous SL/TP bar keeps the
     // pessimistic stop, exactly as the fixture's saved `expected.json` was computed.
-    replay::run(plan, candles, gran, live_start, expires_at, mark_cfg, &[]).await
+    replay::run(plan, candles, gran, live_start, expires_at, mark_cfg, None).await
 }
 
 /// Build a readable diff error when a fixture's computed outcome diverges from

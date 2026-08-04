@@ -173,13 +173,19 @@ pub async fn run(
     live_start: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     mark_cfg: DetectorMarkConfig,
-    // A pre-fetched FINER-granularity bid/ask series (e.g. M1 under an H1 plan),
-    // spanning the same window, for the sub-bar zoom (PR-2): when an exit bar
-    // straddles both SL and TP, the sim replays these finer candles for that bar
-    // to see which level hit first, instead of pessimistically assuming the stop.
-    // Empty ⇒ no zoom (pessimistic stop everywhere, unchanged from PR-1) — the
-    // driver passes `&[]` when the plan is already M1 or the finer pull failed.
-    finer_candles: &[EngineCandle],
+    // The sub-bar zoom provider (PR-2): when an exit bar straddles both SL and
+    // TP, the sim replays that bar's FINER candles (e.g. M1 under an H1 plan) to
+    // see which level hit first, instead of pessimistically assuming the stop.
+    //
+    // A provider rather than a candle slice so the driver can run the LAZY
+    // two-pass zoom (`super::lazy_zoom`): pass 1 injects a `RecordingSubBars`
+    // (serves nothing — so that pass is byte-identical to `NoZoom` — but records
+    // which windows the sim asked for), the driver fetches only those windows,
+    // and pass 2 injects a `WindowSubBars` over them. `None` ⇒ no zoom
+    // (pessimistic stop everywhere, unchanged from PR-1) — what the driver passes
+    // when the plan is already M1, the finer pull failed, or the caller is the
+    // frozen-fixture re-sim.
+    sub_bars: Option<Box<dyn super::fill_sim::SubBars>>,
 ) -> Replay {
     // The engine evaluates on MID (matching the live worker, whose
     // `Broker::get_candles` is contractually mid); the bid/ask books are only
@@ -229,8 +235,12 @@ pub async fn run(
     // (Proceed) or is blocked (a prior attempt still open / the cap reached) —
     // exactly as the live worker would. Single-shot enters never enter this gate
     // (the engine retires them after one fire).
-    let replay_broker =
-        ReplayBroker::new(candles.to_vec(), plan.pip_size).with_sub_bars(finer_candles.to_vec());
+    let replay_broker = match sub_bars {
+        Some(provider) => {
+            ReplayBroker::new(candles.to_vec(), plan.pip_size).with_sub_bars_provider(provider)
+        }
+        None => ReplayBroker::new(candles.to_vec(), plan.pip_size),
+    };
     let store = MemStateStore::default();
     // PR 4b-3: the SAME shared spread-hour resting-order lifecycle the live cron
     // runs, driven per bar below. Its two offline seams — a fixed dispatch config
@@ -1111,7 +1121,7 @@ mod tests {
             all_live(),
             expires,
             no_marks(),
-            &[],
+            None,
         )
         .await;
 
@@ -1148,7 +1158,7 @@ mod tests {
             all_live(),
             all_live(),
             no_marks(),
-            &[],
+            None,
         )
         .await;
         assert!(replay.fires.is_empty());
@@ -1173,7 +1183,7 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
-            &[],
+            None,
         )
         .await;
         assert!(
@@ -1199,7 +1209,7 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
-            &[],
+            None,
         )
         .await;
         assert!(!replay.done);
@@ -1287,7 +1297,7 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
-            &[],
+            None,
         )
         .await;
 
@@ -1441,7 +1451,7 @@ mod tests {
             live_at,
             expires_at,
             no_marks(),
-            &[],
+            None,
         )
         .await;
 
@@ -1511,7 +1521,7 @@ mod tests {
             live_at,
             expires_at,
             no_marks(),
-            &[],
+            None,
         )
         .await;
 
@@ -1555,7 +1565,7 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
-            &[],
+            None,
         )
         .await;
 
@@ -1658,7 +1668,7 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
-            &[],
+            None,
         )
         .await;
 
@@ -1756,7 +1766,7 @@ mod tests {
             live_at,
             expires(),
             no_marks(),
-            &[],
+            None,
         )
         .await;
         assert_eq!(
@@ -1899,7 +1909,7 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
-            &[],
+            None,
         )
         .await;
 
@@ -2034,7 +2044,7 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
-            &[],
+            None,
         )
         .await;
 
@@ -2145,7 +2155,7 @@ mod tests {
             live,
             expires(),
             cfg,
-            &[],
+            None,
         )
         .await;
 
@@ -2184,7 +2194,7 @@ mod tests {
             live,
             expires(),
             against,
-            &[],
+            None,
         )
         .await;
         assert!(marks(&r).is_empty(), "against-dir hides the bullish golden");
@@ -2200,7 +2210,7 @@ mod tests {
             live,
             expires(),
             off,
-            &[],
+            None,
         )
         .await;
         assert!(marks(&r_off).is_empty(), "none disables marking");
@@ -2249,7 +2259,7 @@ mod tests {
         let cfg =
             DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
         let plan = golden_enter_resolve_fails_plan();
-        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg, &[]).await;
+        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg, None).await;
 
         // The golden fired the detector but the enter declined — nothing fired.
         assert!(
@@ -2354,7 +2364,7 @@ mod tests {
             live,
             expires(),
             golden_only,
-            &[],
+            None,
         )
         .await;
 
@@ -2362,7 +2372,16 @@ mod tests {
         // nothing). Under a `both` golden filter it's marked and NOT golden.
         let both =
             DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Both, Direction::Long);
-        let r_both = run(&plan, &candles, Granularity::H1, live, expires(), both, &[]).await;
+        let r_both = run(
+            &plan,
+            &candles,
+            Granularity::H1,
+            live,
+            expires(),
+            both,
+            None,
+        )
+        .await;
         let marked: Vec<&super::super::verbose::DetectedMark> = r_both
             .traces
             .iter()
@@ -2453,7 +2472,7 @@ mod tests {
         let plan = break_and_close_pending_plan();
         let cfg =
             DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
-        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg, &[]).await;
+        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg, None).await;
 
         // The enter never fires: break-and-close never crossed 9.99, so the
         // spine stays AwaitBreakAndClose and the enter is never considered.
@@ -2499,7 +2518,7 @@ mod tests {
         let plan = golden_enter_resolve_fails_plan();
         let cfg =
             DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
-        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg, &[]).await;
+        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg, None).await;
 
         let marked_bar = r
             .traces
@@ -2678,7 +2697,7 @@ mod tests {
             live_at,
             expires_at,
             no_marks(),
-            &[],
+            None,
         )
         .await;
 
@@ -2788,7 +2807,7 @@ mod tests {
             live_at,
             expires_at,
             no_marks(),
-            &[],
+            None,
         )
         .await;
 
@@ -2949,7 +2968,7 @@ mod tests {
             live_at,
             expires_at,
             no_marks(),
-            &[],
+            None,
         )
         .await;
 
@@ -3138,7 +3157,7 @@ mod tests {
             live_at,
             expires_at,
             no_marks(),
-            &[],
+            None,
         )
         .await;
 

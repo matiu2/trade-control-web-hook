@@ -3412,4 +3412,197 @@ mod tests {
             other => panic!("no covering sub-bars must stay pessimistic stop, got {other:?}"),
         }
     }
+
+    // --- two-pass LAZY zoom (pass 1 records, pass 2 serves) -----------------
+    //
+    // The lazy zoom replaces the eager whole-window finer pull with: run the sim
+    // under a recorder that serves nothing, fetch only the windows it asked for,
+    // re-run with those. Its soundness rests on ONE property — pass 1 asks for
+    // exactly the window pass 2 needs — which the first test below pins down.
+
+    use super::super::lazy_zoom::{RecordingSubBars, WindowSubBars, ZoomWindow};
+
+    #[test]
+    fn pass_one_records_the_ambiguous_bars_sub_window() {
+        let (intent, shell) = ambiguous_long_setup();
+        let path = ambiguous_exit_path();
+        let resolved = Resolved::from_intent(&intent, &shell, 0.0001, 0.0).expect("resolves");
+
+        let rec = RecordingSubBars::new();
+        let outcome = simulate_fill_resolved_zoom(&resolved, &intent, &shell, 0.0001, &path, &rec);
+
+        // Serving nothing ⇒ identical to `NoZoom`: the pessimistic stop.
+        assert!(
+            matches!(outcome, SimOutcome::StoppedOut { .. }),
+            "recorder must behave like NoZoom, got {outcome:?}"
+        );
+        // And it recorded the ambiguous bar's window: the parent bar opens at
+        // 13:00 and the inferred bar length is 1h.
+        assert_eq!(
+            rec.windows(),
+            vec![ZoomWindow {
+                start: ts("2026-06-17T13:00:00Z"),
+                end: ts("2026-06-17T14:00:00Z"),
+            }],
+        );
+    }
+
+    /// The invariant the whole two-pass design rests on: the window pass 1 asks
+    /// for does not depend on what the provider serves. If a provider could
+    /// change which bars get zoomed, the narrow fetch could miss the bar pass 2
+    /// then needs, and the lazy zoom would silently score differently from the
+    /// eager one.
+    ///
+    /// Verified by running the SAME sim under providers with opposite outcomes
+    /// (one resolves to TP, one to SL) and asserting both requested the same
+    /// window — even though they disagree about the result.
+    #[test]
+    fn zoom_requests_are_invariant_to_the_provider() {
+        let (intent, shell) = ambiguous_long_setup();
+        let path = ambiguous_exit_path();
+        let resolved = Resolved::from_intent(&intent, &shell, 0.0001, 0.0).expect("resolves");
+
+        /// Records like `RecordingSubBars` but also serves a fixed series, so we
+        /// can vary the OUTCOME while watching the REQUESTS.
+        struct RecordAndServe {
+            inner: RecordingSubBars,
+            serve: Vec<BidAskCandle>,
+        }
+        impl SubBars for RecordAndServe {
+            fn sub_bars(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<BidAskCandle> {
+                self.inner.sub_bars(start, end);
+                self.serve
+                    .iter()
+                    .filter(|c| c.time >= start && c.time < end)
+                    .cloned()
+                    .collect()
+            }
+        }
+
+        let tp_first = RecordAndServe {
+            inner: RecordingSubBars::new(),
+            serve: vec![candle(
+                "2026-06-17T13:00:00Z",
+                1.1052,
+                1.1155,
+                1.1051,
+                1.1150,
+            )],
+        };
+        let sl_first = RecordAndServe {
+            inner: RecordingSubBars::new(),
+            serve: vec![candle(
+                "2026-06-17T13:00:00Z",
+                1.1050,
+                1.1051,
+                1.0990,
+                1.0995,
+            )],
+        };
+
+        let a = simulate_fill_resolved_zoom(&resolved, &intent, &shell, 0.0001, &path, &tp_first);
+        let b = simulate_fill_resolved_zoom(&resolved, &intent, &shell, 0.0001, &path, &sl_first);
+
+        // The providers genuinely disagree about the outcome...
+        assert!(matches!(a, SimOutcome::TookProfit { .. }), "got {a:?}");
+        assert!(matches!(b, SimOutcome::StoppedOut { .. }), "got {b:?}");
+        // ...yet asked for exactly the same window, and the same one the
+        // serve-nothing recorder asked for.
+        let expected = vec![ZoomWindow {
+            start: ts("2026-06-17T13:00:00Z"),
+            end: ts("2026-06-17T14:00:00Z"),
+        }];
+        assert_eq!(tp_first.inner.windows(), expected);
+        assert_eq!(sl_first.inner.windows(), expected);
+    }
+
+    #[test]
+    fn no_ambiguous_bar_records_no_windows_so_nothing_is_fetched() {
+        let (intent, shell) = ambiguous_long_setup();
+        // Exit bar touches ONLY the TP — unambiguous, so the sim never zooms.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T12:00:00Z", 1.1042, 1.1055, 1.1041, 1.1052),
+            candle("2026-06-17T13:00:00Z", 1.1052, 1.1155, 1.1051, 1.1150),
+        ];
+        let resolved = Resolved::from_intent(&intent, &shell, 0.0001, 0.0).expect("resolves");
+
+        let rec = RecordingSubBars::new();
+        let outcome = simulate_fill_resolved_zoom(&resolved, &intent, &shell, 0.0001, &path, &rec);
+
+        assert!(
+            matches!(outcome, SimOutcome::TookProfit { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            rec.windows().is_empty(),
+            "an unambiguous exit must request NO zoom window (the whole point: \
+             this replay fetches no finer candles at all), got {:?}",
+            rec.windows()
+        );
+    }
+
+    /// End-to-end: the two-pass lazy zoom reaches the same outcome the eager
+    /// whole-window pull does, while only ever holding the recorded window's
+    /// candles. This is the parity claim — lazy is a PERFORMANCE change.
+    #[test]
+    fn two_pass_lazy_zoom_matches_the_eager_whole_window_zoom() {
+        let (intent, shell) = ambiguous_long_setup();
+        let path = ambiguous_exit_path();
+        let resolved = Resolved::from_intent(&intent, &shell, 0.0001, 0.0).expect("resolves");
+
+        // The "broker": a full finer series spanning the WHOLE coarse window,
+        // most of which the eager pull would fetch and never consult.
+        let whole_window = vec![
+            candle("2026-06-17T11:00:00Z", 1.1040, 1.1045, 1.1039, 1.1042),
+            candle("2026-06-17T12:00:00Z", 1.1042, 1.1055, 1.1041, 1.1052),
+            candle("2026-06-17T13:00:00Z", 1.1052, 1.1155, 1.1051, 1.1150), // TP first
+            candle("2026-06-17T13:30:00Z", 1.1150, 1.1151, 1.0990, 1.0995),
+            candle("2026-06-17T15:00:00Z", 1.0995, 1.1000, 1.0990, 1.0995),
+        ];
+
+        // Eager: hand the sim everything.
+        let eager = simulate_fill_resolved_zoom(
+            &resolved,
+            &intent,
+            &shell,
+            0.0001,
+            &path,
+            &FakeSubBars(whole_window.clone()),
+        );
+
+        // Lazy: pass 1 records, fetch only those windows, pass 2 serves them.
+        let rec = RecordingSubBars::new();
+        simulate_fill_resolved_zoom(&resolved, &intent, &shell, 0.0001, &path, &rec);
+        let windows = rec.windows();
+        let fetched: Vec<BidAskCandle> = whole_window
+            .iter()
+            .filter(|c| windows.iter().any(|w| c.time >= w.start && c.time < w.end))
+            .cloned()
+            .collect();
+        let lazy = simulate_fill_resolved_zoom(
+            &resolved,
+            &intent,
+            &shell,
+            0.0001,
+            &path,
+            &WindowSubBars::new(fetched.clone()),
+        );
+
+        assert_eq!(
+            format!("{eager:?}"),
+            format!("{lazy:?}"),
+            "lazy zoom must score identically to the eager pull"
+        );
+        // ...and it only needed the 2 finer candles inside the ambiguous bar's
+        // [13:00, 14:00) window, not all 5. The 11:00/12:00/15:00 bars are
+        // exactly the waste the eager pull pays for on every replay.
+        assert_eq!(fetched.len(), 2, "fetched {fetched:?}");
+        assert!(
+            fetched.iter().all(
+                |c| c.time >= ts("2026-06-17T13:00:00Z") && c.time < ts("2026-06-17T14:00:00Z")
+            ),
+            "fetched outside the recorded window: {fetched:?}"
+        );
+    }
 }

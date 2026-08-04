@@ -1,3 +1,99 @@
+# TODO: lazy two-pass sub-bar zoom (ACTIVE)
+
+## Why
+
+The sub-bar zoom (PR-2) eagerly pulls a FINER series (M1 under an H1 plan)
+across the WHOLE coarse window before the sim runs. But the zoom is consumed
+only when a post-fill bar straddles BOTH SL and TP — and the exit loop `return`s
+on the first such bar, so each entry triggers **at most one** zoom.
+
+Measured on `replay-fixtures/cad-sgd-h1-2026-07-21`:
+
+- coarse window 2026-07-21 14:00Z → 2026-07-29 08:00Z = 186 H1 bars
+- eager M1 pull = **11,160 M1 slots**
+- entries in that cell = 2 ⇒ worst case **2 zoomed bars = 120 M1 slots**
+- the EUR/USD cell has **zero** entries ⇒ pulls 11k, consumes **none**
+
+Those M1 slots are also where candle-cache re-fetches: an illiquid cross has
+scattered non-ticking minutes (CAD/SGD 2026-07-22: 200 missing of 1440), and a
+partial broker response leaves them unmarked, so they re-fetch every run.
+
+We are **NOT** fixing that by negative-caching. Permanent holes bit us before —
+a misclassified "permanent" error left candles that were never retried again and
+corrupted trades. Lazy fetching only ever asks for LESS; it never records
+"don't ask again".
+
+## Approach — two-pass, sim stays sync + deterministic
+
+`SubBars` is deliberately a **sync** one-method trait so no async is threaded
+through the sim. Keep that.
+
+1. **Pass 1**: run the sim with `NoZoom`, collecting the bars that came back
+   ambiguous (the `(true, true)` straddle arm).
+2. **Fetch**: pull the finer series ONLY for those bars' windows.
+3. **Pass 2**: re-run with a provider populated from that narrow fetch.
+
+Rejected: a blocking fetch inside `sub_bars` — smaller diff, but puts I/O in the
+sim hot path and makes it non-deterministic.
+
+## Steps — DONE
+
+- [x] Sibling worktree (`../trade-control-web-hook-lazy-zoom`) so `../`
+      path-deps still resolve
+- [x] Tests first, then **mutation-checked** (green proves nothing on its own).
+      Three mutations, each caught:
+      1. straddle arm no longer zooms → 3 of 4 tests red
+      2. zoom window end halved (`bar_len / 2`) → 3 of 4 red
+      3. `WindowSubBars` drops its sort → parity test red
+- [x] `RecordingSubBars` — pass 1 serves nothing (so it IS `NoZoom`) and records
+      the windows the sim asks for. Derived from the sim ITSELF, not a second
+      hand-written straddle test that would have to agree with it by hand.
+- [x] `WindowSubBars` + `coalesce` (adjacent/touching windows → one fetch)
+- [x] `fetch_windows` — narrow, fail-soft per window
+- [x] Rewired the driver eager pull → two-pass lazy; `replay::run` now takes an
+      `Option<Box<dyn SubBars>>` provider instead of a candle slice
+- [x] Removed the eager `with_sub_bars(Vec<..>)` rather than leaving a second,
+      wasteful way to do the same thing
+- [x] 264 unit tests green; 19/19 fixtures `--check` green; clippy clean (the 2
+      remaining warnings are pre-existing, in files this branch never touched);
+      fmt run
+
+## Measured on real broker data (CAD/SGD H1, 2026-07-21 → 07-29)
+
+| | eager (before) | lazy (after) |
+|---|---|---|
+| replay wall-clock | **80.2 s** | **0.054 s** |
+| `--save` wall-clock | **88.7 s** | **0.050 s** |
+| broker fetches | **258** | **0** |
+| M1 bars pulled | **22,393** | **0** |
+
+Report output byte-identical (`diff` clean), and the `--save` fixture
+byte-identical across `candles.json` / `expected.json` / `plan.json`.
+
+Zero fetches because **no fixture in the corpus has an ambiguous bar** — so no
+finer candle could have changed any outcome. Pass 2 was verified separately by
+temporarily forcing ambiguity: 2 windows → 2 fetches → 103 M1 bars (vs 258 /
+22,393). That probe was reverted.
+
+## Invariant this must not break
+
+`NoZoom` callers (engine unit tests, fixture re-sim, `simulate_fill*` test entry
+points) stay byte-identical. The zoom only ever REDUCES ambiguity; the
+pessimistic stop is the floor.
+
+## Note for whoever adds sub-bar support to FIXTURES
+
+Fixtures do **not** store finer bars (`fixture::save` freezes plan + COARSE
+candles + meta + expected; the frozen re-sim runs with no zoom at all). Don't
+freeze whatever `lazy_zoom` happened to fetch — the recorded windows are a
+function of the *current* strategy/bracket/widen state, so a saved narrow series
+would be missing exactly the bars a changed strategy asks for, and the zoom would
+silently degrade to the pessimistic stop on a fixture that looks complete.
+Offline zoom needs the finer bars for the whole window, as an explicit (larger)
+artifact. Documented in `lazy_zoom.rs`'s module docs.
+
+---
+
 # TODO: auto TP-resistance band — same width as a drawn S/R line
 
 **Rule (operator 2026-07-24):** the auto TP-resistance band is currently HALF the

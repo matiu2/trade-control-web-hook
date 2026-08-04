@@ -1,5 +1,61 @@
 # Changelog
 
+## v128 — 2026-08-04 — the sub-bar zoom fetches lazily (two-pass)
+
+**Why.** The sub-bar zoom pulled a FINER series (M1 under an H1 plan) across the
+WHOLE coarse window before the sim ran. But the zoom is consulted only when a
+post-fill bar straddles BOTH SL and TP, and the exit loop `return`s on the first
+such bar — so each entry zooms **at most once**. A CAD/SGD H1 replay pulled
+22,393 M1 bars over 258 broker requests to disambiguate, in the end, *nothing*:
+no bar in the window was ambiguous.
+
+That cost was paid on **every** run, because it lands on exactly the data
+candle-cache can't keep warm. An illiquid cross has minutes that never ticked
+(CAD/SGD 2026-07-22: 200 missing of 1440); a partial broker response records only
+the candles that came back, so those slots re-fetch forever. Hence the long
+scrolls of `Successfully fetched and cached 3 bid/ask candles` during a replay.
+
+**Not fixed by negative-caching.** Marking "the broker returned nothing here" is
+the obvious repair and is deliberately NOT taken: a misclassified permanent error
+previously left holes that were never retried and corrupted trades. Lazy fetching
+only ever asks for LESS — it never records "don't ask again".
+
+**What changed.** The zoom now runs in two passes, and the sim stays sync +
+deterministic (no async threaded through it, no I/O in the hot path):
+
+1. Pass 1 replays with `RecordingSubBars`, which serves no candles — so the pass
+   is byte-identical to `NoZoom` — while recording the sub-windows the sim asks
+   for. Those are exactly the ambiguous bars.
+2. Only those windows are fetched (touching/overlapping ones coalesced into one
+   request, fail-soft per window).
+3. Pass 2 replays with a `WindowSubBars` over them.
+
+The window set is derived from the sim ITSELF rather than a second hand-written
+straddle test that would have to agree with the first by hand.
+
+**Measured** (CAD/SGD H1, 2026-07-21 → 07-29): replay 80.2 s → **0.054 s**,
+`--save` 88.7 s → **0.050 s**, 258 fetches → **0**, 22,393 M1 bars → **0**.
+Report output byte-identical; the saved fixture byte-identical across
+`candles.json` / `expected.json` / `plan.json`.
+
+**Breaking.** `replay::run` takes `Option<Box<dyn SubBars>>` instead of
+`&[EngineCandle]`. `ReplayBroker::with_sub_bars(Vec<..>)` is replaced by
+`with_sub_bars_provider(Box<dyn SubBars>)` — the eager entry point is removed
+rather than left as a second, wasteful way to do the same thing.
+
+**Tests.** New `cli/src/bin/replay_candles/lazy_zoom.rs` (+ its unit tests) and
+four sim-level tests, including `zoom_requests_are_invariant_to_the_provider` —
+the invariant the design rests on: what pass 1 *asks for* cannot depend on what a
+provider *serves*, so the narrow fetch can't miss the bar pass 2 needs.
+Mutation-checked (green tests prove nothing on their own): breaking the straddle
+arm, halving the zoom window, and dropping `WindowSubBars`'s sort each turn them
+red. 264 unit tests green; 19/19 fixtures `--check` green.
+
+**Note.** Fixtures do not store finer bars and still replay with no zoom at all.
+Whoever adds offline sub-bar support must not freeze the lazy subset — the
+recorded windows are a function of the current strategy/bracket state. See
+`lazy_zoom.rs`'s module docs.
+
 ## v127 — 2026-08-03 — slice 7: the spread-hour proxy leaves order control
 
 **Why.** `hold_reasons` derived `HoldReason::SpreadHour` from the baked clock — a
