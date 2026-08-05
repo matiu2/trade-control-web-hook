@@ -6777,10 +6777,12 @@ mod tests {
     fn two_short_engulfers_window() -> Vec<Candle> {
         vec![
             candle("2026-06-16T09:00:00Z", 120.0, 121.0, 118.0, 118.5),
-            // bar 1: short engulfer #1 — high 117.5 / low 110.
+            // bar 1: short engulfer #1 — spans bar 0+1 → high 121 / low 110.
             candle("2026-06-16T10:00:00Z", 117.0, 117.5, 110.0, 110.5),
-            // bar 2: short engulfer #2 — high 112 / low 104. Its low pushes below
-            // bar1's low (confirm push); its high 112 < bar1's 117.5 (no breach).
+            // bar 2: short engulfer #2 — spans bar 1+2 → high 117.5 / low 104.
+            // Its low pushes below #1's low (confirm push); its high 117.5 <
+            // #1's 121 (no breach). Extremes span both covered bars (v130), so
+            // these are one bar wider than the print bar's own high/low.
             candle("2026-06-16T11:00:00Z", 110.0, 112.0, 104.0, 104.5),
             // bar 3: prints nothing; bar 1 validates here (bars_elapsed = 2).
             candle("2026-06-16T12:00:00Z", 105.0, 106.0, 104.5, 105.3),
@@ -6826,10 +6828,16 @@ mod tests {
             .expect("a PinePattern fire carries latched geometry");
         assert_eq!(sig.direction, Direction::Short);
         assert!(sig.signal_confirmed, "rides the confirmed first signal");
-        // FIRST signal's own geometry — high 117.5 / low 110 — the base the entry
-        // anchors to. The second signal's 112 / 104 would be the latch-bug value.
+        // FIRST signal's geometry — high 121 / low 110 — the base the entry
+        // anchors to. The second signal's 117.5 / 104 would be the latch-bug
+        // value, so the two are still cleanly distinguishable.
+        //
+        // The high is 121, not bar 1's own 117.5, because an engulfer's extremes
+        // span BOTH covered bars (v130): max(bar0.h 121, bar1.h 117.5). Bar 0's
+        // high is the pattern extreme a short's SL must clear. The low is
+        // unchanged at 110 — bar 0's low (118) is above bar 1's.
         assert!(
-            (sig.signal_high - 117.5).abs() < 1e-9,
+            (sig.signal_high - 121.0).abs() < 1e-9,
             "hi {}",
             sig.signal_high
         );
@@ -7037,10 +7045,11 @@ mod tests {
         let sig = eval.fired[0]
             .signal
             .expect("a PinePattern fire carries latched geometry");
-        // The RECENT setup's geometry (high 117.5 / low 110), not a filler-era or
-        // ancient value — and its signal bar is inside the derived recent floor.
+        // The RECENT setup's geometry (high 121 / low 110 — extremes span both
+        // covered bars, v130), not a filler-era or ancient value. The 115.1
+        // filler high would be the mis-scoped value, so this still discriminates.
         assert!(
-            (sig.signal_high - 117.5).abs() < 1e-9,
+            (sig.signal_high - 121.0).abs() < 1e-9,
             "hi {}",
             sig.signal_high
         );
@@ -7258,28 +7267,47 @@ mod tests {
             .iter()
             .filter(|f| f.rule_id == "05-enter")
             .collect();
+        // THREE fires since v130 (was two). The staircase prints a signal on every
+        // bar, and which of them survive to be consumed depends on the breach test
+        // — a signal dies when a later bar's high reaches its `signal_high`.
+        // Widening engulfer extremes to span both covered bars changed exactly
+        // that: bar 2's signal used to report the print bar's high (111), which
+        // bar 4 (high 112) BREACHED, killing it before it could be consumed. Its
+        // true pattern extreme is 117.5 (spanning bars 1+2), which bar 4 doesn't
+        // reach — so the signal correctly survives and is taken.
+        //
+        // That is the v130 fix working as intended: a short's `signal_high` is the
+        // PATTERN extreme, so a later bar poking above the print bar no longer
+        // sits inside the pattern (and no longer puts the SL there either).
         assert_eq!(
             qm_fires.len(),
-            2,
-            "the confirmed multi-shot enter fires twice — once per confirmed signal"
+            3,
+            "one fire per surviving confirmed signal (got {qm_fires:?})"
         );
-        // Fire 1 rides signal A (high 117.5); fire 2 rides the next short down
-        // (high 112) — a DIFFERENT signal, proving the watermark advanced.
+        // Each fire rides a DISTINCT, strictly later signal — the property this
+        // test exists for (the watermark advances instead of re-firing on one
+        // signal forever). Asserted structurally rather than by hard-coded highs,
+        // so a future geometry change can't quietly turn this into a re-fire.
         let a = qm_fires[0].signal.expect("fire 1 geometry");
-        let b = qm_fires[1].signal.expect("fire 2 geometry");
+        let b = qm_fires[qm_fires.len() - 1].signal.expect("last geometry");
+        for w in qm_fires.windows(2) {
+            let (l, r) = (w[0].signal.expect("geom"), w[1].signal.expect("geom"));
+            assert!(
+                r.signal_bar_time > l.signal_bar_time,
+                "each re-entry takes a strictly later signal ({} then {})",
+                l.signal_bar_time,
+                r.signal_bar_time
+            );
+        }
         assert!(
-            (a.signal_high - 117.5).abs() < 1e-9,
-            "fire 1 hi {}",
+            (a.signal_high - 121.0).abs() < 1e-9,
+            "fire 1 rides signal A, extremes spanning bars 0+1: hi {}",
             a.signal_high
         );
         assert!(
             (b.signal_high - 112.0).abs() < 1e-9,
-            "fire 2 hi {}",
+            "last fire rides signal B: hi {}",
             b.signal_high
-        );
-        assert!(
-            b.signal_bar_time > a.signal_bar_time,
-            "the re-entry takes a later signal"
         );
         // The plan stays armed (multi-shot never retires here) and the watermark
         // now points at the second signal, so a third re-entry would look past it.
