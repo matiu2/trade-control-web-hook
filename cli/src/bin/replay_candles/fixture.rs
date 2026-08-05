@@ -441,6 +441,7 @@ mod tests {
              `replay-candles … --save <name>`).",
             super::fixtures_root().display()
         );
+        let mut diverged: Vec<String> = Vec::new();
         for dir in dirs {
             let name = dir.file_name().unwrap_or_default().to_string_lossy();
             let inputs = load(&dir).unwrap_or_else(|e| panic!("load fixture {name}: {e:?}"));
@@ -500,13 +501,26 @@ mod tests {
             // derived `PartialEq` is bit-exact on floats, and the capture and
             // check paths legitimately differ by an ULP or two. Everything
             // structural is still exact.
-            assert!(
-                super::super::golden_eq::outcome_matches(&expected, &computed),
-                "fixture {name} diverged:\n got: {}\n exp: {}",
-                serde_json::to_string_pretty(&computed).unwrap_or_default(),
-                serde_json::to_string_pretty(&expected).unwrap_or_default(),
-            );
+            // COLLECT divergences; don't panic on the first. A bare `assert!`
+            // here aborts the loop at fixture #1, so an intended behaviour change
+            // reports one diverging cell when it may have moved ten — the
+            // operator re-blesses that one, re-runs, finds the next, and has no
+            // idea of the true blast radius. Every cell is checked, then the
+            // whole list is reported at once.
+            if !super::super::golden_eq::outcome_matches(&expected, &computed) {
+                diverged.push(format!(
+                    "fixture {name} diverged:\n got: {}\n exp: {}",
+                    serde_json::to_string_pretty(&computed).unwrap_or_default(),
+                    serde_json::to_string_pretty(&expected).unwrap_or_default(),
+                ));
+            }
         }
+        assert!(
+            diverged.is_empty(),
+            "{} of the corpus diverged:\n\n{}",
+            diverged.len(),
+            diverged.join("\n\n")
+        );
     }
 
     /// S5 regression guard: the stateful broker books reversal- and expiry-close

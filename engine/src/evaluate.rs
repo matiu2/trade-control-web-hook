@@ -152,13 +152,68 @@ pub fn initial_phase(plan: &TradePlan) -> Phase {
 /// rule's `last_close` from that candle, so the *next* tick can detect a cross
 /// against it. `fired` stays empty; the phase is [`initial_phase`].
 ///
-/// It does **not** seed `origin_open`: the origin (the side the plan starts on)
-/// is fixed from the first *live* bar during [`evaluate_plan`], not from the
-/// last warm-up bar — see the note in the body.
+/// It seeds `origin_open` from the **arming bar** — the bar whose span contains
+/// the plan's `armed_at` — and from nothing else; see [`arming_bar`] and the
+/// note in the body. With no `armed_at` (or no bar containing it) the origin is
+/// left unset and fixed from the first *live* bar during [`evaluate_plan`], the
+/// pre-2026-08 behaviour.
 ///
 /// `candles` need not be sorted; the newest by `time` wins. An empty slice
 /// yields an unwatermarked seed (the next tick will itself seed once candles
 /// arrive).
+/// The **arming bar**: the bar in `candles` whose span contains the plan's
+/// `armed_at` — i.e. the bar that was still forming on the chart when the
+/// operator armed the setup. `None` when the plan carries no `armed_at` (a
+/// pre-field plan) or no bar covers it.
+///
+/// # Why this is the origin, and not the bar the engine would otherwise pick
+///
+/// The origin is "the side of the line the plan started on". Two rules that are
+/// each individually correct used to conspire to read it off the wrong bar:
+///
+/// 1. A fresh plan must not retroactively fire on conditions already true when
+///    it was registered (see [`seed_plan_state`]), so the watermark is set to
+///    the newest back-window bar's **open**-time — the arming bar itself, which
+///    is mid-flight. Its close therefore lands *at* the watermark, not past it,
+///    so it is never evaluated as a live bar.
+/// 2. `origin_open` was deliberately not seeded here, because anchoring it to
+///    the last *warm-up* bar (the bar **before** the cursor) let a whip-saw open
+///    poison it — the XAU_USD off-by-one in
+///    `BUG-break-close-origin-seeded-from-warmup-bar.md`.
+///
+/// Together they skip the arming bar and take the origin from the *next* bar's
+/// open. That is wrong whenever price crosses a level **during** the arming bar:
+/// the operator arms on one side, the bar closes on the other, and the engine
+/// records the far side as the origin. A directional settled `OnClose` cross
+/// then requires `origin` on the near side and can never fire, so the rule is
+/// dead for the life of the plan.
+///
+/// NZD/CHF H1 short `hs-nzd-chf-99d6bd00` (2026-08-04, live **and** replay) is
+/// the case: `01-veto-too-high` at 0.47583, armed 10:01:28Z — 88 seconds into
+/// the 10:00Z bar, which **opened 0.47580 (below)** and closed 0.47623 (above).
+/// The next bar opened 0.47622, so the origin was recorded *above* the cap and
+/// the veto never fired through twelve consecutive closes above it (to +12.6
+/// pips), leaving a dead setup armed and enterable.
+///
+/// The arming bar is a strictly better reference than either bar: it is not the
+/// pre-cursor warm-up bar (so the whip-saw bug stays fixed — a different bar),
+/// and it is not the first post-watermark bar (which is what fails above). It is
+/// the bar the operator actually saw. It also keeps replay == live for free:
+/// `armed_at` is baked on the plan, so both read the same bar.
+///
+/// This does **not** relax the "must dip below first" contract
+/// (`reseat_origin_on_dip`): a plan armed when price is *genuinely* already past
+/// a level still records a far-side origin and correctly reports no break.
+fn arming_bar<'a>(plan: &TradePlan, candles: &'a [Candle]) -> Option<&'a Candle> {
+    let armed_at = plan.armed_at?;
+    let span = plan.granularity.seconds();
+    candles.iter().find(|c| {
+        let start = c.time;
+        let end = start + chrono::Duration::seconds(span);
+        start <= armed_at && armed_at < end
+    })
+}
+
 pub fn seed_plan_state(
     plan: &TradePlan,
     candles: &[Candle],
@@ -169,21 +224,30 @@ pub fn seed_plan_state(
         return state;
     };
     state.watermark = Some(newest.time);
+    // Seed each OnClose rule's origin from the ARMING bar (the bar the operator
+    // was looking at when they armed), not the first bar the engine later
+    // evaluates. See `arming_bar` for why the two differ and when it matters.
+    if let Some(arming) = arming_bar(plan, candles) {
+        for rule in &plan.rules {
+            record_origin_open(&rule.rule_id, &rule.trigger, arming, &mut state);
+        }
+    }
     for rule in &plan.rules {
         record_last_close(&rule.rule_id, &rule.trigger, newest, &mut state);
-        // NOTE: `origin_open` is deliberately NOT seeded here. The origin is the
-        // side of the line the plan *starts* on — which is the first **live**
-        // bar (the cursor / arm bar), not the newest **warm-up** bar (the bar
-        // immediately before it). Seeding it from `newest` was an off-by-one:
-        // it anchored the origin to the last warm-up bar, whose open can sit on
-        // the opposite side of the line from where the setup actually begins.
-        // A whip-saw warm-up bar (one that gapped open across the line then
-        // reversed) would then wrongly record the plan as "already broken",
-        // and an `OnClose` break-and-close would never fire. Instead we let
-        // `fire_rule` / `stamp_retest` record the origin from the first live
-        // bar via `record_origin_open` (set-once) — matching the documented
-        // "the seed bar is not special" intent at `fire_rule`. See
-        // BUG-break-close-origin-seeded-from-warmup-bar.md.
+        // NOTE: `origin_open` is NOT seeded from `newest`. That was the XAU_USD
+        // off-by-one: `newest` is the last **warm-up** bar (the bar immediately
+        // before the cursor), whose open can sit on the opposite side of the
+        // line from where the setup actually begins — a whip-saw bar that
+        // gapped open across the line then reversed wrongly recorded the plan
+        // as "already broken", and an `OnClose` break-and-close never fired.
+        // See BUG-break-close-origin-seeded-from-warmup-bar.md.
+        //
+        // The origin comes from the **arming bar** instead (seeded above, via
+        // `arming_bar`) — the mid-flight bar containing `armed_at`, which is a
+        // *different* bar from `newest` and the one the operator actually saw.
+        // Plans with no `armed_at` seed no origin here and keep the older
+        // behaviour: `fire_rule` / `stamp_retest` record it from the first live
+        // bar via `record_origin_open` (set-once).
     }
     state
 }
@@ -6198,6 +6262,136 @@ mod tests {
                 .any(|f| f.rule_id == "03-prep-break-and-close"),
             "break-and-close must not re-stamp after latching (got {:?})",
             e.fired
+        );
+    }
+
+    #[test]
+    fn too_high_veto_fires_when_armed_already_above_and_never_dips() {
+        // NZD/CHF H1 short `hs-nzd-chf-99d6bd00` (2026-08-04, live AND replay).
+        // `01-veto-too-high` at 0.47583 (`horizontal_cross` / Up / OnClose) never
+        // fired despite TWELVE consecutive closes above it (to +12.6 pips), so the
+        // plan stayed in `AwaitBreakAndClose`, stayed enterable, and went on to
+        // fire `09-enter-qm` while price sat 5.8 pips past the level that was
+        // supposed to have retired it.
+        //
+        // Why: the crossing bar (08-04 20:00 BNE, open 0.47580 below → close
+        // 0.47623 above) closed 88s BEFORE the plan armed, so it is a WARM-UP bar.
+        // The first LIVE bar (21:00 BNE) opens 0.47622 — already above — so
+        // `record_origin_open` fixes origin ABOVE the level. The settled Up rule
+        // needs `origin < level`, and `reseat_origin_on_dip` only re-seats when a
+        // bar's open/close dips back BELOW. Price never dips until 08-05 09:00,
+        // long after the setup should have been binned.
+        //
+        // That "must dip below first" contract is correct for a break-and-close
+        // PREP (see `on_close_break_does_not_fire_when_armed_above_and_never_dips`)
+        // but wrong for an INVALIDATION VETO: `too-high` encodes a STATE ("this
+        // setup is invalid if price is up here"), not a transition. A close above
+        // the cap must retire the plan even when the plan armed already above.
+        let level = 0.47583;
+        let veto = terminal_veto_rule(
+            "01-veto-too-high",
+            Trigger::HorizontalCross {
+                level,
+                dir: CrossDir::Up,
+                bar: BarEvent::OnClose,
+            },
+            FireMode::Once,
+        );
+        let mut p = plan(vec![
+            veto,
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ]);
+        p.armed_at = Some(ts("2026-08-04T10:01:28Z"));
+        // The arming bar: still forming when the plan armed 88s into it. Opens
+        // BELOW the cap (0.47580 — what the operator saw), closes above.
+        let arming = candle("2026-08-04T10:00:00Z", 0.47580, 0.47629, 0.47570, 0.47623);
+        // Seeding watermarks this bar, so it never fires retroactively — but it
+        // must still fix the origin BELOW the cap.
+        let st = seed_plan_state(&p, &[arming], ts("2026-08-30T00:00:00Z"));
+        assert_eq!(
+            st.origin_open.get("01-veto-too-high").copied(),
+            Some(0.47580),
+            "origin comes from the arming bar's open, not the next bar's"
+        );
+        // The real live bars that followed. Every one opens AND closes above the
+        // cap — no dip back below, exactly as the market ran.
+        let bars = [
+            candle("2026-08-04T11:00:00Z", 0.47622, 0.47625, 0.47585, 0.47597),
+            candle("2026-08-04T12:00:00Z", 0.47599, 0.47634, 0.47575, 0.47608),
+            candle("2026-08-04T13:00:00Z", 0.47607, 0.47647, 0.47598, 0.47621),
+        ];
+        let mut st = st;
+        let mut fired_veto = false;
+        for c in bars {
+            let e = run(&p, &st, &[c]);
+            fired_veto |= e.fired.iter().any(|f| f.rule_id == "01-veto-too-high");
+            st = e.new_state;
+        }
+        assert!(
+            fired_veto,
+            "too-high must fire on a close above the cap: the plan armed BELOW it \
+             (arming bar open 0.47580), so the origin is on the near side"
+        );
+        assert_eq!(
+            st.phase,
+            Phase::Done,
+            "a ClosePositions invalidation retires the plan"
+        );
+    }
+
+    #[test]
+    fn arming_bar_origin_does_not_relax_the_must_dip_first_contract() {
+        // The guard on the fix: seeding the origin from the arming bar must not
+        // resurrect a break for a plan armed when price is GENUINELY already past
+        // the line. Here the arming bar opens ABOVE the neckline (not a
+        // mid-bar-cross artifact), so the origin is legitimately far-side and an
+        // Up break must still require a dip below first — the 2026-07-24 operator
+        // contract, unchanged.
+        let mut p = up_break_plan();
+        p.armed_at = Some(ts("2026-06-16T10:30:00Z"));
+        let arming = candle("2026-06-16T10:00:00Z", 1.2050, 1.2060, 1.2045, 1.2055);
+        let st = seed_plan_state(&p, &[arming], ts("2026-06-30T00:00:00Z"));
+        assert_eq!(
+            st.origin_open.get("03-prep-break-and-close").copied(),
+            Some(1.2050),
+            "armed genuinely above → origin is above"
+        );
+        let bars = [
+            candle("2026-06-16T11:00:00Z", 1.2055, 1.2070, 1.2050, 1.2065),
+            candle("2026-06-16T12:00:00Z", 1.2065, 1.2075, 1.2060, 1.2070),
+        ];
+        let mut st = st;
+        for c in bars {
+            let e = run(&p, &st, &[c]);
+            assert!(
+                e.fired.is_empty(),
+                "armed above and never dipped → still no break (fired {:?})",
+                e.fired
+            );
+            st = e.new_state;
+        }
+        assert_eq!(st.phase, Phase::AwaitBreakAndClose);
+    }
+
+    #[test]
+    fn plan_without_armed_at_keeps_the_first_live_bar_origin() {
+        // Backward-compat guard: a pre-field plan (no `armed_at`) seeds no origin
+        // and behaves exactly as before — origin fixed from the first LIVE bar by
+        // `fire_rule`. One corpus fixture (`gbpaud-expiry-2026-06-19`) has no
+        // `armed_at`, and every existing unit test builds plans this way.
+        let p = up_break_plan();
+        assert!(p.armed_at.is_none());
+        let warmup = candle("2026-06-16T10:00:00Z", 1.2050, 1.2060, 1.2045, 1.2055);
+        let st = seed_plan_state(&p, &[warmup], ts("2026-06-30T00:00:00Z"));
+        assert!(
+            st.origin_open.is_empty(),
+            "no armed_at → no seeded origin (got {:?})",
+            st.origin_open
         );
     }
 
