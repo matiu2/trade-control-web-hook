@@ -194,9 +194,7 @@ async fn run() -> Result<()> {
     let start = window.start;
     let end = window.end;
     if end <= start {
-        return Err(outcome::bad_input(eyre!(
-            "end ({end}) must be after start ({start})"
-        )));
+        return Err(outcome::bad_input(inverted_window_error(&window)));
     }
 
     // The engine evaluates a `TimeReached` (trade-expiry) against each candle's
@@ -1157,13 +1155,113 @@ fn diff_error(expected: &ReplayOutcome, got: &ReplayOutcome) -> color_eyre::eyre
     ))
 }
 
+/// Where one end of the replay window came from.
+///
+/// Carried so an inverted window can name the two knobs that actually disagree.
+/// The window is assembled from up to three independent sources (a flag, the
+/// plan, the TV chart), and reporting only the two timestamps left the operator
+/// to guess which one to change — see [`WindowSource::describe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowSource {
+    /// An explicit `--start` / `--end` flag.
+    Flag(&'static str),
+    /// The plan's baked `replay_start` (from `tv-arm --start`).
+    PlanReplayStart,
+    /// The plan's `02-veto-trade-expiry` rule.
+    PlanTradeExpiry,
+    /// The TradingView chart — the replay cursor (start) or visible-region end.
+    Chart(&'static str),
+}
+
+impl WindowSource {
+    /// A short phrase naming this end's origin *and* how to override it, so the
+    /// error reads as an instruction rather than a fact.
+    fn describe(self) -> String {
+        match self {
+            Self::Flag(flag) => format!("the {flag} flag"),
+            Self::PlanReplayStart => {
+                "the plan's baked replay_start (from `tv-arm --start`); override with --start"
+                    .to_string()
+            }
+            Self::PlanTradeExpiry => {
+                "the plan's 02-veto-trade-expiry rule (the expiry drawn on the chart); \
+                 override with --end"
+                    .to_string()
+            }
+            Self::Chart(what) => format!("the TradingView chart's {what}; override with --{what}"),
+        }
+    }
+}
+
 /// The fully-resolved replay window: instrument (or `None` to fall back to the
-/// plan) and the UTC start/end. Granularity is resolved separately (from the
-/// plan, see [`resolve_granularity`]).
+/// plan) and the UTC start/end, each with the source it was resolved from.
+/// Granularity is resolved separately (from the plan, see
+/// [`resolve_granularity`]).
 struct ResolvedWindow {
     instrument: Option<String>,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
+    start_source: WindowSource,
+    end_source: WindowSource,
+}
+
+/// Explain an inverted (or empty) replay window in terms of the two knobs that
+/// disagree, not just the two timestamps.
+///
+/// The window is assembled from up to three independent sources, so the bare
+/// "end must be after start" this replaced named a symptom the operator had no
+/// way to map back to a cause: nothing in it said the end came from the plan's
+/// trade-expiry while the start came from the chart. The overwhelmingly common
+/// shape is exactly that pair — a chart whose expiry line sits *behind* its
+/// replay cursor — which `tv-arm --plan-out` arms happily (its lenient
+/// build only `warn!`s about a past expiry) and which then surfaces here.
+fn inverted_window_error(w: &ResolvedWindow) -> color_eyre::eyre::Report {
+    let back = start_end_gap(w);
+    let headline = if w.end == w.start {
+        format!(
+            "the replay window is empty: start and end are the same instant ({})",
+            w.start
+        )
+    } else {
+        format!(
+            "the replay window runs backwards: it ends {back} before it starts \
+             (start {}, end {})",
+            w.start, w.end
+        )
+    };
+
+    // The signature case gets its own closing line, because the fix is on the
+    // chart rather than in the flags.
+    let hint = if w.start_source == WindowSource::Chart("start")
+        && w.end_source == WindowSource::PlanTradeExpiry
+    {
+        "\n  The trade-expiry drawn on the chart is BEHIND the replay start anchor, so there \
+         is nothing to replay. Move the expiry past the start anchor and re-arm, or pass an \
+         explicit --end. (`tv-arm --plan-out` only warns about a past expiry, so the plan \
+         still armed — this is the replay refusing the resulting window.)"
+    } else {
+        "\n  Move whichever end is wrong, or override it with the flag named above."
+    };
+
+    eyre!(
+        "{headline}\n  start = {} — from {}\n  end   = {} — from {}{hint}",
+        w.start,
+        w.start_source.describe(),
+        w.end,
+        w.end_source.describe(),
+    )
+}
+
+/// Render how far the window runs backwards, in whole days/hours/minutes. Keeps
+/// the headline readable — "8 days" lands where "-684000s" does not.
+fn start_end_gap(w: &ResolvedWindow) -> String {
+    let secs = (w.start - w.end).num_seconds().max(0);
+    match secs {
+        s if s >= 86_400 => format!("{:.1} days", s as f64 / 86_400.0),
+        s if s >= 3_600 => format!("{:.1} hours", s as f64 / 3_600.0),
+        s if s >= 60 => format!("{} minutes", s / 60),
+        s => format!("{s} seconds"),
+    }
 }
 
 /// Resolve the granularity. Defaults to the plan's granularity; `--granularity`
@@ -1233,10 +1331,13 @@ fn resolve_window(args: &Args, plan: &TradePlan) -> Result<ResolvedWindow> {
         .clone()
         .or_else(|| tv.as_ref().map(|d: &TvDefaults| d.instrument.clone()));
 
-    let start = match (&args.start, plan_start, &tv) {
-        (Some(s), _, _) => parse_start_end(s).wrap_err("parse --start")?,
-        (None, Some(baked), _) => baked,
-        (None, None, Some(d)) => d.start,
+    let (start, start_source) = match (&args.start, plan_start, &tv) {
+        (Some(s), _, _) => (
+            parse_start_end(s).wrap_err("parse --start")?,
+            WindowSource::Flag("--start"),
+        ),
+        (None, Some(baked), _) => (baked, WindowSource::PlanReplayStart),
+        (None, None, Some(d)) => (d.start, WindowSource::Chart("start")),
         (None, None, None) => {
             unreachable!(
                 "need_start_from_chart is true when --start and plan replay_start are both absent"
@@ -1244,10 +1345,13 @@ fn resolve_window(args: &Args, plan: &TradePlan) -> Result<ResolvedWindow> {
         }
     };
 
-    let end = match (&args.end, plan_expiry, &tv) {
-        (Some(e), _, _) => parse_start_end(e).wrap_err("parse --end")?,
-        (None, Some(expiry), _) => expiry,
-        (None, None, Some(d)) => d.fallback_end,
+    let (end, end_source) = match (&args.end, plan_expiry, &tv) {
+        (Some(e), _, _) => (
+            parse_start_end(e).wrap_err("parse --end")?,
+            WindowSource::Flag("--end"),
+        ),
+        (None, Some(expiry), _) => (expiry, WindowSource::PlanTradeExpiry),
+        (None, None, Some(d)) => (d.fallback_end, WindowSource::Chart("end")),
         (None, None, None) => {
             unreachable!("need_end_from_chart is true when --end and plan expiry are both absent")
         }
@@ -1257,6 +1361,8 @@ fn resolve_window(args: &Args, plan: &TradePlan) -> Result<ResolvedWindow> {
         instrument,
         start,
         end,
+        start_source,
+        end_source,
     })
 }
 
@@ -1364,6 +1470,114 @@ mod tests {
     #[test]
     fn rejects_garbage_datetime() {
         assert!(parse_start_end("yesterday").is_err());
+    }
+
+    fn window(
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        start_source: WindowSource,
+        end_source: WindowSource,
+    ) -> ResolvedWindow {
+        ResolvedWindow {
+            instrument: None,
+            start,
+            end,
+            start_source,
+            end_source,
+        }
+    }
+
+    /// The real GBP/JPY failure (2026-08-06): chart replay cursor at 07-31
+    /// 14:00, plan trade-expiry at 07-23 17:00 — the window runs 8 days
+    /// backwards.
+    ///
+    /// The message this replaced was `end (…) must be after start (…)`: two
+    /// timestamps and nothing else, so the operator could not tell that the end
+    /// came from a rule baked into the plan while the start came from the chart.
+    /// Every assertion below is a thing that message could NOT answer.
+    #[test]
+    fn inverted_window_names_both_sources_and_the_fix() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 31, 14, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 7, 23, 17, 0, 0).unwrap();
+        let msg = inverted_window_error(&window(
+            start,
+            end,
+            WindowSource::Chart("start"),
+            WindowSource::PlanTradeExpiry,
+        ))
+        .to_string();
+
+        // Says WHICH WAY it is wrong, and by how much, in human units.
+        assert!(msg.contains("runs backwards"), "got: {msg}");
+        assert!(msg.contains("7.9 days"), "got: {msg}");
+        // Names the origin of each end — the whole point of the change.
+        assert!(msg.contains("TradingView chart"), "got: {msg}");
+        assert!(msg.contains("02-veto-trade-expiry"), "got: {msg}");
+        // Tells the operator where the fix lives (the chart, not a flag) and
+        // explains why arming still succeeded.
+        assert!(
+            msg.contains("Move the expiry past the start anchor"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("only warns about a past expiry"), "got: {msg}");
+        // Both instants still present — the old message's only content.
+        assert!(msg.contains("2026-07-31 14:00:00 UTC"), "got: {msg}");
+        assert!(msg.contains("2026-07-23 17:00:00 UTC"), "got: {msg}");
+    }
+
+    /// An equal start/end is empty, not backwards — "ends 0 seconds before it
+    /// starts" would be nonsense.
+    #[test]
+    fn an_empty_window_is_described_as_empty_not_backwards() {
+        let t = Utc.with_ymd_and_hms(2026, 7, 31, 14, 0, 0).unwrap();
+        let msg = inverted_window_error(&window(
+            t,
+            t,
+            WindowSource::Flag("--start"),
+            WindowSource::Flag("--end"),
+        ))
+        .to_string();
+        assert!(msg.contains("empty"), "got: {msg}");
+        assert!(!msg.contains("runs backwards"), "got: {msg}");
+    }
+
+    /// When the operator passed the flags explicitly, the chart-specific advice
+    /// would be actively misleading — there is no expiry line to move.
+    #[test]
+    fn flag_sourced_window_does_not_blame_the_chart() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 31, 14, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 7, 31, 12, 0, 0).unwrap();
+        let msg = inverted_window_error(&window(
+            start,
+            end,
+            WindowSource::Flag("--start"),
+            WindowSource::Flag("--end"),
+        ))
+        .to_string();
+        assert!(msg.contains("the --start flag"), "got: {msg}");
+        assert!(msg.contains("the --end flag"), "got: {msg}");
+        assert!(!msg.contains("trade-expiry"), "got: {msg}");
+        // Sub-day gaps read in hours, not "0.1 days".
+        assert!(msg.contains("2.0 hours"), "got: {msg}");
+    }
+
+    /// The window error must stay `bad-input` (exit 4, "fix your input"), never
+    /// infrastructure (exit 3, "retry me") — retrying an inverted window
+    /// forever is exactly the silent cell-loss `outcome` exists to prevent.
+    #[test]
+    fn inverted_window_is_classified_bad_input() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 31, 14, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 7, 23, 17, 0, 0).unwrap();
+        let err = outcome::bad_input(inverted_window_error(&window(
+            start,
+            end,
+            WindowSource::Chart("start"),
+            WindowSource::PlanTradeExpiry,
+        )));
+        assert_eq!(
+            outcome::FailureKind::classify(&err),
+            outcome::FailureKind::BadInput,
+        );
     }
 
     /// Build a minimal `TradePlan` from JSON, with the given rules spliced in.

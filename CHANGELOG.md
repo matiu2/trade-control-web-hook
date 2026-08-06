@@ -1,5 +1,55 @@
 # Changelog
 
+## v131 — 2026-08-06 — an inverted replay window names the two knobs that disagree
+
+**Why.** `replay-candles` refused a GBP/JPY replay with
+`end (2026-07-23 17:00:00 UTC) must be after start (2026-07-31 14:00:00 UTC)` —
+two timestamps and nothing else. The window is assembled from up to *three*
+independent sources (a flag, the plan, the TV chart), so that message named a
+symptom the operator had no way to map back to a cause: nothing in it said the
+end came from a rule baked into the plan while the start came from the chart.
+
+The actual situation was a chart whose **trade-expiry line sat 8 days behind its
+replay start anchor**. `tv-arm --plan-out` builds leniently (`BuildStrictness::
+Lenient` only `warn!`s that `trade_expiry` is in the past, where the live worker
+path would reject it), so the plan armed fine — and the replay then inherited the
+contradiction and refused a window that runs backwards.
+
+**What changed.** `resolve_window` already knew each end's provenance and threw
+it away; it now returns it (`WindowSource`), and `inverted_window_error` renders:
+
+```
+the replay window runs backwards: it ends 7.9 days before it starts (start …, end …)
+  start = 2026-07-31 14:00:00 UTC — from the TradingView chart's start; override with --start
+  end   = 2026-07-23 17:00:00 UTC — from the plan's 02-veto-trade-expiry rule …; override with --end
+  The trade-expiry drawn on the chart is BEHIND the replay start anchor, so there is
+  nothing to replay. Move the expiry past the start anchor and re-arm, or pass an
+  explicit --end. (`tv-arm --plan-out` only warns about a past expiry, so the plan
+  still armed — this is the replay refusing the resulting window.)
+```
+
+Each end names its origin *and* the flag that overrides it. The chart-specific
+closing advice appears only for the chart-start/plan-expiry pair — with explicit
+flags it would be misleading, since there is no expiry line to move. An equal
+start/end reads "empty", not "ends 0 seconds before it starts". The gap renders
+in days/hours/minutes rather than raw seconds.
+
+**Breaking.** None. `ResolvedWindow` gained two private fields; the exit code is
+unchanged — still `bad-input` (4, "fix your input"), never infrastructure (3,
+"retry me"), which a test pins.
+
+**Tests.** Four new, all mutation-verified (reverting to the old bare message
+turns three red; the fourth guards the exit-code classification and correctly
+does not): the real GBP/JPY case asserts both sources and the fix are named;
+empty-vs-backwards wording; flag-sourced windows don't blame the chart; and the
+`bad_input` classification holds.
+
+**Follow-up.** `tv-arm --replay` still turns a failed post-arm replay into a
+top-level `Error:` and a non-zero exit, even though `run_replay`'s own docs say
+the replay is "a post-arm convenience, not part of arming" — so a *successful*
+arm reports as a failed command, and the wrapper's second error chain adds
+nothing over the child's own report. Not fixed here.
+
 ## v130 — 2026-08-04 — engulfer signal extremes span both covered bars
 
 **Why.** A short's stop-loss anchors on `signal_high` (`PriceAnchor::SignalHigh`),
