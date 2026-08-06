@@ -12,6 +12,7 @@ mod cli;
 mod clipboard;
 mod content;
 mod divergence;
+mod fixtures;
 mod jobs;
 mod keys;
 mod plan;

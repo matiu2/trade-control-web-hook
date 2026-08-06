@@ -1,6 +1,7 @@
 //! The persistent info bar: instrument · tf · broker │ entry-mode (order type) │
-//! entry-ts │ outcome. Drawn on every non-list screen from the plan's cached
-//! `PlanDetail` + timeline-derived facts.
+//! entry-ts │ outcome │ fixture. Drawn on every non-list screen from the plan's
+//! cached `PlanDetail` + timeline-derived facts, plus the scanned fixture
+//! corpus (see [`crate::fixtures`]).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -60,6 +61,13 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(outcome, outcome_style(ok)));
     }
 
+    // Whether this setup is already in the replay-fixtures corpus — the answer
+    // to "have I saved this one?" without leaving the TUI to `ls`. Dimmed when
+    // absent so a missing fixture reads as a quiet gap rather than an error.
+    let fixture = app.current_fixture_status();
+    spans.push(Span::raw("  │  "));
+    spans.push(Span::styled(fixture.label(), fixture_style(&fixture)));
+
     let title = format!(" {} ", plan.trade_id);
     let block = crate::ui::titled_block(&title);
     f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
@@ -115,6 +123,17 @@ fn dir_style(direction: &str) -> Style {
         "long" => Style::default().fg(Color::Green),
         "short" => Style::default().fg(Color::Red),
         _ => Style::default().fg(Color::Gray),
+    }
+}
+
+/// Green when a capture covers this setup, dim grey when none does. "No
+/// fixture" is a normal state for most plans — it's a prompt to press `s`, not
+/// a problem — so it must not compete with the outcome for attention.
+fn fixture_style(status: &crate::fixtures::Status) -> Style {
+    if status.is_saved() {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::DarkGray)
     }
 }
 

@@ -18,10 +18,15 @@ pub enum Action {
     Shallower,
     LoadTv,
     Replay,
-    /// Capture the six-cell fixture corpus for the current trade — the `s` key.
+    /// Capture the fixture-grid corpus for the current trade — the `s` key.
     /// Runs `tv-arm --save-fixture … replay`, which writes JSON fixtures under
     /// `replay-fixtures/` (committed to git). Replaced the old journal-DB
     /// "record" action on 2026-07-29.
+    ///
+    /// The grid is **eight cells** — four entry rules (`normal`, `skip-bcr`,
+    /// `strategy-v2`, `strategy-v2-qm-market`) × news on/off — not the six it
+    /// launched with. The count isn't restated in the status message; that
+    /// reports what actually landed on disk (see `App::apply_job`).
     SaveFixture,
     TogglePopup,
     RequestDelete,
