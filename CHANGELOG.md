@@ -1,5 +1,68 @@
 # Changelog
 
+## v132 — 2026-08-09 — the TP resistance band is fib-derived, decoupled from drawn S/R
+
+**Why.** A EUR/NZD M15 short (`hs-eur-nzd-2385e01a`, 2026-07-24) was flattened at
+22:15 by `07-close-on-sr-reversal` with no drawn support line anywhere near it and
+the news window four hours closed. The gate was working correctly — what it matched
+was the **automatic take-profit resistance band**, which had silently grown to
+**39.3 pips**, reaching from the TP at 1.96299 up to 1.96692. The reversal's band
+anchor sat at 1.96527, 22.8 pips short of target, well inside it. The operator's
+intent was a band bounded by the trade's own geometry: TP → the pcl-exhausted
+level, ~10 pips.
+
+The band drifted because it was built by re-using `build_sr_ranges`' shape — a
+`±pct`-of-price band — which coupled its width to the **drawn** S/R lines:
+
+- `437f3f2` (2026-07-23) added it as one-sided `[TP, TP·(1+pct)]`.
+- `7cba843` (2026-07-24) widened it to a full `±pct` radius so it would "match a
+  drawn S/R line's width" — correct reasoning for a drawn line, but this is not
+  one.
+
+Neither step changed the flag name or its `0.1` default, so a number that read as
+"0.1%" produced 0.2% of price — 39 pips at 1.96, and proportionally worse on
+higher-priced instruments. Each change was locally defensible; the coupling is what
+made the drift invisible.
+
+**What changed.** `tp_resistance_band` now takes `(head, neckline, fib_level)` and
+spans **TP → a level on the operator's own fib**, where the fib is drawn
+`head(0) → neckline(1)` so `2.0` is TP and `1.8` is the pcl-exhausted level. It no
+longer sees a percent of price, and nothing about drawn S/R lines can move it.
+Direction falls out of the geometry (head above neckline ⇒ TP is the low edge)
+rather than being branched on.
+
+On the EUR/NZD chart that takes the band from `[1.96299, 1.96692]` (39.3p) to
+`[1.96299, 1.96401]` (10.2p) — top edge exactly the `too-low` veto price — while
+the two drawn bands stay at ~40p, unchanged. The reversal that closed the trade
+now falls outside every band.
+
+**Breaking.** `--tp-resistance-pct` is **replaced** by `--tp-resistance-fib-level`
+(default `1.8`). A stale invocation fails to parse rather than being silently
+ignored — pinned by `tp_resistance_flags_parse`. No wire-format change: the emitted
+`sr_bands` are the same shape, only narrower.
+
+**Config.** `--tp-resistance-fib-level 1.8` — `2.0` is the TP (degenerate,
+zero-width), `1.0` the neckline. Lower values reach further from TP and are
+deliberately **not** clamped at 1.8, so the fixture grid can test a wider band.
+`--skip-tp-resistance` is unchanged.
+
+**Tests.** `tp_resistance_band_spans_tp_to_the_fib_level` (both directions);
+`default_fib_level_matches_the_pcl_exhausted_veto_price` (the band's far edge and
+the `too-low` trigger are one price, so they can't drift);
+`eur_nzd_2026_07_24_anchor_falls_outside_the_fib_band` (the regression, pinned as
+arithmetic); `fib_level_below_the_default_widens_past_pcl_unclamped`;
+`drawn_line_width_does_not_move_the_tp_band` (the decoupling — `--reversal-band-pct`
+must not touch this band). Verified by mutation: reverting to the percent shape
+kills 4 tests, hardcoding the level past the flag kills 1, and re-coupling to
+`--reversal-band-pct` kills the decoupling test. tv-arm 391 green; clippy; fmt.
+
+**Follow-up.** Every H&S fixture blessed since 2026-07-23 encodes the wide band, so
+the corpus needs a re-run to see what the narrow band moves — deliberately not
+re-blessed here. The unmerged `skip-reversals` branch (`1c95727`) touches the same
+call site and will need this change applied on merge. The replay trace still prints
+neither the band anchor nor which band matched, which is what made this take a
+candle-by-candle reconstruction to diagnose.
+
 ## v131 — 2026-08-06 — an inverted replay window names the two knobs that disagree
 
 **Why.** `replay-candles` refused a GBP/JPY replay with
