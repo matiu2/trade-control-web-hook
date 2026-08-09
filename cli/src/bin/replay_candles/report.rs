@@ -61,6 +61,72 @@ fn close_gate_passes(fire: &Fire) -> bool {
     )
 }
 
+/// Why a reversal-close fired: the **band anchor** it tested and the S/R band
+/// that matched, or the open news window.
+///
+/// Without this the journal said only "flattens the open position", which names
+/// the rule but not the reason. A EUR/NZD short (2026-07-24 22:15,
+/// `hs-eur-nzd-2385e01a`) was closed by `07-close-on-sr-reversal` with no drawn
+/// support anywhere near the price and the news window four hours shut — and the
+/// trace gave the operator nothing to reconcile that against. Diagnosing it took
+/// a candle-by-candle reconstruction to discover the automatic take-profit band
+/// had silently grown to 39 pips (fixed in v132). Both numbers were already
+/// computed and already in scope here; only the printing was missing.
+///
+/// Mirrors [`close_windows_pass`](../../../../engine/src/evaluate.rs) — the price
+/// window tests the pattern-aware anchor (engulfer = first covered bar's open,
+/// pinbar/tweezer = the print bar's wick-50%), NOT the candle's close. Printing
+/// the close here would misreport *why* the gate matched. Returns a leading-space
+/// suffix, or empty when there's nothing to add.
+fn close_gate_detail(plan: &TradePlan, fire: &Fire) -> String {
+    use trade_control_core::intent::EventWindow;
+    let intent = &fire.fired.intent;
+    let Some(sig) = &fire.fired.signal else {
+        return String::new();
+    };
+    let anchor = sig.band_anchor;
+    let pip = intent.pip_size.unwrap_or(0.0001);
+    if intent.inside_window.contains(&EventWindow::Price)
+        && let Some([lo, hi]) = intent
+            .sr_bands
+            .iter()
+            .copied()
+            .find(|[lo, hi]| anchor >= *lo && anchor <= *hi)
+    {
+        // Name the band's provenance. The auto take-profit band has an edge
+        // sitting exactly on the enter's TP, which is what distinguishes it from
+        // a line the operator drew — and that distinction is the whole diagnosis
+        // in the EUR/NZD case: "there's no support line here" was correct; the
+        // band that matched was the automatic one.
+        let tp = plan_enter_intent(plan)
+            .and_then(|i| i.take_profit.as_ref())
+            .and_then(|tp| match tp {
+                // Only a plain absolute TP can be compared to a band edge. An
+                // R-multiple or anchored TP isn't a fixed price at arm time, so
+                // there's nothing to match against — fall through to "drawn S/R"
+                // rather than guess.
+                trade_control_core::intent::TakeProfit::Anchored(
+                    trade_control_core::intent::PriceRef::Absolute { absolute },
+                ) => Some(*absolute),
+                _ => None,
+            });
+        let source = match tp {
+            Some(tp) if (lo - tp).abs() < 1e-9 || (hi - tp).abs() < 1e-9 => "auto tp-resistance",
+            _ => "drawn S/R",
+        };
+        return format!(
+            " [anchor {} in band [{}, {}] — {source}]",
+            fmt_price(anchor, pip),
+            fmt_price(lo, pip),
+            fmt_price(hi, pip)
+        );
+    }
+    if intent.inside_window.contains(&EventWindow::News) {
+        return format!(" [anchor {}; news window open]", fmt_price(anchor, pip));
+    }
+    String::new()
+}
+
 /// How a position resolved, for annotation purposes. The first three are
 /// *taken* (filled) outcomes; the last two are *not-taken* — an order that
 /// the price path never filled, or an entry the worker declined to place.
@@ -548,8 +614,9 @@ fn render_fire(
         // allow_close gate, keeping the position open).
         let note = if close_gate_passes(fire) {
             format!(
-                "close-on-reversal ({}) — flattens the open position",
-                fire.fired.rule_id
+                "close-on-reversal ({}) — flattens the open position{}",
+                fire.fired.rule_id,
+                close_gate_detail(plan, fire)
             )
         } else {
             format!(
