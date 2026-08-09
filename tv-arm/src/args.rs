@@ -583,21 +583,32 @@ pub struct Args {
     #[arg(long, default_value_t = 0.1)]
     pub reversal_band_pct: f64,
 
-    /// Width of the automatic take-profit resistance band, as a percent
-    /// of the take-profit price. Default 0.1 (= 0.1% of TP). The band's
-    /// **far edge is pinned to the take-profit** and it sits on the
-    /// approach side (just below TP for a long, just above for a short),
-    /// so a golden reversal candle printing as price nears TP closes the
-    /// position for a partial win instead of round-tripping to the stop.
+    /// Far edge of the automatic take-profit resistance band, as a **level
+    /// on the drawn fib**. Default 1.8.
+    ///
+    /// The fib is drawn `head(0) → neckline(1)`, so `2.0` is the take-profit
+    /// and `1.8` is the pcl-exhausted level (the same price the
+    /// `too-low`/`too-high` veto uses). The band spans TP → this level, on
+    /// the approach side: a golden reversal candle printing as price nears
+    /// TP closes the position for a partial win instead of round-tripping
+    /// to the stop. Lower values reach further from TP and are **not**
+    /// clamped at 1.8.
+    ///
+    /// Deliberately a fib level, not a percent of price — the band is bounded
+    /// by the trade's own geometry, so `--reversal-band-pct` (which sizes
+    /// *drawn* S/R lines) can't move it, and it doesn't mean different things
+    /// at different price levels. Replaced `--tp-resistance-pct` in 2026-08;
+    /// see `tp_resistance_band`.
+    ///
     /// H&S / iH&S only — the M/W path recomputes TP live and gets no auto
     /// band. Ignored when `--skip-tp-resistance` is set.
-    #[arg(long, default_value_t = 0.1)]
-    pub tp_resistance_pct: f64,
+    #[arg(long, default_value_t = 1.8)]
+    pub tp_resistance_fib_level: f64,
 
     /// Do not add the automatic take-profit resistance band. By default
-    /// (H&S / iH&S) every trade gets a one-sided S/R band pinned to the
-    /// take-profit (see `--tp-resistance-pct`); pass this to arm without
-    /// it and rely only on any chart-drawn `support` / `resistance` lines.
+    /// (H&S / iH&S) every trade gets a band spanning the take-profit to the
+    /// `--tp-resistance-fib-level` fib level; pass this to arm without it
+    /// and rely only on any chart-drawn `support` / `resistance` lines.
     #[arg(long)]
     pub skip_tp_resistance: bool,
 
@@ -1018,8 +1029,9 @@ mod tests {
         assert!(!args.broker_dry_run);
         assert!(!args.skip_calendar_bars);
         assert_eq!(args.reversal_band_pct, 0.1);
-        // Auto TP-resistance band: on by default, 0.1% wide.
-        assert_eq!(args.tp_resistance_pct, 0.1);
+        // Auto TP-resistance band: on by default, spanning TP → the 1.8 fib
+        // level (the pcl-exhausted price).
+        assert_eq!(args.tp_resistance_fib_level, 1.8);
         assert!(!args.skip_tp_resistance);
         // No subcommand by default → build+sign to disk only.
         assert!(args.command.is_none());
@@ -1077,10 +1089,17 @@ mod tests {
 
     #[test]
     fn tp_resistance_flags_parse() {
-        let args = Args::try_parse_from(["tv-arm", "--tp-resistance-pct", "0.25"])
-            .expect("parse --tp-resistance-pct");
-        assert_eq!(args.tp_resistance_pct, 0.25);
+        let args = Args::try_parse_from(["tv-arm", "--tp-resistance-fib-level", "1.9"])
+            .expect("parse --tp-resistance-fib-level");
+        assert_eq!(args.tp_resistance_fib_level, 1.9);
         assert!(!args.skip_tp_resistance);
+
+        // The percent flag is gone, not silently accepted-and-ignored: a stale
+        // invocation must fail loudly rather than arm with a default band.
+        assert!(
+            Args::try_parse_from(["tv-arm", "--tp-resistance-pct", "0.25"]).is_err(),
+            "--tp-resistance-pct was replaced by --tp-resistance-fib-level"
+        );
 
         let args =
             Args::try_parse_from(["tv-arm", "--skip-tp-resistance"]).expect("parse --skip flag");

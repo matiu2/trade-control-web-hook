@@ -324,14 +324,33 @@ pub fn build_trade_spec(
             needs_golden: !args.skip_golden,
             needs_confirmed: args.require_confirmation,
             close_on_news,
-            // Chart-drawn S/R bands, plus (default-on) a one-sided band pinned
-            // to the take-profit so a reversal near TP flattens for a partial win
+            // Chart-drawn S/R bands, plus (default-on) the take-profit
+            // resistance band so a reversal near TP flattens for a partial win
             // rather than round-tripping to the stop. `07-close-on-sr-reversal`
-            // OR-fires across every band. H&S only — see `tp_resistance_band`.
+            // OR-fires across every band. H&S only — the M/W path recomputes TP
+            // live and gets no auto band.
+            //
+            // The two are sized by **different** rules and must stay that way:
+            // drawn lines widen by `--reversal-band-pct` (a percent of price),
+            // the TP band spans TP → a fib level (`--tp-resistance-fib-level`).
+            // They shared one percent until 2026-08, so two widenings meant for
+            // drawn lines silently inflated the TP band — see `tp_resistance_band`.
             sr_reversal_ranges: {
                 let mut bands = build_sr_ranges(geom, args.reversal_band_pct);
-                if !args.skip_tp_resistance {
-                    bands.push(tp_resistance_band(tp, direction, args.tp_resistance_pct));
+                // Needs the fib itself, not just the TP derived from it: the band's
+                // far edge is a level *on* that fib. `check_required` has already
+                // rejected a missing/degenerate fib by here, so this is present for
+                // any H&S that resolves — but stay `if let` rather than unwrapping,
+                // so a future caller that skips that check loses the band instead
+                // of panicking mid-arm.
+                if !args.skip_tp_resistance
+                    && let Some((head, neckline)) = geom.fib_head_neckline
+                {
+                    bands.push(tp_resistance_band(
+                        head,
+                        neckline,
+                        args.tp_resistance_fib_level,
+                    ));
                 }
                 bands
             },
@@ -470,38 +489,58 @@ pub fn build_sr_ranges(geom: &PlanGeometry, band_pct: f64) -> Vec<[f64; 2]> {
         .collect()
 }
 
-/// S/R band pinned so its **far edge is the take-profit**, sitting on the
-/// approach side (toward entry). A golden reversal candle whose band-anchor lands
-/// inside it fires `07-close-on-sr-reversal`, closing the position for a partial
-/// win instead of round-tripping to the stop. H&S / iH&S only — the M/W path
-/// recomputes TP live and gets no auto band.
+/// The take-profit resistance band: from the **take-profit** back up the
+/// approach side to a **level on the operator's fib**. A golden reversal candle
+/// whose band-anchor lands inside it fires `07-close-on-sr-reversal`, closing the
+/// position for a partial win instead of round-tripping to the stop. H&S / iH&S
+/// only — the M/W path recomputes TP live and gets no auto band.
 ///
-/// **Width matches a drawn S/R line** ([`build_sr_ranges`]). A drawn line is a
-/// full `±pct` band (`2·pct` total) centred on the line; this band is the same
-/// total width, but placed so its far edge is TP: the "line" (centre) sits one
-/// `pct` step onto the approach side (`TP·(1+pct)` for a short, `TP·(1-pct)` for
-/// a long) and the normal `±pct` band around it lands the near edge exactly on
-/// TP. So the band never extends *past* TP (a clean run to TP is unaffected) yet
-/// reaches a full drawn-band width up the approach side — twice the old
-/// one-sided `[TP, TP+pct]`, which was accidentally half a drawn line's width.
-/// Catching a reversal that turns further short of TP is a separate lever
-/// (`--tp-resistance-pct`).
+/// # It is NOT a drawn S/R line, and must not share their sizing
 ///
-/// `pct` is a percent of the TP price (e.g. `0.1` = 0.1%). Returns `[lo, hi]`
-/// with `lo <= hi` as required by the `sr_bands` validator.
-pub fn tp_resistance_band(tp: f64, direction: Direction, pct: f64) -> [f64; 2] {
-    let pct = pct / 100.0;
-    // The S/R "line" (band centre) is one pct step onto the approach side of TP,
-    // so the ±pct band's far edge lands back on TP.
-    let center = match direction {
-        // Long: price rises into TP from below → approach side (and the band) is
-        // below TP, top edge = TP.
-        Direction::Long => tp * (1.0 - pct),
-        // Short: price falls into TP from above → approach side (and the band) is
-        // above TP, bottom edge = TP.
-        Direction::Short => tp * (1.0 + pct),
-    };
-    [round5(center * (1.0 - pct)), round5(center * (1.0 + pct))]
+/// This band began life re-using [`build_sr_ranges`]' shape — a `±pct`-of-price
+/// band — which coupled it to the drawn-line width. That coupling made it drift
+/// **silently**: first one-sided `pct` (2026-07-23), then widened to a full
+/// `±pct` radius to "match a drawn S/R line's width" (2026-07-24), while the flag
+/// name and its `0.1` default never changed. On EUR/NZD (price ~1.96) that left a
+/// **39-pip** band reaching far past any level with meaning for the setup, and it
+/// flattened a short 22.8 pips short of target off a reversal that had nothing to
+/// do with support or resistance (2026-07-24 22:15, `hs-eur-nzd-2385e01a`). The
+/// operator's intent throughout was a band bounded by the *trade's own geometry*
+/// — ~10 pips there.
+///
+/// So the band is derived from the fib the operator drew, not from a percent of
+/// price. Nothing about drawn S/R lines can move it (pinned by
+/// `drawn_line_width_does_not_move_the_tp_band`), and a percent that means one
+/// thing at 1.96 and another at 68.3 can't distort it.
+///
+/// # The fib scale
+///
+/// On the operator's fib — drawn `head(0) → neckline(1)`, so the `2.0` extension
+/// lands on TP by the reflection `TP = 2·neckline − head` — a level `L` prices as
+/// `head + L·(neckline − head)`. The band runs from TP (`L = 2.0`) back to `L`:
+///
+/// | `L` | where |
+/// |---|---|
+/// | `1.0` | the neckline |
+/// | `1.8` | the pcl-exhausted level — the same price [`crate::geometry::pcl_exhausted_price`] feeds the `too-low`/`too-high` veto |
+/// | `2.0` | the take-profit (a degenerate, zero-width band) |
+///
+/// `1.8` is the default: past it the projected move is essentially complete, the
+/// pcl-exhausted veto already blocks *new* entries, and a reversal there is the
+/// "it turned just short of target" case this band exists to catch.
+///
+/// **Not clamped.** An `L` below `1.8` is honoured and widens the band past the
+/// pcl-exhausted level (operator's call — it keeps the flag predictable and lets
+/// the fixture grid test a deliberately wider band).
+///
+/// Direction falls out of the geometry rather than being branched on: for a short
+/// the head is above the neckline so TP is the low edge; for a long it is the
+/// high edge. Returns `[lo, hi]` with `lo <= hi` as the `sr_bands` validator
+/// requires, so the ordering is applied last regardless of direction.
+pub fn tp_resistance_band(head: f64, neckline: f64, fib_level: f64) -> [f64; 2] {
+    let tp = crate::geometry::tp_price(head, neckline);
+    let edge = head + fib_level * (neckline - head);
+    [round5(tp.min(edge)), round5(tp.max(edge))]
 }
 
 pub fn round5(v: f64) -> f64 {
@@ -737,73 +776,122 @@ mod tests {
     }
 
     #[test]
-    fn tp_resistance_band_long_far_edge_is_tp() {
-        // Long: band hangs UNDER the TP (approach from below), TOP edge = TP.
-        // Centre one pct step below TP → the +pct edge lands back on TP.
-        let tp = 1.20;
-        let pct = 0.1 / 100.0;
-        let center = tp * (1.0 - pct);
-        let [lo, hi] = tp_resistance_band(tp, Direction::Long, 0.1);
-        assert_eq!(hi, round5(center * (1.0 + pct)), "far (top) edge is the TP");
-        assert_eq!(hi, round5(tp), "top edge lands exactly on TP");
-        assert_eq!(
-            lo,
-            round5(center * (1.0 - pct)),
-            "near edge is 2·pct below TP"
-        );
-        assert!(lo < hi, "lo < hi for a valid band");
+    fn tp_resistance_band_spans_tp_to_the_fib_level() {
+        // Short: head 1.20 above neckline 1.10 → TP = 2·1.10 − 1.20 = 1.00.
+        // The fib prices `head + L·(neckline − head)`, so L=1.8 → 1.20 − 1.8·0.10
+        // = 1.02. The band runs TP(1.00) → 1.02, with TP as the LOW edge.
+        let [lo, hi] = tp_resistance_band(1.20, 1.10, 1.8);
+        assert_eq!(lo, 1.00, "short: TP is the low edge");
+        assert_eq!(hi, 1.02, "far edge is the 1.8 fib level");
+
+        // Long (inverse H&S): head 1.00 below neckline 1.10 → TP = 1.20. Mirror
+        // image — TP is now the HIGH edge and the fib level the low.
+        let [lo, hi] = tp_resistance_band(1.00, 1.10, 1.8);
+        assert_eq!(hi, 1.20, "long: TP is the high edge");
+        assert_eq!(lo, 1.18, "far edge is the 1.8 fib level");
     }
 
+    /// The band's far edge at the default 1.8 must be the **same price** the
+    /// pcl-exhausted veto uses. They are two consumers of one level ("the
+    /// projected move is essentially complete"), and if they drift the band
+    /// silently stops lining up with the `too-low`/`too-high` trigger the
+    /// operator reads off the chart.
     #[test]
-    fn tp_resistance_band_short_far_edge_is_tp() {
-        // Short: band sits OVER the TP (approach from above), BOTTOM edge = TP.
-        // Centre one pct step above TP → the −pct edge lands back on TP.
-        let tp = 1.00;
-        let pct = 0.1 / 100.0;
-        let center = tp * (1.0 + pct);
-        let [lo, hi] = tp_resistance_band(tp, Direction::Short, 0.1);
-        assert_eq!(
-            lo,
-            round5(center * (1.0 - pct)),
-            "far (bottom) edge is the TP"
-        );
-        assert_eq!(lo, round5(tp), "bottom edge lands exactly on TP");
-        assert_eq!(
-            hi,
-            round5(center * (1.0 + pct)),
-            "near edge is 2·pct above TP"
-        );
-        assert!(lo < hi, "lo < hi for a valid band");
-    }
-
-    #[test]
-    fn tp_resistance_band_matches_a_drawn_sr_line_width() {
-        // The operator's requirement: the auto TP band must be the SAME total
-        // width as a drawn S/R line for the same pct — not the old half-width.
-        // A drawn line at price P → [P·(1−pct), P·(1+pct)]; its width is what the
-        // TP band must match. Compare at the TP band's own centre.
-        for (dir, tp) in [(Direction::Short, 1.00), (Direction::Long, 1.20)] {
-            let [lo, hi] = tp_resistance_band(tp, dir, 0.1);
-            let tp_width = hi - lo;
-            // A drawn band centred at this TP band's centre (the S/R "line").
-            let pct = 0.1 / 100.0;
-            let center = match dir {
-                Direction::Short => tp * (1.0 + pct),
-                Direction::Long => tp * (1.0 - pct),
-            };
-            let drawn = [round5(center * (1.0 - pct)), round5(center * (1.0 + pct))];
-            let drawn_width = drawn[1] - drawn[0];
-            assert!(
-                (tp_width - drawn_width).abs() < 1e-9,
-                "{dir:?}: TP band width {tp_width} must equal a drawn S/R band width {drawn_width}"
-            );
-            // And it must be ~twice the old one-sided width (pct·tp), the bug.
-            let old_one_sided = pct * tp;
-            assert!(
-                tp_width > old_one_sided * 1.9,
-                "{dir:?}: new width {tp_width} must be ~2× the old one-sided {old_one_sided}"
+    fn default_fib_level_matches_the_pcl_exhausted_veto_price() {
+        for (head, neckline) in [(1.20, 1.10), (1.00, 1.10), (1.973194, 1.968092)] {
+            let [lo, hi] = tp_resistance_band(head, neckline, 1.8);
+            let pcl = round5(crate::geometry::pcl_exhausted_price(head, neckline));
+            let far = if head > neckline { hi } else { lo };
+            assert_eq!(
+                far, pcl,
+                "head {head} neckline {neckline}: far edge must be the pcl level"
             );
         }
+    }
+
+    /// The EUR/NZD regression, pinned as arithmetic.
+    ///
+    /// Trade `hs-eur-nzd-2385e01a` (2026-07-24, M15 short) was flattened at
+    /// 22:15 by `07-close-on-sr-reversal` off a FloatingEngulfer whose band
+    /// anchor was 1.96527 — 22.8 pips above the TP of 1.96299. The old
+    /// percent-of-price band reached 1.96692 (39.3p) and swallowed it. The
+    /// fib band stops at the 1.8 level, 1.96401, and does not.
+    #[test]
+    fn eur_nzd_2026_07_24_anchor_falls_outside_the_fib_band() {
+        // Reconstructed from the plan: TP 1.96299 with the pcl level at 1.96401.
+        let (head, neckline) = (1.9731940000000002, 1.968092);
+        let [lo, hi] = tp_resistance_band(head, neckline, 1.8);
+        assert_eq!(lo, 1.96299, "band bottom is the TP");
+        assert_eq!(
+            hi, 1.96401,
+            "band top is the 1.8 fib — the operator's number"
+        );
+
+        let anchor = 1.96527; // origin bar's open, the engulfer's band anchor
+        assert!(
+            anchor > hi,
+            "the reversal that wrongly closed this trade must now sit OUTSIDE \
+             the band (anchor {anchor} vs top {hi})"
+        );
+
+        // ~10 pips, not the ~39 the percent band produced.
+        let width_pips = (hi - lo) * 10_000.0;
+        assert!(
+            (width_pips - 10.2).abs() < 0.1,
+            "band should be ~10.2 pips, got {width_pips}"
+        );
+    }
+
+    /// A lower fib level widens the band *past* the pcl-exhausted level, and is
+    /// deliberately NOT clamped (operator's call — keeps the flag predictable
+    /// and lets the fixture grid test a wider band).
+    #[test]
+    fn fib_level_below_the_default_widens_past_pcl_unclamped() {
+        let (head, neckline) = (1.20, 1.10);
+        let [_, narrow] = tp_resistance_band(head, neckline, 1.8);
+        let [_, wide] = tp_resistance_band(head, neckline, 1.5);
+        assert!(
+            wide > narrow,
+            "L=1.5 must reach further from TP than L=1.8 ({wide} vs {narrow})"
+        );
+        let pcl = crate::geometry::pcl_exhausted_price(head, neckline);
+        assert!(wide > pcl, "and past the pcl level {pcl} — no clamp");
+    }
+
+    /// The TP band must not move when the **drawn**-line width changes. This is
+    /// the coupling that caused the regression: both were sized by one percent,
+    /// so two widenings aimed at drawn S/R lines silently inflated the TP band.
+    #[test]
+    fn drawn_line_width_does_not_move_the_tp_band() {
+        let mut roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        roles.sr_levels = vec![hline("sr", "support", 1.05)];
+        let geom = PlanGeometry::from_roles(&roles);
+
+        let tp_band = |flags: &[&str]| -> [f64; 2] {
+            let (_dir, spec) = resolve_hs_trade(
+                &mw_args(flags),
+                &geom,
+                false,
+                "EUR_USD",
+                "ms-oanda-1",
+                Broker::Oanda,
+                0.0001,
+                0.0001,
+            )
+            .expect("valid H&S resolves");
+            // The TP band is pushed last, after the drawn ones.
+            *spec
+                .sr_reversal_ranges
+                .last()
+                .expect("auto TP band present")
+        };
+
+        let base = tp_band(&[]);
+        let widened = tp_band(&["--reversal-band-pct", "0.5"]);
+        assert_eq!(
+            base, widened,
+            "--reversal-band-pct is for DRAWN lines only; it must not touch the TP band"
+        );
     }
 
     #[test]
