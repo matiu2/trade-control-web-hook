@@ -34,13 +34,19 @@ set -euo pipefail
 FIXTURES_DIR="${FIXTURES_DIR:-replay-fixtures}"
 OUT_DIR=""
 DRY_RUN=0
+RESUME=0
 TV_ARM="${TV_ARM:-./target/release/tv-arm}"
+
+# One setup's SL cells: 2 structural anchors × 4 entry rules × news on/off.
+# A setup with all of them present is complete and `--resume` skips it.
+CELLS_PER_SETUP=16
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fixtures-dir) FIXTURES_DIR="$2"; shift 2 ;;
     --out)          OUT_DIR="$2";      shift 2 ;;
     --dry-run)      DRY_RUN=1;         shift   ;;
+    --resume)       RESUME=1;          shift   ;;
     -h|--help)      sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -74,10 +80,25 @@ echo
 
 ARMED=0
 FAILED=0
+SKIPPED=0
 FAILED_NAMES=()
 
 for spec in "${SPECS[@]}"; do
   name="$(basename "$spec" .spec.json)"
+
+  # --resume: a setup whose 16 SL cells are all on disk is already done. The
+  # sweep is long enough that losing it to a closed terminal is a real cost, and
+  # re-arming a finished setup burns ~40s to reproduce identical output.
+  if [[ $RESUME -eq 1 ]]; then
+    have=$(find "$OUT_DIR" -mindepth 1 -maxdepth 1 -type d \
+             \( -name "${name}-*-sl-invalidation" -o -name "${name}-*-sl-fib-top" \) \
+           | wc -l | tr -d ' ')
+    if [[ "$have" -ge $CELLS_PER_SETUP ]]; then
+      SKIPPED=$((SKIPPED + 1))
+      echo "· ${name}: ${have}/${CELLS_PER_SETUP} cells present — skipping (--resume)"
+      continue
+    fi
+  fi
   # The instrument is frozen in the spec, but replay-candles must be told
   # explicitly — left implicit, the TV CHART's symbol silently wins.
   instrument="$(python3 -c "
@@ -121,6 +142,13 @@ done
 
 echo
 echo "sl-anchor sweep: ${ARMED}/${#SPECS[@]} setup(s) swept"
+if [[ $SKIPPED -gt 0 ]]; then
+  # Named explicitly: a resumed run that reported only "swept" would look like a
+  # partial sweep, and one that silently counted skips as swept would look like
+  # a full one. Neither is true.
+  echo "  skipped (already complete): ${SKIPPED}"
+  echo "  covered = swept + skipped  = $((ARMED + SKIPPED))/${#SPECS[@]}"
+fi
 if [[ $FAILED -gt 0 ]]; then
   echo "  failed: ${FAILED_NAMES[*]}"
 fi
