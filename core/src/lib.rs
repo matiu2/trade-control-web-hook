@@ -30,6 +30,7 @@ pub mod recover_entry;
 pub mod retry_gate;
 pub mod rounding;
 pub mod rules;
+pub mod screenshot;
 pub mod sig;
 pub mod signals;
 pub mod spread_blackout;

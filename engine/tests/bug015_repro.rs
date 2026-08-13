@@ -208,6 +208,7 @@ fn experimental_plan() -> TradePlan {
         replay_start: None,
         armed_at: None,
         armed_sentiment: None,
+        screenshot_url: None,
     }
 }
 

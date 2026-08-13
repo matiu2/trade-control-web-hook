@@ -39,6 +39,9 @@ pub enum Action {
     Redraw,
     /// Copy the full content of the current view to the clipboard (the `c` key).
     Copy,
+    /// Open the current plan's arm-time TradingView screenshot in the browser
+    /// (the `o` key). No-op when the plan carries no screenshot URL.
+    OpenScreenshot,
     /// Open the `/` search prompt on the list.
     SearchOpen,
     /// Type a character into the live search query.
@@ -135,6 +138,7 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
             KeyCode::Char('l') => Action::LoadTv,
             KeyCode::Char('r') => Action::Replay,
             KeyCode::Char('c') => Action::Copy,
+            KeyCode::Char('o') => Action::OpenScreenshot,
             KeyCode::Char('i') => Action::TogglePopup,
             KeyCode::Char('x') => Action::RequestDelete,
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
@@ -158,6 +162,7 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
         KeyCode::Char('r') => Action::Replay,
         KeyCode::Char('s') | KeyCode::Char('S') => Action::SaveFixture,
         KeyCode::Char('c') => Action::Copy,
+        KeyCode::Char('o') => Action::OpenScreenshot,
         KeyCode::Char('i') => Action::TogglePopup,
         KeyCode::Char('d') | KeyCode::Char('x') => Action::RequestDelete,
         _ => Action::None,
@@ -187,6 +192,7 @@ pub fn apply(app: &mut App, action: Action) {
         Action::ReplayEnd => app.scroll_replay_end(),
         Action::Redraw => app.request_redraw(),
         Action::Copy => app.copy_current(),
+        Action::OpenScreenshot => app.open_screenshot(),
         Action::SearchOpen => app.open_search(),
         Action::SearchPush(c) => app.search_push(c),
         Action::SearchPop => app.search_pop(),
@@ -232,7 +238,7 @@ mod tests {
     fn typing_in_the_prompt_never_triggers_commands() {
         let mut app = app_with_one_plan();
         app.open_search();
-        for c in ['q', 'd', 'r', 'c', 'l', 's', 'i', 'n', 'x', '/'] {
+        for c in ['q', 'd', 'r', 'c', 'l', 's', 'i', 'n', 'x', 'o', '/'] {
             assert_eq!(
                 map_key(&app, press(c)),
                 Action::SearchPush(c),

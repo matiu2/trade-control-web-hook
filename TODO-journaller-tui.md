@@ -9,6 +9,26 @@ outcome`) → Replay (full `replay-candles` report) → Compare (replay ‖ live
 side-by-side). Delete guard blocks unopened plans; confirm modal, `i` detail
 popup, and `←`-unwind all work. 13 tests (incl. 2 TestBackend render tests).
 
+**Done (v3):**
+- **Arm-time screenshot** — SHIPPED. `tv-arm register` reads the system
+  clipboard (`wl-paste` → `xclip` → `xsel`) and, when it holds a TradingView
+  snapshot URL (`https://www.tradingview.com/x/<id>/`), bakes it onto the plan
+  as `TradePlan.screenshot_url`. Workflow: hit TV's camera button, then arm —
+  the chart as drawn is pinned to the trade. Fail-soft like `armed_sentiment`:
+  any other clipboard contents (or no clipboard tool) yields `None` and arming
+  proceeds silently. Recognition lives in `core/src/screenshot.rs`
+  (`ScreenshotUrl`; the only constructor is `parse`) so tv-arm and the journal
+  share one answer, and is deliberately narrow — a TV *chart* link or any other
+  URL is **not** a screenshot.
+  The journal shows it on a second info-bar line (the bar grows 3→4 rows only
+  when a URL is present) and `o` opens it via `xdg-open`. The URL is
+  **re-validated** through `ScreenshotUrl::parse` when read back from the plan,
+  so a stored plan can't hand an arbitrary URL to the browser. Deliberately
+  *not* an OSC 8 terminal hyperlink: ratatui measures span width with
+  unicode-width over the raw string, so the escape bytes would be counted as
+  visible cells and smeared one-per-cell through the buffer (ratatui#902) —
+  `o` is the reliable mechanism.
+
 **Done (v2):**
 - **Compare diff** — SHIPPED. `journal/src/divergence.rs` extracts fire facts
   keyed by `rule_id` from both sides (live = `ticks[].eval.fired[]`; replay =
