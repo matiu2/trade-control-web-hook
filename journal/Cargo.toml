@@ -16,3 +16,4 @@ serde_yaml = "0.9.34"
 tracing = "0.1.44"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+trade-control-core = { version = "0.1.0", path = "../core" }

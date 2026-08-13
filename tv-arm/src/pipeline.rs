@@ -1937,6 +1937,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // pullback_arm
+            None, // screenshot_url
         )
     }
 

@@ -25,6 +25,7 @@ mod args;
 mod broker_kind;
 mod broker_read;
 mod calendar;
+mod clipboard;
 mod control_bundle;
 mod control_windows;
 mod frozen_setup;

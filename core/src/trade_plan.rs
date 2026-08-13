@@ -46,6 +46,7 @@ pub use trade_control_conventions::RuleKind;
 use crate::broker::Granularity;
 use crate::intent::{Direction, Intent};
 use crate::plan_sentiment::PlanSentiment;
+use crate::screenshot::ScreenshotUrl;
 
 /// Default percent-of-price cross-depth buffer baked onto a plan at arm time —
 /// **`0.0` (off) as of 2026-07-15**. The percent buffer is being **deprecated in
@@ -257,6 +258,24 @@ pub struct TradePlan {
     /// line (like `armed_at`), so it adds no new top-level signed key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub armed_sentiment: Option<PlanSentiment>,
+    /// TradingView **snapshot** (screenshot) URL for the chart this plan was
+    /// armed from, e.g. `https://www.tradingview.com/x/pM2uDdC2/`. Captured by
+    /// `tv-arm register` from the system clipboard at arm time: press
+    /// TradingView's camera button (which copies the link), then arm, and the
+    /// chart-as-drawn is pinned to the plan. The `journal` TUI shows it and can
+    /// open it, so a trade can be reviewed against the picture the operator
+    /// actually saw — annotations and all — rather than a re-derived chart.
+    ///
+    /// **Journalling only** — the worker/engine never reads it, exactly like
+    /// [`armed_at`](Self::armed_at) and
+    /// [`armed_sentiment`](Self::armed_sentiment). `None` when the clipboard
+    /// held no snapshot URL (the common, silent case — arming never depends on
+    /// the clipboard) or for plans armed before this field existed;
+    /// `#[serde(skip_serializing_if)]` keeps it out of the JSON entirely then,
+    /// so pre-field plans round-trip unchanged. Nested inside the whole-`TradePlan`
+    /// signed line, so it adds no new top-level signed key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_url: Option<ScreenshotUrl>,
 }
 
 /// One condition + the intent it fires. The engine evaluates [`trigger`] each
@@ -748,5 +767,42 @@ bar: on_close
             RuleKind::PerPositionClose,
             "legacy per_trade_exit must alias to PerPositionClose"
         );
+    }
+
+    /// A minimal plan body with no `screenshot_url` key — i.e. every plan
+    /// registered before the field existed, and every arm where the clipboard
+    /// held no snapshot link. It must still deserialize, with the URL absent.
+    #[test]
+    fn plan_without_screenshot_url_still_parses() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[]}"#;
+        let plan: TradePlan = serde_json::from_str(json).expect("pre-field plan must parse");
+        assert_eq!(plan.screenshot_url, None);
+    }
+
+    /// The URL round-trips as a bare string on the plan body, and a plan
+    /// without one keeps the key out of the JSON entirely — so pre-field plans
+    /// re-serialise byte-identically.
+    #[test]
+    fn screenshot_url_round_trips_and_is_elided_when_absent() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[]}"#;
+        let mut plan: TradePlan = serde_json::from_str(json).expect("parse");
+
+        let without = serde_json::to_string(&plan).expect("serialise");
+        assert!(
+            !without.contains("screenshot_url"),
+            "absent URL must be elided: {without}"
+        );
+
+        plan.screenshot_url = ScreenshotUrl::parse("https://www.tradingview.com/x/pM2uDdC2/");
+        assert!(plan.screenshot_url.is_some(), "fixture URL should parse");
+        let with = serde_json::to_string(&plan).expect("serialise");
+        assert!(
+            with.contains(r#""screenshot_url":"https://www.tradingview.com/x/pM2uDdC2/""#),
+            "URL must serialise as a bare string: {with}"
+        );
+        let back: TradePlan = serde_json::from_str(&with).expect("re-parse");
+        assert_eq!(back.screenshot_url, plan.screenshot_url);
     }
 }

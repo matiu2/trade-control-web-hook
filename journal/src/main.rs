@@ -14,6 +14,7 @@ mod content;
 mod divergence;
 mod jobs;
 mod keys;
+mod opener;
 mod plan;
 mod screen;
 mod search;
