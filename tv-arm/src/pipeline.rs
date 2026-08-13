@@ -228,7 +228,13 @@ fn arm_context<'a>(args: &'a Args, chart_symbol: &'a str) -> crate::replay::ArmC
 }
 
 fn arm_the_matrix(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Result<i32> {
-    let outcomes: Vec<save_matrix::CellOutcome> = save_matrix::GRID
+    let grid = save_matrix::grid_for(args.sl_matrix);
+    info!(
+        cells = grid.len(),
+        sl_matrix = args.sl_matrix,
+        "matrix grid"
+    );
+    let outcomes: Vec<save_matrix::CellOutcome> = grid
         .iter()
         .map(|variant| {
             let cell_args = variant.apply(args);
@@ -1777,6 +1783,8 @@ mod tests {
             // Distinct tick (finer than pip) to prove it's baked independently.
             0.001,
             Vec::new(),
+            // `--sl-anchor` default (signal): no absolute stop baked.
+            None,
         );
         assert_eq!(spec.pattern, cli::TradePattern::Hs);
         assert!(spec.mw.is_none());
@@ -1803,6 +1811,8 @@ mod tests {
             0.0001,
             0.0001,
             Vec::new(),
+            // `--sl-anchor` default (signal): no absolute stop baked.
+            None,
         );
         assert!(
             default.needs_golden,
@@ -1822,6 +1832,8 @@ mod tests {
             0.0001,
             0.0001,
             Vec::new(),
+            // `--sl-anchor` default (signal): no absolute stop baked.
+            None,
         );
         assert!(
             !skipped.needs_golden,
@@ -1853,6 +1865,8 @@ mod tests {
                 0.0001,
                 0.0001,
                 Vec::new(),
+                // `--sl-anchor` default (signal): no absolute stop baked.
+                None,
             )
         };
         assert!(
@@ -1901,6 +1915,8 @@ mod tests {
             0.0001,
             0.0001,
             Vec::new(),
+            // `--sl-anchor` default (signal): no absolute stop baked.
+            None,
         );
         let built = cli::build_trade_from_spec(spec, now(), cli::BuildStrictness::Lenient)
             .expect("build trade bundle");
@@ -2116,6 +2132,8 @@ mod tests {
             pip_size,
             pip_size,
             Vec::new(),
+            // `--sl-anchor` default (signal): no absolute stop baked.
+            None,
         );
         assert_eq!(spec.pip_size, Some(0.25));
     }

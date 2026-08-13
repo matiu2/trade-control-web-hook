@@ -346,6 +346,31 @@ pub struct Args {
     #[arg(long)]
     pub sl_note_buffer_atr_pct: Option<f64>,
 
+    /// Which level the stop-loss is anchored to.
+    ///
+    /// `signal` (default) keeps the shipped behaviour: the latched signal
+    /// candle's own wick + 0.5%·ATR, resolved live. That is already a *tight*,
+    /// non-structural stop. The two structural alternatives bake the drawn price
+    /// at arm time and are buffered by `--sl-note-buffer-atr-pct`:
+    ///
+    /// * `invalidation` — the drawn `too-high`/`too-low` horizontal (the level
+    ///   that says the pattern has failed).
+    /// * `fib-top` — the fib's head, i.e. the pattern extreme. The widest.
+    ///
+    /// An `sl` chart Note still wins over all three — an explicitly drawn stop
+    /// is the operator's direct instruction. When the requested level isn't
+    /// drawn the arm is **rejected**, never silently downgraded to `signal`.
+    #[arg(long, value_enum, default_value_t = crate::sl_anchor::SlAnchor::Signal)]
+    pub sl_anchor: crate::sl_anchor::SlAnchor,
+
+    /// Sweep the three `--sl-anchor` values as an extra `--save-matrix` axis,
+    /// turning the 8-cell grid into 24 cells.
+    ///
+    /// Off by default so the standard matrix stays 8 cells and the existing
+    /// fixture corpus stays valid. Only meaningful with `--save-matrix`.
+    #[arg(long)]
+    pub sl_matrix: bool,
+
     /// Require the break-and-close (`03`) and retest (`04`) candles to be
     /// **golden** — the crossing bar's full range (`high − low`) must be at
     /// least the Wilder ATR at that bar. A weak, indecisive bar that merely

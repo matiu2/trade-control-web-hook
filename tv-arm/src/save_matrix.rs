@@ -49,6 +49,7 @@
 //! says plainly how many armed.
 
 use crate::args::Args;
+use crate::sl_anchor::SlAnchor;
 
 /// One cell of the entry-sensitivity grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +67,12 @@ pub struct Variant {
     pub qm_entry: Option<crate::args::QmEntry>,
     /// Skip the news calendar entirely (`--skip-calendar-bars`).
     pub skip_calendar_bars: bool,
+    /// Which level the stop-loss is anchored to (`--sl-anchor`).
+    ///
+    /// [`SlAnchor::Signal`] on every cell of the base [`GRID`], so the default
+    /// 8-cell matrix stays byte-identical to before this axis existed. Only
+    /// [`sl_grid`] varies it.
+    pub sl_anchor: SlAnchor,
 }
 
 impl Variant {
@@ -75,13 +82,23 @@ impl Variant {
     /// news axis would give six cells only three directory names, and the later
     /// three saves would silently overwrite the first three — a half-empty grid
     /// that looks complete.
+    ///
+    /// The SL axis appends `-sl-<anchor>` **only** for a non-default anchor, so
+    /// every pre-existing fixture directory name is unchanged. Adding a
+    /// `-sl-signal` suffix to the default cells would rename all 206 of them and
+    /// orphan the corpus for no gain.
     pub fn fixture_suffix(&self) -> String {
         let news = if self.skip_calendar_bars {
             "news-off"
         } else {
             "news-on"
         };
-        format!("{}-{news}", self.entry_rule)
+        let sl = if self.sl_anchor.is_structural() {
+            format!("-{}", self.sl_anchor.label())
+        } else {
+            String::new()
+        };
+        format!("{}-{news}{sl}", self.entry_rule)
     }
 
     /// Apply this variant's flags to a copy of the operator's args.
@@ -109,6 +126,7 @@ impl Variant {
         args.strategy_v2 = self.strategy_v2;
         args.qm_entry = self.qm_entry;
         args.skip_calendar_bars = self.skip_calendar_bars;
+        args.sl_anchor = self.sl_anchor;
         // The one expansion `apply_aliases` performs for these flags.
         if self.skip_bcr {
             args.skip_break_and_close = true;
@@ -165,6 +183,7 @@ pub const GRID: [Variant; 8] = [
         strategy_v2: false,
         qm_entry: None,
         skip_calendar_bars: false,
+        sl_anchor: SlAnchor::Signal,
     },
     Variant {
         entry_rule: "normal",
@@ -172,6 +191,7 @@ pub const GRID: [Variant; 8] = [
         strategy_v2: false,
         qm_entry: None,
         skip_calendar_bars: true,
+        sl_anchor: SlAnchor::Signal,
     },
     Variant {
         entry_rule: "skip-bcr",
@@ -179,6 +199,7 @@ pub const GRID: [Variant; 8] = [
         strategy_v2: false,
         qm_entry: None,
         skip_calendar_bars: false,
+        sl_anchor: SlAnchor::Signal,
     },
     Variant {
         entry_rule: "skip-bcr",
@@ -186,6 +207,7 @@ pub const GRID: [Variant; 8] = [
         strategy_v2: false,
         qm_entry: None,
         skip_calendar_bars: true,
+        sl_anchor: SlAnchor::Signal,
     },
     Variant {
         entry_rule: "strategy-v2",
@@ -196,6 +218,7 @@ pub const GRID: [Variant; 8] = [
         // which is what every fixture captured before `--qm-entry` existed froze.
         qm_entry: None,
         skip_calendar_bars: false,
+        sl_anchor: SlAnchor::Signal,
     },
     Variant {
         entry_rule: "strategy-v2",
@@ -203,6 +226,7 @@ pub const GRID: [Variant; 8] = [
         strategy_v2: true,
         qm_entry: None,
         skip_calendar_bars: true,
+        sl_anchor: SlAnchor::Signal,
     },
     Variant {
         entry_rule: "strategy-v2-qm-market",
@@ -210,6 +234,7 @@ pub const GRID: [Variant; 8] = [
         strategy_v2: true,
         qm_entry: Some(crate::args::QmEntry::Market),
         skip_calendar_bars: false,
+        sl_anchor: SlAnchor::Signal,
     },
     Variant {
         entry_rule: "strategy-v2-qm-market",
@@ -217,8 +242,45 @@ pub const GRID: [Variant; 8] = [
         strategy_v2: true,
         qm_entry: Some(crate::args::QmEntry::Market),
         skip_calendar_bars: true,
+        sl_anchor: SlAnchor::Signal,
     },
 ];
+
+/// The stop-loss axis: the shipped default plus the two structural levels.
+///
+/// Ordered widest-last so a grid reads tight → structural.
+pub const SL_AXIS: [SlAnchor; 3] = [SlAnchor::Signal, SlAnchor::Invalidation, SlAnchor::FibTop];
+
+/// The grid to run: the base 8 cells, or all 24 when `--sl-matrix` is set.
+///
+/// ## Why this is opt-in
+///
+/// The SL axis triples the cell count, and the matrix loop is **sequential** —
+/// each cell shells out to `replay-candles` (`crate::replay::run_replay`), so 24
+/// cells is 3× the wall-clock of 8. Making that the default would slow every
+/// existing corpus run to answer a question most of them aren't asking.
+///
+/// Leaving it off also keeps the default 8 cells producing byte-identical
+/// fixture names, so the existing corpus stays valid rather than being orphaned
+/// by a rename.
+///
+/// ## Why the product rather than a v2-only slice
+///
+/// The tight-stop claim interacts with entry precision: a tight stop survives
+/// only if the entry is precise enough that noise doesn't clip it, which is
+/// exactly what the v2 confirming candle buys. Crossing SL against *every* entry
+/// rule is what makes that interaction visible; a v2-only slice would answer the
+/// narrower question and leave the interesting one unanswered. An operator who
+/// wants the narrow slice can still pass `--sl-anchor` with a plain arm.
+pub fn grid_for(sl_matrix: bool) -> Vec<Variant> {
+    if !sl_matrix {
+        return GRID.to_vec();
+    }
+    SL_AXIS
+        .iter()
+        .flat_map(|&sl_anchor| GRID.iter().map(move |base| Variant { sl_anchor, ..*base }))
+        .collect()
+}
 
 /// How one cell turned out.
 #[derive(Debug)]
@@ -586,6 +648,113 @@ mod tests {
         let args = GRID[2].apply(&b);
         assert_eq!(args.risk_amount, Some(5.0));
         assert!(args.skip_golden);
+    }
+
+    // ---- the stop-loss axis ----------------------------------------------
+
+    /// Without `--sl-matrix` the grid is exactly the old 8 cells, every one on
+    /// the default anchor. The SL axis must cost nothing when unused.
+    #[test]
+    fn the_sl_axis_is_off_by_default() {
+        let grid = grid_for(false);
+        assert_eq!(grid.len(), 8);
+        assert!(grid.iter().all(|v| v.sl_anchor == SlAnchor::Signal));
+    }
+
+    /// **The corpus-compatibility guarantee.** Every fixture name the default
+    /// grid produces must be byte-identical to the pre-feature name, or all 206
+    /// existing fixture directories are orphaned by a rename.
+    #[test]
+    fn default_cells_keep_their_original_fixture_names() {
+        let names: Vec<String> = grid_for(false).iter().map(|v| v.fixture_suffix()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "normal-news-on",
+                "normal-news-off",
+                "skip-bcr-news-on",
+                "skip-bcr-news-off",
+                "strategy-v2-news-on",
+                "strategy-v2-news-off",
+                "strategy-v2-qm-market-news-on",
+                "strategy-v2-qm-market-news-off",
+            ],
+            "a default cell's fixture name changed — this orphans the corpus"
+        );
+    }
+
+    /// `--sl-matrix` is the full 3× product, and every cell still has a
+    /// distinct directory name.
+    #[test]
+    fn the_sl_matrix_is_the_full_product_with_distinct_names() {
+        let grid = grid_for(true);
+        assert_eq!(grid.len(), 24, "3 anchors × 8 base cells");
+        let names: std::collections::HashSet<String> =
+            grid.iter().map(|v| v.fixture_suffix()).collect();
+        assert_eq!(names.len(), 24, "colliding fixture names");
+        // The base 8 keep their bare names; the structural cells are suffixed.
+        assert!(names.contains("normal-news-on"), "{names:?}");
+        assert!(
+            names.contains("normal-news-on-sl-invalidation"),
+            "{names:?}"
+        );
+        assert!(names.contains("normal-news-on-sl-fib-top"), "{names:?}");
+    }
+
+    /// Each anchor appears on every base cell — the axis is a true product, not
+    /// a few cells sprinkled in.
+    #[test]
+    fn every_anchor_covers_every_base_cell() {
+        let grid = grid_for(true);
+        for anchor in SL_AXIS {
+            assert_eq!(
+                grid.iter().filter(|v| v.sl_anchor == anchor).count(),
+                8,
+                "{anchor:?} must cover all 8 base cells"
+            );
+        }
+    }
+
+    /// The SL axis varies ONLY the anchor: the entry-rule and news axes of each
+    /// base cell survive untouched. A cell that silently changed its entry rule
+    /// would be attributing an entry difference to the stop.
+    #[test]
+    fn the_sl_axis_varies_only_the_stop() {
+        for (i, v) in grid_for(true).iter().enumerate() {
+            let base = &GRID[i % 8];
+            assert_eq!(v.entry_rule, base.entry_rule);
+            assert_eq!(v.skip_bcr, base.skip_bcr);
+            assert_eq!(v.strategy_v2, base.strategy_v2);
+            assert_eq!(v.qm_entry, base.qm_entry);
+            assert_eq!(v.skip_calendar_bars, base.skip_calendar_bars);
+        }
+    }
+
+    /// `apply` puts the anchor onto the args, so the cell actually arms with the
+    /// stop it names. Without this the whole axis is cosmetic — 24 directories
+    /// holding 8 distinct results.
+    #[test]
+    fn apply_sets_the_sl_anchor_on_the_args() {
+        let v = Variant {
+            sl_anchor: SlAnchor::FibTop,
+            ..GRID[0]
+        };
+        assert_eq!(v.apply(&base()).sl_anchor, SlAnchor::FibTop);
+    }
+
+    /// A structural cell's `--save` name is suffixed, so it lands in its own
+    /// fixture directory rather than overwriting the default cell's.
+    #[test]
+    fn a_structural_cell_saves_to_its_own_directory() {
+        let b = Args::try_parse_from(["tv-arm", "replay", "--save", "trade-7"]).expect("parse");
+        let v = Variant {
+            sl_anchor: SlAnchor::Invalidation,
+            ..GRID[0]
+        };
+        assert_eq!(
+            v.apply(&b).replay_args(),
+            ["--save", "trade-7-normal-news-on-sl-invalidation"]
+        );
     }
 
     fn cell(i: usize, result: Result<i32, String>) -> CellOutcome {
