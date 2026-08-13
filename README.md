@@ -3490,6 +3490,53 @@ shares byte-identical geometry.
 It composes with `--spec-in`, which is the actual corpus workflow: confirm once
 on the chart, then regenerate the whole grid offline after any engine change.
 
+#### The stop-loss axis: `--sl-anchor` / `--sl-matrix`
+
+The shipped stop is **not** structural: it anchors to the latched signal
+candle's own wick (`PriceAnchor::SignalHigh` / `SignalLow`) plus 0.5%·ATR,
+resolved live. That is already a *tight* stop, so the open question is whether
+it gets noise-clipped by the very wick it sits on. `--sl-anchor` moves it:
+
+| value | stop sits at | notes |
+|---|---|---|
+| `signal` (default) | signal-candle wick + 0.5%·ATR | live-resolved; unchanged behaviour |
+| `invalidation` | the drawn `too-high`/`too-low` horizontal | the level that says the pattern failed |
+| `fib-top` | the fib's head (pattern extreme) | widest; the "beginner's" stop |
+
+The two structural values bake the drawn price at arm time and reuse the same
+`PriceRef::AbsoluteBuffered` path a drawn `sl` Note takes, buffered by
+`--sl-note-buffer-atr-pct`. An `sl` Note still **wins** over the flag — an
+explicitly drawn stop is a direct instruction. The SL-vs-spread floor
+(`widen_sl_to_spread_floor`) applies downstream in both worker and replay, so
+no anchor bypasses it.
+
+`--sl-anchor` resolves by **role, not by veto name**: `too-high`/`too-low` swap
+roles with direction, and the opposite name is the pcl-exhausted fib, which sits
+on the *profit* side. A level that resolves onto the wrong side of the neckline
+is rejected, and a level that isn't drawn **rejects the arm** rather than
+silently falling back to `signal` (which would give a grid column secretly
+duplicating the control).
+
+`--sl-matrix` adds the axis to the grid — 8 cells become 24:
+
+```sh
+tv-arm --spec-in setups/trade-124.json --save-matrix --sl-matrix \
+  replay --instrument AUD_CAD --fixtures-dir replay-fixtures --save trade-124
+# → trade-124-normal-news-on                    (signal: name unchanged)
+#   trade-124-normal-news-on-sl-invalidation
+#   trade-124-normal-news-on-sl-fib-top          … ×8 base cells
+```
+
+Off by default: the loop is sequential, so 24 cells is 3× the wall-clock, and
+the default cells keep their **original** fixture names so the existing corpus
+isn't orphaned by a rename.
+
+To sweep every frozen setup in the corpus, `scripts/sl-anchor-sweep.sh` drives
+this over each `*.spec.json`. Note the coverage limit it prints: only setups
+armed with `--spec-out` can be re-armed chartlessly (currently ~26 of ~206
+fixture directories); the rest predate `--spec-out` and need one chart re-arm
+before they join the sweep.
+
 Each cell suffixes the replay's `--save` name, so eight cells land in eight
 directories rather than overwriting each other, and records its own
 `arm.entry_rule` label so a batch tool groups columns from **data** rather than

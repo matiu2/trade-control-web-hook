@@ -50,6 +50,7 @@ mod save_fixture;
 mod save_matrix;
 mod sentiment;
 mod setup_inputs;
+mod sl_anchor;
 mod sl_note;
 mod spread;
 mod start_note;

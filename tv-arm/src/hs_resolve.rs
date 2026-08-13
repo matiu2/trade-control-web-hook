@@ -109,6 +109,17 @@ pub fn resolve_hs_trade(
         )));
     }
     let tp = crate::geometry::tp_price(head, neckline);
+    // Rule 2c: `--sl-anchor` may move the stop onto a drawn structural level
+    // (the invalidation line, or the fib's head) instead of the live-resolved
+    // signal wick. A drawn `sl` Note still wins — it's the operator's explicit
+    // per-chart instruction, whereas the flag is a per-run default. Resolution
+    // re-applies the same protective-side guard as rule 2b, and a missing level
+    // rejects rather than falling back (see `crate::sl_anchor`).
+    let anchored_sl = match geom.stop_loss {
+        Some(_) => None,
+        None => crate::sl_anchor::resolve_sl_anchor(args.sl_anchor, geom, direction, neckline)
+            .map_err(|e| ResolveError::Reject(format!("{e:#}")))?,
+    };
     // Continuous at-entry level vetos (Bug #12): the pcl-exhausted (`too-low`)
     // and invalidation (`too-high`) levels, baked onto the enter so the worker
     // rejects an entry already past either — independent of the cross-guard.
@@ -130,6 +141,7 @@ pub fn resolve_hs_trade(
         pip_size,
         tick_size,
         entry_level_vetos,
+        anchored_sl,
     );
     Ok((direction, spec))
 }
@@ -255,6 +267,12 @@ pub fn build_trade_spec(
     pip_size: f64,
     tick_size: f64,
     entry_level_vetos: Vec<trade_control_core::intent::EntryLevelVeto>,
+    // Absolute stop from `--sl-anchor`, already resolved and side-checked by
+    // `crate::sl_anchor::resolve_sl_anchor`. `None` for the default `signal`
+    // anchor (the stop stays live-resolved) *and* whenever an `sl` chart Note is
+    // present — the Note wins, and the caller passes `None` so the two can never
+    // both be `Some` and race for the same field.
+    anchored_sl: Option<f64>,
 ) -> cli::TradeSpec {
     use cli::TradePattern;
     let pattern = match direction {
@@ -307,8 +325,17 @@ pub fn build_trade_spec(
             // — see `crate::sl_note`. The buffer keeps the stop *clear* of that
             // level; its direction is derived from `direction` when the spec is
             // lowered (`build_enter_alert`), not stored here.
-            sl_price: geom.stop_loss.map(round5),
-            sl_price_buffer_atr_pct: geom.stop_loss.map(|_| {
+            // A drawn `sl` Note, else a `--sl-anchor` structural level. Both
+            // lower to `PriceRef::AbsoluteBuffered`; the buffer keeps the stop
+            // clear of the level either way, and the SL-vs-spread floor
+            // (`widen_sl_to_spread_floor`) still applies downstream in both the
+            // worker and the replay, so no anchor bypasses it.
+            //
+            // `or` and not `or_else`: the caller already guarantees `anchored_sl`
+            // is `None` whenever a Note exists, so this is precedence made
+            // explicit rather than a fallback that could mask a double-set.
+            sl_price: geom.stop_loss.or(anchored_sl).map(round5),
+            sl_price_buffer_atr_pct: geom.stop_loss.or(anchored_sl).map(|_| {
                 args.sl_note_buffer_atr_pct
                     .unwrap_or(DEFAULT_SL_NOTE_BUFFER_ATR_PCT)
             }),
