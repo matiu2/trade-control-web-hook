@@ -54,6 +54,11 @@ done
 
 OUT_DIR="${OUT_DIR:-$FIXTURES_DIR}"
 
+# Used to restore tracked baseline cells the matrix rewrites (see the loop).
+# Empty when the output isn't inside a git repo, which disables the restore —
+# correct, since there is then nothing to restore from.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+
 if [[ ! -x "$TV_ARM" ]]; then
   echo "tv-arm binary not found at $TV_ARM" >&2
   echo "build it first:  cargo build --release -p tv-arm" >&2
@@ -130,6 +135,26 @@ print(sym.split(':')[-1] if sym else '')
     continue
   fi
 
+  # ⚠ The 24-cell matrix rewrites the 8 BASELINE cells too (they're the
+  # `signal` anchor), and a rewrite is destructive even when the verdict is
+  # unchanged: `meta.json`'s `message` is a HAND-WRITTEN analysis note that the
+  # replay cannot regenerate, so it comes back empty. Observed on the first full
+  # sweep — 12 tracked cells rewritten, 6 hand-written notes lost, and every
+  # `expected.json` byte-identical. Pure loss.
+  #
+  # Only the 16 new `-sl-*` cells are wanted here, so any tracked baseline cell
+  # is restored from git afterwards. Untracked cells are left alone: git can't
+  # restore them, and they carry no notes to lose.
+  restore_tracked_baseline() {
+    git -C "$REPO_ROOT" status --porcelain -- "$OUT_DIR" 2>/dev/null \
+      | awk '$1=="M"{print $2}' \
+      | grep -E "/${name}-[^/]*/(meta|plan|expected)\.json$" \
+      | grep -vE '\-sl\-(invalidation|fib-top)/' \
+      | while read -r tracked; do
+          git -C "$REPO_ROOT" checkout -- "$tracked" 2>/dev/null || true
+        done
+  }
+
   # A setup that fails to arm is recorded and the sweep continues — the same
   # discipline the matrix itself uses. One bad spec must not cost the other 25.
   if "${cmd[@]}"; then
@@ -138,6 +163,9 @@ print(sym.split(':')[-1] if sym else '')
     echo "  ✗ ${name}: arm/replay returned non-zero"
     FAILED=$((FAILED + 1)); FAILED_NAMES+=("$name")
   fi
+  # Runs on success AND failure: a partial run can still have rewritten a
+  # baseline cell before it died.
+  restore_tracked_baseline
 done
 
 echo
