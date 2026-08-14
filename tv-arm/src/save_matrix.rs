@@ -47,8 +47,43 @@
 //! cells that *did* work, and at 291 trades that's a slow way to learn nothing.
 //! Each cell is recorded with its outcome and the run continues; the summary
 //! says plainly how many armed.
+//!
+//! ## The news axis needs TWO applications, not one
+//!
+//! Read-the-chart-once is what makes the grid trustworthy, and it is also what
+//! broke the news axis for as long as the matrix has existed. The other two axes
+//! (entry rule, SL anchor) act on flags read *downstream* of [`SetupInputs`], so
+//! setting them in [`Variant::apply`] is enough. The news axis is different: its
+//! flag is consumed **upstream**, by `resolve_control_windows`, which has already
+//! run by the time the matrix loops. So `apply` set `skip_calendar_bars` on a
+//! copy of the args that nothing would ever read again, and every `news-off` cell
+//! armed the news rules anyway — same pause/resume/news-start/news-end rules as
+//! its `news-on` twin, differing only in `trade_id`.
+//!
+//! That failure was invisible in the worst way: the cell *recorded*
+//! `skip_calendar_bars: true` in its fixture metadata, so on disk it claimed to
+//! be news-off while carrying a full set of news rules. Measured across the
+//! corpus when it was found: **13 of 26 setups** had news rules present in a cell
+//! named `news-off` (the other 13 had no calendar events in window, so both cells
+//! were legitimately empty and the mislabel was undetectable).
+//!
+//! Hence [`Variant::apply_to_setup`]: the news axis is applied to the *setup*,
+//! not just the args, by swapping in [`ControlWindows::empty`] — the same value
+//! `resolve_control_windows` returns for `--skip-calendar-bars`, so a news-off
+//! cell is identical to one armed with the flag on the command line.
+//!
+//! **Both must be called.** `apply` alone silently rearms news; `apply_to_setup`
+//! alone leaves the recorded metadata claiming news was on. They are separate
+//! because they have different inputs, and `arm_the_matrix` calls both.
+//!
+//! Suppressing rather than re-fetching is deliberate: a second `calendar_windows`
+//! call per cell would re-read a calendar that may have moved between cells,
+//! reintroducing exactly the "comparing setups rather than flags" problem the
+//! single chart read exists to prevent.
 
 use crate::args::Args;
+use crate::control_windows::ControlWindows;
+use crate::setup_inputs::SetupInputs;
 use crate::sl_anchor::SlAnchor;
 
 /// One cell of the entry-sensitivity grid.
@@ -135,6 +170,11 @@ impl Variant {
         // A matrix run must never write a spec per cell: the whole point is that
         // all six share ONE frozen setup.
         args.spec_out = None;
+        // NOTE: setting `skip_calendar_bars` above is necessary but NOT
+        // sufficient — the calendar has already been resolved into the shared
+        // `SetupInputs` by now, so this copy only reaches the recorded metadata.
+        // `apply_to_setup` is what actually suppresses the windows. See the
+        // module doc.
         // Suffix the replay's `--save <name>` so each cell lands in its OWN
         // fixture directory. Without this all six saves collide on one name and
         // the last cell silently overwrites the other five.
@@ -142,6 +182,34 @@ impl Variant {
             suffix_save_name(replay, &self.fixture_suffix());
         }
         args
+    }
+
+    /// Apply this variant's **news** axis to the shared setup.
+    ///
+    /// The companion to [`Self::apply`], which handles the entry-rule and SL
+    /// axes. This one exists because the news flag is consumed *upstream* of
+    /// [`SetupInputs`]: by the time the matrix loops, `resolve_control_windows`
+    /// has already turned the calendar into `setup.control`, and no later reader
+    /// consults `args.skip_calendar_bars` again. Varying the flag alone therefore
+    /// changed nothing except the cell's recorded metadata — see the module doc
+    /// for how that presented on disk.
+    ///
+    /// Suppression, not re-fetch: [`ControlWindows::empty`] is exactly what
+    /// `resolve_control_windows` returns under `--skip-calendar-bars`, so a
+    /// news-off cell here is indistinguishable from one armed with the flag
+    /// directly. Re-fetching per cell would re-read a calendar that may have
+    /// moved mid-run, which is the failure the single chart read prevents.
+    ///
+    /// A news-**on** cell is returned untouched, so the common path clones
+    /// nothing it doesn't have to.
+    pub fn apply_to_setup(&self, setup: SetupInputs) -> SetupInputs {
+        if !self.skip_calendar_bars {
+            return setup;
+        }
+        SetupInputs {
+            control: ControlWindows::empty(),
+            ..setup
+        }
     }
 }
 
@@ -319,10 +387,145 @@ pub fn summarise(outcomes: &[CellOutcome]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_windows::AsOf;
+    use crate::news_marker::NewsMarker;
+    use crate::news_window::NewsWindow;
+    use chrono::{DateTime, Utc};
     use clap::Parser;
+    use trade_control_cli::Impact;
 
     fn base() -> Args {
         Args::try_parse_from(["tv-arm"]).expect("parse")
+    }
+
+    /// A setup carrying real calendar windows, as a live arm would produce.
+    ///
+    /// `SetupInputs::tests::sample` deliberately carries `ControlWindows::empty`,
+    /// which is the *result* the news-off path is supposed to produce — so it
+    /// cannot distinguish "suppressed" from "never had any" and would pass
+    /// against a `apply_to_setup` that did nothing at all.
+    fn setup_with_news() -> SetupInputs {
+        let at = |s: &str| {
+            DateTime::parse_from_rfc3339(s)
+                .expect("valid rfc3339")
+                .with_timezone(&Utc)
+        };
+        // Far future, so `ControlWindows::new`'s elapsed-prune keeps them: a
+        // past window would be dropped at construction and this fixture would
+        // silently become the empty case it exists to avoid.
+        let win = NewsWindow::new(at("2099-01-01T00:00:00Z"), at("2099-01-01T01:00:00Z"));
+        let marker = NewsMarker::new("USD", Impact::High, at("2099-01-01T00:30:00Z"));
+        let control = ControlWindows::new(
+            vec![win],
+            vec![win],
+            vec![marker],
+            AsOf::wallclock(at("2026-01-01T00:00:00Z")),
+        );
+        assert!(
+            control.has_news() && !control.blackout().is_empty(),
+            "fixture must actually carry windows, else the suppression tests prove nothing"
+        );
+        SetupInputs {
+            control,
+            ..crate::setup_inputs::tests::sample()
+        }
+    }
+
+    fn variant_with_news(skip_calendar_bars: bool) -> Variant {
+        Variant {
+            skip_calendar_bars,
+            ..GRID[0]
+        }
+    }
+
+    /// The news-OFF cell must actually lose its windows.
+    ///
+    /// This is the regression that motivated `apply_to_setup`. Before it, a
+    /// `news-off` cell armed the full set of pause/news rules and only its
+    /// recorded metadata said otherwise — 13 of 26 corpus setups had news rules
+    /// sitting in a directory named `news-off`.
+    #[test]
+    fn a_news_off_cell_suppresses_the_calendar_windows() {
+        let out = variant_with_news(true).apply_to_setup(setup_with_news());
+        assert!(
+            !out.control.has_news(),
+            "news-off must drop the news windows"
+        );
+        assert!(
+            out.control.blackout().is_empty(),
+            "news-off must drop the blackout (pause/resume) windows too — a pause \
+             is calendar-derived and skipping the calendar must skip both"
+        );
+        assert!(
+            out.control.markers().is_empty(),
+            "news-off must drop the markers, keeping drawn == armed"
+        );
+    }
+
+    /// The news-ON cell must keep them — otherwise the axis is dead in the other
+    /// direction and every cell is news-off.
+    #[test]
+    fn a_news_on_cell_keeps_the_calendar_windows() {
+        let out = variant_with_news(false).apply_to_setup(setup_with_news());
+        assert!(out.control.has_news(), "news-on must keep the news windows");
+        assert!(
+            !out.control.blackout().is_empty(),
+            "news-on must keep the blackout windows"
+        );
+    }
+
+    /// Suppression touches the calendar and NOTHING else.
+    ///
+    /// The grid's whole premise is that cells differ only in the flag under
+    /// test. If the news axis also perturbed geometry or resolution, the
+    /// news-on/news-off comparison would be measuring two setups rather than one
+    /// flag — the exact failure the single chart read exists to prevent.
+    #[test]
+    fn suppression_changes_only_the_control_windows() {
+        let before = setup_with_news();
+        let after = variant_with_news(true).apply_to_setup(before.clone());
+        assert_eq!(after.geom, before.geom, "geometry must be untouched");
+        assert_eq!(after.resolution, before.resolution);
+        assert_eq!(after.chart_symbol, before.chart_symbol);
+        assert_eq!(after.instrument, before.instrument);
+        assert_eq!(after.start, before.start);
+        // `AsOf` has no `PartialEq` and doesn't get one just to satisfy a test —
+        // compare the instant it carries, which is the load-bearing part.
+        assert_eq!(after.prune_as_of.at, before.prune_as_of.at);
+    }
+
+    /// Every news-off cell in the real grid suppresses, and every news-on keeps.
+    ///
+    /// Walks `GRID` rather than a hand-built variant so a newly-added cell is
+    /// covered automatically — a new row that forgot the axis would otherwise
+    /// only be caught by someone re-reading this file.
+    #[test]
+    fn every_grid_cell_matches_its_news_label() {
+        for v in grid_for(true) {
+            let out = v.apply_to_setup(setup_with_news());
+            let suffix = v.fixture_suffix();
+            if suffix.contains("news-off") {
+                assert!(
+                    !out.control.has_news() && out.control.blackout().is_empty(),
+                    "{suffix} is named news-off but kept calendar windows"
+                );
+            } else {
+                assert!(
+                    out.control.has_news(),
+                    "{suffix} is named news-on but lost its news windows"
+                );
+            }
+        }
+    }
+
+    /// `apply` must keep setting the flag even though `apply_to_setup` does the
+    /// real work: the flag is what lands in the fixture's `arm` metadata, and a
+    /// cell whose data says news-off while its metadata says news-on is the same
+    /// class of silent lie, just inverted.
+    #[test]
+    fn apply_still_records_the_news_flag_for_the_metadata() {
+        assert!(variant_with_news(true).apply(&base()).skip_calendar_bars);
+        assert!(!variant_with_news(false).apply(&base()).skip_calendar_bars);
     }
 
     /// Eight cells, eight DISTINCT directory names.

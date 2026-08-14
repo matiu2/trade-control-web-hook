@@ -3487,6 +3487,28 @@ have moved, so the cells could differ by more than the flag under test — and t
 grid would be comparing *setups* rather than gates. One read means every cell
 shares byte-identical geometry.
 
+**The news axis is applied to the setup, not just the args.** The entry-rule and
+SL axes are flags read *downstream* of the shared `SetupInputs`, so varying the
+args is enough. The news flag is consumed *upstream* — by the calendar resolution
+that produced `SetupInputs` in the first place — so a `news-off` cell suppresses
+the already-resolved windows via `Variant::apply_to_setup`, rather than re-running
+the calendar (which would re-read a calendar that may have moved mid-run, the very
+thing the single read prevents).
+
+Until 2026-08-15 only the args were varied, so **every `news-off` cell armed the
+news rules anyway** while its fixture metadata recorded `skip_calendar_bars: true`
+— a cell that claimed on disk to be news-off and wasn't. It affected 13 of 26
+corpus setups (the other 13 had no events in window, so both cells were
+legitimately empty and the mislabel was invisible). Fixtures written before that
+date have a `news-off` column that is a duplicate of `news-on`; re-run the grid to
+get a real one.
+
+Note what the axis can and cannot show. A pause blocks *new entries* and pulls
+*resting orders*; it does **not** close a filled position. So a news window that
+opens while a position is already filled changes the fire log but not the R — the
+position runs to its own SL/TP either way. Expect most cells to match across the
+axis even now that it works.
+
 It composes with `--spec-in`, which is the actual corpus workflow: confirm once
 on the chart, then regenerate the whole grid offline after any engine change.
 
