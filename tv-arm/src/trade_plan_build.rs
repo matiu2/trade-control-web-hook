@@ -93,10 +93,14 @@ pub fn resolution_to_granularity(resolution: &str) -> Option<Granularity> {
 //   baked for journalling only; `None` when it couldn't be computed (arming
 //   never blocks on it). See
 //   [`TradePlan::armed_sentiment`](trade_control_core::trade_plan::TradePlan::armed_sentiment).
+// - `screenshot_url` is the TradingView snapshot link read off the clipboard at
+//   arm time, likewise baked for journalling only; `None` when the clipboard
+//   held no such URL (arming never depends on it). See
+//   [`TradePlan::screenshot_url`](trade_control_core::trade_plan::TradePlan::screenshot_url).
 //
-// Fourteen parameters: each is a distinct chart-derived primitive (id, instrument,
-// alerts, direction, roles, granularity, is_mw, shadow, replay_start,
-// retest_atr_step, cross_buffer_pct, cross_buffer_atr, armed_at, armed_sentiment)
+// Each parameter is a distinct chart-derived primitive (id, instrument, alerts,
+// direction, roles, granularity, is_mw, shadow, replay_start, retest_atr_step,
+// cross_buffer_pct, cross_buffer_atr, armed_at, armed_sentiment, screenshot_url)
 // threaded once from the single pipeline call site. Grouping them into a struct
 // would just move the same fields elsewhere without clarifying anything.
 #[allow(clippy::too_many_arguments)]
@@ -117,6 +121,7 @@ pub fn build_trade_plan(
     armed_at: chrono::DateTime<chrono::Utc>,
     armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
     pullback_arm: Option<PullbackArm>,
+    screenshot_url: Option<trade_control_core::screenshot::ScreenshotUrl>,
 ) -> TradePlan {
     let rules = alerts
         .iter()
@@ -138,6 +143,7 @@ pub fn build_trade_plan(
         replay_start,
         armed_at: Some(armed_at),
         armed_sentiment,
+        screenshot_url,
     }
 }
 
@@ -754,6 +760,7 @@ mod tests {
                 chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid"),
                 None,
                 None,
+                None, // screenshot_url
             )
         };
         assert_eq!(
@@ -803,6 +810,7 @@ mod tests {
                 chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
                 None,
                 None,
+                None, // screenshot_url
             )
         };
 
@@ -996,6 +1004,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // pullback_arm
+            None, // screenshot_url
         );
 
         assert!(!plan.shadow, "default build is live, not shadow");
@@ -1084,6 +1093,7 @@ mod tests {
                 anchor_open: 1.2345,
                 atr_mult: 1.5,
             }),
+            None, // screenshot_url
         );
         assert_eq!(plan.rules.len(), 1);
         assert!(matches!(
@@ -1118,6 +1128,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // no pullback arm
+            None, // screenshot_url
         );
         assert_eq!(plan.rules.len(), 0);
     }
@@ -1163,6 +1174,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // pullback_arm
+            None, // screenshot_url
         );
 
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
@@ -1216,6 +1228,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // pullback_arm
+            None, // screenshot_url
         );
 
         // This is exactly what `register_trade_plan` writes for `--plan-out`.
@@ -1288,6 +1301,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // pullback_arm
+            None, // screenshot_url
         );
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
 
@@ -1341,6 +1355,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // pullback_arm
+            None, // screenshot_url
         );
         assert!(plan.rules.is_empty());
     }
@@ -1367,6 +1382,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // pullback_arm
+            None, // screenshot_url
         );
         assert!(plan.shadow, "shadow=true must reach the built plan");
     }
@@ -1392,6 +1408,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // pullback_arm
+            None, // screenshot_url
         );
         assert!(
             (custom.retest_atr_step - 0.2).abs() < 1e-9,
@@ -1416,6 +1433,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // pullback_arm
+            None, // screenshot_url
         );
         assert!(
             (defaulted.retest_atr_step - 0.075).abs() < 1e-9,
@@ -1445,6 +1463,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // pullback_arm
+            None, // screenshot_url
         );
         assert!(
             custom.cross_buffer_pct.abs() < 1e-9,
@@ -1469,6 +1488,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // pullback_arm
+            None, // screenshot_url
         );
         assert!(
             (defaulted.cross_buffer_pct - trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT)
@@ -1501,6 +1521,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // pullback_arm
+            None, // screenshot_url
         );
         assert!(
             (custom.cross_buffer_atr - 0.15).abs() < 1e-9,
@@ -1525,6 +1546,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // pullback_arm
+            None, // screenshot_url
         );
         assert!(
             defaulted.cross_buffer_atr.abs() < 1e-9,
@@ -1598,6 +1620,7 @@ mod tests {
             chrono::Utc::now(),
             None,
             None, // pullback_arm
+            None, // screenshot_url
         );
         assert_eq!(plan.rules.len(), 1, "just the enter before appending");
 

@@ -2076,6 +2076,7 @@ dependencies = [
  "tracing",
  "tracing-error",
  "tracing-subscriber",
+ "trade-control-core",
 ]
 
 [[package]]

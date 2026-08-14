@@ -794,6 +794,38 @@ impl App {
             Err(e) => self.status = Status::error(format!("copy: {e}")),
         }
     }
+
+    /// Open the current plan's arm-time TradingView screenshot in the browser
+    /// (the `o` key) — the chart as the operator saw it when they armed.
+    ///
+    /// A plan with no screenshot says so in the status line rather than failing
+    /// silently: `o` on a plan armed before the feature (or with nothing on the
+    /// clipboard) should explain itself, not look broken.
+    pub fn open_screenshot(&mut self) {
+        let Some(url) = self.current_screenshot_url() else {
+            self.status = Status::info("no screenshot URL on this plan");
+            return;
+        };
+        match crate::opener::open(&url) {
+            Ok(tool) => self.status = Status::info(format!("opened screenshot ({tool})")),
+            Err(e) => self.status = Status::error(format!("open screenshot: {e}")),
+        }
+    }
+
+    /// The current plan's screenshot URL as an owned string, if it has one.
+    /// Owned so the caller can mutate `self.status` without holding a borrow.
+    fn current_screenshot_url(&self) -> Option<String> {
+        let plan = self.current_plan()?;
+        Some(
+            self.data
+                .get(&plan.trade_id)?
+                .detail
+                .as_ref()?
+                .screenshot_url
+                .as_ref()?
+                .to_string(),
+        )
+    }
 }
 
 /// Fetch + parse the plan list.

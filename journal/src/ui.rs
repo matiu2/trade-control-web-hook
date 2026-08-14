@@ -22,7 +22,10 @@ pub fn render(f: &mut Frame, app: &App) {
     let show_infobar = app.screen != Screen::List;
     let constraints = if show_infobar {
         vec![
-            Constraint::Length(3), // info bar
+            // Borders + the facts row, plus a second row only when the plan
+            // carries a screenshot URL — so a plan without one keeps the bar's
+            // old height rather than showing a blank line.
+            Constraint::Length(infobar::height(app)),
             Constraint::Min(1),    // body
             Constraint::Length(1), // footer
         ]
@@ -67,13 +70,13 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = match app.screen {
         Screen::List => "↑↓ move  →/n open  / search  s fixtures  c copy  q quit",
         Screen::Replay => {
-            "↑↓/jk scroll  ←/→ nav  r replay  c copy  ^L refresh  i detail  x delete  q quit"
+            "↑↓/jk scroll  ←/→ nav  r replay  c copy  o shot  ^L refresh  i detail  x delete  q quit"
         }
         Screen::Compare => {
-            "← back  l load-TV  r replay  s fixtures  c copy  i detail  d/x delete  q quit"
+            "← back  l load-TV  r replay  s fixtures  c copy  o shot  i detail  d/x delete  q quit"
         }
         _ => {
-            "← back  →/n deeper  l load-TV  r replay  s fixtures  c copy  i detail  d/x delete  q quit"
+            "← back  →/n deeper  l load-TV  r replay  s fixtures  c copy  o shot  i detail  d/x delete  q quit"
         }
     };
     let status_style = if app.status.is_error {

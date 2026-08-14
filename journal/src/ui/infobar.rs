@@ -1,16 +1,39 @@
 //! The persistent info bar: instrument · tf · broker │ entry-mode (order type) │
-//! entry-ts │ outcome. Drawn on every non-list screen from the plan's cached
-//! `PlanDetail` + timeline-derived facts.
+//! entry-ts │ outcome, plus the arm-time screenshot link. Drawn on every
+//! non-list screen from the plan's cached `PlanDetail` + timeline-derived facts.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+
+use trade_control_core::screenshot::ScreenshotUrl;
 
 use crate::app::App;
 use crate::plan::{EntryMode, PlanDetail};
 use crate::timeline::{derive_entry_ts, derive_outcome};
+
+/// Total height the info bar needs: two borders + the facts row, plus one more
+/// row when the current plan carries a screenshot URL.
+///
+/// Shares [`screenshot_url`] with [`render`] so the reserved height and the
+/// rendered content can't disagree — a mismatch would either clip the link or
+/// leave a blank row.
+pub fn height(app: &App) -> u16 {
+    if screenshot_url(app).is_some() { 4 } else { 3 }
+}
+
+/// The current plan's arm-time screenshot URL, if it has one.
+fn screenshot_url(app: &App) -> Option<&ScreenshotUrl> {
+    let plan = app.current_plan()?;
+    app.data
+        .get(&plan.trade_id)?
+        .detail
+        .as_ref()?
+        .screenshot_url
+        .as_ref()
+}
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let Some(plan) = app.current_plan() else {
@@ -60,9 +83,32 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(outcome, outcome_style(ok)));
     }
 
+    let mut lines = vec![Line::from(spans)];
+    // Second line: the arm-time TradingView screenshot, when the plan carries
+    // one. Shown as plain text and opened with `o` — deliberately *not* an
+    // OSC 8 terminal hyperlink. ratatui measures a span's width with
+    // unicode-width over the raw string, so the escape bytes would be counted
+    // as ~30 visible cells and smeared one-per-cell through the buffer; the
+    // diff then splices cursor moves into the middle of the URL and truncation
+    // leaves an unterminated sequence. See ratatui#902 and its own
+    // `examples/hyperlink.rs`, whose workaround only fits a bespoke
+    // single-line widget. `o` is the reliable mechanism.
+    if let Some(url) = screenshot_url(app) {
+        lines.push(Line::from(vec![
+            Span::raw("screenshot "),
+            Span::styled(
+                url.to_string(),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+            Span::styled("  (o to open)", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
     let title = format!(" {} ", plan.trade_id);
     let block = crate::ui::titled_block(&title);
-    f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Format the entry mode + per-leg order types, e.g.
@@ -123,5 +169,76 @@ fn outcome_style(ok: bool) -> Style {
         Style::default().fg(Color::Green)
     } else {
         Style::default().fg(Color::Red)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::PlanData;
+    use crate::plan::{BcrPreps, PlanRow};
+
+    fn app_with(screenshot_url: Option<&str>) -> App {
+        let row = PlanRow {
+            trade_id: "t-1".into(),
+            account: "demo".into(),
+            instrument: "EUR_USD".into(),
+            granularity: "h1".into(),
+            phase: None,
+            shadow: false,
+            archived_at: None,
+            watermark: None,
+        };
+        let mut app = App::from_rows(vec![row]);
+        let detail = PlanDetail {
+            trade_id: "t-1".into(),
+            instrument: "EUR_USD".into(),
+            direction: "short".into(),
+            granularity: "h1".into(),
+            armed_at: None,
+            entry_mode: EntryMode::Normal,
+            order_types: Vec::new(),
+            bcr_preps: BcrPreps {
+                break_and_close: true,
+                retest: true,
+            },
+            broker: "oanda".into(),
+            screenshot_url: screenshot_url.and_then(ScreenshotUrl::parse),
+        };
+        app.data.insert(
+            "t-1".to_string(),
+            PlanData {
+                detail: Some(detail),
+                ..Default::default()
+            },
+        );
+        app
+    }
+
+    /// The reserved height must track the screenshot line, or the link is
+    /// clipped (too short) / a blank row appears (too tall).
+    #[test]
+    fn height_grows_by_one_row_for_a_screenshot() {
+        assert_eq!(height(&app_with(None)), 3, "no URL keeps the old height");
+        assert_eq!(
+            height(&app_with(Some("https://www.tradingview.com/x/pM2uDdC2/"))),
+            4,
+            "a URL adds exactly one row"
+        );
+    }
+
+    /// The height and the rendered content read the *same* accessor, so they
+    /// can't disagree about whether there's a line to show.
+    #[test]
+    fn height_and_content_agree_on_presence() {
+        let with = app_with(Some("https://www.tradingview.com/x/pM2uDdC2/"));
+        assert!(screenshot_url(&with).is_some());
+        assert_eq!(height(&with), 4);
+
+        // A junk URL is dropped at parse time, so neither the line nor the row
+        // appears — the two stay in step.
+        let junk = app_with(Some("https://evil.example.com/pwn"));
+        assert!(screenshot_url(&junk).is_none());
+        assert_eq!(height(&junk), 3);
     }
 }

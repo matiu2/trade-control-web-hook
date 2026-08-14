@@ -192,6 +192,12 @@ pub(crate) fn register_trade_plan(
         }
         None => None,
     };
+    // Arm-time screenshot: if the operator hit TradingView's camera button
+    // before arming, the clipboard holds a snapshot URL — bake it on so the
+    // journal can show the chart as it looked at this moment. Fail-soft: a
+    // clipboard holding anything else (or no clipboard tool at all) yields
+    // `None` and arming proceeds, same as `armed_sentiment`.
+    let screenshot_url = crate::clipboard::screenshot_url_from_clipboard();
     let mut plan = build_trade_plan(
         &built_trade.trade_id,
         &built_trade.instrument,
@@ -209,6 +215,7 @@ pub(crate) fn register_trade_plan(
         armed_at,
         armed_sentiment,
         pullback_arm,
+        screenshot_url,
     );
     // Unwrap the tv-arm bundle wrappers to the cli `BuiltPause`/`BuiltNews` the
     // appender reads (each carries the signed intents + window times).

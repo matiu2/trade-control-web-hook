@@ -11,6 +11,7 @@
 
 use color_eyre::eyre::{Result, eyre};
 use serde::Deserialize;
+use trade_control_core::screenshot::ScreenshotUrl;
 
 /// One plan as summarised by `plan list --yaml`. Terminated (archived) plans
 /// carry `archived_at`; live plans leave it `None`.
@@ -197,6 +198,12 @@ pub struct PlanDetail {
     /// exchange prefix so the *right* broker's chart is loaded, and is shown in
     /// the info bar. Empty if no rule carried one.
     pub broker: String,
+    /// TradingView snapshot URL for the chart the plan was armed from, captured
+    /// by `tv-arm register` off the clipboard. `None` for plans armed without
+    /// one. Re-validated through [`ScreenshotUrl`] on the way in rather than
+    /// taken as a bare string — the TUI can *open* this, so a stored plan must
+    /// not be able to hand an arbitrary URL to the browser.
+    pub screenshot_url: Option<ScreenshotUrl>,
 }
 
 /// Parse the single-line `plan export` JSON into the info-bar facts.
@@ -296,6 +303,12 @@ pub fn parse_plan_export(json: &str) -> Result<PlanDetail> {
         order_types,
         bcr_preps,
         broker,
+        // Re-parse rather than trust: an unrecognised value is dropped, so the
+        // `o` key can only ever open a real TradingView snapshot link.
+        screenshot_url: v
+            .get("screenshot_url")
+            .and_then(|x| x.as_str())
+            .and_then(ScreenshotUrl::parse),
     })
 }
 
@@ -370,6 +383,41 @@ mod tests {
         );
         // Broker comes from the rule intents (this fixture is an OANDA plan).
         assert_eq!(d.broker, "oanda");
+        // This fixture predates the screenshot field — the absent case.
+        assert_eq!(d.screenshot_url, None);
+    }
+
+    /// A plan carrying a screenshot URL surfaces it for the info bar and the
+    /// `o` key.
+    #[test]
+    fn parses_screenshot_url_from_export() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","rules":[],
+            "screenshot_url":"https://www.tradingview.com/x/pM2uDdC2/"}"#;
+        let d = parse_plan_export(json).expect("parse");
+        assert_eq!(
+            d.screenshot_url.map(|u| u.to_string()),
+            Some("https://www.tradingview.com/x/pM2uDdC2/".to_string())
+        );
+    }
+
+    /// A stored value that isn't a TradingView snapshot link is **dropped**,
+    /// not carried through — the TUI can hand this to a browser, so a plan must
+    /// not be able to smuggle an arbitrary URL into the `o` key.
+    #[test]
+    fn a_non_snapshot_url_in_the_plan_is_dropped() {
+        for bad in [
+            "https://evil.example.com/pwn",
+            "file:///etc/passwd",
+            "not a url at all",
+        ] {
+            let json = format!(
+                r#"{{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+                "granularity":"h1","rules":[],"screenshot_url":"{bad}"}}"#
+            );
+            let d = parse_plan_export(&json).expect("parse");
+            assert_eq!(d.screenshot_url, None, "{bad:?} must be dropped");
+        }
     }
 
     /// A "normal" `05-enter` with NO prep rules is skip-BCR — the case the
