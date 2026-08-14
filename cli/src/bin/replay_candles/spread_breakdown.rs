@@ -32,6 +32,7 @@
 //! exists to prevent. When the experiment ships, [`Breakdown::applied`] flips and
 //! the same renderer starts marking a forecast term as the winner.
 
+#[cfg(test)]
 use trade_control_core::order_control::SpreadInputs;
 
 /// Which of the three readings governed the floor.
@@ -169,6 +170,14 @@ impl Breakdown {
 ///
 /// Kept alongside [`Breakdown::for_entry`] so that when the experiment ships the
 /// renderer needs no change: only the source of the winner does.
+///
+/// **Test-only until that experiment ships.** Nothing on the shipped path calls
+/// this — the entry floor is measured-only (see the module docs), so a `pub fn`
+/// here is dead code and warns. It stays `#[cfg(test)]` rather than deleted
+/// because the tests below are the standing proof that the renderer already
+/// handles a governing forecast; when the experiment lands, drop the `cfg` and
+/// call this from `for_entry`'s caller.
+#[cfg(test)]
 pub fn from_inputs(inputs: &SpreadInputs, pip_size: f64) -> Breakdown {
     let to_pips = |v: f64| {
         if pip_size.is_finite() && pip_size > 0.0 {
