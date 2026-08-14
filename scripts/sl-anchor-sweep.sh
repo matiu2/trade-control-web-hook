@@ -80,7 +80,7 @@ echo "sl-anchor sweep"
 echo "  specs found     : ${#SPECS[@]}"
 echo "  fixture dirs    : ${TOTAL_DIRS}  (only the ${#SPECS[@]} with a spec can be re-armed)"
 echo "  anchors         : signal, invalidation, fib-top"
-echo "  cells per setup : 24  (8 base × 3 anchors)"
+echo "  cells per setup : 24  (4 entry rules × news on/off × 3 anchors)"
 echo
 
 ARMED=0

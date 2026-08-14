@@ -238,9 +238,16 @@ fn arm_the_matrix(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Res
         .iter()
         .map(|variant| {
             let cell_args = variant.apply(args);
+            // BOTH halves are required. `apply` covers the entry-rule and SL
+            // axes (flags read downstream); `apply_to_setup` covers the news
+            // axis, whose flag was consumed upstream when the calendar was
+            // resolved into `setup`. Dropping the second call re-arms the news
+            // rules in every `news-off` cell while its metadata still claims
+            // they were skipped. See `save_matrix`'s module doc.
+            let cell_setup = variant.apply_to_setup(setup.clone());
             info!(cell = %variant.fixture_suffix(), "arming matrix cell");
             let result =
-                arm_from_inputs(&cell_args, setup.clone(), roles).map_err(|e| format!("{e:#}"));
+                arm_from_inputs(&cell_args, cell_setup, roles).map_err(|e| format!("{e:#}"));
             if let Err(e) = &result {
                 // Loud per-cell, so a failure isn't only visible in the summary
                 // at the very end of a long run.
