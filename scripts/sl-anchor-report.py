@@ -56,6 +56,58 @@ def verdict(cell_dir):
     return out
 
 
+def news_axis_table(cells):
+    """What the news standoff actually cost or earned, per cell.
+
+    Only meaningful for fixtures written after 2026-08-15. Before that the
+    `news-off` cells armed the news rules anyway (the flag was consumed upstream
+    of the shared `SetupInputs`), so every pair matched by construction and this
+    table would read as a confident "news never matters".
+
+    Expect most pairs to still match even now: a pause blocks *new entries* and
+    pulls *resting orders*, but does not close a filled position — so a window
+    that opens while a position is already filled changes the fire log and not
+    the R. The rows that DO differ are the whole point; they are the only direct
+    evidence the corpus carries about whether standing aside for news pays.
+    """
+    diffs = []
+    same = 0
+    for (rule, news, anchor), per_setup in cells.items():
+        if news != "on":
+            continue
+        off = cells.get((rule, "off", anchor), {})
+        for setup, v in per_setup.items():
+            if setup not in off:
+                continue
+            d = v["net_r"] - off[setup]["net_r"]
+            if abs(d) < 1e-9:
+                same += 1
+            else:
+                diffs.append((d, setup, rule, anchor, v["net_r"], off[setup]["net_r"]))
+
+    print()
+    print("news axis — where standing aside for news changed the result")
+    print("-" * 72)
+    if not diffs and not same:
+        print("  no comparable news-on/news-off pairs found")
+        return
+    if not diffs:
+        print(f"  {same} pair(s) compared, none differ.")
+        print("  If this reads 0-of-everything on a FRESH sweep, suspect the axis")
+        print("  again (see save_matrix's module doc) rather than concluding news")
+        print("  is irrelevant — that is exactly how the dead axis presented.")
+        return
+
+    diffs.sort(reverse=True)
+    print(f"  {len(diffs)} of {len(diffs) + same} pair(s) differ")
+    print(f"  {'setup':30}{'rule':24}{'anchor':14}{'on':>8}{'off':>8}{'Δ':>8}")
+    for d, setup, rule, anchor, on, off_r in diffs:
+        print(f"  {setup[:30]:30}{rule:24}{anchor:14}{on:+8.2f}{off_r:+8.2f}{d:+8.2f}")
+    net = sum(d for d, *_ in diffs)
+    verb = "EARNED" if net > 0 else "COST"
+    print(f"\n  net effect of the news standoff: {net:+.2f}R  ({verb} across differing cells)")
+
+
 def main():
     # (rule, news, anchor) -> {setup: net_r}
     cells = defaultdict(dict)
@@ -93,14 +145,15 @@ def main():
                 row += f"{sum(per[a][s]['net_r'] for s in common):+14.2f}"
             print(row)
 
-    # Totals across every rule/news combination, again on common setups only.
+    # Totals, NEWS-ON ONLY. Summing both sides of the news axis would count every
+    # setup twice — and while the axis was dead (before 2026-08-15 every
+    # `news-off` cell armed the news rules anyway) the two halves were identical,
+    # so the doubled total was exactly 2× the real number and looked plausible.
+    # news-on is the live-worker configuration, so it is the honest single view.
     print("-" * 72)
     totals = {a: 0.0 for a in anchors}
     setups = set()
-    # Iterate DISTINCT (rule, news) groups — `cells` is keyed by anchor too, so
-    # walking its keys directly visits each group up to three times and triples
-    # every total.
-    groups = {(rule, news) for (rule, news, _) in cells}
+    groups = {(rule, news) for (rule, news, _) in cells if news == "on"}
     for rule, news in groups:
         per = {a: cells.get((rule, news, a), {}) for a in anchors}
         if not all(per.values()):
@@ -109,15 +162,18 @@ def main():
         for a in anchors:
             totals[a] += sum(per[a][s]["net_r"] for s in common)
         setups |= common
-    print(f"{'TOTAL (net R)':24} {'':5} {len(setups):3}  "
+    print(f"{'TOTAL (news-ON only)':24} {'':5} {len(setups):3}  "
           + "".join(f"{totals[a]:+14.2f}" for a in anchors))
-    print(f"  ({len(setups)} distinct setup(s); each contributes up to 8 rule×news cells)")
+    print(f"  ({len(setups)} distinct setup(s) × up to 4 entry rules; news-off excluded")
+    print("   so setups aren't counted twice — see the news-axis table below.)")
+
+    news_axis_table(cells)
 
     # Why the totals differ. A stop-loss change should show up as stop-outs
     # traded for something else; a net-R gap with identical `sl_hits` came from
     # somewhere other than the stop and is worth a second look.
     print()
-    print(f"{'exit reason (all cells)':24} {'':5} {'':3}  " + "".join(f"{a:>14}" for a in anchors))
+    print(f"{'exit reason (news-ON)':24} {'':5} {'':3}  " + "".join(f"{a:>14}" for a in anchors))
     print("-" * 72)
     for label, key in [
         ("stopped out", "sl_hits"),
