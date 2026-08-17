@@ -1,5 +1,50 @@
 # Changelog
 
+## v133 — 2026-08-17 — the calendar guard rail silently blinded daily-chart setups
+
+**Why.** Arming a head-and-shoulders on a **1D** chart (`TRADENATION:AMD`) lost its
+news and blackout windows entirely:
+
+```
+WARN tv_arm::pipeline: calendar window resolution failed; continuing with no news/blackout windows
+  0: fetch_events_for_range: range spans 20 weeks, more than the 10-week guard rail
+```
+
+`fetch_events_for_range` capped a range at 10 weeks. That bound was sized when the
+only caller was `tv-news`, which fetches a chart's **visible window** (2.5–3 weeks).
+But `tv-arm` fetches `[cursor, trade-expiry]` — the trade's own lifetime — and a
+daily-chart H&S is a months-long pattern whose expiry sits a couple of quarters out.
+The rail therefore ruled out an entire timeframe rather than catching misuse.
+
+The failure mode is the bad half: `calendar_windows` failing is caught by a `warn!`
+in `pipeline.rs` and the pipeline **continues**, so the setup armed **news-blind** —
+no blackout windows for its whole multi-month life — instead of failing loudly.
+
+**What changed.** The bound is now a named `MAX_RANGE_WEEKS = 30` (~7 months),
+sized for the longest *legitimate* setup rather than the common one. It still
+catches what the rail is for — an accidental multi-year range. The cost of widening
+is bounded anyway: each week is disk-cached for 4 weeks
+(`crate::forex_factory_cache`), so a wider range is a one-off fetch, not a repeated
+one. The error message now names trade-expiry as the likely cause instead of
+implying operator error.
+
+**Breaking.** None. Behaviour only widens; every range that previously succeeded
+still does.
+
+**Config.** None.
+
+**Tests.** `a_daily_chart_trade_lifetime_is_within_the_guard_rail` asserts a 20-week
+daily lifetime fits, **and** that it exceeds the OLD 10-week rail — so it is a real
+regression test rather than one that would have passed before.
+`a_multi_year_range_still_trips_the_guard_rail` pins the upper edge.
+
+**Follow-up.** Two things this deliberately does not address:
+
+- 30 is not load-bearing — a 1D chart with a year-out expiry hits it again. The
+  better fix is keying the rail off the chart timeframe rather than a flat constant.
+- A news-window fetch failure arguably should not be non-fatal for a setup that
+  wanted news windows. Arming news-blind on a `warn!` is its own bug.
+
 ## v132 — 2026-08-09 — the TP resistance band is fib-derived, decoupled from drawn S/R
 
 **Why.** A EUR/NZD M15 short (`hs-eur-nzd-2385e01a`, 2026-07-24) was flattened at
