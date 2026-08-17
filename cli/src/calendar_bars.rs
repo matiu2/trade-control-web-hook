@@ -363,6 +363,25 @@ pub async fn fetch_week_events(now: DateTime<Utc>) -> Result<Vec<EconomicEvent>>
     get_week_events_cached(local_today).await
 }
 
+/// Upper bound on how many weekly calendar pages one range fetch may walk.
+///
+/// This is a **blast-radius limit on HTTP round-trips**, not a correctness
+/// constraint — every week is disk-cached for 4 weeks
+/// ([`crate::forex_factory_cache`]), so the cost is one-off per week.
+///
+/// Sized for the longest *legitimate* setup rather than the common one. It was
+/// 10 weeks, chosen when the only caller was `tv-news` against a chart's
+/// visible window (2.5–3 weeks). That silently ruled out higher timeframes:
+/// `tv-arm` fetches `[cursor, trade-expiry]`, and a daily-chart H&S is a
+/// months-long pattern whose expiry sits a couple of quarters out — a 1D AMD
+/// setup asked for 20 weeks and lost its news windows entirely (the failure is
+/// a `warn!` that continues with no news/blackout windows, so the trade armed
+/// news-blind rather than failing loudly).
+///
+/// 30 weeks (~7 months) covers a daily setup with room to spare while still
+/// catching the misuse the guard is for — an accidental multi-year range.
+const MAX_RANGE_WEEKS: usize = 30;
+
 /// Fetch every forex-factory event whose timestamp falls in `[from, to]`,
 /// walking the weeks the range spans. Each fetch is a separate HTTP
 /// round-trip; consecutive fetches may return overlapping events when
@@ -370,9 +389,11 @@ pub async fn fetch_week_events(now: DateTime<Utc>) -> Result<Vec<EconomicEvent>>
 /// [`dedupe_and_filter_events`] before being returned.
 ///
 /// Used by `tv-news` to align the events it annotates with the chart's
-/// visible window — typically 2.5–3 weeks. Bounded to 10 weeks to
-/// catch operator misuse (e.g. accidentally fetching a whole year's
-/// worth of calendar pages).
+/// visible window — typically 2.5–3 weeks — and by `tv-arm`, whose range
+/// is the trade's own lifetime `[cursor, trade-expiry]`.
+///
+/// Bounded by [`MAX_RANGE_WEEKS`] to catch operator misuse (e.g.
+/// accidentally fetching a whole year's worth of calendar pages).
 pub async fn fetch_events_for_range(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
@@ -383,9 +404,11 @@ pub async fn fetch_events_for_range(
         ));
     }
     let anchors = week_anchors(from, to);
-    if anchors.len() > 10 {
+    if anchors.len() > MAX_RANGE_WEEKS {
         return Err(eyre!(
-            "fetch_events_for_range: range spans {} weeks, more than the 10-week guard rail",
+            "fetch_events_for_range: range spans {} weeks, more than the {MAX_RANGE_WEEKS}-week \
+             guard rail. For tv-arm the range is [cursor, trade-expiry], so this usually means \
+             the trade-expiry vertical is much further out than intended.",
             anchors.len(),
         ));
     }
@@ -809,6 +832,41 @@ mod tests {
                 chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
                 chrono::NaiveDate::from_ymd_opt(2026, 6, 8).unwrap(),
             ]
+        );
+    }
+
+    /// The 1D-chart regression: a daily H&S whose trade-expiry sits months out.
+    ///
+    /// `fetch_events_for_range` does network I/O, so the boundary is asserted
+    /// against `week_anchors` — the same count the guard compares. A 20-week
+    /// range (the observed AMD 1D case) must now be under the rail; before this
+    /// it exceeded the 10-week limit and the setup armed with NO news windows.
+    #[test]
+    fn a_daily_chart_trade_lifetime_is_within_the_guard_rail() {
+        let from = ts("2026-08-17T00:00:00Z");
+        let to = from + chrono::Duration::weeks(20);
+
+        let weeks = week_anchors(from, to).len();
+
+        assert!(
+            weeks > 10,
+            "this range must exceed the OLD 10-week rail, else it isn't the regression (got {weeks})"
+        );
+        assert!(
+            weeks <= MAX_RANGE_WEEKS,
+            "a 20-week daily-chart trade lifetime must fit ({weeks} > {MAX_RANGE_WEEKS})"
+        );
+    }
+
+    /// The rail still catches what it's for: an accidental multi-year range.
+    #[test]
+    fn a_multi_year_range_still_trips_the_guard_rail() {
+        let from = ts("2026-08-17T00:00:00Z");
+        let to = from + chrono::Duration::weeks(104);
+
+        assert!(
+            week_anchors(from, to).len() > MAX_RANGE_WEEKS,
+            "two years must still be rejected"
         );
     }
 
