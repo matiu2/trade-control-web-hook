@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1784584800,
+        "price": 0.47292
+      },
+      "b": {
+        "at_epoch": 1784642400,
+        "price": 0.47286
+      }
+    },
+    "invalidation": 0.4740687904762835,
+    "fib_head_neckline": [
+      0.47542,
+      0.4728959173695445
+    ],
+    "trade_expiry_epoch": 1784901600,
+    "sr_levels": [
+      0.45746,
+      0.4686,
+      0.47157
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:NZDCHF",
+  "start": 1784771653,
+  "tv_arm_version": "v131"
+}

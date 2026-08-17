@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1784588400,
+        "price": 0.98478
+      },
+      "b": {
+        "at_epoch": 1784707200,
+        "price": 0.98574
+      }
+    },
+    "invalidation": 0.9886150577279796,
+    "fib_head_neckline": [
+      0.98882,
+      0.9855619788101296
+    ],
+    "trade_expiry_epoch": 1784872800,
+    "sr_levels": [
+      0.98429
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:AUDCAD",
+  "start": 1784714400,
+  "tv_arm_version": "v116-127-gbf260c8"
+}

@@ -1,0 +1,463 @@
+{
+  "trade_id": "hs-eur-nzd-ab39979e",
+  "instrument": "EUR/NZD",
+  "direction": "short",
+  "granularity": "m15",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 1.9708650436441828,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-too-high",
+        "not_after": "2026-07-30T07:30:00Z",
+        "action": "veto",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 147,
+        "level": "close-positions",
+        "trade_id": "hs-eur-nzd-ab39979e"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 1.9637897852916495,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-too-low",
+        "not_after": "2026-07-30T07:30:00Z",
+        "action": "veto",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 147,
+        "level": "stop-next-entry",
+        "trade_id": "hs-eur-nzd-ab39979e"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785394800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-trade-expiry",
+        "not_before": "2026-07-30T07:00:00Z",
+        "not_after": "2026-07-30T07:30:00Z",
+        "action": "veto",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 147,
+        "level": "close-positions",
+        "trade_id": "hs-eur-nzd-ab39979e"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1784804400,
+          "price": 1.96797
+        },
+        "b": {
+          "at_epoch": 1784857500,
+          "price": 1.96815
+        },
+        "extend_forward": true,
+        "bar_seconds": 900,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-break-and-close",
+        "not_after": "2026-07-30T07:00:00Z",
+        "action": "prep",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "hs-eur-nzd-ab39979e"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1784804400,
+          "price": 1.96797
+        },
+        "b": {
+          "at_epoch": 1784857500,
+          "price": 1.96815
+        },
+        "extend_forward": true,
+        "bar_seconds": 900,
+        "dir": "up",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-retest",
+        "not_after": "2026-07-30T07:00:00Z",
+        "action": "prep",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "hs-eur-nzd-ab39979e"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-enter",
+        "not_after": "2026-07-29T01:45:00Z",
+        "action": "enter",
+        "instrument": "EUR/NZD",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 1.96271
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 1.9637897852916495,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 1.9708650436441828,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-eur-nzd-ab39979e",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-close-on-sr-reversal",
+        "not_after": "2026-07-30T07:00:00Z",
+        "action": "close",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-nzd-ab39979e",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            2.01202,
+            2.01604
+          ],
+          [
+            1.95404,
+            1.95795
+          ],
+          [
+            1.96271,
+            1.96379
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-close-on-reversal",
+        "not_after": "2026-07-30T07:00:00Z",
+        "action": "close",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-nzd-ab39979e",
+        "needs_golden": true,
+        "inside_window": [
+          "news"
+        ],
+        "reason": "news-window reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "01-pause-1784866500-1784878200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784866500
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-pause-1784866500-1784878200",
+        "not_after": "2026-07-24T07:30:00Z",
+        "action": "pause",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-nzd-ab39979e",
+        "blackout_id": "1784866500-1784878200",
+        "reason": "news:EUR/NZD-2026-07-24T04:15:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1784866500-1784878200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784878200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-resume-1784866500-1784878200",
+        "not_after": "2026-07-24T08:00:00Z",
+        "action": "resume",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-nzd-ab39979e",
+        "blackout_id": "1784866500-1784878200",
+        "reason": "news:EUR/NZD-2026-07-24T04:15:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-pause-1785378600-1785389400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785378600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-pause-1785378600-1785389400",
+        "not_after": "2026-07-30T05:30:00Z",
+        "action": "pause",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-nzd-ab39979e",
+        "blackout_id": "1785378600-1785389400",
+        "reason": "news:EUR/NZD-2026-07-30T02:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1785378600-1785389400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785389400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-resume-1785378600-1785389400",
+        "not_after": "2026-07-30T06:00:00Z",
+        "action": "resume",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-nzd-ab39979e",
+        "blackout_id": "1785378600-1785389400",
+        "reason": "news:EUR/NZD-2026-07-30T02:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1784878200-1784881800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784878200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-news-start-1784878200-1784881800",
+        "not_after": "2026-07-24T08:30:00Z",
+        "action": "news-start",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-nzd-ab39979e",
+        "news_id": "1784878200-1784881800",
+        "reason": "news:EUR/NZD-2026-07-24T07:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1784878200-1784881800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784881800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-news-end-1784878200-1784881800",
+        "not_after": "2026-07-24T09:00:00Z",
+        "action": "news-end",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-nzd-ab39979e",
+        "news_id": "1784878200-1784881800",
+        "reason": "news:EUR/NZD-2026-07-24T07:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1785389400-1785393000",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785389400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-news-start-1785389400-1785393000",
+        "not_after": "2026-07-30T06:30:00Z",
+        "action": "news-start",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-nzd-ab39979e",
+        "news_id": "1785389400-1785393000",
+        "reason": "news:EUR/NZD-2026-07-30T05:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1785389400-1785393000",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785393000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-nzd-ab39979e-news-end-1785389400-1785393000",
+        "not_after": "2026-07-30T07:00:00Z",
+        "action": "news-end",
+        "instrument": "EUR/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-nzd-ab39979e",
+        "news_id": "1785389400-1785393000",
+        "reason": "news:EUR/NZD-2026-07-30T05:30:00+00:00"
+      },
+      "kind": "control"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1784868300,
+  "armed_at": "2026-07-24T04:45:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-23T04:45:00Z",
+    "period_end": "2026-07-24T04:45:00Z",
+    "overall_direction": "bullish",
+    "confidence": "medium",
+    "currencies": [
+      {
+        "currency": "EUR",
+        "direction": "bullish",
+        "net_score": 1.0,
+        "events": [
+          "Main Refinancing Rate: Actual (2.40%) matched forecast (2.40%)",
+          "Consumer Confidence: Actual (-16) beat forecast (-17)"
+        ]
+      }
+    ]
+  }
+}

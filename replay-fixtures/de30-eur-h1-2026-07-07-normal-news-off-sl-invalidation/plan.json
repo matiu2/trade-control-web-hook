@@ -1,0 +1,274 @@
+{
+  "trade_id": "hs-de30-eur-8c192107",
+  "instrument": "DE30_EUR",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 1.0,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 25846.6,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-de30-eur-8c192107-too-high",
+        "not_after": "2026-07-10T03:30:00Z",
+        "action": "veto",
+        "instrument": "DE30_EUR",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-high",
+        "ttl_hours": 69,
+        "level": "close-positions",
+        "trade_id": "hs-de30-eur-8c192107"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 25502.728781840236,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-de30-eur-8c192107-too-low",
+        "not_after": "2026-07-10T03:30:00Z",
+        "action": "veto",
+        "instrument": "DE30_EUR",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-low",
+        "ttl_hours": 69,
+        "level": "stop-next-entry",
+        "trade_id": "hs-de30-eur-8c192107"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1783652400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-de30-eur-8c192107-trade-expiry",
+        "not_before": "2026-07-10T03:00:00Z",
+        "not_after": "2026-07-10T03:30:00Z",
+        "action": "veto",
+        "instrument": "DE30_EUR",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "trade-expiry",
+        "ttl_hours": 69,
+        "level": "close-positions",
+        "trade_id": "hs-de30-eur-8c192107"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1783069200,
+          "price": 25650.2
+        },
+        "b": {
+          "at_epoch": 1783400400,
+          "price": 25758.6
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-de30-eur-8c192107-break-and-close",
+        "not_after": "2026-07-10T03:00:00Z",
+        "action": "prep",
+        "instrument": "DE30_EUR",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "hs-de30-eur-8c192107"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1783069200,
+          "price": 25650.2
+        },
+        "b": {
+          "at_epoch": 1783400400,
+          "price": 25758.6
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "up",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-de30-eur-8c192107-retest",
+        "not_after": "2026-07-10T03:00:00Z",
+        "action": "prep",
+        "instrument": "DE30_EUR",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "hs-de30-eur-8c192107"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-de30-eur-8c192107-enter",
+        "not_after": "2026-07-09T13:24:00Z",
+        "action": "enter",
+        "instrument": "DE30_EUR",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "absolute": 25846.6,
+          "offset_atr_pct": 0.5,
+          "sign": 1.0
+        },
+        "take_profit": {
+          "absolute": 25457.2542
+        },
+        "broker": "oanda",
+        "account": "m-and-w",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 25502.728781840236,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 25846.6,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-de30-eur-8c192107",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 1.0,
+        "tick_size": 0.1
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-de30-eur-8c192107-close-on-sr-reversal",
+        "not_after": "2026-07-10T03:00:00Z",
+        "action": "close",
+        "instrument": "DE30_EUR",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-de30-eur-8c192107",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            25013.1618,
+            25063.2382
+          ],
+          [
+            24895.7793,
+            24945.6207
+          ],
+          [
+            25457.2542,
+            25502.72878
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1783407600,
+  "armed_at": "2026-07-07T07:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-06T07:00:00Z",
+    "period_end": "2026-07-07T07:00:00Z",
+    "overall_direction": "bullish",
+    "confidence": "medium",
+    "currencies": [
+      {
+        "currency": "EUR",
+        "direction": "bullish",
+        "net_score": 1.0,
+        "events": [
+          "Sentix Investor Confidence: Actual (-3.1) beat forecast (-8.9)",
+          "PPI m/m: Actual (0.2%) matched forecast (0.2%)",
+          "Retail Sales m/m: Actual (0.2%) matched forecast (0.2%)",
+          "German Industrial Production m/m: Actual (0.9%) beat forecast (0.1%)",
+          "French Trade Balance: Actual (-6.9B) missed forecast (-5.9B)"
+        ]
+      }
+    ]
+  }
+}

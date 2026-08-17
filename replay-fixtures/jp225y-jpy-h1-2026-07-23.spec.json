@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1784631600,
+        "price": 66033.7
+      },
+      "b": {
+        "at_epoch": 1784703600,
+        "price": 65798.7
+      }
+    },
+    "invalidation": 67461.2,
+    "fib_head_neckline": [
+      67533.7,
+      65945.89220701196
+    ],
+    "trade_expiry_epoch": 1785178800,
+    "sr_levels": [
+      66834.7,
+      65825.9899015957,
+      64778.1
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:JP225YJPY",
+  "start": 1784768400,
+  "tv_arm_version": "v132-3-g46d8b10"
+}

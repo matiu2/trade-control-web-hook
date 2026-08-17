@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785499200,
+        "price": 0.47469
+      },
+      "b": {
+        "at_epoch": 1785751200,
+        "price": 0.47443
+      }
+    },
+    "invalidation": 0.47583,
+    "fib_head_neckline": [
+      0.4766,
+      0.4745450941512233
+    ],
+    "trade_expiry_epoch": 1786114800,
+    "sr_levels": [
+      0.46802758618271545,
+      0.4740729715341951
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:NZDCHF",
+  "start": 1785837688,
+  "tv_arm_version": "v130"
+}

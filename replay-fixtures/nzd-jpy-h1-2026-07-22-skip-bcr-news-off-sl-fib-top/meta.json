@@ -1,0 +1,16 @@
+{
+  "instrument": "NZD_JPY",
+  "granularity": "h1",
+  "source": "oanda",
+  "start": "2026-07-22T16:00:00Z",
+  "end": "2026-07-27T23:00:00Z",
+  "arm": {
+    "entry_rule": "skip-bcr",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "oanda",
+    "chart_symbol": "OANDA:NZDJPY",
+    "tv_arm_version": "v132-12-g948e5f3-dirty",
+    "engine_version": "v132-12-g948e5f3-dirty"
+  }
+}

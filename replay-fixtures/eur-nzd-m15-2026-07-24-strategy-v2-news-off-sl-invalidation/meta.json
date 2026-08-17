@@ -1,0 +1,16 @@
+{
+  "instrument": "EUR/NZD",
+  "granularity": "m15",
+  "source": "tradenation",
+  "start": "2026-07-24T04:45:00Z",
+  "end": "2026-07-30T07:00:00Z",
+  "arm": {
+    "entry_rule": "strategy-v2",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:EURNZD",
+    "tv_arm_version": "v132-12-g948e5f3-dirty",
+    "engine_version": "v132-12-g948e5f3-dirty"
+  }
+}

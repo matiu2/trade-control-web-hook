@@ -1,0 +1,98 @@
+{
+  "fires": [
+    {
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-07-24T07:45:00Z",
+      "candle_close": 1.9677
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "action": "prep",
+      "candle_time": "2026-07-24T09:00:00Z",
+      "candle_close": 1.96899
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-24T09:45:00Z",
+      "candle_close": 1.96807
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-24T10:00:00Z",
+      "candle_close": 1.9679
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-24T10:15:00Z",
+      "candle_close": 1.9677
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-24T14:00:00Z",
+      "candle_close": 1.96589
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-24T14:30:00Z",
+      "candle_close": 1.96537
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-07-24T15:00:00Z",
+      "candle_close": 1.96354
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-07-24T15:30:00Z",
+      "candle_close": 1.96403
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "action": "veto",
+      "candle_time": "2026-07-28T00:00:00Z",
+      "candle_close": 1.97117
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 0.8465116279070983,
+    "tp_hits": 0,
+    "sl_hits": 1,
+    "reversal_closes": 1,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-07-24T10:00:00Z",
+        "entry_price": 1.96802,
+        "stop_loss": 1.9700199999999999,
+        "take_profit": 1.96271,
+        "exit_time": "2026-07-24T13:30:00Z",
+        "exit_price": 1.96802,
+        "exit_reason": "stopped_out",
+        "r": -0.0
+      },
+      {
+        "entry_time": "2026-07-24T14:15:00Z",
+        "entry_price": 1.96585,
+        "stop_loss": 1.968,
+        "take_profit": 1.96271,
+        "exit_time": "2026-07-24T15:30:00Z",
+        "exit_price": 1.96403,
+        "exit_reason": "reversal",
+        "r": 0.8465116279070983
+      }
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1784494800,
+        "price": 94.695
+      },
+      "b": {
+        "at_epoch": 1784710800,
+        "price": 94.805
+      }
+    },
+    "invalidation": 95.155,
+    "fib_head_neckline": [
+      95.348,
+      94.77475017511046
+    ],
+    "trade_expiry_epoch": 1785193200,
+    "sr_levels": [
+      94.618
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:NZDJPY",
+  "start": 1784736000,
+  "tv_arm_version": "v132-12-g948e5f3"
+}

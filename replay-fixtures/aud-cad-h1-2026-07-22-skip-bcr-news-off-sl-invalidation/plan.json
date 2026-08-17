@@ -1,0 +1,195 @@
+{
+  "trade_id": "hs-aud-cad-881c8cf1",
+  "instrument": "AUD_CAD",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 0.9886150577279796,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-cad-881c8cf1-too-high",
+        "not_after": "2026-07-24T06:30:00Z",
+        "action": "veto",
+        "instrument": "AUD_CAD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-high",
+        "ttl_hours": 45,
+        "level": "close-positions",
+        "trade_id": "hs-aud-cad-881c8cf1"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 0.9829555618582332,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-cad-881c8cf1-too-low",
+        "not_after": "2026-07-24T06:30:00Z",
+        "action": "veto",
+        "instrument": "AUD_CAD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-low",
+        "ttl_hours": 45,
+        "level": "stop-next-entry",
+        "trade_id": "hs-aud-cad-881c8cf1"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784872800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-cad-881c8cf1-trade-expiry",
+        "not_before": "2026-07-24T06:00:00Z",
+        "not_after": "2026-07-24T06:30:00Z",
+        "action": "veto",
+        "instrument": "AUD_CAD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "trade-expiry",
+        "ttl_hours": 45,
+        "level": "close-positions",
+        "trade_id": "hs-aud-cad-881c8cf1"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-cad-881c8cf1-enter",
+        "not_after": "2026-07-23T21:12:00Z",
+        "action": "enter",
+        "instrument": "AUD_CAD",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "absolute": 0.98862,
+          "offset_atr_pct": 0.5,
+          "sign": 1.0
+        },
+        "take_profit": {
+          "absolute": 0.9823
+        },
+        "broker": "oanda",
+        "account": "m-and-w",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 0.9829555618582332,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 0.9886150577279796,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-aud-cad-881c8cf1",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-cad-881c8cf1-close-on-sr-reversal",
+        "not_after": "2026-07-24T06:00:00Z",
+        "action": "close",
+        "instrument": "AUD_CAD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-aud-cad-881c8cf1",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            0.98331,
+            0.98527
+          ],
+          [
+            0.9823,
+            0.98296
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1784714400,
+  "armed_at": "2026-07-22T10:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-21T10:00:00Z",
+    "period_end": "2026-07-22T10:00:00Z",
+    "overall_direction": "bullish",
+    "confidence": "low",
+    "currencies": [
+      {
+        "currency": "AUD",
+        "direction": "bullish",
+        "net_score": 1.0,
+        "events": [
+          "MI Leading Index m/m: Actual (0.0%) improved from previous (-0.1%)"
+        ]
+      }
+    ]
+  }
+}

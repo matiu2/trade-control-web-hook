@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1784824200,
+        "price": 0.8137
+      },
+      "b": {
+        "at_epoch": 1784857500,
+        "price": 0.81394
+      }
+    },
+    "invalidation": 0.8130213027727454,
+    "fib_head_neckline": [
+      0.81186,
+      0.8138487504040638
+    ],
+    "trade_expiry_epoch": 1785115800,
+    "sr_levels": [
+      0.80593,
+      0.8190929644908821,
+      0.8168724845945545
+    ]
+  },
+  "resolution": "15",
+  "chart_symbol": "TRADENATION:NZDCAD",
+  "start": 1784859300,
+  "tv_arm_version": "v131"
+}

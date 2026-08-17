@@ -1,0 +1,626 @@
+{
+  "trade_id": "ihs-aud-nzd-b4e499d3",
+  "instrument": "AUD/NZD",
+  "direction": "long",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 1.2064373874913454,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-too-low",
+        "not_after": "2026-06-25T04:30:00Z",
+        "action": "veto",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 321,
+        "level": "close-positions",
+        "trade_id": "ihs-aud-nzd-b4e499d3"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 1.2132011550857735,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-too-high",
+        "not_after": "2026-06-25T04:30:00Z",
+        "action": "veto",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 321,
+        "level": "stop-next-entry",
+        "trade_id": "ihs-aud-nzd-b4e499d3"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1782360000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-trade-expiry",
+        "not_before": "2026-06-25T04:00:00Z",
+        "not_after": "2026-06-25T04:30:00Z",
+        "action": "veto",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 321,
+        "level": "close-positions",
+        "trade_id": "ihs-aud-nzd-b4e499d3"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1781046000,
+          "price": 1.20933
+        },
+        "b": {
+          "at_epoch": 1781190000,
+          "price": 1.21039
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-break-and-close",
+        "not_after": "2026-06-25T04:00:00Z",
+        "action": "prep",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "ihs-aud-nzd-b4e499d3"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1781046000,
+          "price": 1.20933
+        },
+        "b": {
+          "at_epoch": 1781190000,
+          "price": 1.21039
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "down",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-retest",
+        "not_after": "2026-06-25T04:00:00Z",
+        "action": "prep",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "ihs-aud-nzd-b4e499d3"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-enter",
+        "not_after": "2026-06-22T12:00:00Z",
+        "action": "enter",
+        "instrument": "AUD/NZD",
+        "direction": "long",
+        "entry": {
+          "type": "stop",
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "absolute": 1.20495,
+          "offset_atr_pct": 0.5,
+          "sign": -1.0
+        },
+        "take_profit": {
+          "absolute": 1.21412
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 1.2132011550857735,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 1.2064373874913454,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-close-on-sr-reversal",
+        "not_after": "2026-06-25T04:00:00Z",
+        "action": "close",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            1.21221,
+            1.21463
+          ],
+          [
+            1.2132,
+            1.21412
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-close-on-reversal",
+        "not_after": "2026-06-25T04:00:00Z",
+        "action": "close",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "needs_golden": true,
+        "inside_window": [
+          "news"
+        ],
+        "reason": "news-window reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "01-pause-1781555400-1781587800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1781555400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-pause-1781555400-1781587800",
+        "not_after": "2026-06-16T05:30:00Z",
+        "action": "pause",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "blackout_id": "1781555400-1781587800",
+        "reason": "news:AUD/NZD-2026-06-15T20:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1781555400-1781587800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1781587800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-resume-1781555400-1781587800",
+        "not_after": "2026-06-16T06:00:00Z",
+        "action": "resume",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "blackout_id": "1781555400-1781587800",
+        "reason": "news:AUD/NZD-2026-06-15T20:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-pause-1781707500-1781736300",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1781707500
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-pause-1781707500-1781736300",
+        "not_after": "2026-06-17T22:45:00Z",
+        "action": "pause",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "blackout_id": "1781707500-1781736300",
+        "reason": "news:AUD/NZD-2026-06-17T14:45:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1781707500-1781736300",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1781736300
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-resume-1781707500-1781736300",
+        "not_after": "2026-06-17T23:15:00Z",
+        "action": "resume",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "blackout_id": "1781707500-1781736300",
+        "reason": "news:AUD/NZD-2026-06-17T14:45:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-pause-1782235800-1782264600",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1782235800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-pause-1782235800-1782264600",
+        "not_after": "2026-06-24T01:30:00Z",
+        "action": "pause",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "blackout_id": "1782235800-1782264600",
+        "reason": "news:AUD/NZD-2026-06-23T17:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1782235800-1782264600",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1782264600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-resume-1782235800-1782264600",
+        "not_after": "2026-06-24T02:00:00Z",
+        "action": "resume",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "blackout_id": "1782235800-1782264600",
+        "reason": "news:AUD/NZD-2026-06-23T17:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-pause-1782322200-1782351000",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1782322200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-pause-1782322200-1782351000",
+        "not_after": "2026-06-25T01:30:00Z",
+        "action": "pause",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "blackout_id": "1782322200-1782351000",
+        "reason": "news:AUD/NZD-2026-06-24T17:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1782322200-1782351000",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1782351000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-resume-1782322200-1782351000",
+        "not_after": "2026-06-25T02:00:00Z",
+        "action": "resume",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "blackout_id": "1782322200-1782351000",
+        "reason": "news:AUD/NZD-2026-06-24T17:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1781587800-1781591400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1781587800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-news-start-1781587800-1781591400",
+        "not_after": "2026-06-16T06:30:00Z",
+        "action": "news-start",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "news_id": "1781587800-1781591400",
+        "reason": "news:AUD/NZD-2026-06-16T05:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1781587800-1781591400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1781591400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-news-end-1781587800-1781591400",
+        "not_after": "2026-06-16T07:00:00Z",
+        "action": "news-end",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "news_id": "1781587800-1781591400",
+        "reason": "news:AUD/NZD-2026-06-16T05:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1781736300-1781739900",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1781736300
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-news-start-1781736300-1781739900",
+        "not_after": "2026-06-17T23:45:00Z",
+        "action": "news-start",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "news_id": "1781736300-1781739900",
+        "reason": "news:AUD/NZD-2026-06-17T22:45:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1781736300-1781739900",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1781739900
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-news-end-1781736300-1781739900",
+        "not_after": "2026-06-18T00:15:00Z",
+        "action": "news-end",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "news_id": "1781736300-1781739900",
+        "reason": "news:AUD/NZD-2026-06-17T22:45:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1782264600-1782268200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1782264600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-news-start-1782264600-1782268200",
+        "not_after": "2026-06-24T02:30:00Z",
+        "action": "news-start",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "news_id": "1782264600-1782268200",
+        "reason": "news:AUD/NZD-2026-06-24T01:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1782264600-1782268200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1782268200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-news-end-1782264600-1782268200",
+        "not_after": "2026-06-24T03:00:00Z",
+        "action": "news-end",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "news_id": "1782264600-1782268200",
+        "reason": "news:AUD/NZD-2026-06-24T01:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1782351000-1782354600",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1782351000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-news-start-1782351000-1782354600",
+        "not_after": "2026-06-25T02:30:00Z",
+        "action": "news-start",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "news_id": "1782351000-1782354600",
+        "reason": "news:AUD/NZD-2026-06-25T01:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1782351000-1782354600",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1782354600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-aud-nzd-b4e499d3-news-end-1782351000-1782354600",
+        "not_after": "2026-06-25T03:00:00Z",
+        "action": "news-end",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-aud-nzd-b4e499d3",
+        "news_id": "1782351000-1782354600",
+        "reason": "news:AUD/NZD-2026-06-25T01:30:00+00:00"
+      },
+      "kind": "control"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1781208000,
+  "armed_at": "2026-06-11T20:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-06-10T20:00:00Z",
+    "period_end": "2026-06-11T20:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "low",
+    "currencies": [
+      {
+        "currency": "AUD",
+        "direction": "neutral",
+        "net_score": 0.0,
+        "events": [
+          "MI Inflation Expectations: Actual (5.5%) unchanged from previous (5.6%)"
+        ]
+      }
+    ]
+  }
+}

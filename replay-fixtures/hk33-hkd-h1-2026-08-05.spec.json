@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785463200,
+        "price": 25687.20207592353
+      },
+      "b": {
+        "at_epoch": 1785848400,
+        "price": 25743.2
+      }
+    },
+    "invalidation": 25954.8,
+    "fib_head_neckline": [
+      26016.0,
+      25724.07762861144
+    ],
+    "trade_expiry_epoch": 1786471200
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:HK33HKD",
+  "start": 1785909600,
+  "tv_arm_version": "v131"
+}

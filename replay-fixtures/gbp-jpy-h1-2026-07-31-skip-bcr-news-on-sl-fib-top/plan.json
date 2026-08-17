@@ -1,0 +1,182 @@
+{
+  "trade_id": "hs-gbp-jpy-67b20c3a",
+  "instrument": "GBP/JPY",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.01,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 215.5074864297769,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-gbp-jpy-67b20c3a-too-high",
+        "not_after": "2026-08-04T01:30:00Z",
+        "action": "veto",
+        "instrument": "GBP/JPY",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 84,
+        "level": "close-positions",
+        "trade_id": "hs-gbp-jpy-67b20c3a"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 212.2633392107957,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-gbp-jpy-67b20c3a-too-low",
+        "not_after": "2026-08-04T01:30:00Z",
+        "action": "veto",
+        "instrument": "GBP/JPY",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 84,
+        "level": "stop-next-entry",
+        "trade_id": "hs-gbp-jpy-67b20c3a"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785805200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-gbp-jpy-67b20c3a-trade-expiry",
+        "not_before": "2026-08-04T01:00:00Z",
+        "not_after": "2026-08-04T01:30:00Z",
+        "action": "veto",
+        "instrument": "GBP/JPY",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 84,
+        "level": "close-positions",
+        "trade_id": "hs-gbp-jpy-67b20c3a"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-gbp-jpy-67b20c3a-enter",
+        "not_after": "2026-08-03T08:24:00Z",
+        "action": "enter",
+        "instrument": "GBP/JPY",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "absolute": 216.205,
+          "offset_atr_pct": 0.5,
+          "sign": 1.0
+        },
+        "take_profit": {
+          "absolute": 211.82538
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 212.2633392107957,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 215.5074864297769,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-gbp-jpy-67b20c3a",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.01,
+        "tick_size": 0.001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-gbp-jpy-67b20c3a-close-on-sr-reversal",
+        "not_after": "2026-08-04T01:00:00Z",
+        "action": "close",
+        "instrument": "GBP/JPY",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-gbp-jpy-67b20c3a",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            211.82538,
+            212.26334
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1785506400,
+  "armed_at": "2026-07-31T14:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-30T14:00:00Z",
+    "period_end": "2026-07-31T14:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "low",
+    "currencies": []
+  }
+}
