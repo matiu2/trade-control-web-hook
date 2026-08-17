@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1784178000,
+        "price": 0.91725
+      },
+      "b": {
+        "at_epoch": 1784584800,
+        "price": 0.9167
+      }
+    },
+    "invalidation": 0.917879833982491,
+    "fib_head_neckline": [
+      0.92212,
+      0.9169605752409016
+    ],
+    "trade_expiry_epoch": 1785312000,
+    "sr_levels": [
+      0.91471,
+      0.9123878253335644,
+      0.9165,
+      0.91388
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:CADSGD",
+  "start": 1784642400,
+  "tv_arm_version": "v127-2-g7341c5b"
+}

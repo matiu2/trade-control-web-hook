@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1783069200,
+        "price": 25650.2
+      },
+      "b": {
+        "at_epoch": 1783400400,
+        "price": 25758.6
+      }
+    },
+    "invalidation": 25846.6,
+    "fib_head_neckline": [
+      25912.0,
+      25684.627101022354
+    ],
+    "trade_expiry_epoch": 1783652400,
+    "sr_levels": [
+      25038.2,
+      24920.7
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:DE30EUR",
+  "start": 1783407600,
+  "tv_arm_version": "v130-1-gc630e81"
+}

@@ -1,0 +1,16 @@
+{
+  "instrument": "HK33_HKD",
+  "granularity": "h1",
+  "source": "oanda",
+  "start": "2026-08-05T06:00:00Z",
+  "end": "2026-08-11T18:00:00Z",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "oanda",
+    "chart_symbol": "OANDA:HK33HKD",
+    "tv_arm_version": "v132-12-g948e5f3-dirty",
+    "engine_version": "v132-12-g948e5f3-dirty"
+  }
+}

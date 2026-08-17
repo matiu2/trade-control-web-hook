@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1784898000,
+        "price": 0.98362
+      },
+      "b": {
+        "at_epoch": 1785218400,
+        "price": 0.98359
+      }
+    },
+    "invalidation": 0.9876,
+    "fib_head_neckline": [
+      0.98789,
+      0.9836449988897112
+    ],
+    "trade_expiry_epoch": 1786122000,
+    "sr_levels": [
+      0.98046
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:AUDCAD",
+  "start": 1785222000,
+  "tv_arm_version": "v132-3-g46d8b10"
+}

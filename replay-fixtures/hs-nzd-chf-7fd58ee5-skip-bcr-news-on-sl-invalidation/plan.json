@@ -1,0 +1,203 @@
+{
+  "trade_id": "hs-nzd-chf-ec4bb438",
+  "instrument": "NZD_CHF",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 0.4740687904762835,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-nzd-chf-ec4bb438-too-high",
+        "not_after": "2026-07-24T14:30:00Z",
+        "action": "veto",
+        "instrument": "NZD_CHF",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-high",
+        "ttl_hours": 37,
+        "level": "close-positions",
+        "trade_id": "hs-nzd-chf-ec4bb438"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 0.4708766512651801,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-nzd-chf-ec4bb438-too-low",
+        "not_after": "2026-07-24T14:30:00Z",
+        "action": "veto",
+        "instrument": "NZD_CHF",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-low",
+        "ttl_hours": 37,
+        "level": "stop-next-entry",
+        "trade_id": "hs-nzd-chf-ec4bb438"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784901600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-nzd-chf-ec4bb438-trade-expiry",
+        "not_before": "2026-07-24T14:00:00Z",
+        "not_after": "2026-07-24T14:30:00Z",
+        "action": "veto",
+        "instrument": "NZD_CHF",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "trade-expiry",
+        "ttl_hours": 37,
+        "level": "close-positions",
+        "trade_id": "hs-nzd-chf-ec4bb438"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-nzd-chf-ec4bb438-enter",
+        "not_after": "2026-07-24T06:46:50Z",
+        "action": "enter",
+        "instrument": "NZD_CHF",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "absolute": 0.47407,
+          "offset_atr_pct": 0.5,
+          "sign": 1.0
+        },
+        "take_profit": {
+          "absolute": 0.47037
+        },
+        "broker": "oanda",
+        "account": "m-and-w",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 0.4708766512651801,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 0.4740687904762835,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-nzd-chf-ec4bb438",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-nzd-chf-ec4bb438-close-on-sr-reversal",
+        "not_after": "2026-07-24T14:00:00Z",
+        "action": "close",
+        "instrument": "NZD_CHF",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-nzd-chf-ec4bb438",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            0.457,
+            0.45792
+          ],
+          [
+            0.46813,
+            0.46907
+          ],
+          [
+            0.4711,
+            0.47204
+          ],
+          [
+            0.47037,
+            0.47088
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1784771653,
+  "armed_at": "2026-07-23T01:54:13Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-22T01:54:13Z",
+    "period_end": "2026-07-23T01:54:13Z",
+    "overall_direction": "bearish",
+    "confidence": "low",
+    "currencies": [
+      {
+        "currency": "NZD",
+        "direction": "bearish",
+        "net_score": -1.0,
+        "events": [
+          "Credit Card Spending y/y: Actual (3.1%) declined from previous (4.2%)"
+        ]
+      }
+    ]
+  }
+}

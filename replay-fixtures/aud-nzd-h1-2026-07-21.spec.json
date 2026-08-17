@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1784235600,
+        "price": 1.19867
+      },
+      "b": {
+        "at_epoch": 1784581200,
+        "price": 1.19911
+      }
+    },
+    "invalidation": 1.1941900966288908,
+    "fib_head_neckline": [
+      1.1939,
+      1.1989902490944446
+    ],
+    "trade_expiry_epoch": 1785124800,
+    "sr_levels": [
+      1.21342
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:AUDNZD",
+  "start": 1784599200,
+  "tv_arm_version": "v131"
+}

@@ -1,0 +1,16 @@
+{
+  "instrument": "AUD/NZD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-06-11T20:00:00Z",
+  "end": "2026-06-25T04:00:00Z",
+  "arm": {
+    "entry_rule": "skip-bcr",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:AUDNZD",
+    "tv_arm_version": "v132-12-g948e5f3-dirty",
+    "engine_version": "v132-12-g948e5f3-dirty"
+  }
+}

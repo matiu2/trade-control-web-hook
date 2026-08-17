@@ -1,0 +1,617 @@
+{
+  "trade_id": "ihs-nas100-usd-adc4e304",
+  "instrument": "NAS100_USD",
+  "direction": "long",
+  "granularity": "h4",
+  "pip_size": 1.0,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 28068.95161132376,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-too-low",
+        "not_after": "2026-08-13T21:30:00Z",
+        "action": "veto",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-low",
+        "ttl_hours": 321,
+        "level": "close-positions",
+        "trade_id": "ihs-nas100-usd-adc4e304"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 29649.86931456923,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-too-high",
+        "not_after": "2026-08-13T21:30:00Z",
+        "action": "veto",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-high",
+        "ttl_hours": 321,
+        "level": "stop-next-entry",
+        "trade_id": "ihs-nas100-usd-adc4e304"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786654800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-trade-expiry",
+        "not_before": "2026-08-13T21:00:00Z",
+        "not_after": "2026-08-13T21:30:00Z",
+        "action": "veto",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "trade-expiry",
+        "ttl_hours": 321,
+        "level": "close-positions",
+        "trade_id": "ihs-nas100-usd-adc4e304"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1785142800,
+          "price": 28601.4
+        },
+        "b": {
+          "at_epoch": 1785488400,
+          "price": 28489.6
+        },
+        "extend_forward": true,
+        "bar_seconds": 14400,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-break-and-close",
+        "not_after": "2026-08-13T21:00:00Z",
+        "action": "prep",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "ihs-nas100-usd-adc4e304"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1785142800,
+          "price": 28601.4
+        },
+        "b": {
+          "at_epoch": 1785488400,
+          "price": 28489.6
+        },
+        "extend_forward": true,
+        "bar_seconds": 14400,
+        "dir": "down",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-retest",
+        "not_after": "2026-08-13T21:00:00Z",
+        "action": "prep",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "ihs-nas100-usd-adc4e304"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-enter",
+        "not_after": "2026-08-11T05:00:00Z",
+        "action": "enter",
+        "instrument": "NAS100_USD",
+        "direction": "long",
+        "entry": {
+          "type": "stop",
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "absolute": 27160.6,
+          "offset_atr_pct": 0.5,
+          "sign": -1.0
+        },
+        "take_profit": {
+          "absolute": 29926.45479
+        },
+        "broker": "oanda",
+        "account": "m-and-w",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 29649.86931456923,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 28068.95161132376,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 1.0,
+        "tick_size": 0.1
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-close-on-sr-reversal",
+        "not_after": "2026-08-13T21:00:00Z",
+        "action": "close",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            29083.79592,
+            29142.02174
+          ],
+          [
+            29649.86931,
+            29926.45479
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-close-on-reversal",
+        "not_after": "2026-08-13T21:00:00Z",
+        "action": "close",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "needs_golden": true,
+        "inside_window": [
+          "news"
+        ],
+        "reason": "news-window reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "01-pause-1785736800-1785765600",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785736800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-pause-1785736800-1785765600",
+        "not_after": "2026-08-03T14:00:00Z",
+        "action": "pause",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "blackout_id": "1785736800-1785765600",
+        "reason": "news:NAS100_USD-2026-08-03T06:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1785736800-1785765600",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785765600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-resume-1785736800-1785765600",
+        "not_after": "2026-08-03T14:30:00Z",
+        "action": "resume",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "blackout_id": "1785736800-1785765600",
+        "reason": "news:NAS100_USD-2026-08-03T06:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-pause-1786077000-1786105800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786077000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-pause-1786077000-1786105800",
+        "not_after": "2026-08-07T12:30:00Z",
+        "action": "pause",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "blackout_id": "1786077000-1786105800",
+        "reason": "news:NAS100_USD-2026-08-07T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1786077000-1786105800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786105800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-resume-1786077000-1786105800",
+        "not_after": "2026-08-07T13:00:00Z",
+        "action": "resume",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "blackout_id": "1786077000-1786105800",
+        "reason": "news:NAS100_USD-2026-08-07T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-pause-1786509000-1786537800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786509000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-pause-1786509000-1786537800",
+        "not_after": "2026-08-12T12:30:00Z",
+        "action": "pause",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "blackout_id": "1786509000-1786537800",
+        "reason": "news:NAS100_USD-2026-08-12T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1786509000-1786537800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786537800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-resume-1786509000-1786537800",
+        "not_after": "2026-08-12T13:00:00Z",
+        "action": "resume",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "blackout_id": "1786509000-1786537800",
+        "reason": "news:NAS100_USD-2026-08-12T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-pause-1786595400-1786624200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786595400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-pause-1786595400-1786624200",
+        "not_after": "2026-08-13T12:30:00Z",
+        "action": "pause",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "blackout_id": "1786595400-1786624200",
+        "reason": "news:NAS100_USD-2026-08-13T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1786595400-1786624200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786624200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-resume-1786595400-1786624200",
+        "not_after": "2026-08-13T13:00:00Z",
+        "action": "resume",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "blackout_id": "1786595400-1786624200",
+        "reason": "news:NAS100_USD-2026-08-13T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1785765600-1785769200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785765600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-news-start-1785765600-1785769200",
+        "not_after": "2026-08-03T15:00:00Z",
+        "action": "news-start",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "news_id": "1785765600-1785769200",
+        "reason": "news:NAS100_USD-2026-08-03T14:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1785765600-1785769200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785769200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-news-end-1785765600-1785769200",
+        "not_after": "2026-08-03T15:30:00Z",
+        "action": "news-end",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "news_id": "1785765600-1785769200",
+        "reason": "news:NAS100_USD-2026-08-03T14:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1786105800-1786109400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786105800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-news-start-1786105800-1786109400",
+        "not_after": "2026-08-07T13:30:00Z",
+        "action": "news-start",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "news_id": "1786105800-1786109400",
+        "reason": "news:NAS100_USD-2026-08-07T12:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1786105800-1786109400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786109400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-news-end-1786105800-1786109400",
+        "not_after": "2026-08-07T14:00:00Z",
+        "action": "news-end",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "news_id": "1786105800-1786109400",
+        "reason": "news:NAS100_USD-2026-08-07T12:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1786537800-1786541400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786537800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-news-start-1786537800-1786541400",
+        "not_after": "2026-08-12T13:30:00Z",
+        "action": "news-start",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "news_id": "1786537800-1786541400",
+        "reason": "news:NAS100_USD-2026-08-12T12:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1786537800-1786541400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786541400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-news-end-1786537800-1786541400",
+        "not_after": "2026-08-12T14:00:00Z",
+        "action": "news-end",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "news_id": "1786537800-1786541400",
+        "reason": "news:NAS100_USD-2026-08-12T12:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1786624200-1786627800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786624200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-news-start-1786624200-1786627800",
+        "not_after": "2026-08-13T13:30:00Z",
+        "action": "news-start",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "news_id": "1786624200-1786627800",
+        "reason": "news:NAS100_USD-2026-08-13T12:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1786624200-1786627800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786627800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nas100-usd-adc4e304-news-end-1786624200-1786627800",
+        "not_after": "2026-08-13T14:00:00Z",
+        "action": "news-end",
+        "instrument": "NAS100_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "ihs-nas100-usd-adc4e304",
+        "news_id": "1786624200-1786627800",
+        "reason": "news:NAS100_USD-2026-08-13T12:30:00+00:00"
+      },
+      "kind": "control"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1785502800,
+  "armed_at": "2026-07-31T13:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-30T13:00:00Z",
+    "period_end": "2026-07-31T13:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "low",
+    "currencies": []
+  }
+}

@@ -1,0 +1,379 @@
+{
+  "trade_id": "hs-eur-zar-a7a64f0b",
+  "instrument": "EUR/ZAR",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 18.8686,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-zar-a7a64f0b-too-high",
+        "not_after": "2026-07-29T05:30:00Z",
+        "action": "veto",
+        "instrument": "EUR/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 185,
+        "level": "close-positions",
+        "trade_id": "hs-eur-zar-a7a64f0b"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 18.62760011910042,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-zar-a7a64f0b-too-low",
+        "not_after": "2026-07-29T05:30:00Z",
+        "action": "veto",
+        "instrument": "EUR/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 185,
+        "level": "stop-next-entry",
+        "trade_id": "hs-eur-zar-a7a64f0b"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785301200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-zar-a7a64f0b-trade-expiry",
+        "not_before": "2026-07-29T05:00:00Z",
+        "not_after": "2026-07-29T05:30:00Z",
+        "action": "veto",
+        "instrument": "EUR/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 185,
+        "level": "close-positions",
+        "trade_id": "hs-eur-zar-a7a64f0b"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1784232000,
+          "price": 18.7613
+        },
+        "b": {
+          "at_epoch": 1784628000,
+          "price": 18.7644
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-zar-a7a64f0b-break-and-close",
+        "not_after": "2026-07-29T05:00:00Z",
+        "action": "prep",
+        "instrument": "EUR/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "hs-eur-zar-a7a64f0b"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1784232000,
+          "price": 18.7613
+        },
+        "b": {
+          "at_epoch": 1784628000,
+          "price": 18.7644
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "up",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-zar-a7a64f0b-retest",
+        "not_after": "2026-07-29T05:00:00Z",
+        "action": "prep",
+        "instrument": "EUR/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "hs-eur-zar-a7a64f0b"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-zar-a7a64f0b-enter",
+        "not_after": "2026-07-27T16:12:00Z",
+        "action": "enter",
+        "instrument": "EUR/ZAR",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 18.59381
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 18.62760011910042,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 18.8686,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-eur-zar-a7a64f0b",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.0001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-zar-a7a64f0b-close-on-sr-reversal",
+        "not_after": "2026-07-29T05:00:00Z",
+        "action": "close",
+        "instrument": "EUR/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-zar-a7a64f0b",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            18.59948,
+            18.63672
+          ],
+          [
+            18.86816,
+            18.90594
+          ],
+          [
+            18.59381,
+            18.6276
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-zar-a7a64f0b-close-on-reversal",
+        "not_after": "2026-07-29T05:00:00Z",
+        "action": "close",
+        "instrument": "EUR/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-zar-a7a64f0b",
+        "needs_golden": true,
+        "inside_window": [
+          "news"
+        ],
+        "reason": "news-window reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "01-pause-1784780100-1784810700",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784780100
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-zar-a7a64f0b-pause-1784780100-1784810700",
+        "not_after": "2026-07-23T12:45:00Z",
+        "action": "pause",
+        "instrument": "EUR/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-zar-a7a64f0b",
+        "blackout_id": "1784780100-1784810700",
+        "reason": "news:EUR/ZAR-2026-07-23T04:15:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1784780100-1784810700",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784810700
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-zar-a7a64f0b-resume-1784780100-1784810700",
+        "not_after": "2026-07-23T13:15:00Z",
+        "action": "resume",
+        "instrument": "EUR/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-zar-a7a64f0b",
+        "blackout_id": "1784780100-1784810700",
+        "reason": "news:EUR/ZAR-2026-07-23T04:15:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1784810700-1784814300",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784810700
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-zar-a7a64f0b-news-start-1784810700-1784814300",
+        "not_after": "2026-07-23T13:45:00Z",
+        "action": "news-start",
+        "instrument": "EUR/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-zar-a7a64f0b",
+        "news_id": "1784810700-1784814300",
+        "reason": "news:EUR/ZAR-2026-07-23T12:45:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1784810700-1784814300",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784814300
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-zar-a7a64f0b-news-end-1784810700-1784814300",
+        "not_after": "2026-07-23T14:15:00Z",
+        "action": "news-end",
+        "instrument": "EUR/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-eur-zar-a7a64f0b",
+        "news_id": "1784810700-1784814300",
+        "reason": "news:EUR/ZAR-2026-07-23T12:45:00+00:00"
+      },
+      "kind": "control"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1784638800,
+  "armed_at": "2026-07-21T13:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-20T13:00:00Z",
+    "period_end": "2026-07-21T13:00:00Z",
+    "overall_direction": "bullish",
+    "confidence": "medium",
+    "currencies": [
+      {
+        "currency": "EUR",
+        "direction": "bullish",
+        "net_score": 2.0,
+        "events": [
+          "ZEW Economic Sentiment: Actual (23.4) beat forecast (11.2)",
+          "German ZEW Economic Sentiment: Actual (26.3) beat forecast (15.1)"
+        ]
+      }
+    ]
+  }
+}

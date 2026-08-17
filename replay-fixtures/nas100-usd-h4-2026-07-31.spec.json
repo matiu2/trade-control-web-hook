@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785142800,
+        "price": 28601.4
+      },
+      "b": {
+        "at_epoch": 1785488400,
+        "price": 28489.6
+      }
+    },
+    "invalidation": 28068.95161132376,
+    "fib_head_neckline": [
+      27160.6,
+      28543.527396982907
+    ],
+    "trade_expiry_epoch": 1786654800,
+    "sr_levels": [
+      29112.90882707706
+    ]
+  },
+  "resolution": "240",
+  "chart_symbol": "OANDA:NAS100USD",
+  "start": 1785502800,
+  "tv_arm_version": "v131"
+}

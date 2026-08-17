@@ -1,0 +1,16 @@
+{
+  "instrument": "NAS100_USD",
+  "granularity": "h4",
+  "source": "oanda",
+  "start": "2026-07-31T13:00:00Z",
+  "end": "2026-08-13T21:00:00Z",
+  "arm": {
+    "entry_rule": "normal",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "oanda",
+    "chart_symbol": "OANDA:NAS100USD",
+    "tv_arm_version": "v132-12-g948e5f3-dirty",
+    "engine_version": "v132-12-g948e5f3-dirty"
+  }
+}

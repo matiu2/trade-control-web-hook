@@ -1,0 +1,194 @@
+{
+  "trade_id": "hs-jp225y-jpy-85d7088e",
+  "instrument": "JP225Y_JPY",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 1.0,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 67461.2,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-jp225y-jpy-85d7088e-too-high",
+        "not_after": "2026-07-27T19:30:00Z",
+        "action": "veto",
+        "instrument": "JP225Y_JPY",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-high",
+        "ttl_hours": 115,
+        "level": "close-positions",
+        "trade_id": "hs-jp225y-jpy-85d7088e"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 64675.645972621525,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-jp225y-jpy-85d7088e-too-low",
+        "not_after": "2026-07-27T19:30:00Z",
+        "action": "veto",
+        "instrument": "JP225Y_JPY",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-low",
+        "ttl_hours": 115,
+        "level": "stop-next-entry",
+        "trade_id": "hs-jp225y-jpy-85d7088e"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785178800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-jp225y-jpy-85d7088e-trade-expiry",
+        "not_before": "2026-07-27T19:00:00Z",
+        "not_after": "2026-07-27T19:30:00Z",
+        "action": "veto",
+        "instrument": "JP225Y_JPY",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "trade-expiry",
+        "ttl_hours": 115,
+        "level": "close-positions",
+        "trade_id": "hs-jp225y-jpy-85d7088e"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-jp225y-jpy-85d7088e-enter",
+        "not_after": "2026-07-26T20:12:00Z",
+        "action": "enter",
+        "instrument": "JP225Y_JPY",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "absolute": 67533.7,
+          "offset_atr_pct": 0.5,
+          "sign": 1.0
+        },
+        "take_profit": {
+          "absolute": 64358.08441
+        },
+        "broker": "oanda",
+        "account": "m-and-w",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 64675.645972621525,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 67461.2,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-jp225y-jpy-85d7088e",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 1.0,
+        "tick_size": 0.1
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-jp225y-jpy-85d7088e-close-on-sr-reversal",
+        "not_after": "2026-07-27T19:00:00Z",
+        "action": "close",
+        "instrument": "JP225Y_JPY",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-jp225y-jpy-85d7088e",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            66767.8653,
+            66901.5347
+          ],
+          [
+            65760.16391,
+            65891.81589
+          ],
+          [
+            64713.3219,
+            64842.8781
+          ],
+          [
+            64358.08441,
+            64675.64597
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1784768400,
+  "armed_at": "2026-07-23T01:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-22T01:00:00Z",
+    "period_end": "2026-07-23T01:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "low",
+    "currencies": []
+  }
+}

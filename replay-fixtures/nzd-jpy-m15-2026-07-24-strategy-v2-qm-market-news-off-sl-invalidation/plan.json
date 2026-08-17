@@ -1,0 +1,339 @@
+{
+  "trade_id": "ihs-nzd-jpy-8c240713",
+  "instrument": "NZD/JPY",
+  "direction": "long",
+  "granularity": "m15",
+  "pip_size": 0.01,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 94.5809907876044,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-jpy-8c240713-too-low",
+        "not_after": "2026-07-27T22:30:00Z",
+        "action": "veto",
+        "instrument": "NZD/JPY",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 85,
+        "level": "close-positions",
+        "trade_id": "ihs-nzd-jpy-8c240713"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 94.9104795306564,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-jpy-8c240713-too-high",
+        "not_after": "2026-07-27T22:30:00Z",
+        "action": "veto",
+        "instrument": "NZD/JPY",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 85,
+        "level": "stop-next-entry",
+        "trade_id": "ihs-nzd-jpy-8c240713"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785189600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-jpy-8c240713-trade-expiry",
+        "not_before": "2026-07-27T22:00:00Z",
+        "not_after": "2026-07-27T22:30:00Z",
+        "action": "veto",
+        "instrument": "NZD/JPY",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 85,
+        "level": "close-positions",
+        "trade_id": "ihs-nzd-jpy-8c240713"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1784815200,
+          "price": 94.682
+        },
+        "b": {
+          "at_epoch": 1784854800,
+          "price": 94.756
+        },
+        "extend_forward": true,
+        "bar_seconds": 900,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-jpy-8c240713-break-and-close",
+        "not_after": "2026-07-27T22:00:00Z",
+        "action": "prep",
+        "instrument": "NZD/JPY",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "ihs-nzd-jpy-8c240713"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1784815200,
+          "price": 94.682
+        },
+        "b": {
+          "at_epoch": 1784854800,
+          "price": 94.756
+        },
+        "extend_forward": true,
+        "bar_seconds": 900,
+        "dir": "down",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-jpy-8c240713-retest",
+        "not_after": "2026-07-27T22:00:00Z",
+        "action": "prep",
+        "instrument": "NZD/JPY",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "ihs-nzd-jpy-8c240713"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-jpy-8c240713-enter",
+        "not_after": "2026-07-27T05:09:00Z",
+        "action": "enter",
+        "instrument": "NZD/JPY",
+        "direction": "long",
+        "entry": {
+          "type": "stop",
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "absolute": 94.58099,
+          "offset_atr_pct": 0.5,
+          "sign": -1.0
+        },
+        "take_profit": {
+          "absolute": 94.95853
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 94.9104795306564,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 94.5809907876044,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-nzd-jpy-8c240713",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.01,
+        "tick_size": 0.001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-jpy-8c240713-enter-qm",
+        "not_after": "2026-07-27T05:09:00Z",
+        "action": "enter",
+        "instrument": "NZD/JPY",
+        "direction": "long",
+        "entry": {
+          "type": "market"
+        },
+        "stop_loss": {
+          "absolute": 94.58099,
+          "offset_atr_pct": 0.5,
+          "sign": -1.0
+        },
+        "take_profit": {
+          "absolute": 94.95853
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 94.9104795306564,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 94.5809907876044,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-nzd-jpy-8c240713",
+        "max_retries": 5,
+        "needs_golden": true,
+        "needs_confirmed": true,
+        "pip_size": 0.01,
+        "tick_size": 0.001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-jpy-8c240713-close-on-sr-reversal",
+        "not_after": "2026-07-27T22:00:00Z",
+        "action": "close",
+        "instrument": "NZD/JPY",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-nzd-jpy-8c240713",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            94.06359,
+            94.25191
+          ],
+          [
+            94.7022,
+            94.8918
+          ],
+          [
+            94.78081,
+            94.97056
+          ],
+          [
+            95.04986,
+            95.24014
+          ],
+          [
+            93.25865,
+            93.44535
+          ],
+          [
+            94.91048,
+            94.95853
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1784886300,
+  "armed_at": "2026-07-24T09:45:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-23T09:45:00Z",
+    "period_end": "2026-07-24T09:45:00Z",
+    "overall_direction": "neutral",
+    "confidence": "medium",
+    "currencies": [
+      {
+        "currency": "JPY",
+        "direction": "neutral",
+        "net_score": 0.0,
+        "events": [
+          "National Core CPI y/y: Actual (1.6%) matched forecast (1.6%)",
+          "Flash Manufacturing PMI: Actual (54.7) matched forecast (55.0)"
+        ]
+      }
+    ]
+  }
+}

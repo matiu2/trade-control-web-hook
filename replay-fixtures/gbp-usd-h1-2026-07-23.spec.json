@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1784685600,
+        "price": 1.33854
+      },
+      "b": {
+        "at_epoch": 1784725200,
+        "price": 1.33868
+      }
+    },
+    "invalidation": 1.33592,
+    "fib_head_neckline": [
+      1.33592,
+      1.3386635395192803
+    ],
+    "trade_expiry_epoch": 1784905200,
+    "sr_levels": [
+      1.3290762083298846,
+      1.3374715794032208,
+      1.33406,
+      1.3389
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:GBPUSD",
+  "start": 1784768400,
+  "tv_arm_version": "v116-127-gbf260c8"
+}

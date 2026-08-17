@@ -1,0 +1,58 @@
+{
+  "fires": [
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-05T15:00:00Z",
+      "candle_close": 25677.8
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-05T16:00:00Z",
+      "candle_close": 25660.8
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-08-06T01:00:00Z",
+      "candle_close": 25418.3
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-08-06T09:00:00Z",
+      "candle_close": 25569.2
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "action": "veto",
+      "candle_time": "2026-08-10T14:00:00Z",
+      "candle_close": 25964.8
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 1.7537202380952719,
+    "tp_hits": 1,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-08-05T16:00:00Z",
+        "entry_price": 25667.9,
+        "stop_loss": 25802.3,
+        "take_profit": 25432.2,
+        "exit_time": "2026-08-06T01:00:00Z",
+        "exit_price": 25432.2,
+        "exit_reason": "took_profit",
+        "r": 1.7537202380952719
+      }
+    ]
+  }
+}

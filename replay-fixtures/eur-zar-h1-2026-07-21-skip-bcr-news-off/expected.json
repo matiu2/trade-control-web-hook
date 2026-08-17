@@ -1,0 +1,70 @@
+{
+  "fires": [
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-22T14:00:00Z",
+      "candle_close": 18.7227
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-22T15:00:00Z",
+      "candle_close": 18.7085
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-22T23:00:00Z",
+      "candle_close": 18.713
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-23T00:00:00Z",
+      "candle_close": 18.6981
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-23T07:00:00Z",
+      "candle_close": 18.7661
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-23T10:00:00Z",
+      "candle_close": 18.7186
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "action": "veto",
+      "candle_time": "2026-07-23T13:00:00Z",
+      "candle_close": 19.0649
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": -1.0,
+    "tp_hits": 0,
+    "sl_hits": 1,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-07-22T15:00:00Z",
+        "entry_price": 18.7183,
+        "stop_loss": 18.7971,
+        "take_profit": 18.5939,
+        "exit_time": "2026-07-23T13:00:00Z",
+        "exit_price": 18.7971,
+        "exit_reason": "stopped_out",
+        "r": -1.0
+      }
+    ]
+  }
+}

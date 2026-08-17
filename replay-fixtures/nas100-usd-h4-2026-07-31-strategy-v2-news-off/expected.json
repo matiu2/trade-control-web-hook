@@ -1,0 +1,70 @@
+{
+  "fires": [
+    {
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-08-03T01:00:00Z",
+      "candle_close": 28540.0
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "action": "prep",
+      "candle_time": "2026-08-03T05:00:00Z",
+      "candle_close": 28482.4
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-03T13:00:00Z",
+      "candle_close": 28717.3
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-03T21:00:00Z",
+      "candle_close": 28773.0
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "action": "veto",
+      "candle_time": "2026-08-04T17:00:00Z",
+      "candle_close": 29715.8
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-08-05T17:00:00Z",
+      "candle_close": 29485.8
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "action": "veto",
+      "candle_time": "2026-08-13T21:00:00Z",
+      "candle_close": 30085.2
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 2.2042711234911794,
+    "tp_hits": 1,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-08-03T17:00:00Z",
+        "entry_price": 28739.4,
+        "stop_loss": 28200.9,
+        "take_profit": 29926.4,
+        "exit_time": "2026-08-05T13:00:00Z",
+        "exit_price": 29926.4,
+        "exit_reason": "took_profit",
+        "r": 2.2042711234911794
+      }
+    ]
+  }
+}

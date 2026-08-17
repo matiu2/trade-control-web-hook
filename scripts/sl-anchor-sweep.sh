@@ -145,14 +145,29 @@ print(sym.split(':')[-1] if sym else '')
   # Only the 16 new `-sl-*` cells are wanted here, so any tracked baseline cell
   # is restored from git afterwards. Untracked cells are left alone: git can't
   # restore them, and they carry no notes to lose.
+  #
+  # ⚠ `|| true` is LOAD-BEARING, not defensive noise. Every filter here is a
+  # `grep`, and a `grep` that matches nothing exits 1 — which is the NORMAL case
+  # once the guard is working (no tracked cell was touched). Under `set -e` that
+  # non-zero status killed the whole `for` loop after the FIRST setup, and the
+  # script still exited 0 because the trailing `[[ $FAILED -eq 0 ]]` passed. A
+  # 26-setup sweep silently swept one. Anything added here must keep the
+  # "matched nothing" path non-fatal.
   restore_tracked_baseline() {
-    git -C "$REPO_ROOT" status --porcelain -- "$OUT_DIR" 2>/dev/null \
-      | awk '$1=="M"{print $2}' \
-      | grep -E "/${name}-[^/]*/(meta|plan|expected)\.json$" \
-      | grep -vE '\-sl\-(invalidation|fib-top)/' \
-      | while read -r tracked; do
-          git -C "$REPO_ROOT" checkout -- "$tracked" 2>/dev/null || true
-        done
+    local modified
+    modified=$(
+      git -C "$REPO_ROOT" status --porcelain -- "$OUT_DIR" 2>/dev/null \
+        | awk '$1=="M"{print $2}' \
+        | grep -E "/${name}-[^/]*/(meta|plan|expected)\.json$" \
+        | grep -vE -- '-sl-(invalidation|fib-top)/' \
+        || true
+    )
+    [[ -z "$modified" ]] && return 0
+    while read -r tracked; do
+      [[ -n "$tracked" ]] || continue
+      git -C "$REPO_ROOT" checkout -- "$tracked" 2>/dev/null || true
+      echo "   restored tracked baseline: $tracked"
+    done <<<"$modified"
   }
 
   # A setup that fails to arm is recorded and the sweep continues — the same
@@ -182,6 +197,21 @@ if [[ $FAILED -gt 0 ]]; then
 fi
 echo "  NOTE: ${#SPECS[@]} of ${TOTAL_DIRS} fixture dirs have a frozen spec;"
 echo "        the rest predate --spec-out and cannot be re-armed without a chart."
+
+# Every spec must have been accounted for. A `set -e` abort inside the loop
+# leaves the counters short while the script still exits 0 via the check below —
+# which is exactly what happened when `restore_tracked_baseline` ended in a
+# `grep` that matched nothing: 26 specs, 1 swept, exit 0, no error anywhere.
+# Counting is the only thing that catches a loop that ended early rather than
+# iterating.
+ACCOUNTED=$((ARMED + SKIPPED + FAILED))
+if [[ $ACCOUNTED -ne ${#SPECS[@]} ]]; then
+  echo
+  echo "  ✗ INCOMPLETE: ${ACCOUNTED}/${#SPECS[@]} specs accounted for." >&2
+  echo "    The loop exited early — suspect a command returning non-zero under" >&2
+  echo "    'set -e' (a grep matching nothing is the usual culprit)." >&2
+  exit 5
+fi
 
 # Non-zero when anything failed: a partial sweep must not read as a complete one
 # to a driver that only checks the exit code.

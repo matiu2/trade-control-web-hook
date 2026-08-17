@@ -1,0 +1,190 @@
+{
+  "trade_id": "hs-nzd-chf-c05c2c3a",
+  "instrument": "NZD/CHF",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 0.47583,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-nzd-chf-c05c2c3a-too-high",
+        "not_after": "2026-08-07T15:30:00Z",
+        "action": "veto",
+        "instrument": "NZD/CHF",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 78,
+        "level": "close-positions",
+        "trade_id": "hs-nzd-chf-c05c2c3a"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 0.4729011694722019,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-nzd-chf-c05c2c3a-too-low",
+        "not_after": "2026-08-07T15:30:00Z",
+        "action": "veto",
+        "instrument": "NZD/CHF",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 78,
+        "level": "stop-next-entry",
+        "trade_id": "hs-nzd-chf-c05c2c3a"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786114800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-nzd-chf-c05c2c3a-trade-expiry",
+        "not_before": "2026-08-07T15:00:00Z",
+        "not_after": "2026-08-07T15:30:00Z",
+        "action": "veto",
+        "instrument": "NZD/CHF",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 78,
+        "level": "close-positions",
+        "trade_id": "hs-nzd-chf-c05c2c3a"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-nzd-chf-c05c2c3a-enter",
+        "not_after": "2026-08-06T23:36:17Z",
+        "action": "enter",
+        "instrument": "NZD/CHF",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "absolute": 0.4766,
+          "offset_atr_pct": 0.5,
+          "sign": 1.0
+        },
+        "take_profit": {
+          "absolute": 0.47249
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 0.4729011694722019,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 0.47583,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-nzd-chf-c05c2c3a",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-nzd-chf-c05c2c3a-close-on-sr-reversal",
+        "not_after": "2026-08-07T15:00:00Z",
+        "action": "close",
+        "instrument": "NZD/CHF",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-nzd-chf-c05c2c3a",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            0.46756,
+            0.4685
+          ],
+          [
+            0.4736,
+            0.47455
+          ],
+          [
+            0.47249,
+            0.4729
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1785837688,
+  "armed_at": "2026-08-04T10:01:28Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-03T10:01:28Z",
+    "period_end": "2026-08-04T10:01:28Z",
+    "overall_direction": "neutral",
+    "confidence": "low",
+    "currencies": []
+  }
+}
