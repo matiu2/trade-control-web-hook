@@ -2990,6 +2990,7 @@ cargo run -p tv-arm -- \
   --breakeven-pct 0.7 \               # override the break-even arm threshold as a fraction of entry→TP (default 0.5)
   --skip-break-and-close \            # for stocks (no after-hours retests)
   --skip-retest \                     # implies --skip-break-and-close; for late entries
+  --trend \                           # trend-follow arm: implies --skip-bcr AND makes the pcl-exhausted veto close-confirmed instead of wick-triggered (see below)
   --skip-golden \                     # drop the Pine golden-candle requirement (golden is required by default)
   --max-retries 5 \                   # multi-shot re-entry cap (default 5; pass 0 for single-shot). >0 keeps the engine plan in AwaitEntry across re-entries (see below)
   --require-confirmation \            # require a confirmed signal candle on entry (independent of golden). Also flips the recover-entry default to `limit` (see below)
@@ -3104,6 +3105,47 @@ Because the cancel-the-sibling mechanism rides on multi-shot, `--strategy-v2`
 requires `--max-retries > 0` (it defaults to 5; `--max-retries 0` is
 rejected). It conflicts with `--quasimodo`, `--entry-market`,
 `--skip-break-and-close`, and `--skip-retest`.
+
+### Trend-follow arm — `--trend`
+
+Most H&S/iH&S setups are **reversals**: price breaks a neckline and turns. A
+**trend-follow** setup is a continuation — there is no neckline break-and-close
++ retest sequence to wait for, and price is expected to keep running in the
+direction it is already going. `--trend` arms that shape:
+
+1. **It implies `--skip-bcr`** — both preps (`03-prep-break-and-close`,
+   `04-prep-retest`) are dropped; the enter fires on the first qualifying
+   signal.
+2. **It makes the pcl-exhausted veto close-confirmed.** The ~80%-to-TP fib
+   level (`too-low` on a short, `too-high` on a long — the names swap with
+   direction) is normally a **wick-through**: any bar whose range straddles the
+   level aborts the setup. A trend runs further and wicks deeper than a
+   reversal, so that straddle kills trend setups on spikes that close back
+   inside. Under `--trend` the bar must **close** past the level.
+
+```sh
+tv-arm-staging --trend register        # was: tv-arm-staging --skip-bcr register
+```
+
+The **drawn** invalidation cap is untouched — it is the operator's line and is
+already close-confirmed in both directions. So `--trend` changes exactly one
+rule's confirm mode, never a level:
+
+| veto | short | long | default | under `--trend` |
+|---|---|---|---|---|
+| drawn invalidation (CLOSE-VETO) | `too-high` | `too-low` | `OnClose` | `OnClose` (unchanged) |
+| pcl-exhausted (VETO) | `too-low` | `too-high` | `Intrabar` / `Either` (wick) | **`OnClose`** |
+
+Mechanically this is *only* a `BarEvent` on the emitted
+`PriceValueCross` trigger — no new plan field and no engine change. The
+engine's settled/origin `OnClose` arm already reads `CrossDir::Either` as
+"origin on one side of the line, close past the opposite far edge", which is
+exactly "closed through the level" for both directions. Because the switch
+rides the signed plan as the trigger it produced, replay and live read it
+identically for free.
+
+`--trend` implies `--skip-bcr`, so it conflicts with `--strategy-v2` and
+`--save-matrix` for the same reasons `--skip-bcr` does.
 
 ### Server-side engine registration (`register`)
 

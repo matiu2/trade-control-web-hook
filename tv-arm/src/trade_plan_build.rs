@@ -43,6 +43,41 @@ pub struct PullbackArm {
     pub atr_mult: f64,
 }
 
+/// Whether this is a **trend-follow** arm (`tv-arm --trend`).
+///
+/// A newtype rather than a bare `bool` on purpose: [`build_trade_plan`] already
+/// takes several positional `bool`s (`is_mw`, `shadow`, `bcr_require_golden`),
+/// and a transposed one is exactly the failure this crate keeps hitting —
+/// silent, plausible, tests-green (see `plan_geometry`'s module doc on dropped
+/// wires). A distinct type makes the transposition a compile error.
+///
+/// What it changes: the **pcl-exhausted** veto (the computed ~80%-to-TP fib
+/// level) becomes close-confirmed instead of wick-triggered. See
+/// [`invalidation_or_pcl_trigger`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrendFollow(pub bool);
+
+impl TrendFollow {
+    /// The default: a reversal setup, pcl-exhausted reads the wick.
+    pub const REVERSAL: Self = Self(false);
+    /// A trend-continuation setup, pcl-exhausted must close past the level.
+    pub const TREND: Self = Self(true);
+
+    /// Which [`BarEvent`] the pcl-exhausted fib level is read with.
+    ///
+    /// A trend runs further and wicks deeper than a reversal, so the default
+    /// straddle aborts the setup on a spike that closes back inside (the
+    /// 2026-08-07 short: `01-veto-too-low` fired off a wick). Under `--trend`
+    /// the bar must **close** past the level.
+    fn pcl_bar_event(self) -> BarEvent {
+        if self.0 {
+            BarEvent::OnClose
+        } else {
+            BarEvent::Intrabar
+        }
+    }
+}
+
 /// Map a TradingView chart-resolution string (`"1"`, `"15"`, `"60"`, `"240"`,
 /// `"D"`, …) to the engine's [`Granularity`]. The engine only fetches the
 /// closed set of timeframes trades arm on, so an unsupported resolution
@@ -86,6 +121,10 @@ pub fn resolution_to_granularity(resolution: &str) -> Option<Granularity> {
 //   (`tv-arm --retest-atr-step`, default
 //   [`DEFAULT_RETEST_ATR_STEP`](trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP)),
 //   baked onto the plan's `retest_atr_step`.
+// - `trend` is the `tv-arm --trend` arm (see [`TrendFollow`]): it makes the
+//   pcl-exhausted veto close-confirmed rather than wick-triggered. Not a plan
+//   field — it only selects the trigger's `BarEvent`, so it rides the signed
+//   plan as the trigger it produced and needs no engine change.
 // - `armed_at` is the arm-time wall-clock (`Utc::now()` from the pipeline),
 //   baked onto the plan for read-back only (see
 //   [`TradePlan::armed_at`](trade_control_core::trade_plan::TradePlan::armed_at)).
@@ -122,10 +161,21 @@ pub fn build_trade_plan(
     armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
     pullback_arm: Option<PullbackArm>,
     screenshot_url: Option<trade_control_core::screenshot::ScreenshotUrl>,
+    trend: TrendFollow,
 ) -> TradePlan {
     let rules = alerts
         .iter()
-        .filter_map(|alert| build_rule(alert, direction, geom, granularity, is_mw, pullback_arm))
+        .filter_map(|alert| {
+            build_rule(
+                alert,
+                direction,
+                geom,
+                granularity,
+                is_mw,
+                pullback_arm,
+                trend,
+            )
+        })
         .collect();
 
     TradePlan {
@@ -242,9 +292,18 @@ fn build_rule(
     granularity: Granularity,
     is_mw: bool,
     pullback_arm: Option<PullbackArm>,
+    trend: TrendFollow,
 ) -> Option<ConditionRule> {
     let basename = AlertBasename::parse(&alert.basename)?;
-    let trigger = trigger_for(&basename, direction, geom, granularity, is_mw, pullback_arm)?;
+    let trigger = trigger_for(
+        &basename,
+        direction,
+        geom,
+        granularity,
+        is_mw,
+        pullback_arm,
+        trend,
+    )?;
     let fire_mode = fire_mode_for(&trigger);
     let kind = RuleKind::from(&basename);
     Some(ConditionRule {
@@ -266,10 +325,11 @@ fn trigger_for(
     granularity: Granularity,
     is_mw: bool,
     pullback_arm: Option<PullbackArm>,
+    trend: TrendFollow,
 ) -> Option<Trigger> {
     match basename {
         AlertBasename::VetoTooHigh | AlertBasename::VetoTooLow => {
-            invalidation_or_pcl_trigger(basename, direction, geom)
+            invalidation_or_pcl_trigger(basename, direction, geom, trend)
         }
         // Trade-expiry / prep-expiry are vertical-line time triggers. The veto
         // fires when wall-clock reaches the line.
@@ -354,6 +414,7 @@ fn invalidation_or_pcl_trigger(
     basename: &AlertBasename,
     direction: ConvDirection,
     geom: &PlanGeometry,
+    trend: TrendFollow,
 ) -> Option<Trigger> {
     let basename_dir = match basename {
         AlertBasename::VetoTooHigh => ConvDirection::Short,
@@ -382,16 +443,28 @@ fn invalidation_or_pcl_trigger(
         })
     } else {
         // Opposite-name veto = pcl-exhausted, a computed **fib** level ("the
-        // power of the setup has been consumed"). A fib level is a
+        // power of the setup has been consumed"). A fib level is normally a
         // **wick-through** (`Intrabar`, `Either`): any straddle aborts — if the
         // move ran ~80% to TP without us, a wick alone is reason enough.
+        //
+        // `--trend` flips it to `OnClose`. A trend-continuation setup runs
+        // further and wicks deeper than a reversal, so the straddle aborts on a
+        // spike that closes back inside — which is what killed the 2026-08-07
+        // short (`01-veto-too-low` off a wick, ~30 min after arming). Under
+        // `--trend` the bar must *close* past the level. `CrossDir::Either`
+        // carries over unchanged: the engine's settled/origin `OnClose` arm
+        // reads `Either` as "origin one side, close past the opposite far
+        // edge", which is exactly "closed through the level" for both
+        // directions — so this needs no direction handling here and no engine
+        // change.
+        //
         // Head/neckline were already resolved via the fib's `reverse` flag (not
         // point order) when the geometry was extracted.
         let (head, neckline) = geom.fib_head_neckline?;
         Some(Trigger::PriceValueCross {
             level: pcl_exhausted_price(head, neckline),
             dir: CrossDir::Either,
-            bar: BarEvent::Intrabar,
+            bar: trend.pcl_bar_event(),
         })
     }
 }
@@ -761,6 +834,7 @@ mod tests {
                 None,
                 None,
                 None, // screenshot_url
+                TrendFollow::REVERSAL,
             )
         };
         assert_eq!(
@@ -811,6 +885,7 @@ mod tests {
                 None,
                 None,
                 None, // screenshot_url
+                TrendFollow::REVERSAL,
             )
         };
 
@@ -1005,6 +1080,7 @@ mod tests {
             None,
             None, // pullback_arm
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
 
         assert!(!plan.shadow, "default build is live, not shadow");
@@ -1094,6 +1170,7 @@ mod tests {
                 atr_mult: 1.5,
             }),
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
         assert_eq!(plan.rules.len(), 1);
         assert!(matches!(
@@ -1129,6 +1206,7 @@ mod tests {
             None,
             None, // no pullback arm
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
         assert_eq!(plan.rules.len(), 0);
     }
@@ -1175,6 +1253,7 @@ mod tests {
             None,
             None, // pullback_arm
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
 
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
@@ -1189,6 +1268,170 @@ mod tests {
                 bar: BarEvent::OnClose,
             } if (level - 1.1000).abs() < 1e-9
         ));
+    }
+
+    // ===== `--trend`: the pcl-exhausted veto becomes close-confirmed =====
+
+    /// Both roles a `too-high`/`too-low` pair can play, on ONE chart, so a test
+    /// can assert the trend switch moves the fib level *without* touching the
+    /// drawn cap. `direction` picks which name is which (see the CLAUDE.md
+    /// table — the names swap with direction).
+    ///
+    /// Geometry: invalidation drawn at 1.2000, fib head 1.2000 / neckline
+    /// 1.1000 ⇒ TP = 2×1.1 − 1.2 = 1.0000 and pcl-exhausted = 1.1 + 0.8×(1.0 −
+    /// 1.1) = **1.0200**.
+    fn trend_roles() -> Roles {
+        Roles {
+            invalidation: Some(horz(1.2000)),
+            trade_expiry: Some(vert(99_000)),
+            tp_fib: Some(trend((10, 1.1000), (20, 1.2000))),
+            ..Roles::default()
+        }
+    }
+
+    /// Build a short H&S plan carrying BOTH veto names, at the given trend arm.
+    fn trend_plan(trend: TrendFollow, direction: ConvDirection) -> TradePlan {
+        let alerts = vec![
+            alert("01-veto-too-high", Action::Veto),
+            alert("01-veto-too-low", Action::Veto),
+            alert("02-veto-trade-expiry", Action::Invalidate),
+            alert("05-enter", Action::Enter),
+        ];
+        build_trade_plan(
+            "eurusd-trend-1",
+            "EUR_USD",
+            &alerts,
+            direction,
+            &geom_of(&trend_roles()),
+            Granularity::H1,
+            false,
+            false,
+            None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false, // bcr_require_golden
+            chrono::Utc::now(),
+            None,
+            None, // pullback_arm
+            None, // screenshot_url
+            trend,
+        )
+    }
+
+    fn trigger_of(plan: &TradePlan, id: &str) -> Trigger {
+        plan.rules
+            .iter()
+            .find(|r| r.rule_id == id)
+            .unwrap_or_else(|| panic!("no rule {id}"))
+            .trigger
+            .clone()
+    }
+
+    /// The bug this flag exists for. On a **short**, `too-low` is the
+    /// pcl-exhausted fib level; by default it is a wick-through straddle, so a
+    /// spike that closes back inside still aborts the trade — which is what
+    /// killed the 2026-08-07 trend short (`01-veto-too-low` fired ~30 min after
+    /// arming, off a wick). Under `--trend` the bar must **close** past it.
+    #[test]
+    fn trend_makes_the_pcl_exhausted_veto_close_confirmed() {
+        let reversal = trigger_of(
+            &trend_plan(TrendFollow::REVERSAL, ConvDirection::Short),
+            "01-veto-too-low",
+        );
+        assert!(
+            matches!(
+                reversal,
+                Trigger::PriceValueCross {
+                    level,
+                    dir: CrossDir::Either,
+                    bar: BarEvent::Intrabar,
+                } if (level - 1.0200).abs() < 1e-9
+            ),
+            "without --trend the pcl-exhausted level is a wick-through straddle: {reversal:?}"
+        );
+
+        let trend = trigger_of(
+            &trend_plan(TrendFollow::TREND, ConvDirection::Short),
+            "01-veto-too-low",
+        );
+        assert!(
+            matches!(
+                trend,
+                Trigger::PriceValueCross {
+                    level,
+                    dir: CrossDir::Either,
+                    bar: BarEvent::OnClose,
+                } if (level - 1.0200).abs() < 1e-9
+            ),
+            "--trend must make the pcl-exhausted level close-confirmed, same level: {trend:?}"
+        );
+    }
+
+    /// The switch must move the **fib** level only. The drawn invalidation cap
+    /// is the operator's line and is already `OnClose`; `--trend` must not
+    /// touch its level, direction, or trigger variant — otherwise a trend arm
+    /// would silently re-shape the structural invalidation too.
+    #[test]
+    fn trend_leaves_the_drawn_invalidation_cap_untouched() {
+        for direction in [ConvDirection::Short, ConvDirection::Long] {
+            // The DRAWN cap is the name matching the direction: short =>
+            // too-high, long => too-low.
+            let drawn = match direction {
+                ConvDirection::Short => "01-veto-too-high",
+                ConvDirection::Long => "01-veto-too-low",
+            };
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    trigger_of(&trend_plan(TrendFollow::REVERSAL, direction), drawn)
+                ),
+                format!(
+                    "{:?}",
+                    trigger_of(&trend_plan(TrendFollow::TREND, direction), drawn)
+                ),
+                "--trend must not change the drawn invalidation cap ({direction:?} / {drawn})"
+            );
+        }
+    }
+
+    /// The names swap with direction, so the switch has to follow the *role*,
+    /// not the literal name: on a **long** it is `too-high` that carries the
+    /// pcl-exhausted fib level, and that is the one `--trend` must flip.
+    #[test]
+    fn on_a_long_trend_flips_too_high_not_too_low() {
+        let plan = trend_plan(TrendFollow::TREND, ConvDirection::Long);
+        assert!(
+            matches!(
+                trigger_of(&plan, "01-veto-too-high"),
+                Trigger::PriceValueCross {
+                    bar: BarEvent::OnClose,
+                    ..
+                }
+            ),
+            "long: the pcl-exhausted role is `too-high` and must be close-confirmed"
+        );
+    }
+
+    /// Nothing else in the plan moves. `--trend` selects one trigger's
+    /// `BarEvent`; if it started leaking into the enter, the expiry, or the
+    /// plan-level knobs, this catches it.
+    #[test]
+    fn trend_changes_only_the_pcl_exhausted_rule() {
+        let a = trend_plan(TrendFollow::REVERSAL, ConvDirection::Short);
+        let b = trend_plan(TrendFollow::TREND, ConvDirection::Short);
+        for rule in &a.rules {
+            if rule.rule_id == "01-veto-too-low" {
+                continue;
+            }
+            assert_eq!(
+                format!("{:?}", rule.trigger),
+                format!("{:?}", trigger_of(&b, &rule.rule_id)),
+                "--trend must not touch {}",
+                rule.rule_id
+            );
+        }
+        assert_eq!(a.rules.len(), b.rules.len(), "same rule set");
     }
 
     /// A built plan survives the exact JSON round-trip that `--plan-out` writes
@@ -1229,6 +1472,7 @@ mod tests {
             None,
             None, // pullback_arm
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
 
         // This is exactly what `register_trade_plan` writes for `--plan-out`.
@@ -1302,6 +1546,7 @@ mod tests {
             None,
             None, // pullback_arm
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
 
@@ -1356,6 +1601,7 @@ mod tests {
             None,
             None, // pullback_arm
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
         assert!(plan.rules.is_empty());
     }
@@ -1383,6 +1629,7 @@ mod tests {
             None,
             None, // pullback_arm
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
         assert!(plan.shadow, "shadow=true must reach the built plan");
     }
@@ -1409,6 +1656,7 @@ mod tests {
             None,
             None, // pullback_arm
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
         assert!(
             (custom.retest_atr_step - 0.2).abs() < 1e-9,
@@ -1434,6 +1682,7 @@ mod tests {
             None,
             None, // pullback_arm
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
         assert!(
             (defaulted.retest_atr_step - 0.075).abs() < 1e-9,
@@ -1464,6 +1713,7 @@ mod tests {
             None,
             None, // pullback_arm
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
         assert!(
             custom.cross_buffer_pct.abs() < 1e-9,
@@ -1489,6 +1739,7 @@ mod tests {
             None,
             None, // pullback_arm
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
         assert!(
             (defaulted.cross_buffer_pct - trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT)
@@ -1522,6 +1773,7 @@ mod tests {
             None,
             None, // pullback_arm
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
         assert!(
             (custom.cross_buffer_atr - 0.15).abs() < 1e-9,
@@ -1547,6 +1799,7 @@ mod tests {
             None,
             None, // pullback_arm
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
         assert!(
             defaulted.cross_buffer_atr.abs() < 1e-9,
@@ -1621,6 +1874,7 @@ mod tests {
             None,
             None, // pullback_arm
             None, // screenshot_url
+            TrendFollow::REVERSAL,
         );
         assert_eq!(plan.rules.len(), 1, "just the enter before appending");
 

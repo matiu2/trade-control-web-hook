@@ -1,5 +1,84 @@
 # Changelog
 
+## v134 — 2026-08-27 — `--trend`: a trend-follow arm whose pcl veto needs a close
+
+**Why.** A trend-continuation short, armed `tv-arm-staging --skip-bcr register`,
+was killed ~33 minutes after arming:
+
+```
+2026-08-07 21:26 register → ok
+2026-08-07 21:59 fired 01-veto-too-low (veto)
+2026-08-07 21:59 fired 07-close-on-sr-reversal (close)
+2026-08-13 22:00 fired 02-veto-trade-expiry (veto)
+```
+
+On a **short**, `01-veto-too-low` is the **pcl-exhausted** veto — the computed
+~80%-to-TP fib level, not the drawn invalidation cap (the names swap with
+direction; see CLAUDE.md's table). Fib levels are deliberately
+`Intrabar`/`CrossDir::Either`: *any* bar whose range straddles the level aborts,
+because "if the move ran 80% to TP without us, a wick alone is reason enough."
+That reasoning holds for a **reversal**. It does not hold for a trend
+continuation, which runs further and wicks deeper — so the setup was retired on
+a spike that closed back inside, with the whole trade window still ahead of it.
+
+There was also no way to *say* "this is a trend trade": `--skip-bcr` described
+the mechanical consequence (drop both preps) but carried no intent, so nothing
+downstream could treat the setup differently.
+
+**What changed.** New `tv-arm --trend` flag, with two halves:
+
+1. Expands to `--skip-bcr` via `apply_aliases` (both H&S preps dropped) — the
+   mechanical part, unchanged behaviour.
+2. Makes the **pcl-exhausted** veto close-confirmed: its `PriceValueCross`
+   trigger is emitted with `BarEvent::OnClose` instead of `Intrabar`. The bar
+   must *close* past the ~80%-to-TP level to retire the plan.
+
+The **drawn** invalidation cap is untouched (it is already `OnClose` in both
+directions), and no other rule moves — `--trend` selects exactly one trigger's
+`BarEvent`.
+
+Deliberately **not** a new plan field and **not** an engine change. The engine's
+settled/origin `OnClose` arm already reads `CrossDir::Either` as "origin on one
+side of the line, close past the opposite far edge" — which is precisely "closed
+through the level", for a short and a long alike. So the switch rides the signed
+plan as the trigger it produced, and replay↔live parity is structural rather
+than maintained by hand.
+
+`trend` deliberately survives alias expansion rather than being lowered into a
+flag: the plan builder reads it directly, so the two halves cannot drift apart.
+
+**Breaking.** None. `--trend` is off by default; without it every trigger is
+byte-identical to v133. `--skip-bcr` keeps its exact old meaning.
+
+**Config.** `tv-arm --trend` (bool, default off). Conflicts with
+`--strategy-v2` and `--save-matrix`, which already refuse `--skip-bcr`.
+
+**Tests.** 10 new, each verified by mutating the source and confirming red
+(green tests on a new wire prove nothing):
+
+- `trend_makes_the_pcl_exhausted_veto_close_confirmed` — `Intrabar` without,
+  `OnClose` with, same level.
+- `trend_leaves_the_drawn_invalidation_cap_untouched` — both directions.
+- `on_a_long_trend_flips_too_high_not_too_low` — the switch follows the *role*,
+  not the literal name.
+- `trend_changes_only_the_pcl_exhausted_rule` — every other rule byte-identical.
+- `trend_flag_reaches_the_emitted_plan_json` — drives the real
+  `register_trade_plan` offline (`plan_out` + `register: false`) and reads the
+  plan JSON, so a severed call-site wire fails. This is the one that catches the
+  `TrendFollow(false)` hardcode the unit tests cannot see.
+- `trend_arm_emits_no_prep_rules` — the `--skip-bcr` half, on the same JSON.
+- `trend_expands_to_skip_bcr_and_stays_set`, `trend_is_off_by_default`,
+  `trend_conflicts_with_strategy_v2_and_save_matrix` — alias + conflicts.
+
+`TrendFollow` is a newtype, not an 18th positional `bool` on
+`build_trade_plan`: a transposed `bool` there is the silent-plausible-green
+failure this crate keeps hitting, and a distinct type makes it a compile error.
+
+**Follow-up.** The pcl level's *distance* is still the reversal default
+(fib 1.8 / 80% to TP). If trend setups keep getting retired near target, the
+next knob is a `--trend`-specific fib level rather than a further loosening of
+the confirm mode.
+
 ## v133 — 2026-08-17 — the calendar guard rail silently blinded daily-chart setups
 
 **Why.** Arming a head-and-shoulders on a **1D** chart (`TRADENATION:AMD`) lost its
