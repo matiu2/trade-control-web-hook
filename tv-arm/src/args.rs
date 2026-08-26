@@ -254,11 +254,11 @@ pub struct Args {
     /// This is NOT `--quasimodo` (which runs the QM setup *instead of* the
     /// stop entry) — strategy-v2 runs both. Conflicts with `--quasimodo`,
     /// `--entry-market`, `--skip-break-and-close`, `--skip-retest`, and the
-    /// `--skip-bcr` / `--skip-all` aliases that expand to them;
+    /// `--skip-bcr` / `--skip-all` / `--trend` aliases that expand to them;
     /// `--max-retries 0` is rejected at validation.
     #[arg(
         long,
-        conflicts_with_all = ["quasimodo", "entry_market", "entry_stop", "entry_limit", "skip_break_and_close", "skip_retest", "skip_bcr", "skip_all"]
+        conflicts_with_all = ["quasimodo", "entry_market", "entry_stop", "entry_limit", "skip_break_and_close", "skip_retest", "skip_bcr", "skip_all", "trend"]
     )]
     pub strategy_v2: bool,
 
@@ -415,6 +415,28 @@ pub struct Args {
     #[arg(long)]
     pub skip_all: bool,
 
+    /// **Trend-follow arm.** For a setup that is a continuation of an existing
+    /// trend rather than a reversal off a neckline.
+    ///
+    /// Two effects:
+    ///
+    /// 1. Expands to `--skip-bcr` (both H&S preps dropped — there is no
+    ///    break-and-close/retest sequence to wait for). Expanded by
+    ///    `apply_aliases`.
+    /// 2. Makes the **pcl-exhausted** veto (the computed ~80%-to-TP fib
+    ///    level — `too-low` on a short, `too-high` on a long)
+    ///    **close-confirmed** instead of wick-triggered. A trend runs
+    ///    further and wicks deeper than a reversal, so the default
+    ///    `Intrabar`/`Either` straddle kills the setup on a spike that
+    ///    closes back. Under `--trend` the bar must **close** past the
+    ///    level. The **drawn** invalidation cap is unaffected — it is
+    ///    already `OnClose`.
+    ///
+    /// It does *not* touch the retest tolerance, the cross buffer, or the
+    /// entry gate.
+    #[arg(long)]
+    pub trend: bool,
+
     /// Drop the golden-signal-candle requirement on entry. By default
     /// a golden signal candle is required (`needs_golden: true` on the
     /// trade spec); pass this to clear it.
@@ -550,7 +572,7 @@ pub struct Args {
     /// Pairs with `replay ... --save`: each cell's fixture is named
     /// `<your-name>-<entry-rule>-<news-on|news-off>`. A cell that fails to arm
     /// is recorded and the run continues; the summary names it.
-    #[arg(long, conflicts_with_all = ["skip_bcr", "strategy_v2", "skip_all", "quasimodo"])]
+    #[arg(long, conflicts_with_all = ["skip_bcr", "strategy_v2", "skip_all", "quasimodo", "trend"])]
     pub save_matrix: bool,
 
     /// **The one-flag corpus capture.** Read the chart once and save everything:
@@ -810,9 +832,11 @@ impl Args {
     /// reads. `--quasimodo` is shorthand for `--skip-break-and-close
     /// --skip-retest --require-confirmation`; `--skip-bcr` for
     /// `--skip-break-and-close --skip-retest`; `--skip-all` for `--skip-bcr
-    /// --skip-calendar-bars`. All only OR the targets on (never clear them),
-    /// so combining them with the underlying flags is harmless. Call once
-    /// after `parse`, before the pipeline runs.
+    /// --skip-calendar-bars`; `--trend` for `--skip-bcr` (plus the
+    /// close-confirmed pcl-exhausted veto, which is not a flag — it is read
+    /// straight off `trend` by the plan builder). All only OR the targets on
+    /// (never clear them), so combining them with the underlying flags is
+    /// harmless. Call once after `parse`, before the pipeline runs.
     pub fn apply_aliases(mut self) -> Self {
         // --skip-all is the broadest alias; expand it into --skip-bcr +
         // --skip-calendar-bars first so the --skip-bcr expansion below covers
@@ -820,6 +844,14 @@ impl Args {
         if self.skip_all {
             self.skip_bcr = true;
             self.skip_calendar_bars = true;
+        }
+        // --trend is a trend-continuation arm: no neckline break/retest to wait
+        // for. Its OTHER half (the close-confirmed pcl-exhausted veto) is NOT
+        // expanded here — `trend` stays set and the plan builder reads it, so
+        // the two halves can't drift apart the way a lowered-to-a-flag
+        // expansion would.
+        if self.trend {
+            self.skip_bcr = true;
         }
         if self.skip_bcr {
             self.skip_break_and_close = true;
@@ -1280,6 +1312,65 @@ mod tests {
         assert!(args.skip_break_and_close);
         assert!(args.skip_retest);
         assert!(args.require_confirmation);
+    }
+
+    #[test]
+    fn trend_expands_to_skip_bcr_and_stays_set() {
+        // Bare --trend is off until apply_aliases runs.
+        let parsed = Args::try_parse_from(["tv-arm", "--trend"]).expect("parse");
+        assert!(parsed.trend);
+        assert!(!parsed.skip_bcr);
+        assert!(!parsed.skip_break_and_close);
+        assert!(!parsed.skip_retest);
+
+        let args = parsed.apply_aliases();
+        // Half one: it IS a --skip-bcr, chained all the way to the concrete
+        // prep flags (not just to `skip_bcr`, which nothing downstream reads
+        // for the prep decision).
+        assert!(args.skip_bcr);
+        assert!(
+            args.skip_break_and_close,
+            "--trend must drop the break-and-close prep"
+        );
+        assert!(args.skip_retest, "--trend must drop the retest prep");
+        // Half two: `trend` itself survives expansion — the plan builder reads
+        // it directly for the close-confirmed pcl-exhausted veto. If expansion
+        // ever cleared it, the flag would silently become a plain --skip-bcr.
+        assert!(
+            args.trend,
+            "`trend` must stay set for the plan builder to read"
+        );
+        // Nothing unrelated came along.
+        assert!(!args.skip_calendar_bars);
+        assert!(!args.require_confirmation);
+        assert!(!args.skip_golden);
+    }
+
+    /// Default (no `--trend`): the flag is off, so the plan builder gets the
+    /// wick-through pcl level and the preps stay armed.
+    #[test]
+    fn trend_is_off_by_default() {
+        let args = Args::try_parse_from(["tv-arm"])
+            .expect("parse")
+            .apply_aliases();
+        assert!(!args.trend);
+        assert!(!args.skip_break_and_close);
+        assert!(!args.skip_retest);
+    }
+
+    /// `--trend` implies `--skip-bcr`, which `--strategy-v2` and
+    /// `--save-matrix` both already refuse — so it must be refused for the same
+    /// reason, at parse time, rather than quietly arming a contradictory plan.
+    #[test]
+    fn trend_conflicts_with_strategy_v2_and_save_matrix() {
+        assert!(
+            Args::try_parse_from(["tv-arm", "--trend", "--strategy-v2"]).is_err(),
+            "--trend implies --skip-bcr, which --strategy-v2 rejects"
+        );
+        assert!(
+            Args::try_parse_from(["tv-arm", "--trend", "--save-matrix"]).is_err(),
+            "--trend implies --skip-bcr, which --save-matrix rejects"
+        );
     }
 
     #[test]

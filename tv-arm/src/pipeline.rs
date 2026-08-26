@@ -822,6 +822,7 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
                 .unwrap_or(trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR),
             args.bcr_require_golden,
             armed_sentiment,
+            crate::trade_plan_build::TrendFollow(args.trend),
         )?;
     }
 
@@ -1945,6 +1946,7 @@ mod tests {
             None,
             None, // pullback_arm
             None, // screenshot_url
+            crate::trade_plan_build::TrendFollow(args.trend),
         )
     }
 

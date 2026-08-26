@@ -607,8 +607,21 @@ for a **short**, mirror for long):
   intrabar arm (`HorizontalCross { dir: Down, bar: Intrabar }`).
 - **`too-low` = pcl-exhausted** (computed fib, ~80% to TP).
   `PriceValueCross { dir: Either, bar: Intrabar }` — `Either`, so **any
-  straddle** aborts. Unchanged: if a short ran 80% to TP without us, a wick
-  alone is reason enough.
+  straddle** aborts. The reasoning: if a short ran 80% to TP without us, a wick
+  alone is reason enough. **Exception — `tv-arm --trend` (v134)** flips this one
+  trigger to `OnClose`. A trend-continuation setup runs further and wicks deeper
+  than a reversal, so the straddle retired a live trend short on a spike that
+  closed back inside (2026-08-07, `01-veto-too-low` 33 min after arming). Under
+  `--trend` the bar must *close* past the level. `CrossDir::Either` carries over
+  unchanged — the engine's settled/origin `OnClose` arm reads `Either` as
+  "origin one side, close past the opposite far edge", i.e. "closed through the
+  level" for both directions, so there is **no engine change and no new plan
+  field**: the switch rides the signed plan as the trigger it produced, and
+  replay==live is structural. The **drawn** invalidation cap is untouched
+  (already `OnClose`). Wired as `TrendFollow` (a newtype, not another
+  positional `bool` on `build_trade_plan`) from `Args::trend`, which
+  deliberately **survives** `apply_aliases` rather than being lowered to a flag,
+  so its two halves (`--skip-bcr` + the close-confirmed veto) cannot drift.
 - **`04-prep-retest`** — `TrendlineCross { dir: Down (long) / Up (short),
   bar: Intrabar }`. The retest of the neckline: long = open above the descending
   neckline, low wicks below. This is what the fix unblocked.

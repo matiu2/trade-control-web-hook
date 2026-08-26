@@ -161,6 +161,7 @@ pub(crate) fn register_trade_plan(
     cross_buffer_atr: f64,
     bcr_require_golden: bool,
     armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
+    trend: crate::trade_plan_build::TrendFollow,
 ) -> Result<()> {
     use cli::TradePattern;
     let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
@@ -216,6 +217,7 @@ pub(crate) fn register_trade_plan(
         armed_sentiment,
         pullback_arm,
         screenshot_url,
+        trend,
     );
     // Unwrap the tv-arm bundle wrappers to the cli `BuiltPause`/`BuiltNews` the
     // appender reads (each carries the signed intents + window times).
@@ -276,6 +278,142 @@ mod tests {
             trade_id: trade_id.into(),
             instrument: instrument.into(),
         }
+    }
+
+    /// The wire the unit tests below `build_trade_plan` cannot see:
+    /// `register_trade_plan` is the ONE production call site, and if it passed a
+    /// hardcoded `TrendFollow(false)` (or the wrong positional `bool`) every
+    /// `--trend` arm would silently emit a wick-triggered pcl veto — the exact
+    /// bug the flag exists to fix, back again, with green tests and a plausible
+    /// plan. So this drives the real function end-to-end and reads the plan JSON
+    /// it writes.
+    ///
+    /// Runs offline: `register: false` + `plan_out: Some` returns before any
+    /// POST, and with no `--pull-back` there is no live-mid read. The clipboard
+    /// probe is fail-soft.
+    ///
+    /// `tag` names the caller, so two tests running in parallel don't share a
+    /// scratch directory (one would delete it while the other was writing).
+    fn plan_json_for(trend: bool, tag: &str) -> serde_json::Value {
+        use crate::args::Args;
+        use clap::Parser;
+        use trade_control_conventions::Direction as ConvDirection;
+
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid");
+        let mut argv = vec!["tv-arm"];
+        if trend {
+            argv.push("--trend");
+        }
+        let args = Args::try_parse_from(argv).expect("parse").apply_aliases();
+
+        // Fib head 1.2000 / neckline 1.1000 => TP 1.0000, pcl-exhausted 1.0200.
+        let geom = crate::plan_geometry::PlanGeometry {
+            invalidation: Some(1.2000),
+            fib_head_neckline: Some((1.2000, 1.1000)),
+            trade_expiry_epoch: Some(now.timestamp() + 86_400),
+            ..Default::default()
+        };
+        let spec = crate::hs_resolve::build_trade_spec(
+            &args,
+            "EUR_USD",
+            "ms-oanda-1",
+            trade_control_conventions::Broker::Oanda,
+            ConvDirection::Short,
+            now + chrono::Duration::days(1),
+            1.0000,
+            &geom,
+            false,
+            0.0001,
+            0.0001,
+            Vec::new(),
+            None,
+        );
+        let built = cli::build_trade_from_spec(spec, now, cli::BuildStrictness::Lenient)
+            .expect("build trade bundle");
+
+        let dir = std::env::temp_dir().join(format!("tv-arm-trend-wire-{tag}-{trend}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("plan.json");
+        register_trade_plan(
+            &built,
+            ConvDirection::Short,
+            &geom,
+            "60",
+            &[],
+            &[],
+            &[0u8; KEY_LEN],
+            "ms-oanda-1",
+            now,
+            false,       // shadow
+            Some(&path), // plan_out
+            false,       // register — stops before any POST
+            None,        // replay_start
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false, // bcr_require_golden
+            None,  // armed_sentiment
+            crate::trade_plan_build::TrendFollow(args.trend),
+        )
+        .expect("build + write plan offline");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read plan"))
+                .expect("parse plan json");
+        std::fs::remove_dir_all(&dir).ok();
+        json
+    }
+
+    /// The pcl-exhausted rule as the emitted plan JSON spells it.
+    fn pcl_trigger(plan: &serde_json::Value) -> serde_json::Value {
+        plan["rules"]
+            .as_array()
+            .expect("rules array")
+            .iter()
+            .find(|r| r["rule_id"] == "01-veto-too-low")
+            .expect("short H&S emits a `01-veto-too-low` pcl-exhausted rule")["trigger"]
+            .clone()
+    }
+
+    #[test]
+    fn trend_flag_reaches_the_emitted_plan_json() {
+        // Default arm: wick-through straddle (today's behaviour, unchanged).
+        let off = pcl_trigger(&plan_json_for(false, "reaches"));
+        assert_eq!(
+            off["bar"], "intrabar",
+            "without --trend the pcl-exhausted veto stays a wick-through: {off}"
+        );
+
+        // `--trend`: same level, close-confirmed.
+        let on = pcl_trigger(&plan_json_for(true, "reaches"));
+        assert_eq!(
+            on["bar"], "on_close",
+            "--trend must reach the registered plan as a close-confirmed pcl veto: {on}"
+        );
+        assert_eq!(
+            off["level"], on["level"],
+            "--trend moves the confirm mode, never the level"
+        );
+    }
+
+    /// `--trend` is also a `--skip-bcr`, and the plan is where that shows: the
+    /// prep rules must be gone. Asserted on the SAME emitted JSON, so a
+    /// half-wired alias (flag reaches the plan builder but not the prep
+    /// decision) can't pass.
+    #[test]
+    fn trend_arm_emits_no_prep_rules() {
+        let plan = plan_json_for(true, "no-preps");
+        let ids: Vec<&str> = plan["rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .filter_map(|r| r["rule_id"].as_str())
+            .collect();
+        assert!(
+            !ids.iter()
+                .any(|id| id.starts_with("03-prep") || id.starts_with("04-prep")),
+            "--trend implies --skip-bcr: no break-and-close/retest prep rules, got {ids:?}"
+        );
     }
 
     #[test]
