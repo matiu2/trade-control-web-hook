@@ -10,7 +10,7 @@ use candle_model::Granularity as CmGranularity;
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::{
     AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, EntryError,
-    EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
+    EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Placement, Quote,
 };
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 use tradenation_api::ohlcv::PriceType;
@@ -32,7 +32,7 @@ impl Broker for TradeNationAdapter {
         max_risk_pct: f64,
         max_open_positions: u32,
         req: &EntryRequest<'_>,
-    ) -> Result<String, EntryError> {
+    ) -> Result<Placement, EntryError> {
         if req.dry_run {
             // Upstream `place_entry` doesn't yet support a no-op mode,
             // so we can't run the full sizing path (FX, market resolve,
@@ -48,7 +48,10 @@ impl Broker for TradeNationAdapter {
                 req.take_profit,
                 req.risk,
             );
-            return Ok(format!("dry-run-{}", req.instrument));
+            // No size to report: upstream has no dry-run mode, so the sizing
+            // path genuinely did not run. `id_only` says "unknown" rather than
+            // inventing a figure — unlike OANDA's dry-run, which DOES size.
+            return Ok(Placement::id_only(format!("dry-run-{}", req.instrument)));
         }
         let upstream_req = broker_tradenation::EntryRequest {
             instrument: req.instrument,
@@ -61,6 +64,7 @@ impl Broker for TradeNationAdapter {
         self.0
             .place_entry(max_risk_pct, max_open_positions, &upstream_req)
             .await
+            .map(from_upstream_placement)
             .map_err(from_upstream_error)
     }
 
@@ -652,6 +656,23 @@ fn chunk_windows(
         }
     }
     windows
+}
+
+/// Translate upstream's [`broker_tradenation::Placement`] into ours. The two
+/// are structurally identical by convention (like `EntryRequest` /
+/// `EntryError`), so this is a field-for-field move — but it must stay a real
+/// translation rather than a re-export, because the boundary is what keeps the
+/// worker generic over [`Broker`].
+///
+/// `size` is the stake upstream sized; `price` the **requested** rate (`None`
+/// for a market entry, which TN fills at its own live bid/ask). Neither is a
+/// fill price.
+fn from_upstream_placement(p: broker_tradenation::Placement) -> Placement {
+    Placement {
+        order_id: p.order_id,
+        size: p.size,
+        price: p.price,
+    }
 }
 
 fn from_upstream_error(e: broker_tradenation::EntryError) -> EntryError {

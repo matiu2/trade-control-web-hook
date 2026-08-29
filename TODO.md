@@ -1,96 +1,165 @@
-# TODO — `--sl-anchor` matrix axis
+# TODO — entry rate/size on the timeline + broker settlement on archive
 
-Test the claim that a tighter stop is more profitable than a structural one, by
-arming the **same setup** with the stop at three different levels.
+Branch: `feat/entry-rate-size-and-settlement`
+Worktree: `../trade-control-entry-detail` (sibling — path-dep rule)
 
-The current default is already the *tight* stop: `PriceAnchor::SignalHigh` /
-`SignalLow` — the latched **signal candle's own wick** + 0.5%·ATR, resolved live
-(`cli/src/trade_patterns.rs:220-240`). It has no connection to the drawn pattern.
-So the open question is whether that tight default is being noise-clipped, not
-whether we should go tighter.
+## Why
 
-## The three anchors
+Two operator asks off the `journal-staging` timeline:
 
-| value | price | source |
+1. The `fired 05-enter (enter)` line should show **the rate and the trade size**.
+2. Once a trade is **archived**, the server should pull the broker's
+   **activity + transaction** info for the account and fold it into the log.
+
+## Findings so far (verified in code, not prose)
+
+### Where the timeline line comes from
+
+- `journal/src/timeline.rs:91-94` formats `fired {rule_id} ({action})` from
+  `eval.fired[].intent` — the *intent*, not the fill.
+- The placement result rides `dispatch_outcomes[].outcome`
+  (`core/src/tick_bundle.rs:113`), a bare string built at
+  `core/src/dispatch/enter.rs:954` as `entered: order={order_id}`.
+- So enriching that string surfaces in the timeline with **no journal change**.
+
+### Rate and size are computed then discarded
+
+- `Broker::place_entry` returns `Result<String, EntryError>` — order id only
+  (`core/src/broker.rs:248`).
+- OANDA computes `units` at `broker-oanda/src/oanda.rs:146-190` and only
+  `tracing::info!`s it (line 195).
+- **TradeNation computes stake entirely upstream** — the adapter just forwards
+  (`broker-tradenation-adapter/src/lib.rs:53-64`). Units are *not* in scope
+  locally at all for TN.
+- `EntryAttempt` (`core/src/state.rs:163`) stores `stop_loss_price`, `pip_size`,
+  `cancel_at` — but **no entry price and no units**.
+
+⚠️ `ResolvedEntry::reference_price()` is the **requested** price (the trigger for
+a stop/limit), NOT the fill. Slippage means these differ. Label honestly.
+
+### Archive triggers — operator was RIGHT, my first read was wrong
+
+`Phase::Done` → cron archives (`trade-control-cron/src/engine.rs:420-447`).
+
+| Trigger | Archives? | Position closed first? |
 |---|---|---|
-| `signal` (default) | latched signal wick ± 0.5%·ATR | `PriceAnchor::SignalHigh/Low`, live |
-| `invalidation` | the drawn `too-high`/`too-low` line | `PlanGeometry.invalidation` |
-| `fib-top` | the fib's head (pattern extreme) | `PlanGeometry.fib_head_neckline.0` |
+| `too-low` / pcl-exhausted (`StopNextEntry`) | **No** — sets `entries_blocked` | n/a |
+| `too-high` / invalidation (`ClosePositions`) | Yes | Yes (CLOSE-VETO) |
+| `trade-expiry` (`CancelPending`) | Yes | Yes |
+| M/W cancel/abort/overshoot | Yes | Yes |
+| **single-shot enter, first fire** | **Yes, immediately** | **NO** ⚠️ |
 
-`invalidation` and `fib-top` bake an absolute price at arm time and reuse the
-existing `PriceRef::AbsoluteBuffered` path — the same one the `sl` chart Note
-takes. No new intent shape, no worker/engine/wire change.
+- `StopNextEntry` not retiring is deliberate and load-bearing —
+  `engine/src/evaluate.rs:2946` + the XAU_XAG H1 2026-07-21 regression noted at
+  `evaluate.rs:2930-2932`. Confirmed by the operator's own AUD/CAD timeline:
+  `01-veto-too-high` at 11:00 did NOT archive; the plan ran on to a
+  `07-close-on-sr-reversal` a day later and ended at `02-veto-trade-expiry`.
+- **The hole:** `engine/src/evaluate.rs:1048-1055` sets `Phase::Done` on the bar
+  a single-shot (`max_retries == Static(0)`) enter *fires* — before fill, let
+  alone close. Violates the invariant "archive only after all attempts closed".
 
-⚠ **Resolve by ROLE, not by literal name.** `too-high`/`too-low` swap roles with
-direction (see CLAUDE.md). `geom.invalidation` is already the direction-correct
-*drawn* line; the opposite name is the computed pcl-exhausted fib, which sits on
-the **profit** side. Anchoring a stop there would place it past the TP.
+### Broker history APIs available
 
-## Spread: reuse the existing floor, add nothing
+- **TradeNation: already implemented, never wired up.**
+  `tradenation-api/src/activity.rs` — `ActivityRecord { price, stake, ... }`
+  (literally the fill rate + size) via `get_activity` / `get_all_activity`.
+  `tradenation-api/src/transactions.rs` — settled ledger, `get_all_transactions`.
+  Neither is reachable through `broker-tradenation` or the adapter.
+- **OANDA: partial.** `oanda_client::trades::Trade` already carries `price`
+  (execution), `initial_units`, `average_close_price`, `close_time`,
+  `realized_pl`, `financing`, `closing_transaction_ids`.
+  `lookup_attempt_state` (`broker-oanda/src/oanda.rs:339`) already queries
+  `TradeState::Closed` and throws the numbers away, keeping only win/loss.
+  **No `/v3/accounts/{id}/transactions` endpoint exists in `oanda-client`** —
+  the full ledger needs that endpoint added (separate repo/submodule).
+- `Broker` trait has **no** `list_transactions` / `get_activity` method.
 
-`widen_sl_to_spread_floor` (`core/src/intent/sl_spread_floor.rs:164`) acts on the
-**resolved** SL price, downstream of *how* that price was chosen, and is already
-called on both sides — worker (`core/src/dispatch/enter.rs:740`) and replay
-(`fill_sim.rs:937` `apply_entry_spread_floor`). So the new anchors inherit it for
-free, and replay↔live parity is structural. **No new spread code in this change.**
+### Investigation results (single-shot Done-at-fire)
 
-Deliberately NOT touched here:
+**It is near-unreachable in production.**
 
-- The `±½ spread` mid→bid/ask correction exists for **M/W only**
-  (`core/src/intent/mw_resolution.rs:14`). The H&S drawn-price path (the `sl`
-  Note, and now these anchors) doesn't do it. That's a real inconsistency, but
-  fixing it would shift every existing `sl`-Note fixture by half a spread — a
-  deliberate re-bless, not a side effect of this change. Logged, not fixed.
-- Spread *prediction* from hardcoded forward references — out of scope.
+- `tv-arm/src/hs_resolve.rs:306-310` defaults `max_retries` to **5**; `--strategy-v2`
+  *rejects* `--max-retries 0` (`args.rs:936-943`).
+- Only single-shot producers: M/W (`tv-arm/src/mw_resolve.rs:266-268`, deliberate)
+  and the interactive `build-trade` wizard (`cli/src/trade_patterns.rs:1041`).
+- **Corpus: 874 plans, 1308 enter rules, ALL `max_retries: 5`. Zero single-shot.**
 
-## Steps
+**It was never a design decision.** `git log -S "phase = Phase::Done"` returns one
+commit — `e3a76aa`, the engine's original naive spine. `83333fa` carved out
+multi-shot and asserted "for a single-shot enter that's correct" without
+justification.
 
-- [x] Read the SL decision path end to end
-- [x] Confirm both levels are plain `f64` in scope at `hs_resolve.rs:310`
-- [x] Confirm fixtures carry `invalidation` + `fib_head_neckline` (`.spec.json`)
-- [x] Confirm the spread floor is anchor-agnostic ⇒ nothing to add
-- [x] `SlAnchor` enum + `--sl-anchor` flag (`tv-arm/src/sl_anchor.rs`, `args.rs`)
-- [x] Resolve to a price in `hs_resolve.rs`; route through `sl_on_protective_side`
-- [x] Missing geometry ⇒ declined cell (loud), never a silent fallback to `signal`
-- [x] Matrix axis behind `--sl-matrix` (default stays 8 cells)
-- [x] Corpus re-run utility over the `.spec.json` files
-      (`scripts/sl-anchor-sweep.sh`)
-- [x] clippy + fmt + 410 tv-arm tests green
-- [x] **Mutation-verified** (green tests prove nothing until they can fail):
-      fib-top reading `.1` not `.0` → 2 red; protective-side guard removed →
-      2 red; missing level falling back to `signal` → 2 red; default cells
-      always suffixed (corpus-orphaning) → 5 red. All restored.
-- [x] End-to-end: 24/24 cells armed on AUD/CAD 2026-07-22; SL confirmed
-      distinct per anchor (`signal_high` anchored / `0.98862` / `0.98882`)
-- [ ] Commit, push, merge to main + staging, deploy both, advance parent pointer
+**Dropping the `Done` is safe — `fired` is what prevents re-firing.**
+`evaluate.rs:835-837` skips latched rules *before* `evaluate_one_entry`, and the
+`fired.insert` sits on the line above the `Done` (`:1053-1054`). Keep the insert,
+drop the `Done`.
 
-## Verified behaviour on the first real setup
+**What it unlocks (all desirable):** the per-position reversal-close becomes armed
+for single-shot plans (today it can *never* fire — same defect class as the
+XAU_XAG incident); invalidation vetos keep ticking; the pending-order lifecycle
+keeps running (`replay.rs:2608-2612` documents the break skipping spread-hour
+cancel/restore entirely).
 
-AUD/CAD 2026-07-22, `normal-news-on`. The `signal` cell fires `05-enter`
-**twice** (05:00 then 06:00 — a re-entry after the first was stopped out); both
-structural cells enter **once** and hold. That is the tight-vs-structural
-difference showing up as behaviour, which is exactly what the axis is for.
+⚠️ **Two hard constraints found:**
 
-Also visible: `invalidation` (0.98862) and `fib-top` (0.98882) are only ~2 pips
-apart on this setup. If that holds corpus-wide they are near-duplicate columns
-and the third anchor is not worth its replay time — worth checking on the sweep
-output before running all 26.
+1. **The engine is deliberately broker-free.** `core::position_view` / `OpenSet` /
+   the `positions` param on `evaluate_plan` were **removed in v66**. The literal
+   "all attempts closed" invariant CANNOT live in `evaluate_plan` — it needs a
+   cron sweep. Reintroducing a broker there regresses a thrice-fixed bug.
+2. **Plan rows have NO TTL** (`core/src/state.rs:1080-1085`) — `Phase::Done` is the
+   only GC. Any fix must guarantee a terminal path or plans leak and tick every
+   ~5s forever. `02-veto-trade-expiry` (`ClosePositions`) is the backstop, but it
+   needs a bar to *close* past the epoch (guards test `candle.time`, not wall
+   clock — `evaluate.rs:601-603`).
 
-## Known unrelated failure
+⚠️ `not_after` is **NOT enforced by the engine** — it appears only in a test
+fixture. Comments at `:336`, `:731`, `:1024`, `:2937` claiming otherwise are wrong.
+The only retirement is `02-veto-trade-expiry`.
 
-`all_fixtures_match_expected` fails **in a worktree** because most fixture cells
-are untracked and are never copied in (`?? replay-fixtures/hs-nzd-chf-…`). It
-passes in the main checkout. Not caused by this change — verified both ways.
+**Replay parity:** `replay.rs:674-677` `break`s the candle loop on `eval.done`
+(its only early exit). Golden compares `done` AND `final_phase` exactly
+(`golden_eq.rs:131-139`). Corpus terminating fires: `02-veto-trade-expiry` 471,
+`01-veto-too-high` 213, `01-veto-too-low` 129, `06-close-on-reversal` 3 —
+**none reach Done via the enter**, so the change moves ZERO fixtures. Safe, but
+also *unvalidated by the corpus* → needs its own targeted test.
 
-## Corpus re-run — coverage caveat
+**Tests to update (~7):** `evaluate.rs:6668`, `:6744`, `:6768`, `:7347`
+(`assert!(eval.done, "single-shot retires the plan on its fire")` — the explicit
+guard), `:4885`; verify `:5648`, `:8694`. Multi-shot twins already assert
+`!eval.done` and stay green.
 
-**26 `.spec.json` files vs 206 fixture dirs.** Only setups armed with
-`--spec-out` can be re-armed without a chart. The tool must report the covered
-count plainly; implying full-corpus coverage would be the same class of error as
-`--rebless` silently covering 19 of 63.
+## Operator decisions taken
 
-## Out of scope
+- Enter line: **widen `place_entry` to return units** — `reversals` (the account
+  in the timeline) is **TradeNation**, where stake is computed upstream and never
+  returned, so string-only would give rate but NO size on that very account.
+  Corpus: tradenation/reversals 774 enters, oanda/m-and-w 534.
+- Archive settlement: **trade-level + full transaction ledger**.
+- Single-shot Done-at-fire: **fix it** — don't retire until the position closed.
 
-- `--sl-from-recent` (`args.rs:229`) appears **dead** on the H&S path —
-  `sl_anchor` is hard-coded `None` at `hs_resolve.rs:303`, so nothing reads it.
-  Noted, not fixed here.
+## Plan
+
+- [x] **1. Investigate single-shot retirement** — done, see above.
+- [ ] **2. Widen `place_entry`** to return `Placement { order_id, units, price }`.
+      Impls: `broker-oanda/src/lib.rs:54` (units in scope at `oanda.rs:190`),
+      `broker-tradenation-adapter/src/lib.rs:30` (needs upstream stake), plus
+      test spies in `retry_gate.rs:561`, `order_control/reprice.rs:510`,
+      `order_control/promote.rs:319`, `core/src/broker.rs:441`.
+- [ ] **3. Enrich the enter outcome string** at `core/src/dispatch/enter.rs:954`
+      with rate + size. Label the price honestly — for a stop/limit it is the
+      **trigger**, not the fill (slippage).
+- [ ] **4. Fix single-shot Done-at-fire** (`engine/src/evaluate.rs:1054`) — drop
+      the `Done`, keep the `fired.insert`. Update the ~7 tests.
+- [ ] **5. Broker settlement on archive** — new `Broker` trait method; wire TN's
+      existing `get_all_activity`/`get_all_transactions`; add OANDA's
+      `/v3/accounts/{id}/transactions` endpoint to `oanda-client` (separate repo).
+- [ ] **6. Persist settlement on `ArchivedPlan`** (jsonb, `#[serde(default)]`,
+      no migration — matches the `EntryAttempt` additive pattern).
+- [ ] **7. Surface it in the journal timeline output.**
+
+## Gates (per CLAUDE.md)
+
+- Tests first; prove each test can fail (mutate the source, confirm red).
+- `cargo clippy` + `cargo fmt` before each commit.
+- Keep changes < ~600 lines each; commit + push as each lands.
+- Strategy changes must land in **both** replayer and worker.

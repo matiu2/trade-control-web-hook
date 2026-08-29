@@ -12,7 +12,7 @@ use crate::fx::{quote_currency, resolve_quote_to_account_rate};
 use crate::risk;
 use trade_control_core::broker::{
     AmendError, AttemptState, CancelError, EntryError, EntryRequest, LookupError, OpenPosition,
-    PendingOrder as CorePendingOrder, Quote,
+    PendingOrder as CorePendingOrder, Placement, Quote,
 };
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 
@@ -83,7 +83,7 @@ pub async fn place_entry(
     max_risk_pct: f64,
     max_open_positions: u32,
     req: &EntryRequest<'_>,
-) -> Result<String, EntryError> {
+) -> Result<Placement, EntryError> {
     // Cheap-to-check ceiling for `Percent` mode. `Amount` is checked
     // against the equity-derived percent below once we have equity.
     if let RiskBudget::Percent(pct) = req.risk
@@ -203,8 +203,14 @@ pub async fn place_entry(
     }
     if req.dry_run {
         // Sizing succeeded — synthetic order id so the caller treats it
-        // as success. The order is intentionally not placed.
-        return Ok(format!("dry-run-{}", req.instrument));
+        // as success. The order is intentionally not placed. The size IS
+        // known here (the full sizing path just ran), so report it: a dry-run
+        // exists precisely to show what would have been placed.
+        return Ok(Placement {
+            order_id: format!("dry-run-{}", req.instrument),
+            size: Some(f64::from(units)),
+            price: Some(reference_price),
+        });
     }
 
     let sl_details = StopLossDetails {
@@ -296,7 +302,15 @@ pub async fn place_entry(
         }
     };
 
-    Ok(response.order_create_transaction.id)
+    // `units` is the size OANDA was actually asked for, and `reference_price`
+    // the price the risk math used (the trigger for a stop/limit — NOT the
+    // fill, which for a resting order isn't known yet). Both were previously
+    // computed here and only logged.
+    Ok(Placement {
+        order_id: response.order_create_transaction.id,
+        size: Some(f64::from(units)),
+        price: Some(reference_price),
+    })
 }
 
 /// OANDA prices are strings with instrument-appropriate precision. Five decimal

@@ -934,13 +934,36 @@ impl ReplayBroker {
     }
 }
 
+/// The [`Placement`](trade_control_core::broker::Placement) an offline replay
+/// can honestly report.
+///
+/// **`size` is always `None`.** Sizing needs live account equity + an FX rate,
+/// which the offline replay has by definition not got — the real brokers
+/// compute it from an account fetch. Reporting a guessed size here would put a
+/// number in the report that never reached any book, so the replay says
+/// "unknown" instead. (This is the same reason `place_entry` only enforces the
+/// `Percent` risk cap offline and leaves `Amount`/`Units` unchecked.)
+///
+/// `price` IS known — it is the requested entry the replay is placing at, the
+/// same quantity the live brokers report. Not a fill.
+fn replay_placement(
+    order_id: String,
+    req: &EntryRequest<'_>,
+) -> trade_control_core::broker::Placement {
+    trade_control_core::broker::Placement {
+        order_id,
+        size: None,
+        price: Some(req.entry.reference_price()),
+    }
+}
+
 impl Broker for ReplayBroker {
     async fn place_entry(
         &self,
         max_risk_pct: f64,
         max_open_positions: u32,
         req: &EntryRequest<'_>,
-    ) -> Result<String, EntryError> {
+    ) -> Result<trade_control_core::broker::Placement, EntryError> {
         // Enforce the two account caps the real broker enforces AND the replay
         // can faithfully reproduce offline — so a live reject-at-cap is not
         // silently taken as a fill (bug ③). Both mirror the real
@@ -993,7 +1016,7 @@ impl Broker for ReplayBroker {
                     take_profit: req.take_profit,
                 };
                 self.record_attempt(a.order_id.clone(), a.intent, a.shell, Some(placed));
-                Ok(a.order_id)
+                Ok(replay_placement(a.order_id, req))
             }
             // No armed placement: this is the shared `pending_order_lifecycle`
             // RE-DRIVING a spread-hour-cancelled order (PR 4b-3). The broker
@@ -1006,7 +1029,7 @@ impl Broker for ReplayBroker {
             // broker restoring the resting order the engine told it to re-place —
             // faithful to the cancel→restore→fill sequence the live path runs.
             None => match self.reactivate_matching_cancelled(req) {
-                Some(order_id) => Ok(order_id),
+                Some(order_id) => Ok(replay_placement(order_id, req)),
                 // Neither armed nor a matching cancelled attempt — a genuine
                 // wiring fault (an enter dispatched without arming, and not a
                 // known re-drive). Fail loudly rather than fabricate an id.
@@ -1516,7 +1539,11 @@ mod tests {
         let ok = b
             .place_entry(1.0, 3, &entry_req(RiskBudget::Percent(1.0)))
             .await;
-        assert_eq!(ok.unwrap(), "o1", "1% at a 1% cap is allowed (not >)");
+        assert_eq!(
+            ok.unwrap().order_id,
+            "o1",
+            "1% at a 1% cap is allowed (not >)"
+        );
     }
 
     #[tokio::test]
@@ -1575,7 +1602,11 @@ mod tests {
         let ok = b
             .place_entry(1.0, 3, &entry_req(RiskBudget::Percent(1.0)))
             .await;
-        assert_eq!(ok.unwrap(), "o2", "one open under a cap of 3 is allowed");
+        assert_eq!(
+            ok.unwrap().order_id,
+            "o2",
+            "one open under a cap of 3 is allowed"
+        );
     }
 
     // --- PR 3: list_pending_orders fidelity (shared pending-lifecycle) ---
