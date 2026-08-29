@@ -241,6 +241,64 @@ impl core::fmt::Display for CancelError {
 
 impl std::error::Error for CancelError {}
 
+/// Result of a [`Broker::close_positions`] call.
+///
+/// Replaces a bare `bool`, which collapsed three genuinely different
+/// outcomes into one and made `close-failed` unreadable: an operator
+/// could not tell "the broker call errored" from "there was nothing
+/// open to close". A real incident turned on exactly that ambiguity —
+/// see `BUG-market-entry-no-broker-confirmation-trail.md`, where a
+/// `close-failed` on a position that had never opened was read as
+/// "the system tried to close my trade and failed", leaving what the
+/// operator believed was an unmanaged open short for nine days.
+///
+/// The distinction is load-bearing beyond the log line: `NothingOpen`
+/// is a **successful no-op**, so it maps to `ActionResult::Ok` and
+/// consumes the intent id, while `Errored` stays
+/// `ActionResult::Failed` so the next fire retries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseOutcome {
+    /// At least one position was closed. Carries how many, so the
+    /// outcome string can say so.
+    Closed(usize),
+    /// The broker was reached and reported no open position on this
+    /// instrument. **Not a failure** — the desired end state (flat)
+    /// already holds.
+    NothingOpen,
+    /// The broker call itself failed (network, auth, 5xx) — we do not
+    /// know whether a position is open. The only outcome that should
+    /// be retried.
+    Errored,
+}
+
+impl CloseOutcome {
+    /// Whether the instrument is known to be flat now. True for both
+    /// `Closed` and `NothingOpen`; false only when we genuinely don't
+    /// know because the call errored.
+    pub fn is_flat(&self) -> bool {
+        !matches!(self, Self::Errored)
+    }
+
+    /// Short tag for outcome strings / log lines.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Closed(_) => "closed",
+            Self::NothingOpen => "nothing-open",
+            Self::Errored => "close-errored",
+        }
+    }
+}
+
+impl core::fmt::Display for CloseOutcome {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Closed(n) => write!(f, "closed {n}"),
+            Self::NothingOpen => f.write_str("nothing-open"),
+            Self::Errored => f.write_str("close-errored"),
+        }
+    }
+}
+
 /// Authenticated broker handle. The constructor lives on each implementation
 /// (it depends on broker-specific secrets), so the trait only carries actions.
 pub trait Broker {
@@ -252,8 +310,12 @@ pub trait Broker {
         req: &EntryRequest<'_>,
     ) -> impl Future<Output = Result<String, EntryError>>;
 
-    /// Close all positions for `instrument`. Returns true if anything closed.
-    fn close_positions(&self, instrument: &str) -> impl Future<Output = bool>;
+    /// Close all positions for `instrument`.
+    ///
+    /// Returns a [`CloseOutcome`] rather than a bool so callers can tell
+    /// "nothing was open" (a successful no-op) from "the broker call
+    /// failed" (retryable) — see [`CloseOutcome`].
+    fn close_positions(&self, instrument: &str) -> impl Future<Output = CloseOutcome>;
 
     /// Cancel pending orders on `instrument`. Returns the number cancelled.
     fn cancel_pending_for_instrument(&self, instrument: &str) -> impl Future<Output = usize>;
@@ -446,8 +508,8 @@ mod quote_tests {
         ) -> Result<String, EntryError> {
             Ok("noop".into())
         }
-        async fn close_positions(&self, _instrument: &str) -> bool {
-            false
+        async fn close_positions(&self, _instrument: &str) -> CloseOutcome {
+            CloseOutcome::NothingOpen
         }
         async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
             0

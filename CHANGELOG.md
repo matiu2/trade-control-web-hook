@@ -1,5 +1,73 @@
 # Changelog
 
+## v135 — 2026-08-30 — `close-failed` told an operator a phantom position was real
+
+**Why.** A NZD/CAD close fired and the dispatch log said, in full:
+
+```
+dispatch: close-failed
+```
+
+The operator read that as "the system tried to close my position and failed",
+and left what they believed was an open, unmanaged short running for nine days.
+It was not: the `--market-entry` order they thought had gone through had never
+reached the broker at all, so there was nothing to close. `close-failed` was the
+*correct* return value for "I closed nothing" — it just could not say which of
+the two "nothings" it meant. See
+`BUG-market-entry-no-broker-confirmation-trail.md`.
+
+`Broker::close_positions` returned a bare `bool`, collapsing three genuinely
+different outcomes into two: *closed something* / *nothing was open* / *the
+broker call errored*. The middle case is a **successful no-op** — the
+instrument is already flat, which is exactly what the close asked for — but it
+shared a return value with a real failure.
+
+That miscoding was not only cosmetic. `ActionResult::Failed` is a
+`SeenDecision::Skip`, so the intent id was never consumed and the close refired
+instead of being recorded as fulfilled.
+
+**What changed.**
+
+1. **`Broker::close_positions` returns `CloseOutcome`**, not `bool`:
+   `Closed(n)` / `NothingOpen` / `Errored`. Modelled on the existing
+   `LookupError` / `CancelError` house pattern.
+2. **`run_close` maps them apart** — `NothingOpen` is now
+   `ActionResult::Ok("closed: nothing-open")` (200, id consumed, no refire);
+   only `Errored` stays `Failed` (502, retryable). `Closed(n)` reports its count.
+3. **The `ClosePositions` veto does the same**, and its log line now reads
+   `closed=nothing-open` rather than `closed=failed`.
+4. **Both brokers establish "flat" positively** rather than inferring it from an
+   error: OANDA reads the position's units (a flat instrument answers with zero
+   units, not a 404); the TradeNation adapter counts matching open positions
+   before delegating. Neither pattern-matches on error text.
+5. **The replay broker mirrors all three arms**, so replay == live for this
+   distinction.
+6. **`--market-entry` / `--limit-entry` no longer overstate what happened.** The
+   worker answers a successful dispatch with a flat `ok` and the broker order id
+   is not in that body, so the CLI now prints `accepted by worker: trade_id=…`
+   rather than `entered:`, plus the `plan timeline <trade_id>` command that
+   resolves "did it actually fill?". A `--broker-dry-run` previously printed a
+   byte-identical line to a live placement; it now says `DRY RUN` plainly.
+
+**Breaking.** `Broker::close_positions`' return type. Every in-tree implementor
+is updated; an out-of-tree one is a compile error, which is the intent.
+
+**Config.** None.
+
+**Tests.** `close_with_nothing_open_is_ok_not_failed` (asserts both the outcome
+string and that the id is *marked seen*), `close_with_broker_error_stays_failed_and_retries`,
+`close_that_closed_positions_reports_the_count`,
+`live_entry_reports_acceptance_not_a_confirmed_fill`,
+`dry_run_is_visibly_different_from_a_live_placement`. Each verified by mutating
+the source and confirming it goes red.
+
+**Follow-up.** `--market-entry` still creates no `EntryAttempt` row (it is
+`max_retries: Static(0)`, so `record_placement` is never called), so the crons
+that manage a position — breakeven watch, blackout apply, order-control — do not
+see it. The request record is written and `plan timeline` can read it, which is
+what the new CLI hint points at, but the position itself remains unmanaged by
+design. Worth revisiting if that path stops being fire-and-forget.
+
 ## v134 — 2026-08-27 — `--trend`: a trend-follow arm whose pcl veto needs a close
 
 **Why.** A trend-continuation short, armed `tv-arm-staging --skip-bcr register`,

@@ -328,6 +328,26 @@ spread-blackout gates. `--risk-amount`, `--broker-dry-run`, and
 - `--limit-entry` — pending **limit** order resting at the drawn entry
   price (pullback: it fills when price comes *back* to the level).
 
+**Confirming the placement.** On success the CLI prints
+
+```
+accepted by worker: trade_id=pos-nzd-cad-37926360 — ok
+  confirm the fill with: trade-control-<env> plan timeline pos-nzd-cad-37926360
+```
+
+"Accepted", not "entered", is deliberate: the worker answers a successful
+dispatch with a flat `ok` and keeps the broker order id in the persisted
+request record, so the CLI has not seen a fill. `plan timeline <trade_id>`
+reads that record and shows the `entered: order=<id>` outcome — that is
+the check that answers "did it actually fill?". With `--broker-dry-run`
+the line instead reads `DRY RUN — no order placed at the broker`.
+
+⚠️ Because this path is fire-and-forget it creates **no `EntryAttempt`
+row**, so the crons that manage a position (breakeven watch, blackout
+apply, order-control) do not track it. Once placed, the position is
+yours to manage — a reversal-close alert armed alongside it is the only
+automated touchpoint.
+
 The resting price is baked onto the wire as an absolute trigger
 (`EntrySpec::{Stop,Limit}::at`) — the operator drew the exact level, so
 the worker uses it verbatim rather than re-deriving it from a shell

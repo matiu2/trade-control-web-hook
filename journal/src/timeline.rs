@@ -213,6 +213,27 @@ mod tests {
         );
     }
 
+    /// The journal colours a dispatch green by matching the outcome string's
+    /// prefix, so the v135 `CloseOutcome` strings must keep landing on the
+    /// right side of that test. Both successes (a real close and the
+    /// already-flat no-op) are green; only a genuine broker error is red.
+    /// Without this, renaming an outcome string would silently paint a
+    /// successful close red — the exact misreading
+    /// `BUG-market-entry-no-broker-confirmation-trail.md` turned on.
+    #[test]
+    fn close_outcome_strings_colour_correctly() {
+        let timeline = |outcome: &str| format!(r#"{{"records":[{{"outcome":"{outcome}"}}]}}"#);
+
+        for success in ["closed (2)", "closed: nothing-open"] {
+            let (text, ok) = derive_outcome(&timeline(success));
+            assert!(ok, "{success:?} is a success and must render green");
+            assert_eq!(text, success);
+        }
+
+        let (text, ok) = derive_outcome(&timeline("close-failed: broker-errored"));
+        assert!(!ok, "a broker error must render red, got {text:?}");
+    }
+
     #[test]
     fn outcome_falls_back_without_dispatch() {
         // The AUD/CAD fixture has only register + plan-show records (dumps), so

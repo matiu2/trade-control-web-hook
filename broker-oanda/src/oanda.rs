@@ -5,14 +5,14 @@ use oanda_client::orders::{
     LimitOrder, OrderPositionFill, OrderType, PendingOrder, StopLossDetails, StopOrder,
     TakeProfitDetails, TimeInForce,
 };
-use oanda_client::positions::ClosePositionResponse;
+use oanda_client::positions::{ClosePositionResponse, Position};
 use oanda_client::trades::{Trade, TradeQueryParams, TradeState};
 
 use crate::fx::{quote_currency, resolve_quote_to_account_rate};
 use crate::risk;
 use trade_control_core::broker::{
-    AmendError, AttemptState, CancelError, EntryError, EntryRequest, LookupError, OpenPosition,
-    PendingOrder as CorePendingOrder, Quote,
+    AmendError, AttemptState, CancelError, CloseOutcome, EntryError, EntryRequest, LookupError,
+    OpenPosition, PendingOrder as CorePendingOrder, Quote,
 };
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 
@@ -32,23 +32,64 @@ pub(super) fn live_flag_from_secret(raw: Option<String>) -> bool {
     raw.map(|s| s.to_lowercase() == "true").unwrap_or(false)
 }
 
-/// Closes all positions for a selected instrument. Returns true if any positions were closed;
-/// false if there were no positions, or there was an error; errors are logged to the console
+/// Closes all positions for a selected instrument.
+///
+/// Distinguishes the three outcomes the old `bool` collapsed (see
+/// [`CloseOutcome`]): a flat instrument is [`CloseOutcome::NothingOpen`],
+/// a genuine broker error is [`CloseOutcome::Errored`].
+///
+/// The flat check is a positive one rather than an inference from an error:
+/// OANDA answers `GET /positions/{instrument}` for a flat instrument with a
+/// `Position` whose long/short units are both `0` (not a 404), so reading the
+/// units tells us we are flat without pattern-matching on error text.
+///
+/// It costs one extra read — `close_position` makes the same `get_position`
+/// call internally — which is a fair price for not having to guess "was that
+/// a no-op or a failure?" from a bool. On the flat path it also *saves* the
+/// close round-trip, since we return before issuing it.
 pub async fn close_positions(
     client: &OandaClient,
     account_id: &str,
     instrument_name: &str,
-) -> bool {
+) -> CloseOutcome {
+    match client.get_position(account_id, instrument_name).await {
+        Ok(position) => {
+            if !position_has_units(&position) {
+                return CloseOutcome::NothingOpen;
+            }
+        }
+        Err(err) => {
+            tracing::error!("Error reading position before close: {err:?}");
+            return CloseOutcome::Errored;
+        }
+    }
     match client.close_position(account_id, instrument_name).await {
         Ok(ClosePositionResponse {
             related_transaction_ids,
             ..
-        }) => !related_transaction_ids.is_empty(),
+        }) => {
+            if related_transaction_ids.is_empty() {
+                // We saw units a moment ago but the close moved nothing —
+                // the position closed underneath us (its own SL/TP hit).
+                // Flat either way, and not an error.
+                CloseOutcome::NothingOpen
+            } else {
+                CloseOutcome::Closed(related_transaction_ids.len())
+            }
+        }
         Err(err) => {
             tracing::error!("Error closing positions: {err:?}");
-            false
+            CloseOutcome::Errored
         }
     }
+}
+
+/// Whether either side of an OANDA position holds a non-zero unit count.
+/// Unparseable units are treated as "has units" so a malformed payload
+/// makes us attempt the close rather than silently report flat.
+fn position_has_units(position: &Position) -> bool {
+    let side_open = |units: &str| units.parse::<f64>().map(|u| u != 0.0).unwrap_or(true);
+    side_open(&position.long.units) || side_open(&position.short.units)
 }
 
 /// Cancel any pending orders on `instrument` for this account. Used when an
