@@ -140,16 +140,19 @@ guard), `:4885`; verify `:5648`, `:8694`. Multi-shot twins already assert
 ## Plan
 
 - [x] **1. Investigate single-shot retirement** — done, see above.
-- [ ] **2. Widen `place_entry`** to return `Placement { order_id, units, price }`.
-      Impls: `broker-oanda/src/lib.rs:54` (units in scope at `oanda.rs:190`),
-      `broker-tradenation-adapter/src/lib.rs:30` (needs upstream stake), plus
-      test spies in `retry_gate.rs:561`, `order_control/reprice.rs:510`,
-      `order_control/promote.rs:319`, `core/src/broker.rs:441`.
-- [ ] **3. Enrich the enter outcome string** at `core/src/dispatch/enter.rs:954`
-      with rate + size. Label the price honestly — for a stop/limit it is the
-      **trigger**, not the fill (slippage).
+- [x] **2. Widen `place_entry`** to return `Placement { order_id, size, price }`.
+      **DONE** — commit `de91749`. 15 impls across 11 files. Upstream
+      `broker-tradenation` shipped `v0.16.0` (commit `40d768a`, tagged+pushed)
+      so TN returns its stake; **every** TN pin in the workspace moved
+      v0.14.0 → v0.16.0 together (a split pin links two copies of the crate —
+      `spread-baseline-gen` caught this at compile time).
+- [x] **3. Enrich the enter outcome string** at `core/src/dispatch/enter.rs`.
+      **DONE** — same commit. `entered: order=… size=… @ …`, empty halves when
+      unreported so the historic shape survives.
 - [ ] **4. Fix single-shot Done-at-fire** (`engine/src/evaluate.rs:1054`) — drop
       the `Done`, keep the `fired.insert`. Update the ~7 tests.
+      **Deprioritised**: unreachable in production (all 874 corpus plans are
+      multi-shot; tv-arm defaults to 5). Correctness cleanup, not a live fix.
 - [ ] **5. Broker settlement on archive** — new `Broker` trait method; wire TN's
       existing `get_all_activity`/`get_all_transactions`; add OANDA's
       `/v3/accounts/{id}/transactions` endpoint to `oanda-client` (separate repo).
