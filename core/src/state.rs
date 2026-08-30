@@ -15,6 +15,7 @@ use crate::broker::Granularity;
 use crate::control_event::ControlEvent;
 use crate::intent::{Action, BlackoutCloseAction, Breakeven, Direction, NoEntryWindow};
 use crate::plan_state::PlanState;
+use crate::settlement::Settlement;
 use crate::trade_plan::TradePlan;
 
 /// One active cooldown row in a [`Snapshot`]. `set_at` records when the
@@ -1191,12 +1192,18 @@ pub trait StateStore {
     /// `plan:` row this is written with **no TTL** — archived plans accumulate
     /// until an operator runs `plan delete`. `final_state` is the terminal
     /// [`PlanState`] (its `phase`/`fired` record *why* the plan ended).
+    ///
+    /// `settlement` is what the broker said happened to the trade, fetched by
+    /// the caller just before archiving. `None` when no ledger was available —
+    /// it must never block the archive, since the live rows are dropped on the
+    /// same tick regardless.
     fn archive_plan(
         &self,
         account: Option<&str>,
         plan: &TradePlan,
         final_state: &PlanState,
         archived_at: DateTime<Utc>,
+        settlement: Option<Settlement>,
     ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Enumerate every archived plan across all account scopes (mirrors
@@ -1279,6 +1286,22 @@ pub struct ArchivedPlan {
     pub final_state: PlanState,
     /// When the engine archived it (the terminal cron tick's `now`).
     pub archived_at: DateTime<Utc>,
+    /// What the **broker** says happened to the trade — the real fills, the
+    /// realised P&L, and the raw activity / cash rows behind them — fetched
+    /// once at archive time.
+    ///
+    /// Everything else on this struct records what the *system decided*; this
+    /// is the only record of what the *broker did*. `None` means no settlement
+    /// was fetched: the broker reports no ledger, the fetch failed outright, or
+    /// the row predates this field. A fetch that partly succeeded is `Some`
+    /// with its gaps named in
+    /// [`Settlement::warnings`](crate::settlement::Settlement::warnings) —
+    /// never silently empty.
+    ///
+    /// No migration: the row is one `jsonb` body, so this is additive exactly
+    /// like [`EntryAttempt`]'s later fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<Settlement>,
 }
 
 /// Maximum number of recent seen ids retained in the index. Tuning knob;
@@ -2275,6 +2298,7 @@ mod memstore {
             plan: &TradePlan,
             final_state: &PlanState,
             archived_at: DateTime<Utc>,
+            settlement: Option<Settlement>,
         ) -> Result<(), StateError> {
             let key = format!("archived-plan:{}:{}", account_scope(account), plan.trade_id);
             let archived = ArchivedPlan {
@@ -2282,6 +2306,7 @@ mod memstore {
                 plan: plan.clone(),
                 final_state: final_state.clone(),
                 archived_at,
+                settlement,
             };
             let body = serde_json::to_string(&archived)
                 .map_err(|e| StateError::Backend(format!("encode archived plan: {e}")))?;
@@ -2373,6 +2398,70 @@ mod tests {
 
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
+    }
+
+    /// A minimal registered plan, built from JSON the way the conformance
+    /// suite's `sample_plan` does (`TradePlan` has no `Default`).
+    fn sample_archived_plan(trade_id: &str) -> crate::trade_plan::TradePlan {
+        let json = format!(
+            r#"{{"trade_id":"{trade_id}","instrument":"AUD_CAD","direction":"short",
+                "granularity":"h1","pip_size":0.0001,"rules":[]}}"#
+        );
+        serde_json::from_str(&json).expect("the sample plan parses")
+    }
+
+    /// A row archived before `settlement` existed must still decode.
+    ///
+    /// `archived_plan` rows have **no TTL** — they persist until `plan delete`,
+    /// so the staging/prod tables already hold bodies written without this
+    /// field. If the added field weren't `#[serde(default)]` every one of them
+    /// would fail to decode and `plan list --include-all` would go blind on the
+    /// entire archive. Same additive discipline as `EntryAttempt`'s later
+    /// fields; no SQL migration because the body is one `jsonb` column.
+    #[test]
+    fn an_archived_row_written_before_settlement_existed_still_decodes() {
+        let plan = sample_archived_plan("hs-aud-cad-a07622da");
+        let legacy = serde_json::json!({
+            "plan": plan,
+            "final_state": PlanState::seed(
+                crate::plan_state::Phase::Done,
+                ts("2026-08-18T05:00:00Z"),
+            ),
+            "archived_at": "2026-08-18T05:00:00Z",
+            // NOTE: no `settlement` key — this is the pre-field shape.
+        });
+
+        let back: ArchivedPlan =
+            serde_json::from_value(legacy).expect("a pre-settlement row must still decode");
+        assert_eq!(back.plan.trade_id, "hs-aud-cad-a07622da");
+        assert_eq!(
+            back.settlement, None,
+            "a missing settlement reads as None, not a decode failure"
+        );
+    }
+
+    /// …and a plan archived without a settlement must not write an empty one.
+    ///
+    /// `skip_serializing_if` keeps the stored body a faithful record of what
+    /// was known: an absent key means "never fetched", which is a different
+    /// fact from a fetched-but-empty settlement.
+    #[test]
+    fn no_settlement_is_omitted_from_the_body_not_written_as_null() {
+        let archived = ArchivedPlan {
+            account: None,
+            plan: sample_archived_plan("hs-aud-cad-a07622da"),
+            final_state: PlanState::seed(
+                crate::plan_state::Phase::Done,
+                ts("2026-08-18T05:00:00Z"),
+            ),
+            archived_at: ts("2026-08-18T05:00:00Z"),
+            settlement: None,
+        };
+        let body = serde_json::to_string(&archived).expect("serialises");
+        assert!(
+            !body.contains("settlement"),
+            "an unfetched settlement must be absent, not null: {body}"
+        );
     }
 
     /// The cross-backend conformance harness, run against the in-memory
@@ -3913,6 +4002,7 @@ mod tests {
             &plan,
             &final_state,
             ts("2026-06-20T01:00:00Z"),
+            None,
         ))
         .unwrap();
         pollster::block_on(store.clear_trade_plan(None, "hs-archive-me")).unwrap();
@@ -4026,13 +4116,14 @@ mod tests {
         term.fired.insert("01-veto-too-high".into());
         let when = ts("2026-06-19T09:00:00Z");
 
-        pollster::block_on(store.archive_plan(None, &sample_plan("hs-global"), &term, when))
+        pollster::block_on(store.archive_plan(None, &sample_plan("hs-global"), &term, when, None))
             .unwrap();
         pollster::block_on(store.archive_plan(
             Some("reversals"),
             &sample_plan("hs-scoped"),
             &term,
             when,
+            None,
         ))
         .unwrap();
 

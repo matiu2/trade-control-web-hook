@@ -83,6 +83,7 @@ pub async fn run_all(store: &impl StateStore, tag: &str) {
     plan_state(store, tag).await;
     control_events(store, tag).await;
     archived_plan(store, tag).await;
+    archived_plan_settlement(store, tag).await;
     order_body(store, tag).await;
 }
 
@@ -1136,7 +1137,7 @@ pub async fn trade_plan(store: &impl StateStore, tag: &str) {
     let final_state = PlanState::seed(Phase::Done, now_us());
     store.put_trade_plan(None, &plan).await.unwrap();
     store
-        .archive_plan(None, &plan, &final_state, now_us())
+        .archive_plan(None, &plan, &final_state, now_us(), None)
         .await
         .unwrap();
     store.clear_trade_plan(None, &archive_me).await.unwrap();
@@ -1287,11 +1288,11 @@ pub async fn archived_plan(store: &impl StateStore, tag: &str) {
     let when = now_us();
 
     store
-        .archive_plan(None, &sample_plan(&global), &term, when)
+        .archive_plan(None, &sample_plan(&global), &term, when, None)
         .await
         .unwrap();
     store
-        .archive_plan(Some("reversals"), &sample_plan(&scoped), &term, when)
+        .archive_plan(Some("reversals"), &sample_plan(&scoped), &term, when, None)
         .await
         .unwrap();
 
@@ -1320,4 +1321,97 @@ pub async fn archived_plan(store: &impl StateStore, tag: &str) {
 
     // Cleanup.
     store.clear_archived_plan(None, &global).await.unwrap();
+}
+
+/// A broker settlement survives the archive round-trip, and a plan archived
+/// without one still reads back.
+///
+/// This is the whole point of the settlement: it is written once, when the
+/// plan retires, and read much later by whoever asks what the trade actually
+/// did. If it doesn't survive the store it records nothing.
+pub async fn archived_plan_settlement(store: &impl StateStore, tag: &str) {
+    use crate::settlement::{LedgerEntry, LedgerSource, SettledTrade, Settlement};
+
+    let with = format!("{tag}-arch-settled");
+    let without = format!("{tag}-arch-unsettled");
+    let term = PlanState::seed(Phase::Done, now_us());
+    let when = now_us();
+
+    let settlement = Settlement {
+        broker: "tradenation".into(),
+        fetched_at: when,
+        trades: vec![SettledTrade {
+            broker_trade_id: "27187050".into(),
+            broker_order_id: Some("26793941".into()),
+            instrument: Some("EUR/USD".into()),
+            entry_price: Some(1.1000),
+            exit_price: Some(1.1050),
+            size: Some(2.75),
+            opened_at: Some(when),
+            closed_at: Some(when),
+            realized_pl: Some(1.25),
+            financing: None,
+            currency: Some("AUD".into()),
+        }],
+        ledger: vec![LedgerEntry {
+            source: LedgerSource::Activity,
+            reference: Some("26793941".into()),
+            occurred_at: Some(when),
+            description: "Execute Order:26793941".into(),
+            instrument: Some("EUR/USD".into()),
+            price: Some(1.1000),
+            size: Some(2.75),
+            amount: None,
+            currency: Some("AUD".into()),
+        }],
+        warnings: vec!["cash-ledger rows carry only a RefID".into()],
+    };
+
+    store
+        .archive_plan(
+            None,
+            &sample_plan(&with),
+            &term,
+            when,
+            Some(settlement.clone()),
+        )
+        .await
+        .unwrap();
+    store
+        .archive_plan(None, &sample_plan(&without), &term, when, None)
+        .await
+        .unwrap();
+
+    let all = store.list_all_archived_plans().await.unwrap();
+
+    let settled = all
+        .iter()
+        .find(|a| a.plan.trade_id == with)
+        .expect("settled archived plan listed");
+    let got = settled
+        .settlement
+        .as_ref()
+        .expect("the settlement survives the store round-trip");
+    assert_eq!(got, &settlement, "every field must survive verbatim");
+    // The figures the operator's trade log actually reads.
+    assert_eq!(got.total_realized_pl(), Some(1.25));
+    assert_eq!(got.trades[0].entry_price, Some(1.1000));
+    assert_eq!(got.ledger[0].source, LedgerSource::Activity);
+    assert!(
+        !got.warnings.is_empty(),
+        "a stated attribution limit must not be dropped on the way to the store"
+    );
+
+    let unsettled = all
+        .iter()
+        .find(|a| a.plan.trade_id == without)
+        .expect("unsettled archived plan listed");
+    assert_eq!(
+        unsettled.settlement, None,
+        "a plan archived without a settlement stays None, not an empty body"
+    );
+
+    // Cleanup.
+    store.clear_archived_plan(None, &with).await.unwrap();
+    store.clear_archived_plan(None, &without).await.unwrap();
 }

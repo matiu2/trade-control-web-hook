@@ -1087,6 +1087,7 @@ mod tests {
             _plan: &crate::trade_plan::TradePlan,
             _final_state: &crate::plan_state::PlanState,
             _archived_at: DateTime<Utc>,
+            _settlement: Option<crate::settlement::Settlement>,
         ) -> Result<(), StateError> {
             Ok(())
         }

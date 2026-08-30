@@ -193,7 +193,7 @@ where
     // Persist the advanced state (or clear it + the plan when the spine is
     // done) before dispatching, so a dispatch failure can't replay a fired bar.
     // Capture the transition (before/after/success/error) for the tick-bundle.
-    let kv = persist_plan_state(store, plan, account, &eval, now, &prior).await;
+    let kv = persist_plan_state(store, &broker, plan, account, &eval, now, &prior).await;
     // A hard put failure is still a skip for this tick — but the bundle records
     // the failed transition first, so a replay can see "wanted to advance,
     // couldn't" rather than a silent gap.
@@ -339,7 +339,7 @@ where
     // Persist the control state (open_news_windows / blackout) before dispatch,
     // so a dispatch failure can't replay a fired window edge. A control tick
     // never advances the watermark (no bar processed) and is never `done`.
-    let kv = persist_plan_state(store, plan, account, &eval, now, prior).await;
+    let kv = persist_plan_state(store, broker, plan, account, &eval, now, prior).await;
     if !kv.success {
         let bundle = build_tick_bundle(
             stored,
@@ -403,6 +403,99 @@ where
     Ok(())
 }
 
+/// Ask the broker what actually happened to a finishing plan's trade.
+///
+/// Runs once, on the terminal tick, immediately before the rows that identify
+/// the trade are dropped. Returns `None` when there is nothing worth recording.
+///
+/// # Best-effort by design
+///
+/// Every failure path here returns `None` (or a warning-carrying
+/// [`Settlement`]) rather than propagating: the caller is mid-archive and will
+/// drop the live rows on this tick regardless, so a failed fetch must cost the
+/// *settlement*, never the archive. A plan archived without its settlement is
+/// still a plan archived; a plan not archived is a leaked row that ticks
+/// forever (plan rows have no TTL).
+///
+/// # Attribution
+///
+/// The broker order ids come from the plan's own `EntryAttempt` rows — the
+/// only record tying account-wide broker traffic back to *this* trade. A plan
+/// that never placed anything has none, and there is correspondingly nothing
+/// to settle, so the fetch is skipped entirely rather than dredging the
+/// account's ledger for a trade that was never opened.
+async fn fetch_plan_settlement<S: StateStore>(
+    store: &S,
+    broker: &BrokerHandle,
+    plan: &trade_control_core::trade_plan::TradePlan,
+    account: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<trade_control_core::settlement::Settlement> {
+    let attempts = match store.list_entry_attempts(account, &plan.trade_id).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::error!(
+                "cron engine: settlement list_entry_attempts({}): {err} — archiving without it",
+                plan.trade_id
+            );
+            return None;
+        }
+    };
+    if attempts.is_empty() {
+        // Never placed an order: a vetoed-before-entry setup. There is no
+        // trade to settle, and asking would only return other trades' rows.
+        return None;
+    }
+
+    let order_ids: Vec<String> = attempts.iter().map(|a| a.broker_order_id.clone()).collect();
+    // Bound the ledger scan by the trade's own life: the earliest placement is
+    // the first moment this trade could appear in the broker's history.
+    let since = attempts.iter().map(|a| a.placed_at).min().unwrap_or(now);
+
+    // Per-broker match, as everywhere else `BrokerHandle` is used — the enum
+    // exists so an `impl Trait` future needn't be boxed across the boundary.
+    let fetched = match broker {
+        BrokerHandle::Oanda(b) => {
+            b.fetch_settlement(&plan.instrument, since, &order_ids, now)
+                .await
+        }
+        BrokerHandle::TradeNation(b) => {
+            b.fetch_settlement(&plan.instrument, since, &order_ids, now)
+                .await
+        }
+    };
+
+    match fetched {
+        Ok(s) if s.is_empty() && s.warnings.is_empty() => {
+            // Asked, and the broker had nothing at all to say. Recording an
+            // empty body would imply a fetch that found a genuinely empty
+            // ledger; `None` says "nothing recorded", which is the truth.
+            tracing::info!(
+                "cron engine: settlement for {} came back empty",
+                plan.trade_id
+            );
+            None
+        }
+        Ok(s) => {
+            tracing::info!(
+                "cron engine: settlement for {} — {} trade(s), {} ledger row(s), pl={:?}",
+                plan.trade_id,
+                s.trades.len(),
+                s.ledger.len(),
+                s.total_realized_pl(),
+            );
+            Some(s)
+        }
+        Err(err) => {
+            tracing::error!(
+                "cron engine: fetch_settlement({}): {err} — archiving without it",
+                plan.trade_id
+            );
+            None
+        }
+    }
+}
+
 /// Persist the tick's advanced state and report the KV transition for the
 /// tick-bundle. On `done` the plan-state row *and* the plan row are cleared
 /// (the spine is finished); otherwise the new state is written with a fresh TTL.
@@ -411,6 +504,7 @@ where
 /// while a failed `put` is surfaced so the caller can skip dispatch.
 async fn persist_plan_state<S: StateStore>(
     store: &S,
+    broker: &BrokerHandle,
     plan: &trade_control_core::trade_plan::TradePlan,
     account: Option<&str>,
     eval: &PlanEval,
@@ -419,13 +513,20 @@ async fn persist_plan_state<S: StateStore>(
 ) -> KvTickTransition {
     let key = plan_state_key(account, &plan.trade_id);
     if eval.done {
+        // Ask the broker what actually happened to the trade before the rows
+        // that identify it are dropped. This is the last moment it can be
+        // asked: `clear_trade_plan` below removes the plan, and the
+        // `EntryAttempt` rows that carry the broker order ids age out on their
+        // own TTL. Best-effort by construction (see `fetch_settlement`).
+        let settlement = fetch_plan_settlement(store, broker, plan, account, now).await;
+
         // Snapshot the finished plan + its terminal state to the archive
         // keyspace BEFORE dropping the live rows, so `plan list --include-all`
         // can still surface a vetoed/completed setup for analysis. A failed
         // archive is logged but must not fail the tick — the clears below still
         // proceed (the engine has finished with this plan regardless).
         if let Err(err) = store
-            .archive_plan(account, plan, &eval.new_state, now)
+            .archive_plan(account, plan, &eval.new_state, now, settlement)
             .await
         {
             tracing::error!("cron engine: archive_plan({}): {err}", plan.trade_id);

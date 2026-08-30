@@ -1067,6 +1067,7 @@ mod plan_show_tests {
             &sample_plan("hs-nzd-chf-d12eb831"),
             &final_state,
             archived_at,
+            None,
         ))
         .expect("archive");
 

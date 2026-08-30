@@ -12,6 +12,7 @@ use core::future::Future;
 use chrono::{DateTime, Utc};
 
 use crate::intent::{Direction, ResolvedEntry, RiskBudget};
+use crate::settlement::Settlement;
 
 mod candles;
 pub use candles::*;
@@ -482,6 +483,52 @@ pub trait Broker {
         _now: DateTime<Utc>,
     ) -> impl Future<Output = Result<Vec<BidAskCandle>, CandleError>> {
         async { Err(CandleError::Transient) }
+    }
+
+    /// Fetch what the broker says actually happened to a finished trade: the
+    /// real fills, the realised P&L, and the raw activity / cash rows behind
+    /// them.
+    ///
+    /// Called once when a plan is **archived**, so the operator's trade log can
+    /// show the outcome and not just the decisions. `instrument` narrows the
+    /// search; `since` bounds how far back to look (a plan's own lifetime plus
+    /// slack — an unbounded ledger scan is expensive and mostly irrelevant).
+    /// `broker_order_ids` are the ids this worker placed for the trade, from
+    /// its `EntryAttempt` rows: the only reliable way to tell *our* trades from
+    /// the rest of the account's traffic.
+    ///
+    /// # Contract
+    ///
+    /// - **Never fabricate.** A figure the broker didn't report is `None`, not
+    ///   zero — see [`crate::settlement`].
+    /// - **Partial answers are kept**, with the reason in
+    ///   [`Settlement::warnings`]. An archived plan cannot be re-derived later,
+    ///   so half an answer beats none.
+    /// - **A trade may still be open.** A plan archives on a terminal veto or
+    ///   the expiry clock, which can precede the position closing.
+    ///
+    /// **Default impl returns an empty [`Settlement`]** carrying a warning, so
+    /// a broker that hasn't implemented a ledger feed compiles unchanged and
+    /// its callers degrade to "no settlement recorded" rather than failing the
+    /// archive — the same fail-open discipline as [`Broker::get_bidask_candles`].
+    /// Archiving must never be blocked by a settlement fetch: the plan rows are
+    /// dropped on that same tick either way.
+    fn fetch_settlement(
+        &self,
+        _instrument: &str,
+        _since: DateTime<Utc>,
+        _broker_order_ids: &[String],
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Settlement, LookupError>> {
+        async move {
+            Ok(Settlement {
+                broker: "unknown".to_string(),
+                fetched_at: now,
+                trades: Vec::new(),
+                ledger: Vec::new(),
+                warnings: vec!["this broker reports no settlement ledger".to_string()],
+            })
+        }
     }
 }
 
