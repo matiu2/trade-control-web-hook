@@ -153,12 +153,39 @@ guard), `:4885`; verify `:5648`, `:8694`. Multi-shot twins already assert
       the `Done`, keep the `fired.insert`. Update the ~7 tests.
       **Deprioritised**: unreachable in production (all 874 corpus plans are
       multi-shot; tv-arm defaults to 5). Correctness cleanup, not a live fix.
-- [ ] **5. Broker settlement on archive** — new `Broker` trait method; wire TN's
-      existing `get_all_activity`/`get_all_transactions`; add OANDA's
-      `/v3/accounts/{id}/transactions` endpoint to `oanda-client` (separate repo).
-- [ ] **6. Persist settlement on `ArchivedPlan`** (jsonb, `#[serde(default)]`,
-      no migration — matches the `EntryAttempt` additive pattern).
-- [ ] **7. Surface it in the journal timeline output.**
+- [x] **5. Broker settlement on archive** — **DONE**, commit `ca24b7e`.
+      `core::settlement` (`Settlement` / `SettledTrade` / `LedgerEntry`), a
+      fail-open `Broker::fetch_settlement`, and the TN impl wired onto its
+      existing-but-never-called `get_all_activity` + `get_all_transactions`.
+      **No upstream change needed** — `TradeNationBroker::{client,session}()`
+      accessors exist for exactly this extension case.
+- [x] **6. Persist settlement on `ArchivedPlan`** — **DONE**, same commit.
+      jsonb + `#[serde(default)]`, no migration; the store-conformance
+      round-trip runs against **both** backends, and two tests pin the serde
+      attrs so an existing (no-TTL, never-expiring) archived row still decodes.
+- [x] **7. Surface it in the journal** — **DONE**, commit `f43ac5a`. Plus the
+      `dispatch_outcomes` join, which is what actually puts the size + rate on
+      the `05-enter` line.
+
+## Remaining
+
+- [ ] **OANDA settlement.** `oanda-client` has **no
+      `/v3/accounts/{id}/transactions` endpoint** — it needs adding to that
+      separate repo, then an impl here. OANDA uses the fail-open default (empty
+      + warning) until then. Note `oanda_client::trades::Trade` **already**
+      carries `price`, `initial_units`, `average_close_price`, `close_time`,
+      `realized_pl`, `financing`, `closing_transaction_ids` — so a *trade-level*
+      impl needs no new endpoint and could land first; only the full **ledger**
+      needs it.
+- [ ] **4. Single-shot Done-at-fire** (`engine/src/evaluate.rs:1054`) — drop the
+      `Done`, keep the `fired.insert`. Update the ~7 tests. **Deprioritised**:
+      unreachable in production (all 874 corpus plans are multi-shot; tv-arm
+      defaults to 5). Correctness cleanup, not a live-trading fix.
+- [ ] **Verify against a real TradeNation session.** Nothing here has run
+      against live TN data: the builder is unit-tested on synthetic records and
+      the field names come from the upstream structs, not from an observed
+      response. **The first plan archived after deploy is the real test** —
+      check the ledger rows attribute and the P&L matches the platform.
 
 ## Gates (per CLAUDE.md)
 
