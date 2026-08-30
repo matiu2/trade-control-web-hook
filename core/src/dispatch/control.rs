@@ -742,6 +742,13 @@ pub struct PlanDetail {
     /// finished plan.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
+    /// What the broker said happened to the trade, captured when the plan was
+    /// archived. Only ever `Some` alongside `archived_at` — a live plan has not
+    /// settled yet. This is the only record of what the *broker* did, as opposed
+    /// to what the engine decided, so `plan show` / the journal surface it here
+    /// rather than making the operator query the store directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<crate::settlement::Settlement>,
 }
 
 /// Handle the `plan-list` action: enumerate every registered plan across all
@@ -881,6 +888,9 @@ pub async fn collect_plan_details<S: StateStore>(
             plan: stored.plan,
             state,
             archived_at: None,
+            // A live plan hasn't been settled: the broker is only asked once the
+            // plan retires, on the terminal tick.
+            settlement: None,
         });
     }
 
@@ -895,6 +905,7 @@ pub async fn collect_plan_details<S: StateStore>(
             plan: archived.plan,
             state: Some(archived.final_state),
             archived_at: Some(archived.archived_at),
+            settlement: archived.settlement,
         });
     }
 

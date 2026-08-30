@@ -7,12 +7,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem};
 
 use crate::app::App;
-use crate::timeline::parse_events;
+use crate::timeline::{parse_events, settlement_lines};
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let json = app.current_data().and_then(|d| d.timeline_json.as_deref());
 
-    let items: Vec<ListItem> = match json {
+    let mut items: Vec<ListItem> = match json {
         None => vec![ListItem::new(Line::from(Span::styled(
             "loading timeline…",
             Style::default().fg(Color::DarkGray),
@@ -43,6 +43,24 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             }
         }
     };
+
+    // The broker's own account of the trade, once the plan has been archived
+    // with one. Appended below the event trail: the timeline says what the
+    // system decided, this says what the broker actually did.
+    if let Some(export) = app.current_data().and_then(|d| d.export_json.as_deref()) {
+        for line in settlement_lines(export) {
+            let style = if line.starts_with("  !") {
+                // A stated limit on what the numbers mean — must not read as
+                // just more data.
+                Style::default().fg(Color::Yellow)
+            } else if line.starts_with("  ") {
+                Style::default()
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            items.push(ListItem::new(Line::from(Span::styled(line, style))));
+        }
+    }
 
     let list = List::new(items).block(crate::ui::titled_block("Timeline"));
     f.render_widget(list, area);
