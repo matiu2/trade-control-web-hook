@@ -23,8 +23,8 @@ use oanda::{
 };
 use oanda_client::OandaClient;
 use trade_control_core::broker::{
-    AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, EntryError,
-    EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
+    AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, CloseOutcome,
+    EntryError, EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
 };
 
 /// Authenticated OANDA broker handle. Holds the API client and the account id
@@ -56,7 +56,7 @@ impl Broker for OandaBroker {
         max_risk_pct: f64,
         max_open_positions: u32,
         req: &EntryRequest<'_>,
-    ) -> Result<String, EntryError> {
+    ) -> Result<trade_control_core::broker::Placement, EntryError> {
         place_entry(
             &self.client,
             &self.account_id,
@@ -67,7 +67,7 @@ impl Broker for OandaBroker {
         .await
     }
 
-    async fn close_positions(&self, instrument: &str) -> bool {
+    async fn close_positions(&self, instrument: &str) -> CloseOutcome {
         close_positions(&self.client, &self.account_id, instrument).await
     }
 

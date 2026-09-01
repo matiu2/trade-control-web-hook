@@ -12,6 +12,7 @@ use core::future::Future;
 use chrono::{DateTime, Utc};
 
 use crate::intent::{Direction, ResolvedEntry, RiskBudget};
+use crate::settlement::Settlement;
 
 mod candles;
 pub use candles::*;
@@ -34,6 +35,78 @@ impl Quote {
     pub fn spread(&self) -> f64 {
         self.ask - self.bid
     }
+}
+
+/// What a [`Broker::place_entry`] actually put on the book.
+///
+/// `place_entry` used to return a bare order-id `String`, so the **size** the
+/// broker had just computed (OANDA's `units`, TradeNation's stake) was logged
+/// and thrown away — leaving the operator's trade log unable to say how big the
+/// trade was. This carries it back out.
+///
+/// # `size` is the broker's own number, not ours
+///
+/// Each broker sizes the trade itself from equity + risk + FX, so this is the
+/// figure that actually reached the book — not a local re-derivation that could
+/// drift from it. `None` means "this broker didn't tell us", which is a real
+/// state, not a failure: the offline replay has no equity to size against, and
+/// a dry-run never sizes at all. A consumer must render `None` as unknown
+/// rather than substituting a guess.
+///
+/// # `price` is the REQUESTED price, never the fill
+///
+/// For a market order this is the reference price the risk math used; for a
+/// stop / limit it is the **trigger** the order rests at. The real fill can
+/// differ by slippage, and for a pending order it isn't known for hours. Call
+/// it a requested rate when showing it to a human — see
+/// [`ResolvedEntry::reference_price`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Placement {
+    /// The broker's order id — what `place_entry` has always returned.
+    pub order_id: String,
+    /// The position size the broker computed: OANDA `units`, TradeNation stake.
+    /// `None` when the broker doesn't report one (replay, dry-run).
+    pub size: Option<f64>,
+    /// The requested entry price (market reference, or stop/limit trigger).
+    /// **Not** the fill — see the type docs.
+    pub price: Option<f64>,
+}
+
+impl Placement {
+    /// A placement carrying only an order id — the pre-`Placement` shape.
+    /// For brokers/stubs that can't report a size (offline replay, dry-run).
+    pub fn id_only(order_id: impl Into<String>) -> Self {
+        Self {
+            order_id: order_id.into(),
+            size: None,
+            price: None,
+        }
+    }
+
+    /// Render the size + rate for a human-facing outcome line, e.g.
+    /// `" size=1000 @ 1.10250"`. Empty when the broker reported neither, so
+    /// the caller's `entered: order=…` line is unchanged rather than growing a
+    /// dangling `size=?`. Deliberately says nothing about *fills*: `price` is
+    /// the requested rate (see the type docs).
+    pub fn describe_fill(&self) -> String {
+        let size = self
+            .size
+            .map(|s| format!(" size={}", trim_float(s)))
+            .unwrap_or_default();
+        let price = self
+            .price
+            .map(|p| format!(" @ {}", trim_float(p)))
+            .unwrap_or_default();
+        format!("{size}{price}")
+    }
+}
+
+/// Format a float for a log line without a trailing `.0` on whole numbers —
+/// OANDA units are integral (`size=1000`, not `size=1000.0`) while a price
+/// needs its decimals (`1.10250`). `{}` on an `f64` already does exactly this,
+/// so this is a named seam for the intent rather than new behaviour.
+fn trim_float(v: f64) -> String {
+    format!("{v}")
 }
 
 /// An open position as the broker reports it. Broker ids are `String`s
@@ -241,19 +314,86 @@ impl core::fmt::Display for CancelError {
 
 impl std::error::Error for CancelError {}
 
+/// Result of a [`Broker::close_positions`] call.
+///
+/// Replaces a bare `bool`, which collapsed three genuinely different
+/// outcomes into one and made `close-failed` unreadable: an operator
+/// could not tell "the broker call errored" from "there was nothing
+/// open to close". A real incident turned on exactly that ambiguity —
+/// see `BUG-market-entry-no-broker-confirmation-trail.md`, where a
+/// `close-failed` on a position that had never opened was read as
+/// "the system tried to close my trade and failed", leaving what the
+/// operator believed was an unmanaged open short for nine days.
+///
+/// The distinction is load-bearing beyond the log line: `NothingOpen`
+/// is a **successful no-op**, so it maps to `ActionResult::Ok` and
+/// consumes the intent id, while `Errored` stays
+/// `ActionResult::Failed` so the next fire retries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseOutcome {
+    /// At least one position was closed. Carries how many, so the
+    /// outcome string can say so.
+    Closed(usize),
+    /// The broker was reached and reported no open position on this
+    /// instrument. **Not a failure** — the desired end state (flat)
+    /// already holds.
+    NothingOpen,
+    /// The broker call itself failed (network, auth, 5xx) — we do not
+    /// know whether a position is open. The only outcome that should
+    /// be retried.
+    Errored,
+}
+
+impl CloseOutcome {
+    /// Whether the instrument is known to be flat now. True for both
+    /// `Closed` and `NothingOpen`; false only when we genuinely don't
+    /// know because the call errored.
+    pub fn is_flat(&self) -> bool {
+        !matches!(self, Self::Errored)
+    }
+
+    /// Short tag for outcome strings / log lines.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Closed(_) => "closed",
+            Self::NothingOpen => "nothing-open",
+            Self::Errored => "close-errored",
+        }
+    }
+}
+
+impl core::fmt::Display for CloseOutcome {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Closed(n) => write!(f, "closed {n}"),
+            Self::NothingOpen => f.write_str("nothing-open"),
+            Self::Errored => f.write_str("close-errored"),
+        }
+    }
+}
+
 /// Authenticated broker handle. The constructor lives on each implementation
 /// (it depends on broker-specific secrets), so the trait only carries actions.
 pub trait Broker {
-    /// Risk-gate + place an entry order. Returns a broker-specific order id.
+    /// Risk-gate + place an entry order.
+    ///
+    /// Returns a [`Placement`]: the broker order id plus the size the broker
+    /// itself computed and the price requested. Brokers that can't report a
+    /// size (offline replay, dry-run) return [`Placement::id_only`] — `None`
+    /// means unknown, never zero.
     fn place_entry(
         &self,
         max_risk_pct: f64,
         max_open_positions: u32,
         req: &EntryRequest<'_>,
-    ) -> impl Future<Output = Result<String, EntryError>>;
+    ) -> impl Future<Output = Result<Placement, EntryError>>;
 
-    /// Close all positions for `instrument`. Returns true if anything closed.
-    fn close_positions(&self, instrument: &str) -> impl Future<Output = bool>;
+    /// Close all positions for `instrument`.
+    ///
+    /// Returns a [`CloseOutcome`] rather than a bool so callers can tell
+    /// "nothing was open" (a successful no-op) from "the broker call
+    /// failed" (retryable) — see [`CloseOutcome`].
+    fn close_positions(&self, instrument: &str) -> impl Future<Output = CloseOutcome>;
 
     /// Cancel pending orders on `instrument`. Returns the number cancelled.
     fn cancel_pending_for_instrument(&self, instrument: &str) -> impl Future<Output = usize>;
@@ -406,6 +546,52 @@ pub trait Broker {
     ) -> impl Future<Output = Result<Vec<BidAskCandle>, CandleError>> {
         async { Err(CandleError::Transient) }
     }
+
+    /// Fetch what the broker says actually happened to a finished trade: the
+    /// real fills, the realised P&L, and the raw activity / cash rows behind
+    /// them.
+    ///
+    /// Called once when a plan is **archived**, so the operator's trade log can
+    /// show the outcome and not just the decisions. `instrument` narrows the
+    /// search; `since` bounds how far back to look (a plan's own lifetime plus
+    /// slack — an unbounded ledger scan is expensive and mostly irrelevant).
+    /// `broker_order_ids` are the ids this worker placed for the trade, from
+    /// its `EntryAttempt` rows: the only reliable way to tell *our* trades from
+    /// the rest of the account's traffic.
+    ///
+    /// # Contract
+    ///
+    /// - **Never fabricate.** A figure the broker didn't report is `None`, not
+    ///   zero — see [`crate::settlement`].
+    /// - **Partial answers are kept**, with the reason in
+    ///   [`Settlement::warnings`]. An archived plan cannot be re-derived later,
+    ///   so half an answer beats none.
+    /// - **A trade may still be open.** A plan archives on a terminal veto or
+    ///   the expiry clock, which can precede the position closing.
+    ///
+    /// **Default impl returns an empty [`Settlement`]** carrying a warning, so
+    /// a broker that hasn't implemented a ledger feed compiles unchanged and
+    /// its callers degrade to "no settlement recorded" rather than failing the
+    /// archive — the same fail-open discipline as [`Broker::get_bidask_candles`].
+    /// Archiving must never be blocked by a settlement fetch: the plan rows are
+    /// dropped on that same tick either way.
+    fn fetch_settlement(
+        &self,
+        _instrument: &str,
+        _since: DateTime<Utc>,
+        _broker_order_ids: &[String],
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Settlement, LookupError>> {
+        async move {
+            Ok(Settlement {
+                broker: "unknown".to_string(),
+                fetched_at: now,
+                trades: Vec::new(),
+                ledger: Vec::new(),
+                warnings: vec!["this broker reports no settlement ledger".to_string()],
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -430,6 +616,52 @@ mod quote_tests {
         assert!((q.spread() - 0.0004).abs() < 1e-12);
     }
 
+    #[test]
+    fn describe_fill_renders_size_and_rate() {
+        let p = Placement {
+            order_id: "42".into(),
+            size: Some(1000.0),
+            price: Some(1.1025),
+        };
+        // Units are integral — no trailing `.0`, which would read as a
+        // fractional lot size.
+        assert_eq!(p.describe_fill(), " size=1000 @ 1.1025");
+    }
+
+    #[test]
+    fn describe_fill_is_empty_when_the_broker_reported_nothing() {
+        // The offline replay and a dry-run can't size. The outcome line must
+        // stay exactly `entered: order=…` rather than growing a dangling
+        // `size=` the operator would read as a real (zero) size.
+        assert_eq!(Placement::id_only("42").describe_fill(), "");
+    }
+
+    #[test]
+    fn describe_fill_renders_each_half_independently() {
+        // TradeNation reports a stake but the requested price may be absent,
+        // and vice versa. Neither half may swallow the other.
+        let size_only = Placement {
+            order_id: "42".into(),
+            size: Some(2.5),
+            price: None,
+        };
+        assert_eq!(size_only.describe_fill(), " size=2.5");
+        let price_only = Placement {
+            order_id: "42".into(),
+            size: None,
+            price: Some(1.1025),
+        };
+        assert_eq!(price_only.describe_fill(), " @ 1.1025");
+    }
+
+    #[test]
+    fn id_only_reports_no_size_so_a_consumer_cannot_mistake_it_for_zero() {
+        let p = Placement::id_only("o1");
+        assert_eq!(p.order_id, "o1");
+        assert_eq!(p.size, None, "unknown size must be None, never Some(0.0)");
+        assert_eq!(p.price, None);
+    }
+
     /// A tiny broker implementing only `get_quote`, proving the default
     /// `get_current_price` returns the quote's mid.
     struct MidOnlyBroker {
@@ -443,11 +675,11 @@ mod quote_tests {
             _max_risk_pct: f64,
             _max_open_positions: u32,
             _req: &EntryRequest<'_>,
-        ) -> Result<String, EntryError> {
-            Ok("noop".into())
+        ) -> Result<Placement, EntryError> {
+            Ok(Placement::id_only("noop"))
         }
-        async fn close_positions(&self, _instrument: &str) -> bool {
-            false
+        async fn close_positions(&self, _instrument: &str) -> CloseOutcome {
+            CloseOutcome::NothingOpen
         }
         async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
             0

@@ -2,7 +2,7 @@
 
 use super::action_result::ActionResult;
 use super::shared::{record_control_event_for, resolve_phase1_u32};
-use crate::broker::Broker;
+use crate::broker::{Broker, CloseOutcome};
 use crate::incoming;
 use crate::intent::VetoLevel;
 use crate::state::{StateStore, clear_named_vetos, veto_ttl_seconds};
@@ -122,31 +122,38 @@ pub async fn run_veto_with_broker<B: Broker, S: StateStore>(
     .await;
 
     let cancelled = broker.cancel_pending_for_instrument(instrument).await;
-    let closed_ok = match level {
-        VetoLevel::ClosePositions => broker.close_positions(instrument).await,
+    let close_outcome = match level {
+        VetoLevel::ClosePositions => Some(broker.close_positions(instrument).await),
         // No close requested at this level.
-        VetoLevel::CancelPending | VetoLevel::StopNextEntry => true,
+        VetoLevel::CancelPending | VetoLevel::StopNextEntry => None,
     };
+    // A close-veto that found nothing open still leaves the instrument flat,
+    // which is what the veto asked for — so only a genuine broker error is a
+    // failure. See `CloseOutcome` and the close-dispatch note.
+    let closed_ok = close_outcome.as_ref().is_none_or(CloseOutcome::is_flat);
 
     tracing::info!(
-        "veto set: instrument={} account={} name={} ttl={}h level={:?} cancelled={} closed_ok={} cleared={:?}",
+        "veto set: instrument={} account={} name={} ttl={}h level={:?} cancelled={} close={} cleared={:?}",
         instrument,
         account.unwrap_or("<global>"),
         name,
         ttl_hours,
         level,
         cancelled,
-        closed_ok,
+        close_outcome
+            .as_ref()
+            .map_or_else(|| "n/a".to_string(), |o| o.to_string()),
         cleared
     );
-    let closed_tag = match level {
-        VetoLevel::ClosePositions => Some(if closed_ok {
-            "closed=ok"
-        } else {
-            "closed=failed"
-        }),
-        _ => None,
-    };
+    // Report which of the three outcomes happened, not just ok/failed —
+    // "closed=nothing-open" is the line that would have told the operator
+    // in `BUG-market-entry-no-broker-confirmation-trail.md` that their
+    // believed-open position had never existed.
+    let closed_tag = close_outcome.as_ref().map(|o| match o {
+        CloseOutcome::Closed(_) => "closed=ok",
+        CloseOutcome::NothingOpen => "closed=nothing-open",
+        CloseOutcome::Errored => "closed=failed",
+    });
     let level_tag = match level {
         VetoLevel::StopNextEntry => "stop-next-entry",
         VetoLevel::CancelPending => "cancel-pending",

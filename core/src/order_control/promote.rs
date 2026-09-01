@@ -321,11 +321,11 @@ mod tests {
             _max_risk_pct: f64,
             _max_open_positions: u32,
             _req: &crate::broker::EntryRequest<'_>,
-        ) -> Result<String, crate::broker::EntryError> {
+        ) -> Result<crate::broker::Placement, crate::broker::EntryError> {
             panic!("no test in this module should reach the broker")
         }
-        async fn close_positions(&self, _instrument: &str) -> bool {
-            false
+        async fn close_positions(&self, _instrument: &str) -> crate::broker::CloseOutcome {
+            crate::broker::CloseOutcome::NothingOpen
         }
         async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
             0

@@ -241,7 +241,7 @@ async fn blackout_close_position<B: Broker>(broker: &B, attempt: &EntryAttempt) 
     let closed = broker.close_positions(&attempt.instrument).await;
     tracing::info!(
         "cron sweep market-blackout close: account={} trade_id={} attempt_no={} \
-         instrument={} closed_any={closed}",
+         instrument={} close={closed}",
         attempt.account.as_deref().unwrap_or("<global>"),
         attempt.trade_id,
         attempt.attempt_no,

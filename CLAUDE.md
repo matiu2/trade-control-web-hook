@@ -240,6 +240,62 @@ as the operator emergency-flatten, so the basenames keep the word
 `PerTradeExit` → `PerPositionClose` (2026-07-19) to match — "close",
 scoped per-position not per-trade.
 
+### A close that found nothing open is a SUCCESS, not a failure (v135)
+
+`Broker::close_positions` returns **`CloseOutcome`** — `Closed(n)` /
+`NothingOpen` / `Errored` — not a `bool`. The three are not interchangeable and
+collapsing any two of them is the bug this replaced.
+
+- **`NothingOpen` is a successful no-op.** The instrument is already flat, which
+  is precisely what the close asked for. It maps to `ActionResult::Ok` and so
+  **consumes the intent id**. Coding it as `Failed` (the pre-v135 behaviour) had
+  two costs: the operator-facing log read `close-failed`, and because `Failed`
+  is a `SeenDecision::Skip` the id was never consumed, so the close **refired**
+  instead of being recorded as fulfilled.
+- **Only `Errored` is retryable.** A failed broker call leaves us not knowing
+  whether a position is open, so it stays `Failed` → 502 → id not consumed.
+
+This is not a cosmetic distinction. In the incident that motivated it
+(`BUG-market-entry-no-broker-confirmation-trail.md`), a terse `close-failed` on
+a position that had **never opened** was read by the operator as "the system
+tried to close my trade and could not", and a believed-open, unmanaged short was
+left running for nine days.
+
+Things a refactorer must preserve:
+
+- **Establish "flat" positively, never by inferring it from an error.** OANDA
+  reads the position's units first (a flat instrument answers `GET
+  /positions/{instrument}` with **zero units, not a 404**); the TradeNation
+  adapter counts matching open positions before delegating. Don't replace either
+  with a string-match on broker error text.
+- **The replay broker mirrors all three arms** (`cli/src/bin/replay_candles/replay_broker.rs`) —
+  no bar to price the exit against is the replay analogue of `Errored`, nothing
+  held is `NothingOpen`. That is what keeps replay == live for this distinction.
+- **The `ClosePositions` veto uses the same mapping**, and its log line
+  distinguishes `closed=nothing-open` from `closed=failed`.
+
+### `--market-entry` / `--limit-entry` place NOTHING that the crons manage
+
+The doc comment on `tv-arm/src/position_entry.rs` ("no plan, no engine rules, no
+preps or vetos") is accurate and worth taking literally. Beyond that, because
+these intents are built with `max_retries: Tunable::Static(0)`,
+`retry_attempt_no` is `None` in `run_enter` and **`record_placement` is never
+called** — so there is **no `EntryAttempt` row**. Everything keyed off attempts
+therefore ignores such a position: the pending-order sweep, order-control
+re-check, breakeven watch, and blackout apply/watch.
+
+What *does* persist is the `request_records` row, keyed by the minted
+`pos-<instrument>-<8hex>` `trade_id` — which is why `plan timeline <trade_id>`
+can answer "did it fill?" (the broker order id is in that record's outcome), and
+why the CLI now prints that command at placement time.
+
+⚠️ **The worker answers a successful dispatch with a flat `ok`**
+(`action_to_parts`, `worker/src/http.rs`) — the broker order id is deliberately
+kept out of the response body and put in the record instead. So the CLI cannot
+honestly say "entered"; it says **`accepted by worker`**. A `--broker-dry-run`
+returns the same 2xx `ok`, so the dry-run line is made visibly different rather
+than inferred from the response.
+
 ### Resting-order holds are a REFCOUNT, not a boolean
 
 Several independent conditions can each want a resting (unfilled) entry order
