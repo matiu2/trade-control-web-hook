@@ -9,8 +9,9 @@ use broker_tradenation::TradeNationBroker;
 use candle_model::Granularity as CmGranularity;
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::{
-    AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, EntryError,
-    EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Placement, Quote,
+    AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, CloseOutcome,
+    EntryError, EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Placement,
+    Quote,
 };
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 use trade_control_core::settlement::Settlement;
@@ -71,8 +72,51 @@ impl Broker for TradeNationAdapter {
             .map_err(from_upstream_error)
     }
 
-    async fn close_positions(&self, instrument: &str) -> bool {
-        self.0.close_positions(instrument).await
+    async fn close_positions(&self, instrument: &str) -> CloseOutcome {
+        // Positively establish "flat" before delegating, so a no-op close
+        // is reported as `NothingOpen` rather than as a failure. The
+        // upstream `close_positions` returns a bare bool and cannot tell
+        // us which of the two happened (see `CloseOutcome`); this is the
+        // same account-details call it makes internally, so the common
+        // path costs one extra read and nothing else.
+        let details = match tradenation_api::get_account_details(self.0.session()).await {
+            Ok(d) => d,
+            Err(err) => {
+                tracing::error!("tn close_positions get_account_details: {err:?}");
+                return CloseOutcome::Errored;
+            }
+        };
+        let open = details
+            .positions
+            .records
+            .iter()
+            .filter(|p| p.market_name.eq_ignore_ascii_case(instrument))
+            .count();
+        if open == 0 {
+            return CloseOutcome::NothingOpen;
+        }
+        // Upstream returns "at least one closed", not a count. `open` is what
+        // we *found*, an upper bound on what actually closed — reporting it as
+        // the closed count would over-report a partial failure. Re-read the
+        // account so the count is what genuinely went away; if that read fails
+        // we still know the close succeeded, so fall back to the one position
+        // upstream's `true` proves.
+        if !self.0.close_positions(instrument).await {
+            return CloseOutcome::Errored;
+        }
+        let still_open = match tradenation_api::get_account_details(self.0.session()).await {
+            Ok(after) => after
+                .positions
+                .records
+                .iter()
+                .filter(|p| p.market_name.eq_ignore_ascii_case(instrument))
+                .count(),
+            Err(err) => {
+                tracing::warn!("tn close_positions post-close recount: {err:?}");
+                return CloseOutcome::Closed(1);
+            }
+        };
+        CloseOutcome::Closed(open.saturating_sub(still_open).max(1))
     }
 
     async fn cancel_pending_for_instrument(&self, instrument: &str) -> usize {

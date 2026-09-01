@@ -568,8 +568,8 @@ mod tests {
             *n += 1;
             Ok(crate::broker::Placement::id_only(format!("order-{n}")))
         }
-        async fn close_positions(&self, _instrument: &str) -> bool {
-            false
+        async fn close_positions(&self, _instrument: &str) -> crate::broker::CloseOutcome {
+            crate::broker::CloseOutcome::NothingOpen
         }
         async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
             0

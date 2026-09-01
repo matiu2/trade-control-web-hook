@@ -1,4 +1,10 @@
-# BUG (suspected) — `--market-entry` / `--limit-entry` give no visible confirmation the broker actually opened the position
+# BUG — `--market-entry` / `--limit-entry` give no visible confirmation the broker actually opened the position
+
+**STATUS: FIXED (v135, 2026-08-30)** — both halves. See "Resolution" at the
+bottom. The `close-failed` conflation is fixed at the root (`CloseOutcome`);
+the placement-time confirmation is fixed in the CLI. The remaining known gap —
+no `EntryAttempt` row, so no cron manages the position — is documented as
+intended behaviour rather than fixed, in CLAUDE.md.
 
 **Found:** 2026-08-30, while journaling a NZD/CAD H&S short (demo-journal trade 152).
 
@@ -99,3 +105,60 @@ pulling broker records — which is what happened here, nine days late.
   `broker-tradenation/src/orders.rs:248-270`
 - `run_close`: `core/src/dispatch/close.rs:236-255`
 - `--market-entry` CLI path: `tv-arm/src/position_entry.rs:40-61`
+
+## Resolution (v135, 2026-08-30)
+
+**Sub-possibility (2) is now moot and (1) is much louder.** Both suggested fixes
+were taken, and the `close-failed` half was fixed at its root rather than at the
+log line.
+
+### `close-failed` no longer conflates "nothing to close" with "call errored"
+
+`Broker::close_positions` returned a bare `bool`. It now returns `CloseOutcome`
+— `Closed(n)` / `NothingOpen` / `Errored` (`core/src/broker.rs`).
+
+`NothingOpen` is treated as the **success** it is: the instrument is already
+flat, which is what the close asked for. `run_close` maps it to
+`ActionResult::Ok("closed: nothing-open")`; only `Errored` stays `Failed`.
+
+This turned out to matter more than the log wording. `ActionResult::Failed` is a
+`SeenDecision::Skip`, so the old coding meant the intent id was never consumed
+and the close **refired** rather than being recorded as fulfilled.
+
+Both brokers now establish "flat" *positively* instead of inferring it from an
+error — OANDA reads the position's units (a flat instrument answers with zero
+units, not a 404), the TradeNation adapter counts matching open positions before
+delegating. The replay broker mirrors all three arms, so replay == live.
+
+The `ClosePositions` veto shares the mapping; its log line now reads
+`closed=nothing-open` rather than `closed=failed`.
+
+### The placement-time line no longer overstates what happened
+
+The worker answers a successful dispatch with a flat `ok` (`action_to_parts`) —
+the broker order id goes to the persisted request record, not the response body.
+So the CLI had no evidence for the word it was printing. It now prints:
+
+```
+accepted by worker: trade_id=pos-nzd-cad-...
+  confirm the fill with: trade-control-<env> plan timeline pos-nzd-cad-...
+```
+
+and a `--broker-dry-run` — which returns the same 2xx `ok`, and so previously
+printed a byte-identical line — now says `DRY RUN` plainly.
+
+### What was NOT fixed, and why
+
+The suggested "persisted record keyed by instrument + timestamp" turned out to
+already exist in a better form: `build_position_enter` mints a
+`pos-<instrument>-<8hex>` `trade_id`, and the `request_records` row carries the
+rich `entered: order=<id>` outcome under it. `plan timeline <trade_id>` reads it.
+The gap was that nothing ever showed the operator that trade_id — which the new
+CLI line does.
+
+Still true, and now documented in CLAUDE.md rather than fixed: a position entry
+is `max_retries: Static(0)`, so `record_placement` is never called and **no
+`EntryAttempt` row exists**. Every cron keyed off attempts — breakeven watch,
+blackout apply/watch, order-control, the pending sweep — therefore ignores the
+position. That is the fire-and-forget contract this path advertises, so it is
+left as-is; it is worth revisiting only if that contract changes.

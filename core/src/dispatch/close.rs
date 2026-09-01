@@ -5,7 +5,7 @@
 
 use super::action_result::ActionResult;
 use crate::allow_close_gate;
-use crate::broker::Broker;
+use crate::broker::{Broker, CloseOutcome};
 use crate::incoming;
 use crate::state::StateStore;
 
@@ -233,7 +233,7 @@ pub async fn run_close<B: Broker, S: StateStore>(
             };
         }
     }
-    let ok = broker.close_positions(&verified.intent.instrument).await;
+    let outcome = broker.close_positions(&verified.intent.instrument).await;
     // veto_on_reversal is EXIT-ONLY (2026-07-19): a gate-passed
     // reversal-close flattens the open position and does NOTHING else. It
     // no longer writes a `reversal` veto to block a future enter. The
@@ -248,10 +248,18 @@ pub async fn run_close<B: Broker, S: StateStore>(
     // divergence: the offline replay never ran `run_close`, so it never
     // wrote this veto, and a later multi-shot enter passed offline but
     // rejected live. With no veto written on either side, replay == live.
-    if ok {
-        ActionResult::Ok("closed".into())
-    } else {
-        ActionResult::Failed("close-failed".into())
+    match outcome {
+        CloseOutcome::Closed(n) => ActionResult::Ok(format!("closed ({n})")),
+        // Nothing was open, so the instrument is already in the state the
+        // close asked for. Reporting this as `Failed` (the pre-2026-08
+        // behaviour) was actively misleading twice over: the operator read
+        // `close-failed` as "the system tried to close my position and
+        // could not", and because `Failed` is a `SeenDecision::Skip` the
+        // intent id was never consumed, so the same close refired. It is a
+        // successful no-op — see `BUG-market-entry-no-broker-confirmation-trail.md`.
+        CloseOutcome::NothingOpen => ActionResult::Ok("closed: nothing-open".into()),
+        // Genuinely unknown state — the only case that should retry.
+        CloseOutcome::Errored => ActionResult::Failed("close-failed: broker-errored".into()),
     }
 }
 
@@ -443,9 +451,18 @@ mod reversal_exit_only_tests {
 
     /// A broker whose quote sits inside the reversal band so the
     /// price-window gate passes and `run_close` reaches the (now removed)
-    /// veto-write site. `close_positions` returns true so the close is
-    /// `Ok` — the veto used to be written on the gate-pass regardless.
-    struct InBandBroker;
+    /// veto-write site. The close outcome is a field so the tests below can
+    /// drive all three arms of [`CloseOutcome`] through one gate-passing
+    /// broker.
+    struct InBandBroker(CloseOutcome);
+
+    impl Default for InBandBroker {
+        /// A close that actually closed something — what this fake always
+        /// did before the outcome became configurable.
+        fn default() -> Self {
+            Self(CloseOutcome::Closed(1))
+        }
+    }
 
     impl Broker for InBandBroker {
         async fn place_entry(
@@ -456,8 +473,8 @@ mod reversal_exit_only_tests {
         ) -> Result<crate::broker::Placement, EntryError> {
             Ok(crate::broker::Placement::id_only("noop"))
         }
-        async fn close_positions(&self, _instrument: &str) -> bool {
-            true
+        async fn close_positions(&self, _instrument: &str) -> CloseOutcome {
+            self.0.clone()
         }
         async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
             0
@@ -565,7 +582,12 @@ mod reversal_exit_only_tests {
         let store = MemStateStore::default();
         let verified = armed_close();
 
-        let result = pollster::block_on(run_close(&InBandBroker, &store, &verified, now()));
+        let result = pollster::block_on(run_close(
+            &InBandBroker::default(),
+            &store,
+            &verified,
+            now(),
+        ));
         assert!(
             matches!(result, ActionResult::Ok(_)),
             "gate should pass and close succeed, got {}",
@@ -609,11 +631,103 @@ mod reversal_exit_only_tests {
         )
         .expect("shell parses");
 
-        let result = pollster::block_on(run_close(&InBandBroker, &store, &verified, now()));
+        let result = pollster::block_on(run_close(
+            &InBandBroker::default(),
+            &store,
+            &verified,
+            now(),
+        ));
         assert!(
             matches!(result, ActionResult::Rejected { .. }),
             "an engulfer whose anchor is above the band (continuation) must NOT close, got {}",
             result.describe()
         );
+    }
+
+    /// The `BUG-market-entry-no-broker-confirmation-trail.md` case: a close
+    /// fires against an instrument with no open position. The instrument is
+    /// already flat — exactly what the close asked for — so this is a
+    /// successful no-op, NOT a failure.
+    ///
+    /// Two things turned on this. The operator read the old terse
+    /// `close-failed` as "the system tried to close my position and could
+    /// not", and left what they believed was an unmanaged open short running
+    /// for nine days. And because `ActionResult::Failed` is a
+    /// `SeenDecision::Skip`, the intent id was never consumed, so the close
+    /// refired instead of being recorded as fulfilled.
+    #[test]
+    fn close_with_nothing_open_is_ok_not_failed() {
+        let store = MemStateStore::default();
+        let verified = armed_close();
+        let broker = InBandBroker(CloseOutcome::NothingOpen);
+
+        let result = pollster::block_on(run_close(&broker, &store, &verified, now()));
+
+        match &result {
+            ActionResult::Ok(outcome) => assert!(
+                outcome.contains("nothing-open"),
+                "outcome must name the no-op so an operator can tell it from a \
+                 real close, got {outcome:?}"
+            ),
+            other => panic!(
+                "nothing-open is a successful no-op, not a failure, got {}",
+                other.describe()
+            ),
+        }
+        // The id is consumed, so the close is not retried forever.
+        assert!(
+            matches!(
+                crate::dispatch::seen::seen_decision(&result),
+                crate::dispatch::seen::SeenDecision::Mark { .. }
+            ),
+            "a fulfilled close must be marked seen"
+        );
+    }
+
+    /// The other half of the distinction: a broker call that genuinely errored
+    /// leaves us not knowing whether a position is open, so it stays `Failed`
+    /// — 502, id not consumed, next fire retries.
+    #[test]
+    fn close_with_broker_error_stays_failed_and_retries() {
+        let store = MemStateStore::default();
+        let verified = armed_close();
+        let broker = InBandBroker(CloseOutcome::Errored);
+
+        let result = pollster::block_on(run_close(&broker, &store, &verified, now()));
+
+        assert!(
+            matches!(result, ActionResult::Failed(_)),
+            "a broker error must remain a failure, got {}",
+            result.describe()
+        );
+        assert!(
+            matches!(
+                crate::dispatch::seen::seen_decision(&result),
+                crate::dispatch::seen::SeenDecision::Skip { .. }
+            ),
+            "an errored close must NOT consume the intent id"
+        );
+    }
+
+    /// A close that really closed something reports how many, so a real close
+    /// is distinguishable from the no-op in the log.
+    #[test]
+    fn close_that_closed_positions_reports_the_count() {
+        let store = MemStateStore::default();
+        let verified = armed_close();
+        let broker = InBandBroker(CloseOutcome::Closed(2));
+
+        let result = pollster::block_on(run_close(&broker, &store, &verified, now()));
+
+        match &result {
+            ActionResult::Ok(outcome) => {
+                assert!(outcome.contains('2'), "expected the count, got {outcome:?}");
+                assert!(
+                    !outcome.contains("nothing-open"),
+                    "a real close must not read as a no-op, got {outcome:?}"
+                );
+            }
+            other => panic!("expected Ok, got {}", other.describe()),
+        }
     }
 }

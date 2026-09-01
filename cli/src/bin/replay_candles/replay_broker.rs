@@ -18,8 +18,8 @@ use super::fill_sim::{SimOutcome, simulate_fill_resolved_zoom};
 use super::report::FillKind;
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{
-    AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, EntryError,
-    EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
+    AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, CloseOutcome,
+    EntryError, EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
 };
 use trade_control_core::incoming::Verified;
 use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, RiskBudget, Shell};
@@ -1044,17 +1044,21 @@ impl Broker for ReplayBroker {
         }
     }
 
-    async fn close_positions(&self, instrument: &str) -> bool {
+    async fn close_positions(&self, instrument: &str) -> CloseOutcome {
         // S5: actually flatten held open positions for this instrument at the
         // current bar's close — the live worker's `run_close` / ClosePositions
         // veto flattens at market when the engine dispatches the close, so the
         // bar's close is the faithful exit price. The loop sets the reason
         // (Reversal by default; Expiry for the trade-expiry veto) via
         // `set_close_reason` right before the engine dispatches this close.
-        // Returns true iff at least one position was closed (mirrors the real
-        // broker's "did I close anything").
+        // Mirrors the real broker's three-way `CloseOutcome`: no bar to price
+        // the exit against is the replay analogue of a broker call we cannot
+        // complete (`Errored`), an instrument with nothing held is a
+        // successful no-op (`NothingOpen`), and anything else reports the
+        // count closed. Keeping the same three cases here is what keeps
+        // replay == live for the `close-failed` distinction.
         let Some(bar) = self.candle_at_as_of() else {
-            return false;
+            return CloseOutcome::Errored;
         };
         let exit_at = bar.time;
         let exit_price = (bar.bid_c + bar.ask_c) / 2.0;
@@ -1071,8 +1075,9 @@ impl Broker for ReplayBroker {
             }
         });
         if to_close.is_empty() {
-            return false;
+            return CloseOutcome::NothingOpen;
         }
+        let closed_count = to_close.len();
         let mut closed = self.closed.borrow_mut();
         for p in to_close {
             closed.push(ClosedTrade {
@@ -1098,7 +1103,7 @@ impl Broker for ReplayBroker {
                 reason,
             });
         }
-        true
+        CloseOutcome::Closed(closed_count)
     }
 
     async fn cancel_pending_for_instrument(&self, instrument: &str) -> usize {
