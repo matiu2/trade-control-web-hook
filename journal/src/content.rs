@@ -82,6 +82,15 @@ fn timeline(app: &App) -> String {
     for e in &events {
         out.push_str(&format!("{} {} {}\n", e.ts, e.marker, e.text));
     }
+    // Same settlement block the screen shows, so a copied timeline carries the
+    // broker's account of the trade too — that is usually the half being
+    // pasted into a report.
+    if let Some(export) = app.current_data().and_then(|d| d.export_json.as_deref()) {
+        for line in crate::timeline::settlement_lines(export) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
     out
 }
 

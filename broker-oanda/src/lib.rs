@@ -56,7 +56,7 @@ impl Broker for OandaBroker {
         max_risk_pct: f64,
         max_open_positions: u32,
         req: &EntryRequest<'_>,
-    ) -> Result<String, EntryError> {
+    ) -> Result<trade_control_core::broker::Placement, EntryError> {
         place_entry(
             &self.client,
             &self.account_id,

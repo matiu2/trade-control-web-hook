@@ -1434,8 +1434,8 @@ mod tests {
             _max_risk_pct: f64,
             _max_open_positions: u32,
             _req: &EntryRequest<'_>,
-        ) -> Result<String, EntryError> {
-            Ok("order-redriven".into())
+        ) -> Result<crate::broker::Placement, EntryError> {
+            Ok(crate::broker::Placement::id_only("order-redriven"))
         }
         async fn close_positions(&self, _instrument: &str) -> bool {
             false

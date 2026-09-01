@@ -512,14 +512,16 @@ mod tests {
             _max_risk_pct: f64,
             _max_open_positions: u32,
             req: &EntryRequest<'_>,
-        ) -> Result<String, EntryError> {
+        ) -> Result<crate::broker::Placement, EntryError> {
             self.places.borrow_mut().push(req.instrument.to_string());
             if self.reject_entry {
                 // The real rule-4 rejection: price drifted past the trigger
                 // between cancel and re-place.
                 return Err(EntryError::EntryTooCloseToMarket);
             }
-            Ok("ord-2".into())
+            // These tests assert *which* instrument reached the broker, not the
+            // sizing — `id_only` keeps that the subject.
+            Ok(crate::broker::Placement::id_only("ord-2"))
         }
         async fn close_positions(&self, _instrument: &str) -> bool {
             false

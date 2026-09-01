@@ -871,7 +871,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
         .place_entry(max_risk_pct, max_open_positions, &entry_request)
         .await
     {
-        Ok(order_id) => Ok(order_id),
+        Ok(placed) => Ok(placed),
         Err(EntryError::EntryTooCloseToMarket) => {
             place_entry_too_close_fallback(
                 broker,
@@ -886,7 +886,8 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     };
 
     match placement {
-        Ok(order_id) => {
+        Ok(placed) => {
+            let order_id = placed.order_id.clone();
             if resolved.dry_run {
                 tracing::info!("DRY-RUN entry id={} (not placed)", verified.intent.id);
                 ActionResult::Ok(format!("dry-run: id={}", verified.intent.id))
@@ -951,7 +952,15 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                          — this order can't be blackout-cancelled+restored"
                     );
                 }
-                ActionResult::Ok(format!("entered: order={order_id}"))
+                // The operator's trade log reads this string verbatim (it rides
+                // `DispatchOutcome.outcome` into `plan-timeline` / `journal`),
+                // so the size + requested rate go here rather than only into
+                // the broker's own log line. Empty when the broker reported
+                // neither, keeping the historic `entered: order=…` shape.
+                ActionResult::Ok(format!(
+                    "entered: order={order_id}{}",
+                    placed.describe_fill()
+                ))
             }
         }
         Err(err) => {
@@ -1226,7 +1235,7 @@ async fn place_entry_too_close_fallback<B: Broker>(
     intent_id: &str,
     max_risk_pct: f64,
     max_open_positions: u32,
-) -> Result<String, EntryError> {
+) -> Result<crate::broker::Placement, EntryError> {
     use crate::intent::ResolvedEntry;
 
     // Only stop entries carry the fallback; a too-close on anything else
@@ -1283,11 +1292,12 @@ async fn place_entry_too_close_fallback<B: Broker>(
                 .place_entry(max_risk_pct, max_open_positions, &market_request)
                 .await
             {
-                Ok(order_id) => {
+                Ok(placed) => {
                     tracing::info!(
-                        "too-close fallback: market re-place succeeded (id={intent_id} order={order_id})"
+                        "too-close fallback: market re-place succeeded (id={intent_id} order={})",
+                        placed.order_id
                     );
-                    Ok(order_id)
+                    Ok(placed)
                 }
                 Err(err) => {
                     // One attempt only — do not loop. Surface the
@@ -1324,11 +1334,12 @@ async fn place_entry_too_close_fallback<B: Broker>(
                 .place_entry(max_risk_pct, max_open_positions, &limit_request)
                 .await
             {
-                Ok(order_id) => {
+                Ok(placed) => {
                     tracing::info!(
-                        "too-close fallback: limit re-place succeeded (id={intent_id} order={order_id})"
+                        "too-close fallback: limit re-place succeeded (id={intent_id} order={})",
+                        placed.order_id
                     );
-                    Ok(order_id)
+                    Ok(placed)
                 }
                 Err(err) => {
                     // One attempt only. Surface the original too-close
@@ -1362,11 +1373,12 @@ async fn place_entry_too_close_fallback<B: Broker>(
                 .place_entry(max_risk_pct, max_open_positions, &stop_request)
                 .await
             {
-                Ok(order_id) => {
+                Ok(placed) => {
                     tracing::info!(
-                        "too-close fallback: stop re-place succeeded (id={intent_id} order={order_id})"
+                        "too-close fallback: stop re-place succeeded (id={intent_id} order={})",
+                        placed.order_id
                     );
-                    Ok(order_id)
+                    Ok(placed)
                 }
                 Err(err) => {
                     tracing::error!(

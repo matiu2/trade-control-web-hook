@@ -563,10 +563,10 @@ mod tests {
             _max_risk_pct: f64,
             _max_open_positions: u32,
             _req: &EntryRequest<'_>,
-        ) -> Result<String, EntryError> {
+        ) -> Result<crate::broker::Placement, EntryError> {
             let mut n = self.place_calls.borrow_mut();
             *n += 1;
-            Ok(format!("order-{n}"))
+            Ok(crate::broker::Placement::id_only(format!("order-{n}")))
         }
         async fn close_positions(&self, _instrument: &str) -> bool {
             false
@@ -1087,6 +1087,7 @@ mod tests {
             _plan: &crate::trade_plan::TradePlan,
             _final_state: &crate::plan_state::PlanState,
             _archived_at: DateTime<Utc>,
+            _settlement: Option<crate::settlement::Settlement>,
         ) -> Result<(), StateError> {
             Ok(())
         }

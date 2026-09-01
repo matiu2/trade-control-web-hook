@@ -453,8 +453,8 @@ mod reversal_exit_only_tests {
             _max_risk_pct: f64,
             _max_open_positions: u32,
             _req: &EntryRequest<'_>,
-        ) -> Result<String, EntryError> {
-            Ok("noop".into())
+        ) -> Result<crate::broker::Placement, EntryError> {
+            Ok(crate::broker::Placement::id_only("noop"))
         }
         async fn close_positions(&self, _instrument: &str) -> bool {
             true

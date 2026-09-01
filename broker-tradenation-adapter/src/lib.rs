@@ -10,11 +10,14 @@ use candle_model::Granularity as CmGranularity;
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::{
     AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, EntryError,
-    EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
+    EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Placement, Quote,
 };
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
+use trade_control_core::settlement::Settlement;
 use tradenation_api::ohlcv::PriceType;
 use tradenation_api::{OpeningOrder, Position, TransactionRecord};
+
+mod settlement;
 
 /// Closed-trade scan window. Plan §3 recommends ~50; one TN page
 /// returns ~50 records so we fetch a single page. **Caveat: TN's
@@ -32,7 +35,7 @@ impl Broker for TradeNationAdapter {
         max_risk_pct: f64,
         max_open_positions: u32,
         req: &EntryRequest<'_>,
-    ) -> Result<String, EntryError> {
+    ) -> Result<Placement, EntryError> {
         if req.dry_run {
             // Upstream `place_entry` doesn't yet support a no-op mode,
             // so we can't run the full sizing path (FX, market resolve,
@@ -48,7 +51,10 @@ impl Broker for TradeNationAdapter {
                 req.take_profit,
                 req.risk,
             );
-            return Ok(format!("dry-run-{}", req.instrument));
+            // No size to report: upstream has no dry-run mode, so the sizing
+            // path genuinely did not run. `id_only` says "unknown" rather than
+            // inventing a figure — unlike OANDA's dry-run, which DOES size.
+            return Ok(Placement::id_only(format!("dry-run-{}", req.instrument)));
         }
         let upstream_req = broker_tradenation::EntryRequest {
             instrument: req.instrument,
@@ -61,6 +67,7 @@ impl Broker for TradeNationAdapter {
         self.0
             .place_entry(max_risk_pct, max_open_positions, &upstream_req)
             .await
+            .map(from_upstream_placement)
             .map_err(from_upstream_error)
     }
 
@@ -438,6 +445,76 @@ impl Broker for TradeNationAdapter {
             AmendError::Transient
         })
     }
+
+    /// Fetch both TradeNation history streams and fold them into a
+    /// [`Settlement`]. See `settlement.rs` for why both are needed and how
+    /// attribution works.
+    ///
+    /// **Fails soft.** A stream that errors contributes a warning instead of
+    /// failing the whole call: this runs while a plan is being archived, and
+    /// the plan's rows are dropped on that same tick either way — returning
+    /// `Err` would trade a partial record for no record at all. Only the
+    /// per-stream failure is surfaced, so a silent empty is impossible.
+    async fn fetch_settlement(
+        &self,
+        instrument: &str,
+        since: DateTime<Utc>,
+        broker_order_ids: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<Settlement, LookupError> {
+        // How far back to ask. TN's endpoints take whole days, so round the
+        // plan's own window up and clamp: never less than a day (a plan that
+        // armed and died within hours still needs today's rows), never more
+        // than the 90-day cap the closed-trade scan already uses.
+        let span_days = (now - since)
+            .num_days()
+            .clamp(1, i64::from(CLOSED_TRADE_HISTORY_DAYS));
+        let days = u32::try_from(span_days).unwrap_or(CLOSED_TRADE_HISTORY_DAYS);
+
+        let mut warnings = Vec::new();
+
+        let activity = match tradenation_api::get_all_activity(
+            self.0.client(),
+            self.0.session(),
+            days,
+        )
+        .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::error!("tn fetch_settlement get_all_activity({instrument}): {err:?}");
+                warnings.push(format!("activity log unavailable: {err}"));
+                Vec::new()
+            }
+        };
+
+        let transactions =
+            match tradenation_api::get_all_transactions(self.0.client(), self.0.session(), days)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::error!(
+                        "tn fetch_settlement get_all_transactions({instrument}): {err:?}"
+                    );
+                    warnings.push(format!("cash ledger unavailable: {err}"));
+                    Vec::new()
+                }
+            };
+
+        let mut out = settlement::build_settlement(
+            instrument,
+            broker_order_ids,
+            &activity,
+            &transactions,
+            since,
+            now,
+        );
+        // Fetch-level failures lead: they explain any emptiness below them.
+        warnings.append(&mut out.warnings);
+        out.warnings = warnings;
+        Ok(out)
+    }
 }
 
 /// The bits of a position / opening order `amend_stop` needs to call the
@@ -652,6 +729,23 @@ fn chunk_windows(
         }
     }
     windows
+}
+
+/// Translate upstream's [`broker_tradenation::Placement`] into ours. The two
+/// are structurally identical by convention (like `EntryRequest` /
+/// `EntryError`), so this is a field-for-field move — but it must stay a real
+/// translation rather than a re-export, because the boundary is what keeps the
+/// worker generic over [`Broker`].
+///
+/// `size` is the stake upstream sized; `price` the **requested** rate (`None`
+/// for a market entry, which TN fills at its own live bid/ask). Neither is a
+/// fill price.
+fn from_upstream_placement(p: broker_tradenation::Placement) -> Placement {
+    Placement {
+        order_id: p.order_id,
+        size: p.size,
+        price: p.price,
+    }
 }
 
 fn from_upstream_error(e: broker_tradenation::EntryError) -> EntryError {

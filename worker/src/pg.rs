@@ -22,6 +22,7 @@ use sqlx::postgres::PgPoolOptions;
 use trade_control_core::control_event::ControlEvent;
 use trade_control_core::intent::{Action, NoEntryWindow};
 use trade_control_core::plan_state::PlanState;
+use trade_control_core::settlement::Settlement;
 use trade_control_core::state::{
     ArchivedPlan, EntryAttempt, HeldTradeRecord, MIN_TTL_SECONDS, MwState, NewsEntry, PauseEntry,
     SeenEntry, Snapshot, SpreadBlackoutWindow, StateError, StateStore, StoredPlan,
@@ -1356,14 +1357,18 @@ impl PgStateStore {
         plan: &TradePlan,
         final_state: &PlanState,
         archived_at: DateTime<Utc>,
+        settlement: Option<Settlement>,
     ) -> Result<(), StateError> {
         // ArchivedPlan's `account` field is #[serde(skip)] — the column is the
-        // source of truth, recovered on read. Body carries plan/final_state/at.
+        // source of truth, recovered on read. Body carries plan/final_state/at
+        // and, when the broker answered, the settlement. The body is one
+        // `jsonb` column, so the added field needs no migration.
         let archived = ArchivedPlan {
             account: None, // skipped in serialisation; column holds the truth
             plan: plan.clone(),
             final_state: final_state.clone(),
             archived_at,
+            settlement,
         };
         let body = to_jsonb(&archived)?;
         sqlx::query(
@@ -1922,8 +1927,9 @@ impl StateStore for PgStateStore {
         plan: &TradePlan,
         final_state: &PlanState,
         archived_at: DateTime<Utc>,
+        settlement: Option<Settlement>,
     ) -> Result<(), StateError> {
-        self.archive_plan_impl(account, plan, final_state, archived_at)
+        self.archive_plan_impl(account, plan, final_state, archived_at, settlement)
             .await
     }
     async fn list_all_archived_plans(&self) -> Result<Vec<ArchivedPlan>, StateError> {
