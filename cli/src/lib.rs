@@ -6,6 +6,7 @@ mod admin_secret;
 mod calendar_bars;
 mod control;
 mod expiry;
+pub mod fixtures_dir;
 mod forex_factory_cache;
 mod history;
 mod instruments;
