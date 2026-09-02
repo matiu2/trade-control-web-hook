@@ -609,6 +609,18 @@ pub struct Args {
     #[arg(long, value_name = "NAME", requires = "save_fixture")]
     pub fixture_name: Option<String>,
 
+    /// Directory holding the replay corpus that `--save-fixture` writes into.
+    ///
+    /// Defaults to the `replay-fixtures/` of the checkout you are standing in,
+    /// found by walking up from the current directory. It is deliberately *not*
+    /// derived from where this binary was compiled: a deployed CLI is built in
+    /// whatever tree the deploy script ran in, and that tree may since have been
+    /// deleted — which failed the write with a path the operator never chose.
+    ///
+    /// Also settable as `TRADE_CONTROL_FIXTURES_DIR`; this flag wins.
+    #[arg(long, value_name = "DIR", env = "TRADE_CONTROL_FIXTURES_DIR")]
+    pub fixtures_dir: Option<PathBuf>,
+
     /// What the fixture is meant to pin — stored in its `meta.json` so a future
     /// reader knows why it exists. Free text; never affects a verdict.
     ///

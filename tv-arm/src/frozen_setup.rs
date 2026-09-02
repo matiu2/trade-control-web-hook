@@ -117,8 +117,19 @@ impl FrozenSetup {
 
     /// Write as pretty JSON, with a trailing newline so the file is diffable and
     /// plays nicely with line-oriented tools.
+    ///
+    /// Creates the parent directory if it is missing. The chart read is the
+    /// expensive, human-paced part of a capture, and losing it to a bare
+    /// `No such file or directory` — after the operator has already confirmed
+    /// the pattern — costs a whole chart session to redo. A corpus directory
+    /// that does not exist yet is the normal state of a fresh checkout, not an
+    /// error worth failing a capture over.
     pub fn write(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self).wrap_err("serialize frozen setup")?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .wrap_err_with(|| format!("create fixtures directory {}", parent.display()))?;
+        }
         std::fs::write(path, format!("{json}\n"))
             .wrap_err_with(|| format!("write frozen setup to {}", path.display()))
     }
@@ -297,6 +308,27 @@ mod tests {
         );
         assert_eq!(s, back);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A capture into a corpus directory that does not exist yet must create it
+    /// rather than throw away the chart read. This is the reported failure:
+    /// `write frozen setup to …/replay-fixtures/… : No such file or directory`,
+    /// raised after the pattern had already been confirmed on the chart.
+    #[test]
+    fn writing_into_a_missing_corpus_directory_creates_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp
+            .path()
+            .join("replay-fixtures")
+            .join("eur-cad-h1-2026-08-16.spec.json");
+        assert!(!path.parent().expect("has parent").exists());
+
+        setup()
+            .write(&path)
+            .expect("write must create the corpus dir");
+
+        let back = FrozenSetup::load(&path).expect("reads back");
+        assert_eq!(back, setup(), "the round trip must survive the mkdir");
     }
 
     /// A missing file is a clean error naming the path, not a panic.

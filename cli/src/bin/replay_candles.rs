@@ -63,7 +63,7 @@ mod replay_candles {
 }
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use clap::{CommandFactory, Parser};
@@ -85,14 +85,6 @@ use replay_candles::{
 use trade_control_cli::replay_args::{CandleSource, DetectorMarkConfig, ReplayArgs as Args};
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan, Trigger};
 use trading_view::mcp::TvMcp;
-
-/// Default fixtures directory: `<repo-root>/replay-fixtures`, resolved from the
-/// cli crate's manifest dir (`.../cli`) so it's stable regardless of cwd.
-fn default_fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("replay-fixtures")
-}
 
 /// Classify whatever [`run`] returned, always print a terminal line, and exit
 /// with a code that tells a driver what to do about it.
@@ -639,11 +631,17 @@ fn next_pull_from(
     pull_from - Duration::seconds(extra_secs.max(bar_secs))
 }
 
-/// The fixtures directory: `--fixtures-dir` if given, else the repo-root default.
+/// The fixtures directory: `--fixtures-dir` if given, else resolved from the
+/// **running** process — see [`trade_control_cli::fixtures_dir`].
+///
+/// Deliberately not `env!("CARGO_MANIFEST_DIR")`: that is the tree this binary
+/// was *built* in, which for a deployed CLI is a build directory that may have
+/// been deleted (or, worse, still exist and quietly take the write).
 fn fixtures_dir(args: &Args) -> PathBuf {
-    args.fixtures_dir
-        .clone()
-        .unwrap_or_else(default_fixtures_dir)
+    trade_control_cli::fixtures_dir::resolve(
+        args.fixtures_dir.as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
 }
 
 /// Replay saved fixtures offline: one (`--fixture`) or many
