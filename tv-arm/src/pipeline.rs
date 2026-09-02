@@ -144,30 +144,41 @@ fn expand_save_fixture(mut args: Args, setup: &SetupInputs) -> Args {
     let name = crate::save_fixture::resolve_name(&args, &setup.instrument, &granularity, &date);
 
     args.save_matrix = true;
+    // Resolved ONCE and handed to both halves: the spec written here and the
+    // fixtures the chained `replay-candles` writes must land in the same corpus.
+    let fixtures_dir = default_fixtures_dir(&args);
     if args.spec_out.is_none() {
-        args.spec_out = Some(crate::save_fixture::spec_path(
-            &default_fixtures_dir(),
-            &name,
-        ));
+        args.spec_out = Some(crate::save_fixture::spec_path(&fixtures_dir, &name));
     }
     // The `replay` subcommand is what carries the fixture flags. Without it
     // there is nothing to save, so `validate` rejects the combination before we
     // ever reach a chart.
     if let Some(crate::args::Command::Replay { args: passthrough }) = args.command.as_mut() {
-        *passthrough =
-            crate::save_fixture::replay_tokens(&name, args.message.as_deref(), passthrough);
+        *passthrough = crate::save_fixture::replay_tokens(
+            &name,
+            args.message.as_deref(),
+            &fixtures_dir,
+            passthrough,
+        );
     }
     args
 }
 
 /// Where `--save-fixture` puts specs and fixtures when not told otherwise.
 ///
-/// Mirrors `replay-candles`' own default (`<repo>/replay-fixtures`) so the two
-/// agree without `tv-arm` having to pass `--fixtures-dir` on every call.
-fn default_fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("replay-fixtures")
+/// Shares one resolver with `replay-candles` (`trade_control_cli::fixtures_dir`)
+/// so the spec `tv-arm` writes and the fixtures the chained replay saves land in
+/// the **same** corpus. Two hand-written defaults could disagree, which is worse
+/// than either being wrong: the capture would half-succeed, scattered across two
+/// trees, and still exit 0.
+///
+/// Resolved from the running process, never from `CARGO_MANIFEST_DIR` — see the
+/// module docs on the resolver for why the build directory is the wrong answer.
+fn default_fixtures_dir(args: &Args) -> PathBuf {
+    trade_control_cli::fixtures_dir::resolve(
+        args.fixtures_dir.as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
 }
 
 /// Write the chart-derived setup to a `--spec-out` file for later `--spec-in`.

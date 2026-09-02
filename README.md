@@ -3511,10 +3511,21 @@ of growing near-duplicates (a re-capture is almost always a *correction*).
   to add or reword later by editing that file directly: nothing validates it
   against `expected.json`, and `--rebless` rewrites only `expected.json`, so
   notes survive a re-bless.
+- `--fixtures-dir <dir>` picks the corpus to write into. It defaults to the
+  `replay-fixtures/` of **the checkout you are standing in**, found by walking up
+  from the current directory, and is also settable as
+  `TRADE_CONTROL_FIXTURES_DIR`. The same resolved directory is handed to the
+  chained `replay`, so the spec and the fixtures cannot land in different trees.
 - Anything you put after `replay` still wins — the flag only fills in defaults.
 
 `--spec-out` is included on purpose: the chart read is the expensive,
 human-paced part, and freezing it is what makes every later re-run free.
+
+> The corpus is resolved from the **running process**, never from where the
+> binary was compiled. A deployed CLI is built in whatever tree the deploy script
+> ran in; when that tree is later deleted, a compile-time default fails the write
+> with a path you never chose, and while it still exists it quietly writes into
+> another checkout's corpus. See CHANGELOG v136.
 
 ### The entry-sensitivity grid: `--save-matrix`
 

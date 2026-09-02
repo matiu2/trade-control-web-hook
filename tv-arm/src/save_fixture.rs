@@ -63,13 +63,29 @@ fn sets(passthrough: &[String], flag: &str) -> bool {
 
 /// Fill in the `replay` passthrough for a `--save-fixture` capture.
 ///
-/// Injects `--save <name>`, `--simulate true` and (when given) `--message`,
-/// each only if absent. Returns the augmented token list.
-pub fn replay_tokens(name: &str, message: Option<&str>, passthrough: &[String]) -> Vec<String> {
+/// Injects `--save <name>`, `--simulate true`, `--fixtures-dir <dir>` and (when
+/// given) `--message`, each only if absent. Returns the augmented token list.
+///
+/// `fixtures_dir` is passed through explicitly rather than left to
+/// `replay-candles`' own default so both halves of one capture agree by
+/// construction. They are separate processes resolving the same question, and a
+/// capture whose spec lands in one corpus and whose fixtures land in another
+/// still exits 0 — the failure would be silent and only visible much later, as a
+/// fixture that mysteriously has no spec beside it.
+pub fn replay_tokens(
+    name: &str,
+    message: Option<&str>,
+    fixtures_dir: &std::path::Path,
+    passthrough: &[String],
+) -> Vec<String> {
     let mut out = passthrough.to_vec();
     if !sets(passthrough, "--save") {
         out.push("--save".to_string());
         out.push(name.to_string());
+    }
+    if !sets(passthrough, "--fixtures-dir") {
+        out.push("--fixtures-dir".to_string());
+        out.push(fixtures_dir.display().to_string());
     }
     if !sets(passthrough, "--simulate") {
         out.push("--simulate".to_string());
@@ -158,13 +174,56 @@ mod tests {
         );
     }
 
+    /// The corpus directory used by the tests below. Any absolute path does;
+    /// what matters is that it reaches the chained `replay-candles` verbatim.
+    fn corpus() -> &'static std::path::Path {
+        std::path::Path::new("/corpus")
+    }
+
     #[test]
     fn injects_the_save_and_simulate_defaults() {
-        let got = replay_tokens("eur-usd-h1-2026-07-20", None, &[]);
+        let got = replay_tokens("eur-usd-h1-2026-07-20", None, corpus(), &[]);
         assert_eq!(
             got,
-            vec!["--save", "eur-usd-h1-2026-07-20", "--simulate", "true"]
+            vec![
+                "--save",
+                "eur-usd-h1-2026-07-20",
+                "--fixtures-dir",
+                "/corpus",
+                "--simulate",
+                "true"
+            ]
         );
+    }
+
+    /// The chained replay must be TOLD the corpus, not left to resolve it
+    /// itself: it is a separate process, and if the two disagree the spec and
+    /// the fixtures land in different trees while the run still exits 0.
+    #[test]
+    fn the_chained_replay_is_told_the_same_corpus() {
+        let got = replay_tokens("n", None, std::path::Path::new("/tmp/elsewhere"), &[]);
+        let i = got
+            .iter()
+            .position(|t| t == "--fixtures-dir")
+            .expect("--fixtures-dir injected");
+        assert_eq!(got[i + 1], "/tmp/elsewhere");
+    }
+
+    /// An operator who named a corpus explicitly keeps it — same rule as
+    /// `--save` and `--simulate`.
+    #[test]
+    fn an_explicit_fixtures_dir_is_not_overridden() {
+        let passthrough: Vec<String> = ["--fixtures-dir", "/mine"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let got = replay_tokens("n", None, corpus(), &passthrough);
+        assert_eq!(
+            got.iter().filter(|t| *t == "--fixtures-dir").count(),
+            1,
+            "must not inject a second --fixtures-dir: {got:?}"
+        );
+        assert!(!got.iter().any(|t| t == "/corpus"));
     }
 
     #[test]
@@ -174,10 +233,12 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let got = replay_tokens("derived", None, &passthrough);
+        let got = replay_tokens("derived", None, corpus(), &passthrough);
+        let mut expected = passthrough.clone();
+        expected.extend(["--fixtures-dir".to_string(), "/corpus".to_string()]);
         assert_eq!(
-            got, passthrough,
-            "nothing should be injected over explicit flags"
+            got, expected,
+            "only the un-set --fixtures-dir should be injected"
         );
     }
 
@@ -186,7 +247,7 @@ mod tests {
         // `--save=x` is the same choice as `--save x`; missing this would
         // inject a second `--save` and let replay-candles reject the run.
         let passthrough = vec!["--save=my-name".to_string()];
-        let got = replay_tokens("derived", None, &passthrough);
+        let got = replay_tokens("derived", None, corpus(), &passthrough);
         assert!(
             !got.iter().any(|t| t == "derived"),
             "must not inject a second --save: {got:?}"
@@ -195,7 +256,7 @@ mod tests {
 
     #[test]
     fn a_message_is_passed_through_to_the_fixture_meta() {
-        let got = replay_tokens("n", Some("pins the S/R close"), &[]);
+        let got = replay_tokens("n", Some("pins the S/R close"), corpus(), &[]);
         let i = got
             .iter()
             .position(|t| t == "--message")
@@ -205,7 +266,7 @@ mod tests {
 
     #[test]
     fn no_message_means_no_message_flag() {
-        let got = replay_tokens("n", None, &[]);
+        let got = replay_tokens("n", None, corpus(), &[]);
         assert!(!got.iter().any(|t| t == "--message"));
     }
 

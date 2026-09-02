@@ -1,5 +1,56 @@
 # Changelog
 
+## v136 — 2026-09-02 — `--save-fixture` wrote to the tree the binary was BUILT in
+
+**Why.** A capture died after the chart had already been read:
+
+```
+Error:
+   0: write frozen setup to /…/tc-staging-deploy/tv-arm/../replay-fixtures/eur-cad-h1-2026-08-16.spec.json
+   1: No such file or directory (os error 2)
+```
+
+`tc-staging-deploy` was a throwaway worktree someone deployed staging from, long
+since removed. The corpus path was `env!("CARGO_MANIFEST_DIR")` — expanded at
+**compile** time — so the shipped `tv-arm-staging` pointed at its own build
+directory forever. The expensive, human-paced part of a capture (confirming the
+pattern on the chart) was already done and was thrown away.
+
+The louder failure was the lucky one. While the build tree still exists, the same
+default resolves *silently* to another checkout's corpus: the capture succeeds,
+exits 0, and lands somewhere the operator never looked. That is the already-known
+trap where `--rebless` covered only 19 of 63 fixtures with no error either way.
+
+**What changed.**
+
+- New `trade_control_cli::fixtures_dir::resolve` — one runtime resolver, shared by
+  `replay-candles` and `tv-arm`. Order: explicit `--fixtures-dir`, then
+  `TRADE_CONTROL_FIXTURES_DIR`, then the corpus of the checkout the process is
+  standing in (walk up from cwd, nearest wins), then the build-time path *only if
+  it still exists*, then `./replay-fixtures` so a failure names something the
+  operator recognises.
+- `tv-arm` gained `--fixtures-dir` (env `TRADE_CONTROL_FIXTURES_DIR`). There was
+  previously **no way** to override the baked path on that binary.
+- `--save-fixture` now injects `--fixtures-dir` into the chained `replay` tokens,
+  so the spec `tv-arm` writes and the fixtures `replay-candles` writes are the
+  same resolved directory rather than two processes guessing separately.
+- `FrozenSetup::write` creates the corpus directory if missing, instead of
+  discarding a completed chart read over a `mkdir`.
+
+**Breaking.** None. `replay_tokens` took a new `fixtures_dir` argument (internal).
+
+**Config.** `TRADE_CONTROL_FIXTURES_DIR` pins the corpus for a driver or a deploy.
+
+**Tests.** 6 for the resolver (nearest-corpus-wins, explicit-beats-all,
+subdirectory capture, no-corpus-is-None, vanished build dir), 3 for the injected
+`--fixtures-dir` passthrough, 1 for the missing-directory write. Both key tests
+were verified by mutation (flip nearest→farthest, drop the `mkdir`) and confirmed
+red. Verified end-to-end on the reported command: 8/8 cells armed.
+
+**Follow-up.** The deploy scripts still build from whatever tree they are run in.
+That is now harmless for the corpus, but the same compile-time-path shape is worth
+grepping for before it bites something else.
+
 ## v135 — 2026-08-30 — `close-failed` told an operator a phantom position was real
 
 **Why.** A NZD/CAD close fired and the dispatch log said, in full:
