@@ -1,0 +1,17 @@
+{
+  "instrument": "AUD/CHF",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-06T00:00:00Z",
+  "end": "2026-08-07T09:00:00Z",
+  "message": "No way to win - easy too-high - trend against us",
+  "arm": {
+    "entry_rule": "skip-bcr",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:AUDCHF",
+    "tv_arm_version": "v133-7-g9fcfcd3",
+    "engine_version": "v133-7-g9fcfcd3"
+  }
+}

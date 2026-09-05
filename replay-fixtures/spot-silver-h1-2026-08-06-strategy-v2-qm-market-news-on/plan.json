@@ -1,0 +1,430 @@
+{
+  "trade_id": "hs-spot-silver-38549359",
+  "instrument": "Spot Silver",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.1,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 6234.137988545691,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-spot-silver-38549359-too-high",
+        "not_after": "2026-08-11T05:30:00Z",
+        "action": "veto",
+        "instrument": "Spot Silver",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 114,
+        "level": "close-positions",
+        "trade_id": "hs-spot-silver-38549359"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 6008.866944123949,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-spot-silver-38549359-too-low",
+        "not_after": "2026-08-11T05:30:00Z",
+        "action": "veto",
+        "instrument": "Spot Silver",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 114,
+        "level": "stop-next-entry",
+        "trade_id": "hs-spot-silver-38549359"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786424400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-spot-silver-38549359-trade-expiry",
+        "not_before": "2026-08-11T05:00:00Z",
+        "not_after": "2026-08-11T05:30:00Z",
+        "action": "veto",
+        "instrument": "Spot Silver",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 114,
+        "level": "close-positions",
+        "trade_id": "hs-spot-silver-38549359"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1779184800,
+          "price": 7868.8
+        },
+        "b": {
+          "at_epoch": 1779364800,
+          "price": 7638.5
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-spot-silver-38549359-break-and-close",
+        "not_after": "2026-08-11T05:00:00Z",
+        "action": "prep",
+        "instrument": "Spot Silver",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "hs-spot-silver-38549359"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1779184800,
+          "price": 7868.8
+        },
+        "b": {
+          "at_epoch": 1779364800,
+          "price": 7638.5
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "up",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-spot-silver-38549359-retest",
+        "not_after": "2026-08-11T05:00:00Z",
+        "action": "prep",
+        "instrument": "Spot Silver",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "hs-spot-silver-38549359"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-spot-silver-38549359-enter",
+        "not_after": "2026-08-10T06:24:00Z",
+        "action": "enter",
+        "instrument": "Spot Silver",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 5980.14105
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 6008.866944123949,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 6234.137988545691,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-spot-silver-38549359",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.1,
+        "tick_size": 0.1
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-spot-silver-38549359-enter-qm",
+        "not_after": "2026-08-10T06:24:00Z",
+        "action": "enter",
+        "instrument": "Spot Silver",
+        "direction": "short",
+        "entry": {
+          "type": "market"
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 5980.14105
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 6008.866944123949,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 6234.137988545691,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-spot-silver-38549359",
+        "max_retries": 5,
+        "needs_golden": true,
+        "needs_confirmed": true,
+        "pip_size": 0.1,
+        "tick_size": 0.1
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-spot-silver-38549359-close-on-sr-reversal",
+        "not_after": "2026-08-11T05:00:00Z",
+        "action": "close",
+        "instrument": "Spot Silver",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-spot-silver-38549359",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            5980.14105,
+            6008.86694
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-spot-silver-38549359-close-on-reversal",
+        "not_after": "2026-08-11T05:00:00Z",
+        "action": "close",
+        "instrument": "Spot Silver",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-spot-silver-38549359",
+        "needs_golden": true,
+        "inside_window": [
+          "news"
+        ],
+        "reason": "news-window reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "01-pause-1786077000-1786105800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786077000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-spot-silver-38549359-pause-1786077000-1786105800",
+        "not_after": "2026-08-07T12:30:00Z",
+        "action": "pause",
+        "instrument": "Spot Silver",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-spot-silver-38549359",
+        "blackout_id": "1786077000-1786105800",
+        "reason": "news:Spot Silver-2026-08-07T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1786077000-1786105800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786105800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-spot-silver-38549359-resume-1786077000-1786105800",
+        "not_after": "2026-08-07T13:00:00Z",
+        "action": "resume",
+        "instrument": "Spot Silver",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-spot-silver-38549359",
+        "blackout_id": "1786077000-1786105800",
+        "reason": "news:Spot Silver-2026-08-07T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1786105800-1786109400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786105800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-spot-silver-38549359-news-start-1786105800-1786109400",
+        "not_after": "2026-08-07T13:30:00Z",
+        "action": "news-start",
+        "instrument": "Spot Silver",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-spot-silver-38549359",
+        "news_id": "1786105800-1786109400",
+        "reason": "news:Spot Silver-2026-08-07T12:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1786105800-1786109400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786109400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-spot-silver-38549359-news-end-1786105800-1786109400",
+        "not_after": "2026-08-07T14:00:00Z",
+        "action": "news-end",
+        "instrument": "Spot Silver",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-spot-silver-38549359",
+        "news_id": "1786105800-1786109400",
+        "reason": "news:Spot Silver-2026-08-07T12:30:00+00:00"
+      },
+      "kind": "control"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1786017600,
+  "armed_at": "2026-08-06T12:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-05T12:00:00Z",
+    "period_end": "2026-08-06T12:00:00Z",
+    "overall_direction": "bullish",
+    "confidence": "medium",
+    "currencies": [
+      {
+        "currency": "USD",
+        "direction": "bearish",
+        "net_score": -2.0,
+        "events": [
+          "ADP Non-Farm Employment Change: Actual (44K) missed forecast (68K)",
+          "Final Services PMI: Actual (54.6) matched forecast (53.6)",
+          "ISM Services PMI: Actual (54.1) matched forecast (54.5)",
+          "Crude Oil Inventories: Actual (2.5M) beat forecast (-1.5M)",
+          "Challenger Job Cuts y/y: Actual (-46.1%) declined from previous (-4.5%)"
+        ]
+      }
+    ]
+  }
+}

@@ -11,18 +11,19 @@
         "price": 0.98832
       }
     },
-    "invalidation": 0.9894565664995494,
+    "invalidation": 0.9896059011521244,
     "fib_head_neckline": [
       0.99202,
       0.98832297582719
     ],
     "trade_expiry_epoch": 1786122000,
     "sr_levels": [
-      0.98046
+      0.98046,
+      0.9876
     ]
   },
   "resolution": "60",
   "chart_symbol": "TRADENATION:AUDCAD",
   "start": 1785952800,
-  "tv_arm_version": "v132-3-g46d8b10"
+  "tv_arm_version": "v133-7-g9fcfcd3"
 }

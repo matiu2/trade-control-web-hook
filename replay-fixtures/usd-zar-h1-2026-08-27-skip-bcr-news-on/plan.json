@@ -1,0 +1,298 @@
+{
+  "trade_id": "hs-usd-zar-132579ef",
+  "instrument": "USD/ZAR",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 16.03911162213675,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-usd-zar-132579ef-too-high",
+        "not_after": "2026-09-01T11:30:00Z",
+        "action": "veto",
+        "instrument": "USD/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 123,
+        "level": "close-positions",
+        "trade_id": "hs-usd-zar-132579ef"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 15.82458,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-usd-zar-132579ef-too-low",
+        "not_after": "2026-09-01T11:30:00Z",
+        "action": "veto",
+        "instrument": "USD/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 123,
+        "level": "stop-next-entry",
+        "trade_id": "hs-usd-zar-132579ef"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1788260400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-usd-zar-132579ef-trade-expiry",
+        "not_before": "2026-09-01T11:00:00Z",
+        "not_after": "2026-09-01T11:30:00Z",
+        "action": "veto",
+        "instrument": "USD/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 123,
+        "level": "close-positions",
+        "trade_id": "hs-usd-zar-132579ef"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-usd-zar-132579ef-enter",
+        "not_after": "2026-08-31T10:36:00Z",
+        "action": "enter",
+        "instrument": "USD/ZAR",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 15.8006
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 15.82458,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 16.03911162213675,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-usd-zar-132579ef",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.0001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-usd-zar-132579ef-close-on-sr-reversal",
+        "not_after": "2026-09-01T11:00:00Z",
+        "action": "close",
+        "instrument": "USD/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-usd-zar-132579ef",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            16.41969,
+            16.45256
+          ],
+          [
+            16.62096,
+            16.65424
+          ],
+          [
+            15.8006,
+            15.82458
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-usd-zar-132579ef-close-on-reversal",
+        "not_after": "2026-09-01T11:00:00Z",
+        "action": "close",
+        "instrument": "USD/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-usd-zar-132579ef",
+        "needs_golden": true,
+        "inside_window": [
+          "news"
+        ],
+        "reason": "news-window reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "01-pause-1787896800-1787925600",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787896800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-usd-zar-132579ef-pause-1787896800-1787925600",
+        "not_after": "2026-08-28T14:00:00Z",
+        "action": "pause",
+        "instrument": "USD/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-usd-zar-132579ef",
+        "blackout_id": "1787896800-1787925600",
+        "reason": "news:USD/ZAR-2026-08-28T06:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1787896800-1787925600",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787925600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-usd-zar-132579ef-resume-1787896800-1787925600",
+        "not_after": "2026-08-28T14:30:00Z",
+        "action": "resume",
+        "instrument": "USD/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-usd-zar-132579ef",
+        "blackout_id": "1787896800-1787925600",
+        "reason": "news:USD/ZAR-2026-08-28T06:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1787925600-1787929200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787925600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-usd-zar-132579ef-news-start-1787925600-1787929200",
+        "not_after": "2026-08-28T15:00:00Z",
+        "action": "news-start",
+        "instrument": "USD/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-usd-zar-132579ef",
+        "news_id": "1787925600-1787929200",
+        "reason": "news:USD/ZAR-2026-08-28T14:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1787925600-1787929200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787929200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-usd-zar-132579ef-news-end-1787925600-1787929200",
+        "not_after": "2026-08-28T15:30:00Z",
+        "action": "news-end",
+        "instrument": "USD/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-usd-zar-132579ef",
+        "news_id": "1787925600-1787929200",
+        "reason": "news:USD/ZAR-2026-08-28T14:00:00+00:00"
+      },
+      "kind": "control"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1787821200,
+  "armed_at": "2026-08-27T09:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-26T09:00:00Z",
+    "period_end": "2026-08-27T09:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "low",
+    "currencies": []
+  }
+}

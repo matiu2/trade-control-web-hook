@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1787605200,
+        "price": 1.09349
+      },
+      "b": {
+        "at_epoch": 1787691600,
+        "price": 1.09359
+      }
+    },
+    "invalidation": 1.0959234758504162,
+    "fib_head_neckline": [
+      1.0967299707403786,
+      1.093530313216136
+    ],
+    "trade_expiry_epoch": 1788163200,
+    "sr_levels": [
+      1.05587,
+      1.0692041050077976,
+      1.08018,
+      1.0769762221350223,
+      1.08359,
+      1.09344
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:GBPCHF",
+  "start": 1787702400,
+  "tv_arm_version": "v136-10-gcedb1a9-dirty"
+}

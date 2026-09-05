@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785740400,
+        "price": 1.19566
+      },
+      "b": {
+        "at_epoch": 1785819600,
+        "price": 1.19669
+      }
+    },
+    "invalidation": 1.205601605422174,
+    "fib_head_neckline": [
+      1.20944,
+      1.2049750775564203
+    ],
+    "trade_expiry_epoch": 1787133600
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:AUDNZD",
+  "start": 1786669200,
+  "tv_arm_version": "v134-8-g43c8370-dirty"
+}

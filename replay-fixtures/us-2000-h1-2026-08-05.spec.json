@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785945600,
+        "price": 3021.66
+      },
+      "b": {
+        "at_epoch": 1785855600,
+        "price": 3021.66
+      }
+    },
+    "invalidation": 3031.54,
+    "fib_head_neckline": [
+      3048.9,
+      3021.634986711891
+    ],
+    "trade_expiry_epoch": 1786334400
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:US2000",
+  "start": 1785949200,
+  "tv_arm_version": "v133-7-g9fcfcd3"
+}

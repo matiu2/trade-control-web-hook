@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785834000,
+        "price": 1.6154
+      },
+      "b": {
+        "at_epoch": 1786050000,
+        "price": 1.61444
+      }
+    },
+    "invalidation": 1.6199563686638925,
+    "fib_head_neckline": [
+      1.62472,
+      1.615064606340626
+    ],
+    "trade_expiry_epoch": 1787058000,
+    "sr_levels": [
+      1.61813,
+      1.61102,
+      1.60766,
+      1.61608
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:EURCAD",
+  "start": 1786096800,
+  "tv_arm_version": "v133-7-g9fcfcd3"
+}

@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785830400,
+        "price": 0.85608
+      },
+      "b": {
+        "at_epoch": 1786032000,
+        "price": 0.85617
+      }
+    },
+    "invalidation": 0.85783,
+    "fib_head_neckline": [
+      0.85814,
+      0.8561558435764406
+    ],
+    "trade_expiry_epoch": 1786942800
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:EURGBP",
+  "start": 1786312800,
+  "tv_arm_version": "v134-8-g43c8370-dirty"
+}

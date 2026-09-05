@@ -1,0 +1,17 @@
+{
+  "instrument": "AUD_NZD",
+  "granularity": "h1",
+  "source": "oanda",
+  "start": "2026-08-14T01:00:00Z",
+  "end": "2026-08-19T10:00:00Z",
+  "message": "h&s quick down, then quick up",
+  "arm": {
+    "entry_rule": "skip-bcr",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "oanda",
+    "chart_symbol": "OANDA:AUDNZD",
+    "tv_arm_version": "v134-8-g43c8370-dirty",
+    "engine_version": "v134-8-g43c8370-dirty"
+  }
+}

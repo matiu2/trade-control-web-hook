@@ -1,5 +1,5 @@
 {
-  "trade_id": "ihs-eur-cad-ed43995f",
+  "trade_id": "ihs-eur-cad-480d6e4b",
   "instrument": "EUR/CAD",
   "direction": "long",
   "granularity": "h4",
@@ -9,23 +9,23 @@
       "rule_id": "01-veto-too-low",
       "trigger": {
         "type": "horizontal_cross",
-        "level": 1.6012386505114162,
+        "level": 1.60867,
         "dir": "down",
         "bar": "on_close"
       },
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-cad-ed43995f-too-low",
-        "not_after": "2026-08-13T21:30:00Z",
+        "id": "ihs-eur-cad-480d6e4b-too-low",
+        "not_after": "2026-08-11T01:30:00Z",
         "action": "veto",
         "instrument": "EUR/CAD",
         "broker": "tradenation",
         "account": "reversals",
         "name": "too-low",
-        "ttl_hours": 513,
+        "ttl_hours": 445,
         "level": "close-positions",
-        "trade_id": "ihs-eur-cad-ed43995f"
+        "trade_id": "ihs-eur-cad-480d6e4b"
       },
       "kind": "setup_invalidation"
     },
@@ -40,16 +40,16 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-cad-ed43995f-too-high",
-        "not_after": "2026-08-13T21:30:00Z",
+        "id": "ihs-eur-cad-480d6e4b-too-high",
+        "not_after": "2026-08-11T01:30:00Z",
         "action": "veto",
         "instrument": "EUR/CAD",
         "broker": "tradenation",
         "account": "reversals",
         "name": "too-high",
-        "ttl_hours": 513,
+        "ttl_hours": 445,
         "level": "stop-next-entry",
-        "trade_id": "ihs-eur-cad-ed43995f"
+        "trade_id": "ihs-eur-cad-480d6e4b"
       },
       "kind": "setup_invalidation"
     },
@@ -57,22 +57,22 @@
       "rule_id": "02-veto-trade-expiry",
       "trigger": {
         "type": "time_reached",
-        "at_epoch": 1786654800
+        "at_epoch": 1786410000
       },
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-cad-ed43995f-trade-expiry",
-        "not_before": "2026-08-13T21:00:00Z",
-        "not_after": "2026-08-13T21:30:00Z",
+        "id": "ihs-eur-cad-480d6e4b-trade-expiry",
+        "not_before": "2026-08-11T01:00:00Z",
+        "not_after": "2026-08-11T01:30:00Z",
         "action": "veto",
         "instrument": "EUR/CAD",
         "broker": "tradenation",
         "account": "reversals",
         "name": "trade-expiry",
-        "ttl_hours": 513,
+        "ttl_hours": 445,
         "level": "close-positions",
-        "trade_id": "ihs-eur-cad-ed43995f"
+        "trade_id": "ihs-eur-cad-480d6e4b"
       },
       "kind": "setup_invalidation"
     },
@@ -85,8 +85,8 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-cad-ed43995f-enter",
-        "not_after": "2026-08-09T14:36:00Z",
+        "id": "ihs-eur-cad-480d6e4b-enter",
+        "not_after": "2026-08-07T08:12:00Z",
         "action": "enter",
         "instrument": "EUR/CAD",
         "direction": "long",
@@ -119,14 +119,14 @@
           },
           {
             "name": "too-low",
-            "level": 1.6012386505114162,
+            "level": 1.60867,
             "past": "Below"
           }
         ],
         "breakeven": {
           "threshold": 0.5
         },
-        "trade_id": "ihs-eur-cad-ed43995f",
+        "trade_id": "ihs-eur-cad-480d6e4b",
         "max_retries": 5,
         "needs_golden": true,
         "pip_size": 0.0001,
@@ -143,13 +143,13 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-cad-ed43995f-close-on-sr-reversal",
-        "not_after": "2026-08-13T21:00:00Z",
+        "id": "ihs-eur-cad-480d6e4b-close-on-sr-reversal",
+        "not_after": "2026-08-11T01:00:00Z",
         "action": "close",
         "instrument": "EUR/CAD",
         "broker": "tradenation",
         "account": "reversals",
-        "trade_id": "ihs-eur-cad-ed43995f",
+        "trade_id": "ihs-eur-cad-480d6e4b",
         "needs_golden": true,
         "inside_window": [
           "price"
@@ -176,8 +176,12 @@
             1.61246
           ],
           [
-            1.60605,
-            1.60927
+            1.60583,
+            1.60904
+          ],
+          [
+            1.6111,
+            1.61432
           ],
           [
             1.61709,

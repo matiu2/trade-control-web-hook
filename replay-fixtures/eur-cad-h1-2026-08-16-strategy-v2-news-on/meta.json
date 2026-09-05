@@ -1,0 +1,17 @@
+{
+  "instrument": "EUR/CAD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-16T21:00:00Z",
+  "end": "2026-08-18T23:00:00Z",
+  "message": "ihs late entry. Too much pre-volitility",
+  "arm": {
+    "entry_rule": "strategy-v2",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:EURCAD",
+    "tv_arm_version": "v136-10-gcedb1a9-dirty",
+    "engine_version": "v136-10-gcedb1a9-dirty"
+  }
+}

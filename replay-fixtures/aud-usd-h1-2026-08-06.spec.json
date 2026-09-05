@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785927600,
+        "price": 0.70425
+      },
+      "b": {
+        "at_epoch": 1785999600,
+        "price": 0.7038
+      }
+    },
+    "invalidation": 0.70526,
+    "fib_head_neckline": [
+      0.70607,
+      0.7040968382381809
+    ],
+    "trade_expiry_epoch": 1786388400,
+    "sr_levels": [
+      0.69207,
+      0.69585,
+      0.69429,
+      0.6928031795813749,
+      0.6985999986946979,
+      0.70706,
+      0.71186
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:AUDUSD",
+  "start": 1786014000,
+  "tv_arm_version": "v133-7-g9fcfcd3"
+}

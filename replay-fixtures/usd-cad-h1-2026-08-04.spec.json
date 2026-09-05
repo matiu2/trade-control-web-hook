@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785398400,
+        "price": 1.40668
+      },
+      "b": {
+        "at_epoch": 1785823200,
+        "price": 1.40622
+      }
+    },
+    "invalidation": 1.4027296504700657,
+    "fib_head_neckline": [
+      1.4007078793847834,
+      1.4065150882946484
+    ],
+    "trade_expiry_epoch": 1786572000,
+    "sr_levels": [
+      1.41242,
+      1.41898,
+      1.40945,
+      1.40704
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:USDCAD",
+  "start": 1785834000,
+  "tv_arm_version": "v133-7-g9fcfcd3"
+}

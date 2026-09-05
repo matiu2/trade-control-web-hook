@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1786550400,
+        "price": 0.57384
+      },
+      "b": {
+        "at_epoch": 1786583700,
+        "price": 0.57383
+      }
+    },
+    "invalidation": 0.5742869160136145,
+    "fib_head_neckline": [
+      0.5748,
+      0.5738381007272213
+    ],
+    "trade_expiry_epoch": 1786642200,
+    "sr_levels": [
+      0.56056,
+      0.55753,
+      0.5598,
+      0.55861,
+      0.55934,
+      0.56234,
+      0.56917
+    ]
+  },
+  "resolution": "15",
+  "chart_symbol": "TRADENATION:AUDCHF",
+  "start": 1786586400,
+  "tv_arm_version": "v134-8-g43c8370-dirty"
+}

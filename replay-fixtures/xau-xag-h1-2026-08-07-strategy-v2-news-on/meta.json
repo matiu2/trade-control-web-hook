@@ -1,0 +1,17 @@
+{
+  "instrument": "XAU_XAG",
+  "granularity": "h1",
+  "source": "oanda",
+  "start": "2026-08-07T13:00:00Z",
+  "end": "2026-08-13T11:00:00Z",
+  "message": "trend following; original failed with too-low wick (short trade). We use the next candle for the win",
+  "arm": {
+    "entry_rule": "strategy-v2",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "oanda",
+    "chart_symbol": "OANDA:XAUXAG",
+    "tv_arm_version": "v134-8-g43c8370-dirty",
+    "engine_version": "v134-8-g43c8370-dirty"
+  }
+}

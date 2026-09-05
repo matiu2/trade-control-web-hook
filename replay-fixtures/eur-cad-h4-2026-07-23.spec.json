@@ -11,23 +11,24 @@
         "price": 1.60914
       }
     },
-    "invalidation": 1.6012386505114162,
+    "invalidation": 1.60867,
     "fib_head_neckline": [
       1.601,
       1.6099412956027384
     ],
-    "trade_expiry_epoch": 1786654800,
+    "trade_expiry_epoch": 1786410000,
     "sr_levels": [
       1.613776406156079,
       1.6175,
       1.61933,
       1.61813,
       1.61085,
-      1.60766
+      1.6074351282351398,
+      1.61271
     ]
   },
   "resolution": "240",
   "chart_symbol": "TRADENATION:EURCAD",
   "start": 1784811600,
-  "tv_arm_version": "v127"
+  "tv_arm_version": "v134-8-g43c8370-dirty"
 }

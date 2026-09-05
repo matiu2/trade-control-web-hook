@@ -234,6 +234,70 @@ mod tests {
         assert!(text.contains("Timeline"));
     }
 
+    /// Seed the AUD/CAD plan on a deep screen, with `fixtures` as the corpus.
+    /// Shared by the two indicator tests so they differ only in the corpus.
+    fn app_with_corpus(fixtures: Vec<crate::fixtures::Cell>) -> App {
+        let rows = parse_plan_list(LIST).unwrap();
+        let mut app = App::from_rows(rows);
+        app.select_to("hs-aud-cad-a07622da");
+        app.seed_current(PlanData {
+            detail: parse_plan_export(EXPORT).ok(),
+            export_json: Some(EXPORT.to_string()),
+            timeline_json: Some(TIMELINE.to_string()),
+            replay_report: None,
+            tv_loaded: true,
+            max_depth: 1,
+            fixture_report: None,
+        });
+        app.fixtures = fixtures;
+        app.set_screen(Screen::Timeline);
+        app
+    }
+
+    /// One AUD/CAD cell matching the seeded plan's arm time (2026-07-22T09:12Z).
+    fn matching_cell(name: &str) -> crate::fixtures::Cell {
+        crate::fixtures::Cell {
+            name: name.to_string(),
+            instrument: "AUD_CAD".to_string(),
+            granularity: "h1".to_string(),
+            start: chrono::DateTime::parse_from_rfc3339("2026-07-22T10:00:00Z")
+                .expect("test timestamp parses")
+                .with_timezone(&chrono::Utc),
+        }
+    }
+
+    /// With a matching capture in the corpus, the info bar says so and counts
+    /// the cells — the whole point of the indicator.
+    #[test]
+    fn infobar_reports_a_saved_fixture() {
+        let app = app_with_corpus(vec![
+            matching_cell("aud-cad-h1-2026-07-22-normal-news-off"),
+            matching_cell("aud-cad-h1-2026-07-22-normal-news-on"),
+        ]);
+        let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        term.draw(|f| super::render(f, &app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("fixture 2"),
+            "info bar names the saved cell count:\n{text}"
+        );
+    }
+
+    /// With an empty corpus the same plan reads "no fixture" — the prompt to
+    /// press `s`. If this ever renders a count instead, the indicator is
+    /// claiming a capture that doesn't exist.
+    #[test]
+    fn infobar_reports_a_missing_fixture() {
+        let app = app_with_corpus(Vec::new());
+        let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        term.draw(|f| super::render(f, &app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("no fixture"),
+            "info bar flags the gap:\n{text}"
+        );
+    }
+
     #[test]
     fn detail_popup_scrolls() {
         let rows = parse_plan_list(LIST).unwrap();

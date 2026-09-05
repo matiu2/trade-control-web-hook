@@ -1,0 +1,56 @@
+{
+  "fires": [
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-06T07:00:00Z",
+      "candle_close": 15273.4
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-06T12:00:00Z",
+      "candle_close": 15315.6
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "action": "veto",
+      "candle_time": "2026-08-07T07:00:00Z",
+      "candle_close": 15449.4
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": -2.0,
+    "tp_hits": 0,
+    "sl_hits": 2,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-08-06T08:00:00Z",
+        "entry_price": 15262.0,
+        "stop_loss": 15380.4,
+        "take_profit": 15061.6,
+        "exit_time": "2026-08-06T11:00:00Z",
+        "exit_price": 15380.4,
+        "exit_reason": "stopped_out",
+        "r": -1.0
+      },
+      {
+        "entry_time": "2026-08-06T13:00:00Z",
+        "entry_price": 15301.8,
+        "stop_loss": 15388.0,
+        "take_profit": 15061.6,
+        "exit_time": "2026-08-06T13:00:00Z",
+        "exit_price": 15388.0,
+        "exit_reason": "stopped_out",
+        "r": -1.0
+      }
+    ]
+  }
+}

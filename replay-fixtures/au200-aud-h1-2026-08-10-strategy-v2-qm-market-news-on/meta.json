@@ -1,0 +1,17 @@
+{
+  "instrument": "AU200_AUD",
+  "granularity": "h1",
+  "source": "oanda",
+  "start": "2026-08-10T08:00:00Z",
+  "end": "2026-08-14T07:00:00Z",
+  "message": "must be a win",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "oanda",
+    "chart_symbol": "OANDA:AU200AUD",
+    "tv_arm_version": "v133-7-g9fcfcd3",
+    "engine_version": "v133-7-g9fcfcd3"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "instrument": "GBP/USD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-07-28T23:00:00Z",
+  "end": "2026-08-10T07:00:00Z",
+  "message": "shallow, coming off of a value zone; big fast move up",
+  "arm": {
+    "entry_rule": "skip-bcr",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:GBPUSD",
+    "tv_arm_version": "v133-7-g9fcfcd3",
+    "engine_version": "v133-7-g9fcfcd3"
+  }
+}

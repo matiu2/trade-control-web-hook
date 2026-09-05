@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785873600,
+        "price": 92.992
+      },
+      "b": {
+        "at_epoch": 1785704400,
+        "price": 92.992
+      }
+    },
+    "invalidation": 92.39218010884916,
+    "fib_head_neckline": [
+      91.779,
+      92.98847801474952
+    ],
+    "trade_expiry_epoch": 1786618800,
+    "sr_levels": [
+      94.15774891699878,
+      94.797,
+      94.87568409755202,
+      95.145,
+      93.352
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:NZDJPY",
+  "start": 1785927600,
+  "tv_arm_version": "v133-7-g9fcfcd3"
+}

@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785805200,
+        "price": 1.88518
+      },
+      "b": {
+        "at_epoch": 1786010400,
+        "price": 1.8843
+      }
+    },
+    "invalidation": 1.891108436839612,
+    "fib_head_neckline": [
+      1.89522,
+      1.8847384603316275
+    ],
+    "trade_expiry_epoch": 1786917600
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:GBPCAD",
+  "tv_arm_version": "v134-8-g43c8370-dirty"
+}

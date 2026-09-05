@@ -1,0 +1,17 @@
+{
+  "instrument": "CAD/CHF",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-07-30T07:00:00Z",
+  "end": "2026-08-04T05:00:00Z",
+  "message": "balancing on top of a value zone; went straight in",
+  "arm": {
+    "entry_rule": "skip-bcr",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:CADCHF",
+    "tv_arm_version": "v133-7-g9fcfcd3",
+    "engine_version": "v133-7-g9fcfcd3"
+  }
+}

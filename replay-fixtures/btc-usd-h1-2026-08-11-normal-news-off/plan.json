@@ -1,0 +1,254 @@
+{
+  "trade_id": "hs-btc-usd-f18a73c1",
+  "instrument": "BTC_USD",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.1,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 64600.0,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-f18a73c1-too-high",
+        "not_after": "2026-08-17T18:30:00Z",
+        "action": "veto",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-high",
+        "ttl_hours": 151,
+        "level": "close-positions",
+        "trade_id": "hs-btc-usd-f18a73c1"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 62919.14599611481,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-f18a73c1-too-low",
+        "not_after": "2026-08-17T18:30:00Z",
+        "action": "veto",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-low",
+        "ttl_hours": 151,
+        "level": "stop-next-entry",
+        "trade_id": "hs-btc-usd-f18a73c1"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786989600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-f18a73c1-trade-expiry",
+        "not_before": "2026-08-17T18:00:00Z",
+        "not_after": "2026-08-17T18:30:00Z",
+        "action": "veto",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "trade-expiry",
+        "ttl_hours": 151,
+        "level": "close-positions",
+        "trade_id": "hs-btc-usd-f18a73c1"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1785924000,
+          "price": 64004.5
+        },
+        "b": {
+          "at_epoch": 1786374000,
+          "price": 64004.5
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-f18a73c1-break-and-close",
+        "not_after": "2026-08-17T18:00:00Z",
+        "action": "prep",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "hs-btc-usd-f18a73c1"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1785924000,
+          "price": 64004.5
+        },
+        "b": {
+          "at_epoch": 1786374000,
+          "price": 64004.5
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "up",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-f18a73c1-retest",
+        "not_after": "2026-08-17T18:00:00Z",
+        "action": "prep",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "hs-btc-usd-f18a73c1"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-f18a73c1-enter",
+        "not_after": "2026-08-16T12:00:00Z",
+        "action": "enter",
+        "instrument": "BTC_USD",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 62649.21777
+        },
+        "broker": "oanda",
+        "account": "m-and-w",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 62919.14599611481,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 64600.0,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-btc-usd-f18a73c1",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.1,
+        "tick_size": 0.1
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-f18a73c1-close-on-sr-reversal",
+        "not_after": "2026-08-17T18:00:00Z",
+        "action": "close",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-btc-usd-f18a73c1",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            62649.21777,
+            62919.146
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1786449600,
+  "armed_at": "2026-08-11T12:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-10T12:00:00Z",
+    "period_end": "2026-08-11T12:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "low",
+    "currencies": []
+  },
+  "screenshot_url": "https://www.tradingview.com/x/KHFrHcAt/"
+}

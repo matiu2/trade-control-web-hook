@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785956400,
+        "price": 1.6184
+      },
+      "b": {
+        "at_epoch": 1785841200,
+        "price": 1.6184
+      }
+    },
+    "invalidation": 1.619824252733448,
+    "fib_head_neckline": [
+      1.62469,
+      1.6184420922811418
+    ],
+    "trade_expiry_epoch": 1786413600,
+    "sr_levels": [
+      1.613776406156079,
+      1.6175,
+      1.61933,
+      1.61813,
+      1.61085,
+      1.6074351282351398,
+      1.61271
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:EURCAD",
+  "start": 1785974400,
+  "tv_arm_version": "v134-8-g43c8370-dirty"
+}

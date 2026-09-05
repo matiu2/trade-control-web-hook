@@ -1,0 +1,260 @@
+{
+  "fires": [
+    {
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-07-21T13:00:00Z",
+      "candle_close": 1.40887
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "action": "prep",
+      "candle_time": "2026-07-21T14:00:00Z",
+      "candle_close": 1.40918
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-21T15:00:00Z",
+      "candle_close": 1.40977
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-07-22T06:00:00Z",
+      "candle_close": 1.40982
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-22T12:00:00Z",
+      "candle_close": 1.40918
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-22T13:00:00Z",
+      "candle_close": 1.40902
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-22T16:00:00Z",
+      "candle_close": 1.40938
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-23T06:00:00Z",
+      "candle_close": 1.40667
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-23T07:00:00Z",
+      "candle_close": 1.40703
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-23T08:00:00Z",
+      "candle_close": 1.40761
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-23T08:00:00Z",
+      "candle_close": 1.40761
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-23T09:00:00Z",
+      "candle_close": 1.40813
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-23T09:00:00Z",
+      "candle_close": 1.40813
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-23T10:00:00Z",
+      "candle_close": 1.4084
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-23T11:00:00Z",
+      "candle_close": 1.40793
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-24T02:00:00Z",
+      "candle_close": 1.4079
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-24T04:00:00Z",
+      "candle_close": 1.40822
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-24T07:00:00Z",
+      "candle_close": 1.40758
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-24T08:00:00Z",
+      "candle_close": 1.40791
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-24T11:00:00Z",
+      "candle_close": 1.40884
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-24T12:00:00Z",
+      "candle_close": 1.41063
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-24T13:00:00Z",
+      "candle_close": 1.4098
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-24T17:00:00Z",
+      "candle_close": 1.40976
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-24T19:00:00Z",
+      "candle_close": 1.41005
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-26T22:00:00Z",
+      "candle_close": 1.40907
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-27T00:00:00Z",
+      "candle_close": 1.40811
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-27T09:00:00Z",
+      "candle_close": 1.41061
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-27T10:00:00Z",
+      "candle_close": 1.4107
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-27T11:00:00Z",
+      "candle_close": 1.41081
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-27T12:00:00Z",
+      "candle_close": 1.41084
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-27T17:00:00Z",
+      "candle_close": 1.41208
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-27T18:00:00Z",
+      "candle_close": 1.4125
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-27T19:00:00Z",
+      "candle_close": 1.41218
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-27T20:00:00Z",
+      "candle_close": 1.41244
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-28T06:00:00Z",
+      "candle_close": 1.41223
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-28T07:00:00Z",
+      "candle_close": 1.41187
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "action": "veto",
+      "candle_time": "2026-07-28T19:00:00Z",
+      "candle_close": 1.41109
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 0.808823529411729,
+    "tp_hits": 0,
+    "sl_hits": 1,
+    "reversal_closes": 0,
+    "expiry_closes": 1,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-07-22T07:00:00Z",
+        "entry_price": 1.40901,
+        "stop_loss": 1.40658,
+        "take_profit": 1.41554,
+        "exit_time": "2026-07-23T02:00:00Z",
+        "exit_price": 1.40658,
+        "exit_reason": "stopped_out",
+        "r": -1.0
+      },
+      {
+        "entry_time": "2026-07-23T07:00:00Z",
+        "entry_price": 1.40679,
+        "stop_loss": 1.40441,
+        "take_profit": 1.41554,
+        "exit_time": "2026-07-28T19:00:00Z",
+        "exit_price": 1.411095,
+        "exit_reason": "expiry",
+        "r": 1.808823529411729
+      }
+    ]
+  }
+}

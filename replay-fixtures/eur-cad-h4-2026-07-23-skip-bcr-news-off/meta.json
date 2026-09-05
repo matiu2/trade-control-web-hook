@@ -3,14 +3,15 @@
   "granularity": "h4",
   "source": "tradenation",
   "start": "2026-07-23T13:00:00Z",
-  "end": "2026-08-13T21:00:00Z",
+  "end": "2026-08-11T01:00:00Z",
+  "message": "4h h&s",
   "arm": {
     "entry_rule": "skip-bcr",
     "skip_calendar_bars": true,
     "skip_golden": false,
     "candle_source": "tradenation",
     "chart_symbol": "TRADENATION:EURCAD",
-    "tv_arm_version": "v132-12-g948e5f3-dirty",
-    "engine_version": "v132-12-g948e5f3-dirty"
+    "tv_arm_version": "v134-8-g43c8370-dirty",
+    "engine_version": "v134-8-g43c8370-dirty"
   }
 }

@@ -1,0 +1,86 @@
+{
+  "fires": [
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-08-26T01:00:00Z",
+      "candle_close": 1.0945
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-27T08:00:00Z",
+      "candle_close": 1.09416
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-27T12:00:00Z",
+      "candle_close": 1.09243
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-28T07:00:00Z",
+      "candle_close": 1.09313
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-28T08:00:00Z",
+      "candle_close": 1.09242
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-28T12:00:00Z",
+      "candle_close": 1.09183
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-28T15:00:00Z",
+      "candle_close": 1.09566
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "action": "veto",
+      "candle_time": "2026-08-30T21:00:00Z",
+      "candle_close": 1.0961
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": -0.6200000000000769,
+    "tp_hits": 0,
+    "sl_hits": 1,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 1,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-08-27T09:00:00Z",
+        "entry_price": 1.09391,
+        "stop_loss": 1.0969700000000004,
+        "take_profit": 1.09033,
+        "exit_time": "2026-08-28T06:00:00Z",
+        "exit_price": 1.09391,
+        "exit_reason": "stopped_out",
+        "r": -0.0
+      },
+      {
+        "entry_time": "2026-08-28T17:00:00Z",
+        "entry_price": 1.09517,
+        "stop_loss": 1.0966699999999996,
+        "take_profit": 1.09033,
+        "exit_time": "2026-08-30T21:00:00Z",
+        "exit_price": 1.0960999999999999,
+        "exit_reason": "invalidation",
+        "r": -0.6200000000000769
+      }
+    ]
+  }
+}

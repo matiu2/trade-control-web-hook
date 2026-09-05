@@ -1,0 +1,17 @@
+{
+  "instrument": "EUR_GBP",
+  "granularity": "h1",
+  "source": "oanda",
+  "start": "2026-08-09T22:00:00Z",
+  "end": "2026-08-17T05:00:00Z",
+  "message": "strong dive down h&s",
+  "arm": {
+    "entry_rule": "strategy-v2",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "oanda",
+    "chart_symbol": "OANDA:EURGBP",
+    "tv_arm_version": "v134-8-g43c8370-dirty",
+    "engine_version": "v134-8-g43c8370-dirty"
+  }
+}

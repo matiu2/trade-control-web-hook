@@ -1,0 +1,17 @@
+{
+  "instrument": "EUR/AUD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-04T06:00:00Z",
+  "end": "2026-08-05T14:00:00Z",
+  "message": "IRL got -2.17 (but late entry)",
+  "arm": {
+    "entry_rule": "normal",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:EURAUD",
+    "tv_arm_version": "v133-7-g9fcfcd3",
+    "engine_version": "v133-7-g9fcfcd3"
+  }
+}

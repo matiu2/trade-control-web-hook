@@ -1,0 +1,17 @@
+{
+  "instrument": "USD/ZAR",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-27T09:00:00Z",
+  "end": "2026-09-01T11:00:00Z",
+  "message": "trend continuation loss",
+  "arm": {
+    "entry_rule": "normal",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:USDZAR",
+    "tv_arm_version": "v136-10-gcedb1a9-dirty",
+    "engine_version": "v136-10-gcedb1a9-dirty"
+  }
+}

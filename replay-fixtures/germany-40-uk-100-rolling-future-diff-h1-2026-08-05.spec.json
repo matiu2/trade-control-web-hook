@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785837600,
+        "price": 15338.3
+      },
+      "b": {
+        "at_epoch": 1785942000,
+        "price": 15337.6
+      }
+    },
+    "invalidation": 15405.0,
+    "fib_head_neckline": [
+      15614.4,
+      15337.988732885546
+    ],
+    "trade_expiry_epoch": 1786352400
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:DE40UK100",
+  "start": 1785956400,
+  "tv_arm_version": "v133-7-g9fcfcd3"
+}

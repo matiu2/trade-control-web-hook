@@ -1,0 +1,201 @@
+{
+  "trade_id": "hs-aud-nzd-588cd329",
+  "instrument": "AUD_NZD",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 1.205601605422174,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-588cd329-too-high",
+        "not_after": "2026-08-19T10:30:00Z",
+        "action": "veto",
+        "instrument": "AUD_NZD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-high",
+        "ttl_hours": 130,
+        "level": "close-positions",
+        "trade_id": "hs-aud-nzd-588cd329"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 1.2014031396015563,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-588cd329-too-low",
+        "not_after": "2026-08-19T10:30:00Z",
+        "action": "veto",
+        "instrument": "AUD_NZD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-low",
+        "ttl_hours": 130,
+        "level": "stop-next-entry",
+        "trade_id": "hs-aud-nzd-588cd329"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787133600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-588cd329-trade-expiry",
+        "not_before": "2026-08-19T10:00:00Z",
+        "not_after": "2026-08-19T10:30:00Z",
+        "action": "veto",
+        "instrument": "AUD_NZD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "trade-expiry",
+        "ttl_hours": 130,
+        "level": "close-positions",
+        "trade_id": "hs-aud-nzd-588cd329"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-588cd329-enter",
+        "not_after": "2026-08-18T08:12:00Z",
+        "action": "enter",
+        "instrument": "AUD_NZD",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 1.20051
+        },
+        "broker": "oanda",
+        "account": "m-and-w",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 1.2014031396015563,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 1.205601605422174,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-aud-nzd-588cd329",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-588cd329-close-on-sr-reversal",
+        "not_after": "2026-08-19T10:00:00Z",
+        "action": "close",
+        "instrument": "AUD_NZD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-aud-nzd-588cd329",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            1.20051,
+            1.2014
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1786669200,
+  "armed_at": "2026-08-14T01:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-13T01:00:00Z",
+    "period_end": "2026-08-14T01:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "medium",
+    "currencies": [
+      {
+        "currency": "AUD",
+        "direction": "neutral",
+        "net_score": 0.0,
+        "events": [
+          "CB Leading Index m/m: Actual (0.3%) unchanged from previous (0.3%)"
+        ]
+      },
+      {
+        "currency": "NZD",
+        "direction": "neutral",
+        "net_score": 0.0,
+        "events": [
+          "Inflation Expectations q/q: Actual (2.34%) lower than previous (2.53%) [no forecast]",
+          "BusinessNZ Manufacturing Index: Actual (54.3) declined from previous (60.1)",
+          "Visitor Arrivals m/m: Actual (-0.1%) improved from previous (-2.4%)"
+        ]
+      }
+    ]
+  }
+}

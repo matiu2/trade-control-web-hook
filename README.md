@@ -3640,6 +3640,45 @@ continues (a variant can legitimately be rejected); the summary names what's
 missing, and the exit code is non-zero unless all eight armed — a partial grid
 must not read as complete.
 
+### Reading the corpus — entry-rule comparison and equity simulation
+
+Every blessed cell carries an `expected.json` with a realised `outcome.net_r`, and
+the corpus is a **grid** (each setup armed under all four entry rules × news on/off
+× SL anchor). So comparing entry rules is a *read* of blessed data — no replay run:
+
+```sh
+scripts/compare-entry-rules.py                    # rank the four columns
+scripts/compare-entry-rules.py --all-slices       # every news × SL-anchor slice
+scripts/equity_sim.py --column skip-bcr           # $10k @ 1% per entry, ASCII curve
+scripts/entry_context.py --column skip-bcr        # pre-entry RSI / trend / divergence
+```
+
+Three corpus hazards these handle, each of which silently corrupts a naive average:
+
+- **Unequal SL-anchor coverage** — only ~26 of ~68 setups have `-sl-fib-top` /
+  `-sl-invalidation` variants, so pooling every cell weights those setups 3×. The
+  anchor is held fixed (default `signal`).
+- **A mostly-dead news axis** — every `news-off` cell written before 2026-08-15 is a
+  duplicate of its `news-on` twin (the flag was consumed upstream of `SetupInputs`).
+  Measured: only **16 of 243 pairs differ**. Scoring both double-counts each setup.
+- **Setups are not independent across columns** — the same setup appears in up to
+  four. `compare-entry-rules.py` is therefore **paired** (a setup counts only when
+  every column is present), and any significance test must collapse per-setup first.
+  Pooling all 170 entry-rows showed a striking pre-entry MFI gradient that vanished
+  (p=0.18) once collapsed to 50 independent setups.
+
+⚠️ **`entry_context.py` cannot compute a real MFI.** The corpus candles carry no
+volume field (`time/o/h/l/c` + `bid_*`/`ask_*`), and the `mfi` crate needs
+`candle.volume()`. It reports `mfi_nv` — volume held at 1, i.e. a typical-price RSI.
+Its RSI *is* validated: bit-identical to `indicator-rsi` over 332 values.
+
+⚠️ **Reshuffling trade order is not a bootstrap.** Sequential fixed-fractional
+compounding is a product of `(1 + risk·r)` terms, so permuting legs cannot change the
+final balance at all — a reshuffle reports a zero-width confidence interval.
+`equity_sim.py` resamples **with replacement** instead. It also sizes each entry off
+the balance at *its own* entry time, because the corpus has up to **8 concurrently
+open positions**; `--sequential` gives the optimistic never-overlapping curve.
+
 ### Gotchas worth knowing
 
 - **Trendline alerts need `extend_forward: true` in the payload.** TV's

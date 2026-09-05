@@ -1,0 +1,17 @@
+{
+  "instrument": "NZD/USD",
+  "granularity": "h4",
+  "source": "tradenation",
+  "start": "2026-07-26T21:00:00Z",
+  "end": "2026-08-10T05:00:00Z",
+  "message": "no-way to win",
+  "arm": {
+    "entry_rule": "normal",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:NZDUSD",
+    "tv_arm_version": "v132-12-g948e5f3",
+    "engine_version": "v132-12-g948e5f3"
+  }
+}

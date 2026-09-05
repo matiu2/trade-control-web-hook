@@ -1,5 +1,5 @@
 {
-  "trade_id": "hs-aud-cad-40913adc",
+  "trade_id": "hs-aud-cad-b6af2e62",
   "instrument": "AUD/CAD",
   "direction": "short",
   "granularity": "h1",
@@ -9,14 +9,14 @@
       "rule_id": "01-veto-too-high",
       "trigger": {
         "type": "horizontal_cross",
-        "level": 0.9894565664995494,
+        "level": 0.9896059011521244,
         "dir": "up",
         "bar": "on_close"
       },
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-aud-cad-40913adc-too-high",
+        "id": "hs-aud-cad-b6af2e62-too-high",
         "not_after": "2026-08-07T17:30:00Z",
         "action": "veto",
         "instrument": "AUD/CAD",
@@ -25,7 +25,7 @@
         "name": "too-high",
         "ttl_hours": 48,
         "level": "close-positions",
-        "trade_id": "hs-aud-cad-40913adc"
+        "trade_id": "hs-aud-cad-b6af2e62"
       },
       "kind": "setup_invalidation"
     },
@@ -40,7 +40,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-aud-cad-40913adc-too-low",
+        "id": "hs-aud-cad-b6af2e62-too-low",
         "not_after": "2026-08-07T17:30:00Z",
         "action": "veto",
         "instrument": "AUD/CAD",
@@ -49,7 +49,7 @@
         "name": "too-low",
         "ttl_hours": 48,
         "level": "stop-next-entry",
-        "trade_id": "hs-aud-cad-40913adc"
+        "trade_id": "hs-aud-cad-b6af2e62"
       },
       "kind": "setup_invalidation"
     },
@@ -62,7 +62,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-aud-cad-40913adc-trade-expiry",
+        "id": "hs-aud-cad-b6af2e62-trade-expiry",
         "not_before": "2026-08-07T17:00:00Z",
         "not_after": "2026-08-07T17:30:00Z",
         "action": "veto",
@@ -72,7 +72,7 @@
         "name": "trade-expiry",
         "ttl_hours": 48,
         "level": "close-positions",
-        "trade_id": "hs-aud-cad-40913adc"
+        "trade_id": "hs-aud-cad-b6af2e62"
       },
       "kind": "setup_invalidation"
     },
@@ -85,7 +85,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-aud-cad-40913adc-enter",
+        "id": "hs-aud-cad-b6af2e62-enter",
         "not_after": "2026-08-07T07:36:00Z",
         "action": "enter",
         "instrument": "AUD/CAD",
@@ -119,14 +119,14 @@
           },
           {
             "name": "too-high",
-            "level": 0.9894565664995494,
+            "level": 0.9896059011521244,
             "past": "Above"
           }
         ],
         "breakeven": {
           "threshold": 0.5
         },
-        "trade_id": "hs-aud-cad-40913adc",
+        "trade_id": "hs-aud-cad-b6af2e62",
         "max_retries": 5,
         "needs_golden": true,
         "pip_size": 0.0001,
@@ -143,13 +143,13 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-aud-cad-40913adc-close-on-sr-reversal",
+        "id": "hs-aud-cad-b6af2e62-close-on-sr-reversal",
         "not_after": "2026-08-07T17:00:00Z",
         "action": "close",
         "instrument": "AUD/CAD",
         "broker": "tradenation",
         "account": "reversals",
-        "trade_id": "hs-aud-cad-40913adc",
+        "trade_id": "hs-aud-cad-b6af2e62",
         "needs_golden": true,
         "inside_window": [
           "price"
@@ -158,6 +158,10 @@
           [
             0.97948,
             0.98144
+          ],
+          [
+            0.98661,
+            0.98859
           ],
           [
             0.98463,
