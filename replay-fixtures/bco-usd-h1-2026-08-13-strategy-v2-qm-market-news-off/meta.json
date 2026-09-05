@@ -1,0 +1,17 @@
+{
+  "instrument": "BCO_USD",
+  "granularity": "h1",
+  "source": "oanda",
+  "start": "2026-08-13T05:00:00Z",
+  "end": "2026-08-18T21:00:00Z",
+  "message": "brent crude oil. 1h. No way to win",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "oanda",
+    "chart_symbol": "OANDA:BCOUSD",
+    "tv_arm_version": "v134-8-g43c8370-dirty",
+    "engine_version": "v134-8-g43c8370-dirty"
+  }
+}

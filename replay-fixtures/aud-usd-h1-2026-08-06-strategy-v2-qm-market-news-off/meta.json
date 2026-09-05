@@ -1,0 +1,17 @@
+{
+  "instrument": "AUD/USD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-06T11:00:00Z",
+  "end": "2026-08-10T19:00:00Z",
+  "message": "quasimodo but a little counter trend",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:AUDUSD",
+    "tv_arm_version": "v133-7-g9fcfcd3",
+    "engine_version": "v133-7-g9fcfcd3"
+  }
+}

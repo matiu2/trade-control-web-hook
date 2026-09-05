@@ -1,0 +1,17 @@
+{
+  "instrument": "EUR/CAD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-06T00:00:00Z",
+  "end": "2026-08-11T02:00:00Z",
+  "message": "cup and handle -2R with break and close retest",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:EURCAD",
+    "tv_arm_version": "v134-8-g43c8370-dirty",
+    "engine_version": "v134-8-g43c8370-dirty"
+  }
+}

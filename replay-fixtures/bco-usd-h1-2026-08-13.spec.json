@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1786453200,
+        "price": 89.804
+      },
+      "b": {
+        "at_epoch": 1786582800,
+        "price": 90.3
+      }
+    },
+    "invalidation": 90.918,
+    "fib_head_neckline": [
+      92.71,
+      89.825598220763
+    ],
+    "trade_expiry_epoch": 1787086800,
+    "sr_levels": [
+      75.291
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:BCOUSD",
+  "start": 1786597200,
+  "tv_arm_version": "v134-8-g43c8370-dirty"
+}

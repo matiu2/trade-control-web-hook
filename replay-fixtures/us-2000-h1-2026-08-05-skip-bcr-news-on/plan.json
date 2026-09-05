@@ -1,0 +1,302 @@
+{
+  "trade_id": "hs-us-2000-0afdbb5f",
+  "instrument": "US 2000",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 1.0,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 3031.54,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-us-2000-0afdbb5f-too-high",
+        "not_after": "2026-08-10T04:30:00Z",
+        "action": "veto",
+        "instrument": "US 2000",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 108,
+        "level": "close-positions",
+        "trade_id": "hs-us-2000-0afdbb5f"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 2999.822976081404,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-us-2000-0afdbb5f-too-low",
+        "not_after": "2026-08-10T04:30:00Z",
+        "action": "veto",
+        "instrument": "US 2000",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 108,
+        "level": "stop-next-entry",
+        "trade_id": "hs-us-2000-0afdbb5f"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786334400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-us-2000-0afdbb5f-trade-expiry",
+        "not_before": "2026-08-10T04:00:00Z",
+        "not_after": "2026-08-10T04:30:00Z",
+        "action": "veto",
+        "instrument": "US 2000",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 108,
+        "level": "close-positions",
+        "trade_id": "hs-us-2000-0afdbb5f"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-us-2000-0afdbb5f-enter",
+        "not_after": "2026-08-09T06:36:00Z",
+        "action": "enter",
+        "instrument": "US 2000",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 2994.36997
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 2999.822976081404,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 3031.54,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-us-2000-0afdbb5f",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 1.0,
+        "tick_size": 0.01
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-us-2000-0afdbb5f-close-on-sr-reversal",
+        "not_after": "2026-08-10T04:00:00Z",
+        "action": "close",
+        "instrument": "US 2000",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-us-2000-0afdbb5f",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            2994.36997,
+            2999.82298
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-us-2000-0afdbb5f-close-on-reversal",
+        "not_after": "2026-08-10T04:00:00Z",
+        "action": "close",
+        "instrument": "US 2000",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-us-2000-0afdbb5f",
+        "needs_golden": true,
+        "inside_window": [
+          "news"
+        ],
+        "reason": "news-window reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "01-pause-1786077000-1786105800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786077000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-us-2000-0afdbb5f-pause-1786077000-1786105800",
+        "not_after": "2026-08-07T12:30:00Z",
+        "action": "pause",
+        "instrument": "US 2000",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-us-2000-0afdbb5f",
+        "blackout_id": "1786077000-1786105800",
+        "reason": "news:US 2000-2026-08-07T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1786077000-1786105800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786105800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-us-2000-0afdbb5f-resume-1786077000-1786105800",
+        "not_after": "2026-08-07T13:00:00Z",
+        "action": "resume",
+        "instrument": "US 2000",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-us-2000-0afdbb5f",
+        "blackout_id": "1786077000-1786105800",
+        "reason": "news:US 2000-2026-08-07T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1786105800-1786109400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786105800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-us-2000-0afdbb5f-news-start-1786105800-1786109400",
+        "not_after": "2026-08-07T13:30:00Z",
+        "action": "news-start",
+        "instrument": "US 2000",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-us-2000-0afdbb5f",
+        "news_id": "1786105800-1786109400",
+        "reason": "news:US 2000-2026-08-07T12:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1786105800-1786109400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786109400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-us-2000-0afdbb5f-news-end-1786105800-1786109400",
+        "not_after": "2026-08-07T14:00:00Z",
+        "action": "news-end",
+        "instrument": "US 2000",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-us-2000-0afdbb5f",
+        "news_id": "1786105800-1786109400",
+        "reason": "news:US 2000-2026-08-07T12:30:00+00:00"
+      },
+      "kind": "control"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1785949200,
+  "armed_at": "2026-08-05T17:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-04T17:00:00Z",
+    "period_end": "2026-08-05T17:00:00Z",
+    "overall_direction": "bearish",
+    "confidence": "medium",
+    "currencies": [
+      {
+        "currency": "USD",
+        "direction": "bearish",
+        "net_score": -1.0,
+        "events": [
+          "ADP Non-Farm Employment Change: Actual (44K) missed forecast (68K)",
+          "Final Services PMI: Actual (54.6) matched forecast (53.6)",
+          "ISM Services PMI: Actual (54.1) matched forecast (54.5)",
+          "Crude Oil Inventories: Actual (2.5M) beat forecast (-1.5M)"
+        ]
+      }
+    ]
+  }
+}

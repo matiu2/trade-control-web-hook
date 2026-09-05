@@ -1,0 +1,209 @@
+{
+  "trade_id": "hs-eur-cad-885c42c5",
+  "instrument": "EUR_CAD",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 1.6199563686638925,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-cad-885c42c5-too-high",
+        "not_after": "2026-08-18T13:30:00Z",
+        "action": "veto",
+        "instrument": "EUR_CAD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-high",
+        "ttl_hours": 268,
+        "level": "close-positions",
+        "trade_id": "hs-eur-cad-885c42c5"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 1.6073402914131267,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-cad-885c42c5-too-low",
+        "not_after": "2026-08-18T13:30:00Z",
+        "action": "veto",
+        "instrument": "EUR_CAD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-low",
+        "ttl_hours": 268,
+        "level": "stop-next-entry",
+        "trade_id": "hs-eur-cad-885c42c5"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787058000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-cad-885c42c5-trade-expiry",
+        "not_before": "2026-08-18T13:00:00Z",
+        "not_after": "2026-08-18T13:30:00Z",
+        "action": "veto",
+        "instrument": "EUR_CAD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "trade-expiry",
+        "ttl_hours": 268,
+        "level": "close-positions",
+        "trade_id": "hs-eur-cad-885c42c5"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-cad-885c42c5-enter",
+        "not_after": "2026-08-16T07:36:00Z",
+        "action": "enter",
+        "instrument": "EUR_CAD",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 1.60541
+        },
+        "broker": "oanda",
+        "account": "m-and-w",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 1.6073402914131267,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 1.6199563686638925,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-eur-cad-885c42c5",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-eur-cad-885c42c5-close-on-sr-reversal",
+        "not_after": "2026-08-18T13:00:00Z",
+        "action": "close",
+        "instrument": "EUR_CAD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-eur-cad-885c42c5",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            1.61651,
+            1.61975
+          ],
+          [
+            1.60941,
+            1.61263
+          ],
+          [
+            1.60605,
+            1.60927
+          ],
+          [
+            1.61446,
+            1.6177
+          ],
+          [
+            1.60541,
+            1.60734
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1786096800,
+  "armed_at": "2026-08-07T10:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-06T10:00:00Z",
+    "period_end": "2026-08-07T10:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "medium",
+    "currencies": [
+      {
+        "currency": "EUR",
+        "direction": "neutral",
+        "net_score": 0.0,
+        "events": [
+          "German Industrial Production m/m: Actual (0.2%) matched forecast (0.2%)",
+          "German Trade Balance: Actual (15.4B) missed forecast (17.2B)",
+          "French Trade Balance: Actual (-5.8B) beat forecast (-6.5B)"
+        ]
+      }
+    ]
+  }
+}

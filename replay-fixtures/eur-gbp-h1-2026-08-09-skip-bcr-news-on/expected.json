@@ -1,0 +1,82 @@
+{
+  "fires": [
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-10T10:00:00Z",
+      "candle_close": 0.8559
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-10T12:00:00Z",
+      "candle_close": 0.85568
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-08-10T14:00:00Z",
+      "candle_close": 0.85438
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-08-10T16:00:00Z",
+      "candle_close": 0.85448
+    },
+    {
+      "rule_id": "01-pause-1786572000-1786600800",
+      "action": "pause",
+      "candle_time": "2026-08-12T21:00:00Z",
+      "candle_close": 0.85387
+    },
+    {
+      "rule_id": "02-resume-1786572000-1786600800",
+      "action": "resume",
+      "candle_time": "2026-08-13T05:00:00Z",
+      "candle_close": 0.85406
+    },
+    {
+      "rule_id": "01-news-start-1786600800-1786604400",
+      "action": "news-start",
+      "candle_time": "2026-08-13T05:00:00Z",
+      "candle_close": 0.85406
+    },
+    {
+      "rule_id": "02-news-end-1786600800-1786604400",
+      "action": "news-end",
+      "candle_time": "2026-08-13T06:00:00Z",
+      "candle_close": 0.8543
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "action": "veto",
+      "candle_time": "2026-08-17T05:00:00Z",
+      "candle_close": 0.85492
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 1.3730158730155961,
+    "tp_hits": 1,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-08-10T11:00:00Z",
+        "entry_price": 0.8559,
+        "stop_loss": 0.8571600000000003,
+        "take_profit": 0.85417,
+        "exit_time": "2026-08-10T14:00:00Z",
+        "exit_price": 0.85417,
+        "exit_reason": "took_profit",
+        "r": 1.3730158730155961
+      }
+    ]
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1786323600,
+        "price": 9217.9
+      },
+      "b": {
+        "at_epoch": 1786057200,
+        "price": 9217.9
+      }
+    },
+    "invalidation": 9277.3,
+    "fib_head_neckline": [
+      9310.2,
+      9217.852235426535
+    ],
+    "trade_expiry_epoch": 1786683600,
+    "sr_levels": [
+      6174.0,
+      8913.8,
+      8672.6,
+      8762.0
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:AUS200",
+  "start": 1786345200,
+  "tv_arm_version": "v134-8-g43c8370-dirty"
+}

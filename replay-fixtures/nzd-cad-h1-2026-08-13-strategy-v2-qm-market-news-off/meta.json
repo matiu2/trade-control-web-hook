@@ -1,0 +1,17 @@
+{
+  "instrument": "NZD/CAD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-13T20:00:00Z",
+  "end": "2026-08-18T05:00:00Z",
+  "message": "should win",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:NZDCAD",
+    "tv_arm_version": "v132-12-g948e5f3",
+    "engine_version": "v132-12-g948e5f3"
+  }
+}

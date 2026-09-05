@@ -1,0 +1,358 @@
+{
+  "trade_id": "hs-aud-usd-2ca02188",
+  "instrument": "AUD/USD",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 0.70526,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-usd-2ca02188-too-high",
+        "not_after": "2026-08-10T19:30:00Z",
+        "action": "veto",
+        "instrument": "AUD/USD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 105,
+        "level": "close-positions",
+        "trade_id": "hs-aud-usd-2ca02188"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 0.7025183088287257,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-usd-2ca02188-too-low",
+        "not_after": "2026-08-10T19:30:00Z",
+        "action": "veto",
+        "instrument": "AUD/USD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 105,
+        "level": "stop-next-entry",
+        "trade_id": "hs-aud-usd-2ca02188"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786388400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-usd-2ca02188-trade-expiry",
+        "not_before": "2026-08-10T19:00:00Z",
+        "not_after": "2026-08-10T19:30:00Z",
+        "action": "veto",
+        "instrument": "AUD/USD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 105,
+        "level": "close-positions",
+        "trade_id": "hs-aud-usd-2ca02188"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1785927600,
+          "price": 0.70425
+        },
+        "b": {
+          "at_epoch": 1785999600,
+          "price": 0.7038
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-usd-2ca02188-break-and-close",
+        "not_after": "2026-08-10T19:00:00Z",
+        "action": "prep",
+        "instrument": "AUD/USD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "hs-aud-usd-2ca02188"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1785927600,
+          "price": 0.70425
+        },
+        "b": {
+          "at_epoch": 1785999600,
+          "price": 0.7038
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "up",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-usd-2ca02188-retest",
+        "not_after": "2026-08-10T19:00:00Z",
+        "action": "prep",
+        "instrument": "AUD/USD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "hs-aud-usd-2ca02188"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-usd-2ca02188-enter",
+        "not_after": "2026-08-09T22:12:00Z",
+        "action": "enter",
+        "instrument": "AUD/USD",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 0.70212
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 0.7025183088287257,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 0.70526,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-aud-usd-2ca02188",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-usd-2ca02188-enter-qm",
+        "not_after": "2026-08-09T22:12:00Z",
+        "action": "enter",
+        "instrument": "AUD/USD",
+        "direction": "short",
+        "entry": {
+          "type": "market"
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 0.70212
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 0.7025183088287257,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 0.70526,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-aud-usd-2ca02188",
+        "max_retries": 5,
+        "needs_golden": true,
+        "needs_confirmed": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-usd-2ca02188-close-on-sr-reversal",
+        "not_after": "2026-08-10T19:00:00Z",
+        "action": "close",
+        "instrument": "AUD/USD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-aud-usd-2ca02188",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            0.69138,
+            0.69276
+          ],
+          [
+            0.69515,
+            0.69655
+          ],
+          [
+            0.6936,
+            0.69498
+          ],
+          [
+            0.69211,
+            0.6935
+          ],
+          [
+            0.6979,
+            0.6993
+          ],
+          [
+            0.70635,
+            0.70777
+          ],
+          [
+            0.71115,
+            0.71257
+          ],
+          [
+            0.70212,
+            0.70252
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1786014000,
+  "armed_at": "2026-08-06T11:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-05T11:00:00Z",
+    "period_end": "2026-08-06T11:00:00Z",
+    "overall_direction": "bullish",
+    "confidence": "medium",
+    "currencies": [
+      {
+        "currency": "AUD",
+        "direction": "bullish",
+        "net_score": 1.0,
+        "events": [
+          "Goods Trade Balance: Actual (1.93B) beat forecast (-1.06B)"
+        ]
+      },
+      {
+        "currency": "USD",
+        "direction": "bearish",
+        "net_score": -2.0,
+        "events": [
+          "ADP Non-Farm Employment Change: Actual (44K) missed forecast (68K)",
+          "Final Services PMI: Actual (54.6) matched forecast (53.6)",
+          "ISM Services PMI: Actual (54.1) matched forecast (54.5)",
+          "Crude Oil Inventories: Actual (2.5M) beat forecast (-1.5M)",
+          "Challenger Job Cuts y/y: Actual (-46.1%) declined from previous (-4.5%)"
+        ]
+      }
+    ]
+  }
+}

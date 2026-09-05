@@ -1,0 +1,356 @@
+{
+  "trade_id": "ihs-gbp-usd-5efbbb2d",
+  "instrument": "GBP/USD",
+  "direction": "long",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 1.32832,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-usd-5efbbb2d-too-low",
+        "not_after": "2026-08-10T07:30:00Z",
+        "action": "veto",
+        "instrument": "GBP/USD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 297,
+        "level": "close-positions",
+        "trade_id": "ihs-gbp-usd-5efbbb2d"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 1.332623050242169,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-usd-5efbbb2d-too-high",
+        "not_after": "2026-08-10T07:30:00Z",
+        "action": "veto",
+        "instrument": "GBP/USD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 297,
+        "level": "stop-next-entry",
+        "trade_id": "ihs-gbp-usd-5efbbb2d"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786345200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-usd-5efbbb2d-trade-expiry",
+        "not_before": "2026-08-10T07:00:00Z",
+        "not_after": "2026-08-10T07:30:00Z",
+        "action": "veto",
+        "instrument": "GBP/USD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 297,
+        "level": "close-positions",
+        "trade_id": "ihs-gbp-usd-5efbbb2d"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1785225600,
+          "price": 1.33029
+        },
+        "b": {
+          "at_epoch": 1785250800,
+          "price": 1.33093
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-usd-5efbbb2d-break-and-close",
+        "not_after": "2026-08-10T07:00:00Z",
+        "action": "prep",
+        "instrument": "GBP/USD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "ihs-gbp-usd-5efbbb2d"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1785225600,
+          "price": 1.33029
+        },
+        "b": {
+          "at_epoch": 1785250800,
+          "price": 1.33093
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "down",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-usd-5efbbb2d-retest",
+        "not_after": "2026-08-10T07:00:00Z",
+        "action": "prep",
+        "instrument": "GBP/USD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "ihs-gbp-usd-5efbbb2d"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-usd-5efbbb2d-enter",
+        "not_after": "2026-08-07T19:48:00Z",
+        "action": "enter",
+        "instrument": "GBP/USD",
+        "direction": "long",
+        "entry": {
+          "type": "stop",
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 1.33314
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 1.332623050242169,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 1.32832,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-gbp-usd-5efbbb2d",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-usd-5efbbb2d-enter-qm",
+        "not_after": "2026-08-07T19:48:00Z",
+        "action": "enter",
+        "instrument": "GBP/USD",
+        "direction": "long",
+        "entry": {
+          "type": "market"
+        },
+        "stop_loss": {
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 1.33314
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 1.332623050242169,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 1.32832,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-gbp-usd-5efbbb2d",
+        "max_retries": 5,
+        "needs_golden": true,
+        "needs_confirmed": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-usd-5efbbb2d-close-on-sr-reversal",
+        "not_after": "2026-08-10T07:00:00Z",
+        "action": "close",
+        "instrument": "GBP/USD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-gbp-usd-5efbbb2d",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            1.32862,
+            1.33128
+          ],
+          [
+            1.3403,
+            1.34298
+          ],
+          [
+            1.33219,
+            1.33485
+          ],
+          [
+            1.33756,
+            1.34024
+          ],
+          [
+            1.33015,
+            1.33281
+          ],
+          [
+            1.33501,
+            1.33769
+          ],
+          [
+            1.33262,
+            1.33314
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1785279600,
+  "armed_at": "2026-07-28T23:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-27T23:00:00Z",
+    "period_end": "2026-07-28T23:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "medium",
+    "currencies": [
+      {
+        "currency": "GBP",
+        "direction": "bearish",
+        "net_score": -1.0,
+        "events": [
+          "BRC Shop Price Index y/y: Actual (0.9%) missed forecast (1.1%)"
+        ]
+      },
+      {
+        "currency": "USD",
+        "direction": "bearish",
+        "net_score": -1.0,
+        "events": [
+          "ADP Weekly Employment Change: Actual (15.0K) declined from previous (16.3K)",
+          "Goods Trade Balance: Actual (-101.5B) matched forecast (-100.3B)",
+          "Prelim Wholesale Inventories m/m: Actual (0.3%) missed forecast (0.4%)",
+          "HPI m/m: Actual (0.3%) beat forecast (0.1%)",
+          "S&P/CS Composite-20 HPI y/y: Actual (1.6%) beat forecast (1.3%)",
+          "CB Consumer Confidence: Actual (90.8) matched forecast (92.4)",
+          "Richmond Manufacturing Index: Actual (5) missed forecast (7)"
+        ]
+      }
+    ]
+  }
+}

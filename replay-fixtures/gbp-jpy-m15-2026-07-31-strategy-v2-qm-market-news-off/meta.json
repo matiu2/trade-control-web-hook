@@ -1,0 +1,17 @@
+{
+  "instrument": "GBP/JPY",
+  "granularity": "m15",
+  "source": "tradenation",
+  "start": "2026-07-31T13:00:00Z",
+  "end": "2026-08-03T05:45:00Z",
+  "message": "continuation h&s 15m",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:GBPJPY",
+    "tv_arm_version": "v133-7-g9fcfcd3",
+    "engine_version": "v133-7-g9fcfcd3"
+  }
+}

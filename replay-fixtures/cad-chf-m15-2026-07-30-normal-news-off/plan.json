@@ -1,0 +1,263 @@
+{
+  "trade_id": "hs-cad-chf-e9fff041",
+  "instrument": "CAD/CHF",
+  "direction": "short",
+  "granularity": "m15",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 0.57111,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-cad-chf-e9fff041-too-high",
+        "not_after": "2026-08-04T05:30:00Z",
+        "action": "veto",
+        "instrument": "CAD/CHF",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 118,
+        "level": "close-positions",
+        "trade_id": "hs-cad-chf-e9fff041"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 0.5672104977209376,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-cad-chf-e9fff041-too-low",
+        "not_after": "2026-08-04T05:30:00Z",
+        "action": "veto",
+        "instrument": "CAD/CHF",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 118,
+        "level": "stop-next-entry",
+        "trade_id": "hs-cad-chf-e9fff041"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1785819600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-cad-chf-e9fff041-trade-expiry",
+        "not_before": "2026-08-04T05:00:00Z",
+        "not_after": "2026-08-04T05:30:00Z",
+        "action": "veto",
+        "instrument": "CAD/CHF",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 118,
+        "level": "close-positions",
+        "trade_id": "hs-cad-chf-e9fff041"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1785250800,
+          "price": 0.57979
+        },
+        "b": {
+          "at_epoch": 1785369600,
+          "price": 0.57956
+        },
+        "extend_forward": true,
+        "bar_seconds": 900,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-cad-chf-e9fff041-break-and-close",
+        "not_after": "2026-08-04T05:00:00Z",
+        "action": "prep",
+        "instrument": "CAD/CHF",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "hs-cad-chf-e9fff041"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1785250800,
+          "price": 0.57979
+        },
+        "b": {
+          "at_epoch": 1785369600,
+          "price": 0.57956
+        },
+        "extend_forward": true,
+        "bar_seconds": 900,
+        "dir": "up",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-cad-chf-e9fff041-retest",
+        "not_after": "2026-08-04T05:00:00Z",
+        "action": "prep",
+        "instrument": "CAD/CHF",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "hs-cad-chf-e9fff041"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-cad-chf-e9fff041-enter",
+        "not_after": "2026-08-03T05:33:00Z",
+        "action": "enter",
+        "instrument": "CAD/CHF",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 0.56676
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 0.5672104977209376,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 0.57111,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-cad-chf-e9fff041",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-cad-chf-e9fff041-close-on-sr-reversal",
+        "not_after": "2026-08-04T05:00:00Z",
+        "action": "close",
+        "instrument": "CAD/CHF",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-cad-chf-e9fff041",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            0.56676,
+            0.56721
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1785397500,
+  "armed_at": "2026-07-30T07:45:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-29T07:45:00Z",
+    "period_end": "2026-07-30T07:45:00Z",
+    "overall_direction": "bearish",
+    "confidence": "medium",
+    "currencies": [
+      {
+        "currency": "CHF",
+        "direction": "bullish",
+        "net_score": 2.0,
+        "events": [
+          "UBS Economic Expectations: Actual (10.0) improved from previous (-25.0)",
+          "KOF Economic Barometer: Actual (103.5) beat forecast (100.9)"
+        ]
+      }
+    ]
+  }
+}

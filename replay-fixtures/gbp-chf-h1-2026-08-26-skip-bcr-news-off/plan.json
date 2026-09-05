@@ -1,0 +1,206 @@
+{
+  "trade_id": "hs-gbp-chf-35153cc8",
+  "instrument": "GBP/CHF",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 1.0959234758504162,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-gbp-chf-35153cc8-too-high",
+        "not_after": "2026-08-31T08:30:00Z",
+        "action": "veto",
+        "instrument": "GBP/CHF",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 129,
+        "level": "close-positions",
+        "trade_id": "hs-gbp-chf-35153cc8"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 1.090970587196742,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-gbp-chf-35153cc8-too-low",
+        "not_after": "2026-08-31T08:30:00Z",
+        "action": "veto",
+        "instrument": "GBP/CHF",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 129,
+        "level": "stop-next-entry",
+        "trade_id": "hs-gbp-chf-35153cc8"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1788163200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-gbp-chf-35153cc8-trade-expiry",
+        "not_before": "2026-08-31T08:00:00Z",
+        "not_after": "2026-08-31T08:30:00Z",
+        "action": "veto",
+        "instrument": "GBP/CHF",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 129,
+        "level": "close-positions",
+        "trade_id": "hs-gbp-chf-35153cc8"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-gbp-chf-35153cc8-enter",
+        "not_after": "2026-08-30T06:24:00Z",
+        "action": "enter",
+        "instrument": "GBP/CHF",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 1.09033
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 1.090970587196742,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 1.0959234758504162,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-gbp-chf-35153cc8",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-gbp-chf-35153cc8-close-on-sr-reversal",
+        "not_after": "2026-08-31T08:00:00Z",
+        "action": "close",
+        "instrument": "GBP/CHF",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-gbp-chf-35153cc8",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            1.05481,
+            1.05693
+          ],
+          [
+            1.06813,
+            1.07027
+          ],
+          [
+            1.0791,
+            1.08126
+          ],
+          [
+            1.0759,
+            1.07805
+          ],
+          [
+            1.08251,
+            1.08467
+          ],
+          [
+            1.09235,
+            1.09453
+          ],
+          [
+            1.09033,
+            1.09097
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1787702400,
+  "armed_at": "2026-08-26T00:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-25T00:00:00Z",
+    "period_end": "2026-08-26T00:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "low",
+    "currencies": []
+  }
+}

@@ -1,0 +1,375 @@
+{
+  "trade_id": "hs-btc-usd-1f60399c",
+  "instrument": "BTC_USD",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.1,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 64600.0,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-1f60399c-too-high",
+        "not_after": "2026-08-17T18:30:00Z",
+        "action": "veto",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-high",
+        "ttl_hours": 151,
+        "level": "close-positions",
+        "trade_id": "hs-btc-usd-1f60399c"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 62919.14599611481,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-1f60399c-too-low",
+        "not_after": "2026-08-17T18:30:00Z",
+        "action": "veto",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-low",
+        "ttl_hours": 151,
+        "level": "stop-next-entry",
+        "trade_id": "hs-btc-usd-1f60399c"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786989600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-1f60399c-trade-expiry",
+        "not_before": "2026-08-17T18:00:00Z",
+        "not_after": "2026-08-17T18:30:00Z",
+        "action": "veto",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "trade-expiry",
+        "ttl_hours": 151,
+        "level": "close-positions",
+        "trade_id": "hs-btc-usd-1f60399c"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-1f60399c-enter",
+        "not_after": "2026-08-16T12:00:00Z",
+        "action": "enter",
+        "instrument": "BTC_USD",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 62649.21777
+        },
+        "broker": "oanda",
+        "account": "m-and-w",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 62919.14599611481,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 64600.0,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-btc-usd-1f60399c",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.1,
+        "tick_size": 0.1
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-1f60399c-close-on-sr-reversal",
+        "not_after": "2026-08-17T18:00:00Z",
+        "action": "close",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-btc-usd-1f60399c",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            62649.21777,
+            62919.146
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-1f60399c-close-on-reversal",
+        "not_after": "2026-08-17T18:00:00Z",
+        "action": "close",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-btc-usd-1f60399c",
+        "needs_golden": true,
+        "inside_window": [
+          "news"
+        ],
+        "reason": "news-window reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "01-pause-1786509000-1786537800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786509000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-1f60399c-pause-1786509000-1786537800",
+        "not_after": "2026-08-12T12:30:00Z",
+        "action": "pause",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-btc-usd-1f60399c",
+        "blackout_id": "1786509000-1786537800",
+        "reason": "news:BTC_USD-2026-08-12T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1786509000-1786537800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786537800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-1f60399c-resume-1786509000-1786537800",
+        "not_after": "2026-08-12T13:00:00Z",
+        "action": "resume",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-btc-usd-1f60399c",
+        "blackout_id": "1786509000-1786537800",
+        "reason": "news:BTC_USD-2026-08-12T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-pause-1786595400-1786624200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786595400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-1f60399c-pause-1786595400-1786624200",
+        "not_after": "2026-08-13T12:30:00Z",
+        "action": "pause",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-btc-usd-1f60399c",
+        "blackout_id": "1786595400-1786624200",
+        "reason": "news:BTC_USD-2026-08-13T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1786595400-1786624200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786624200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-1f60399c-resume-1786595400-1786624200",
+        "not_after": "2026-08-13T13:00:00Z",
+        "action": "resume",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-btc-usd-1f60399c",
+        "blackout_id": "1786595400-1786624200",
+        "reason": "news:BTC_USD-2026-08-13T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1786537800-1786541400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786537800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-1f60399c-news-start-1786537800-1786541400",
+        "not_after": "2026-08-12T13:30:00Z",
+        "action": "news-start",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-btc-usd-1f60399c",
+        "news_id": "1786537800-1786541400",
+        "reason": "news:BTC_USD-2026-08-12T12:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1786537800-1786541400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786541400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-1f60399c-news-end-1786537800-1786541400",
+        "not_after": "2026-08-12T14:00:00Z",
+        "action": "news-end",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-btc-usd-1f60399c",
+        "news_id": "1786537800-1786541400",
+        "reason": "news:BTC_USD-2026-08-12T12:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1786624200-1786627800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786624200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-1f60399c-news-start-1786624200-1786627800",
+        "not_after": "2026-08-13T13:30:00Z",
+        "action": "news-start",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-btc-usd-1f60399c",
+        "news_id": "1786624200-1786627800",
+        "reason": "news:BTC_USD-2026-08-13T12:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1786624200-1786627800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786627800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-btc-usd-1f60399c-news-end-1786624200-1786627800",
+        "not_after": "2026-08-13T14:00:00Z",
+        "action": "news-end",
+        "instrument": "BTC_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-btc-usd-1f60399c",
+        "news_id": "1786624200-1786627800",
+        "reason": "news:BTC_USD-2026-08-13T12:30:00+00:00"
+      },
+      "kind": "control"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1786449600,
+  "armed_at": "2026-08-11T12:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-10T12:00:00Z",
+    "period_end": "2026-08-11T12:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "low",
+    "currencies": []
+  },
+  "screenshot_url": "https://www.tradingview.com/x/KHFrHcAt/"
+}

@@ -1,0 +1,17 @@
+{
+  "instrument": "Australia 200",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-10T07:00:00Z",
+  "end": "2026-08-14T05:00:00Z",
+  "message": "normal h&s. Had to extend out the expiry",
+  "arm": {
+    "entry_rule": "normal",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:AUS200",
+    "tv_arm_version": "v134-8-g43c8370-dirty",
+    "engine_version": "v134-8-g43c8370-dirty"
+  }
+}

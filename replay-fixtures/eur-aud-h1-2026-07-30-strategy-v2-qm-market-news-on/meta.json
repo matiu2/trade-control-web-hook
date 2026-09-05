@@ -1,0 +1,17 @@
+{
+  "instrument": "EUR/AUD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-07-30T21:00:00Z",
+  "end": "2026-08-05T14:00:00Z",
+  "message": "no way to win, but reversing off of support should save us some money",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:EURAUD",
+    "tv_arm_version": "v133-7-g9fcfcd3",
+    "engine_version": "v133-7-g9fcfcd3"
+  }
+}

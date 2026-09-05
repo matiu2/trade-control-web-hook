@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1779184800,
+        "price": 7868.8
+      },
+      "b": {
+        "at_epoch": 1779364800,
+        "price": 7638.5
+      }
+    },
+    "invalidation": 6234.137988545691,
+    "fib_head_neckline": [
+      6267.4,
+      6123.770524513305
+    ],
+    "trade_expiry_epoch": 1786424400
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:XAGUSD",
+  "start": 1786017600,
+  "tv_arm_version": "v133-7-g9fcfcd3"
+}

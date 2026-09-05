@@ -1,0 +1,209 @@
+{
+  "fires": [
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-30T08:00:00Z",
+      "candle_close": 0.58049
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-30T08:15:00Z",
+      "candle_close": 0.58007
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-30T09:00:00Z",
+      "candle_close": 0.58019
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-30T09:15:00Z",
+      "candle_close": 0.57978
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-30T09:30:00Z",
+      "candle_close": 0.57963
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-30T10:00:00Z",
+      "candle_close": 0.57921
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-30T11:45:00Z",
+      "candle_close": 0.57866
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-30T12:00:00Z",
+      "candle_close": 0.57824
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-30T13:30:00Z",
+      "candle_close": 0.57673
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-30T13:45:00Z",
+      "candle_close": 0.57566
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-30T15:30:00Z",
+      "candle_close": 0.57525
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-30T16:00:00Z",
+      "candle_close": 0.575
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-30T16:15:00Z",
+      "candle_close": 0.57462
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-30T17:30:00Z",
+      "candle_close": 0.57488
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-31T06:00:00Z",
+      "candle_close": 0.5755
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-31T06:15:00Z",
+      "candle_close": 0.57533
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-31T08:45:00Z",
+      "candle_close": 0.57545
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-31T11:45:00Z",
+      "candle_close": 0.57695
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-31T14:00:00Z",
+      "candle_close": 0.57773
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-31T14:15:00Z",
+      "candle_close": 0.57745
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-31T14:45:00Z",
+      "candle_close": 0.57661
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-31T15:45:00Z",
+      "candle_close": 0.57602
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-31T17:45:00Z",
+      "candle_close": 0.5763
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-31T20:00:00Z",
+      "candle_close": 0.57652
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-31T20:15:00Z",
+      "candle_close": 0.57598
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-03T00:15:00Z",
+      "candle_close": 0.57516
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-03T00:45:00Z",
+      "candle_close": 0.57547
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-03T09:00:00Z",
+      "candle_close": 0.57576
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-03T09:15:00Z",
+      "candle_close": 0.57568
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-03T11:45:00Z",
+      "candle_close": 0.57597
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-04T01:15:00Z",
+      "candle_close": 0.57673
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "action": "veto",
+      "candle_time": "2026-08-04T05:00:00Z",
+      "candle_close": 0.57699
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 0.0,
+    "tp_hits": 0,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": []
+  }
+}

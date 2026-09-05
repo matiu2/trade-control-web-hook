@@ -1,0 +1,83 @@
+{
+  "fires": [
+    {
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-07-30T10:00:00Z",
+      "candle_close": 0.57921
+    },
+    {
+      "rule_id": "01-pause-1785490200-1785501000",
+      "action": "pause",
+      "candle_time": "2026-07-31T09:15:00Z",
+      "candle_close": 0.57643
+    },
+    {
+      "rule_id": "02-resume-1785490200-1785501000",
+      "action": "resume",
+      "candle_time": "2026-07-31T12:15:00Z",
+      "candle_close": 0.57718
+    },
+    {
+      "rule_id": "01-news-start-1785501000-1785504600",
+      "action": "news-start",
+      "candle_time": "2026-07-31T12:15:00Z",
+      "candle_close": 0.57718
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "action": "close",
+      "candle_time": "2026-07-31T12:30:00Z",
+      "candle_close": 0.5773
+    },
+    {
+      "rule_id": "02-news-end-1785501000-1785504600",
+      "action": "news-end",
+      "candle_time": "2026-07-31T13:15:00Z",
+      "candle_close": 0.57746
+    },
+    {
+      "rule_id": "01-pause-1785727800-1785738600",
+      "action": "pause",
+      "candle_time": "2026-08-03T03:15:00Z",
+      "candle_close": 0.57656
+    },
+    {
+      "rule_id": "02-resume-1785727800-1785738600",
+      "action": "resume",
+      "candle_time": "2026-08-03T06:15:00Z",
+      "candle_close": 0.57606
+    },
+    {
+      "rule_id": "01-news-start-1785738600-1785742200",
+      "action": "news-start",
+      "candle_time": "2026-08-03T06:15:00Z",
+      "candle_close": 0.57606
+    },
+    {
+      "rule_id": "02-news-end-1785738600-1785742200",
+      "action": "news-end",
+      "candle_time": "2026-08-03T07:15:00Z",
+      "candle_close": 0.576
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "action": "veto",
+      "candle_time": "2026-08-04T05:00:00Z",
+      "candle_close": 0.57699
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 0.0,
+    "tp_hits": 0,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": []
+  }
+}

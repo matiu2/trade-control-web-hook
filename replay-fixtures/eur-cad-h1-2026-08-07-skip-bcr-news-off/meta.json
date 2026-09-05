@@ -1,0 +1,17 @@
+{
+  "instrument": "EUR_CAD",
+  "granularity": "h1",
+  "source": "oanda",
+  "start": "2026-08-07T10:00:00Z",
+  "end": "2026-08-18T13:00:00Z",
+  "message": "Entered on demo with strategy v2",
+  "arm": {
+    "entry_rule": "skip-bcr",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "oanda",
+    "chart_symbol": "OANDA:EURCAD",
+    "tv_arm_version": "v133-7-g9fcfcd3",
+    "engine_version": "v133-7-g9fcfcd3"
+  }
+}

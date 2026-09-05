@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1784185200,
+        "price": 70.448
+      },
+      "b": {
+        "at_epoch": 1784512800,
+        "price": 70.314
+      }
+    },
+    "invalidation": 69.31417059854557,
+    "fib_head_neckline": [
+      69.4675087900419,
+      68.15697156039911
+    ],
+    "trade_expiry_epoch": 1786618800,
+    "sr_levels": [
+      68.704
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:XAUXAG",
+  "start": 1786107600,
+  "tv_arm_version": "v134-8-g43c8370-dirty"
+}

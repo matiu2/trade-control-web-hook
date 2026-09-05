@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785433500,
+        "price": 213.901
+      },
+      "b": {
+        "at_epoch": 1785488400,
+        "price": 213.912
+      }
+    },
+    "invalidation": 215.5279147619029,
+    "fib_head_neckline": [
+      216.205,
+      213.9521581874645
+    ],
+    "trade_expiry_epoch": 1785735900,
+    "sr_levels": [
+      226.67,
+      118.61,
+      214.272
+    ]
+  },
+  "resolution": "15",
+  "chart_symbol": "TRADENATION:GBPJPY",
+  "start": 1785502800,
+  "tv_arm_version": "v133-7-g9fcfcd3"
+}

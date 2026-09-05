@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785506400,
+        "price": 16.6051
+      },
+      "b": {
+        "at_epoch": 1785780000,
+        "price": 16.5543
+      }
+    },
+    "invalidation": 16.03911162213675,
+    "fib_head_neckline": [
+      16.0404,
+      15.9205
+    ],
+    "trade_expiry_epoch": 1788260400,
+    "sr_levels": [
+      16.436128555195857,
+      16.6376
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:USDZAR",
+  "start": 1787821200,
+  "tv_arm_version": "v136-10-gcedb1a9-dirty"
+}

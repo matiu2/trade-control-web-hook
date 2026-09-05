@@ -1,0 +1,425 @@
+{
+  "trade_id": "ihs-nzd-cad-1fc70285",
+  "instrument": "NZD/CAD",
+  "direction": "long",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 0.81445,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-cad-1fc70285-too-low",
+        "not_after": "2026-08-18T05:30:00Z",
+        "action": "veto",
+        "instrument": "NZD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 106,
+        "level": "close-positions",
+        "trade_id": "ihs-nzd-cad-1fc70285"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 0.8193044043953286,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-cad-1fc70285-too-high",
+        "not_after": "2026-08-18T05:30:00Z",
+        "action": "veto",
+        "instrument": "NZD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 106,
+        "level": "stop-next-entry",
+        "trade_id": "ihs-nzd-cad-1fc70285"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787029200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-cad-1fc70285-trade-expiry",
+        "not_before": "2026-08-18T05:00:00Z",
+        "not_after": "2026-08-18T05:30:00Z",
+        "action": "veto",
+        "instrument": "NZD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 106,
+        "level": "close-positions",
+        "trade_id": "ihs-nzd-cad-1fc70285"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1786629600,
+          "price": 0.81633
+        },
+        "b": {
+          "at_epoch": 1786586400,
+          "price": 0.81633
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-cad-1fc70285-break-and-close",
+        "not_after": "2026-08-18T05:00:00Z",
+        "action": "prep",
+        "instrument": "NZD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "ihs-nzd-cad-1fc70285"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1786629600,
+          "price": 0.81633
+        },
+        "b": {
+          "at_epoch": 1786586400,
+          "price": 0.81633
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "down",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-cad-1fc70285-retest",
+        "not_after": "2026-08-18T05:00:00Z",
+        "action": "prep",
+        "instrument": "NZD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "ihs-nzd-cad-1fc70285"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-cad-1fc70285-enter",
+        "not_after": "2026-08-17T08:00:00Z",
+        "action": "enter",
+        "instrument": "NZD/CAD",
+        "direction": "long",
+        "entry": {
+          "type": "stop",
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 0.82005
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 0.8193044043953286,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 0.81445,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-nzd-cad-1fc70285",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-cad-1fc70285-enter-qm",
+        "not_after": "2026-08-17T08:00:00Z",
+        "action": "enter",
+        "instrument": "NZD/CAD",
+        "direction": "long",
+        "entry": {
+          "type": "market"
+        },
+        "stop_loss": {
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 0.82005
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 0.8193044043953286,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 0.81445,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-nzd-cad-1fc70285",
+        "max_retries": 5,
+        "needs_golden": true,
+        "needs_confirmed": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-cad-1fc70285-close-on-sr-reversal",
+        "not_after": "2026-08-18T05:00:00Z",
+        "action": "close",
+        "instrument": "NZD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-nzd-cad-1fc70285",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            0.80512,
+            0.80674
+          ],
+          [
+            0.81827,
+            0.81991
+          ],
+          [
+            0.8193,
+            0.82005
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-cad-1fc70285-close-on-reversal",
+        "not_after": "2026-08-18T05:00:00Z",
+        "action": "close",
+        "instrument": "NZD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-nzd-cad-1fc70285",
+        "needs_golden": true,
+        "inside_window": [
+          "news"
+        ],
+        "reason": "news-window reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "01-pause-1786941000-1786969800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786941000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-cad-1fc70285-pause-1786941000-1786969800",
+        "not_after": "2026-08-17T12:30:00Z",
+        "action": "pause",
+        "instrument": "NZD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-nzd-cad-1fc70285",
+        "blackout_id": "1786941000-1786969800",
+        "reason": "news:NZD/CAD-2026-08-17T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1786941000-1786969800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786969800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-cad-1fc70285-resume-1786941000-1786969800",
+        "not_after": "2026-08-17T13:00:00Z",
+        "action": "resume",
+        "instrument": "NZD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-nzd-cad-1fc70285",
+        "blackout_id": "1786941000-1786969800",
+        "reason": "news:NZD/CAD-2026-08-17T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1786969800-1786973400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786969800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-cad-1fc70285-news-start-1786969800-1786973400",
+        "not_after": "2026-08-17T13:30:00Z",
+        "action": "news-start",
+        "instrument": "NZD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-nzd-cad-1fc70285",
+        "news_id": "1786969800-1786973400",
+        "reason": "news:NZD/CAD-2026-08-17T12:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1786969800-1786973400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786973400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-nzd-cad-1fc70285-news-end-1786969800-1786973400",
+        "not_after": "2026-08-17T14:00:00Z",
+        "action": "news-end",
+        "instrument": "NZD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-nzd-cad-1fc70285",
+        "news_id": "1786969800-1786973400",
+        "reason": "news:NZD/CAD-2026-08-17T12:30:00+00:00"
+      },
+      "kind": "control"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1786651200,
+  "armed_at": "2026-08-13T20:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-12T20:00:00Z",
+    "period_end": "2026-08-13T20:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "low",
+    "currencies": []
+  }
+}

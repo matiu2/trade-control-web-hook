@@ -1,0 +1,17 @@
+{
+  "instrument": "NZD/JPY",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-05T11:00:00Z",
+  "end": "2026-08-13T11:00:00Z",
+  "message": "a cup and handle long with a wildly swinging htf, coming off of a daily value zone",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:NZDJPY",
+    "tv_arm_version": "v133-7-g9fcfcd3",
+    "engine_version": "v133-7-g9fcfcd3"
+  }
+}

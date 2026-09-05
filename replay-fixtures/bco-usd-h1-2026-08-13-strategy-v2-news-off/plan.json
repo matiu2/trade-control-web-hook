@@ -1,0 +1,334 @@
+{
+  "trade_id": "hs-bco-usd-1cb2b9f8",
+  "instrument": "BCO_USD",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 90.918,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-bco-usd-1cb2b9f8-too-high",
+        "not_after": "2026-08-18T21:30:00Z",
+        "action": "veto",
+        "instrument": "BCO_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-high",
+        "ttl_hours": 137,
+        "level": "close-positions",
+        "trade_id": "hs-bco-usd-1cb2b9f8"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 87.5180767973734,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-bco-usd-1cb2b9f8-too-low",
+        "not_after": "2026-08-18T21:30:00Z",
+        "action": "veto",
+        "instrument": "BCO_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "too-low",
+        "ttl_hours": 137,
+        "level": "stop-next-entry",
+        "trade_id": "hs-bco-usd-1cb2b9f8"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787086800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-bco-usd-1cb2b9f8-trade-expiry",
+        "not_before": "2026-08-18T21:00:00Z",
+        "not_after": "2026-08-18T21:30:00Z",
+        "action": "veto",
+        "instrument": "BCO_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "name": "trade-expiry",
+        "ttl_hours": 137,
+        "level": "close-positions",
+        "trade_id": "hs-bco-usd-1cb2b9f8"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1786453200,
+          "price": 89.804
+        },
+        "b": {
+          "at_epoch": 1786582800,
+          "price": 90.3
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-bco-usd-1cb2b9f8-break-and-close",
+        "not_after": "2026-08-18T21:00:00Z",
+        "action": "prep",
+        "instrument": "BCO_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "hs-bco-usd-1cb2b9f8"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1786453200,
+          "price": 89.804
+        },
+        "b": {
+          "at_epoch": 1786582800,
+          "price": 90.3
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "up",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-bco-usd-1cb2b9f8-retest",
+        "not_after": "2026-08-18T21:00:00Z",
+        "action": "prep",
+        "instrument": "BCO_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "hs-bco-usd-1cb2b9f8"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-bco-usd-1cb2b9f8-enter",
+        "not_after": "2026-08-17T17:48:00Z",
+        "action": "enter",
+        "instrument": "BCO_USD",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 86.9412
+        },
+        "broker": "oanda",
+        "account": "m-and-w",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 87.5180767973734,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 90.918,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-bco-usd-1cb2b9f8",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.001,
+        "tick_size": 0.001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-bco-usd-1cb2b9f8-enter-qm",
+        "not_after": "2026-08-17T17:48:00Z",
+        "action": "enter",
+        "instrument": "BCO_USD",
+        "direction": "short",
+        "entry": {
+          "type": "limit",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "recover_entry": {
+            "action": "stop"
+          }
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 86.9412
+        },
+        "broker": "oanda",
+        "account": "m-and-w",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 87.5180767973734,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 90.918,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-bco-usd-1cb2b9f8",
+        "max_retries": 5,
+        "needs_golden": true,
+        "needs_confirmed": true,
+        "pip_size": 0.001,
+        "tick_size": 0.001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-bco-usd-1cb2b9f8-close-on-sr-reversal",
+        "not_after": "2026-08-18T21:00:00Z",
+        "action": "close",
+        "instrument": "BCO_USD",
+        "broker": "oanda",
+        "account": "m-and-w",
+        "trade_id": "hs-bco-usd-1cb2b9f8",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            75.21571,
+            75.36629
+          ],
+          [
+            86.9412,
+            87.51808
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1786597200,
+  "armed_at": "2026-08-13T05:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-12T05:00:00Z",
+    "period_end": "2026-08-13T05:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "high",
+    "currencies": [
+      {
+        "currency": "USD",
+        "direction": "neutral",
+        "net_score": 0.0,
+        "events": [
+          "Core CPI m/m: Actual (0.2%) matched forecast (0.2%)",
+          "Core CPI y/y: Actual (2.5%) matched forecast (2.5%)",
+          "CPI m/m: Actual (0.1%) matched forecast (0.1%)",
+          "CPI y/y: Actual (3.4%) matched forecast (3.4%)",
+          "Crude Oil Inventories: Actual (17.4M) beat forecast (-1.7M)",
+          "10-y Bond Auction: Actual (4.68|2.5) unchanged from previous (4.58|2.6)",
+          "Federal Budget Balance: Actual (-432.3B) missed forecast (-348.3B)"
+        ]
+      }
+    ]
+  },
+  "screenshot_url": "https://www.tradingview.com/x/mKflM7Ej/"
+}

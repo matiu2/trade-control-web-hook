@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1784818800,
+        "price": 19.0412
+      },
+      "b": {
+        "at_epoch": 1785106800,
+        "price": 19.042
+      }
+    },
+    "invalidation": 19.1766,
+    "fib_head_neckline": [
+      19.2515,
+      19.042484066916447
+    ],
+    "trade_expiry_epoch": 1785301200,
+    "sr_levels": [
+      18.6181,
+      18.887049727147133
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:EURZAR",
+  "start": 1785114000,
+  "tv_arm_version": "v132-12-g948e5f3"
+}

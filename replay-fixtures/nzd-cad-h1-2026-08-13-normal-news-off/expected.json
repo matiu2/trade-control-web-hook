@@ -1,0 +1,41 @@
+{
+  "fires": [
+    {
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-08-14T03:00:00Z",
+      "candle_close": 0.81668
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "action": "prep",
+      "candle_time": "2026-08-14T05:00:00Z",
+      "candle_close": 0.81641
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "action": "veto",
+      "candle_time": "2026-08-17T00:00:00Z",
+      "candle_close": 0.81934
+    },
+    {
+      "rule_id": "01-pause-1786941000-1786969800",
+      "action": "pause",
+      "candle_time": "2026-08-17T03:00:00Z",
+      "candle_close": 0.81892
+    }
+  ],
+  "done": false,
+  "final_phase": "await_entry",
+  "warnings": [],
+  "outcome": {
+    "net_r": 0.0,
+    "tp_hits": 0,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": []
+  }
+}

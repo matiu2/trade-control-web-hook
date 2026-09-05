@@ -1,0 +1,403 @@
+{
+  "trade_id": "ihs-usd-cad-0ce6f493",
+  "instrument": "USD/CAD",
+  "direction": "long",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 1.4027296504700657,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-usd-cad-0ce6f493-too-low",
+        "not_after": "2026-08-12T22:30:00Z",
+        "action": "veto",
+        "instrument": "USD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 206,
+        "level": "close-positions",
+        "trade_id": "ihs-usd-cad-0ce6f493"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 1.4111608554225403,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-usd-cad-0ce6f493-too-high",
+        "not_after": "2026-08-12T22:30:00Z",
+        "action": "veto",
+        "instrument": "USD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 206,
+        "level": "stop-next-entry",
+        "trade_id": "ihs-usd-cad-0ce6f493"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786572000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-usd-cad-0ce6f493-trade-expiry",
+        "not_before": "2026-08-12T22:00:00Z",
+        "not_after": "2026-08-12T22:30:00Z",
+        "action": "veto",
+        "instrument": "USD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 206,
+        "level": "close-positions",
+        "trade_id": "ihs-usd-cad-0ce6f493"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-usd-cad-0ce6f493-enter",
+        "not_after": "2026-08-11T05:00:00Z",
+        "action": "enter",
+        "instrument": "USD/CAD",
+        "direction": "long",
+        "entry": {
+          "type": "stop",
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 1.41232
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 1.4111608554225403,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 1.4027296504700657,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-usd-cad-0ce6f493",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-usd-cad-0ce6f493-close-on-sr-reversal",
+        "not_after": "2026-08-12T22:00:00Z",
+        "action": "close",
+        "instrument": "USD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-usd-cad-0ce6f493",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            1.41101,
+            1.41383
+          ],
+          [
+            1.41756,
+            1.4204
+          ],
+          [
+            1.40804,
+            1.41086
+          ],
+          [
+            1.40563,
+            1.40845
+          ],
+          [
+            1.41116,
+            1.41232
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-usd-cad-0ce6f493-close-on-reversal",
+        "not_after": "2026-08-12T22:00:00Z",
+        "action": "close",
+        "instrument": "USD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-usd-cad-0ce6f493",
+        "needs_golden": true,
+        "inside_window": [
+          "news"
+        ],
+        "reason": "news-window reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "01-pause-1786077000-1786105800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786077000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-usd-cad-0ce6f493-pause-1786077000-1786105800",
+        "not_after": "2026-08-07T12:30:00Z",
+        "action": "pause",
+        "instrument": "USD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-usd-cad-0ce6f493",
+        "blackout_id": "1786077000-1786105800",
+        "reason": "news:USD/CAD-2026-08-07T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1786077000-1786105800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786105800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-usd-cad-0ce6f493-resume-1786077000-1786105800",
+        "not_after": "2026-08-07T13:00:00Z",
+        "action": "resume",
+        "instrument": "USD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-usd-cad-0ce6f493",
+        "blackout_id": "1786077000-1786105800",
+        "reason": "news:USD/CAD-2026-08-07T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-pause-1786509000-1786537800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786509000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-usd-cad-0ce6f493-pause-1786509000-1786537800",
+        "not_after": "2026-08-12T12:30:00Z",
+        "action": "pause",
+        "instrument": "USD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-usd-cad-0ce6f493",
+        "blackout_id": "1786509000-1786537800",
+        "reason": "news:USD/CAD-2026-08-12T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1786509000-1786537800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786537800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-usd-cad-0ce6f493-resume-1786509000-1786537800",
+        "not_after": "2026-08-12T13:00:00Z",
+        "action": "resume",
+        "instrument": "USD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-usd-cad-0ce6f493",
+        "blackout_id": "1786509000-1786537800",
+        "reason": "news:USD/CAD-2026-08-12T04:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1786105800-1786109400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786105800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-usd-cad-0ce6f493-news-start-1786105800-1786109400",
+        "not_after": "2026-08-07T13:30:00Z",
+        "action": "news-start",
+        "instrument": "USD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-usd-cad-0ce6f493",
+        "news_id": "1786105800-1786109400",
+        "reason": "news:USD/CAD-2026-08-07T12:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1786105800-1786109400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786109400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-usd-cad-0ce6f493-news-end-1786105800-1786109400",
+        "not_after": "2026-08-07T14:00:00Z",
+        "action": "news-end",
+        "instrument": "USD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-usd-cad-0ce6f493",
+        "news_id": "1786105800-1786109400",
+        "reason": "news:USD/CAD-2026-08-07T12:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1786537800-1786541400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786537800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-usd-cad-0ce6f493-news-start-1786537800-1786541400",
+        "not_after": "2026-08-12T13:30:00Z",
+        "action": "news-start",
+        "instrument": "USD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-usd-cad-0ce6f493",
+        "news_id": "1786537800-1786541400",
+        "reason": "news:USD/CAD-2026-08-12T12:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1786537800-1786541400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1786541400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-usd-cad-0ce6f493-news-end-1786537800-1786541400",
+        "not_after": "2026-08-12T14:00:00Z",
+        "action": "news-end",
+        "instrument": "USD/CAD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-usd-cad-0ce6f493",
+        "news_id": "1786537800-1786541400",
+        "reason": "news:USD/CAD-2026-08-12T12:30:00+00:00"
+      },
+      "kind": "control"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1785834000,
+  "armed_at": "2026-08-04T09:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-03T09:00:00Z",
+    "period_end": "2026-08-04T09:00:00Z",
+    "overall_direction": "bullish",
+    "confidence": "medium",
+    "currencies": [
+      {
+        "currency": "USD",
+        "direction": "bullish",
+        "net_score": 2.0,
+        "events": [
+          "Final Manufacturing PMI: Actual (53.9) matched forecast (53.8)",
+          "ISM Manufacturing PMI: Actual (55.6) beat forecast (54.0)",
+          "ISM Manufacturing Prices: Actual (71.1) matched forecast (70.0)",
+          "Construction Spending m/m: Actual (-0.1%) missed forecast (0.2%)",
+          "Omdia Total Vehicle Sales: Actual (16.3M) matched forecast (16.3M)"
+        ]
+      }
+    ]
+  }
+}

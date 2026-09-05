@@ -1,0 +1,151 @@
+{
+  "fires": [
+    {
+      "rule_id": "01-pause-1786595400-1786624200",
+      "action": "pause",
+      "candle_time": "2026-08-13T05:00:00Z",
+      "candle_close": 91.372
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-08-13T07:00:00Z",
+      "candle_close": 90.368
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "action": "prep",
+      "candle_time": "2026-08-13T08:00:00Z",
+      "candle_close": 89.924
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-13T08:00:00Z",
+      "candle_close": 89.924,
+      "suppressed_by": [
+        "1786595400-1786624200(news:BCO_USD-2026-08-13T04:30:00+00:00)"
+      ]
+    },
+    {
+      "rule_id": "02-resume-1786595400-1786624200",
+      "action": "resume",
+      "candle_time": "2026-08-13T11:00:00Z",
+      "candle_close": 89.834
+    },
+    {
+      "rule_id": "01-news-start-1786624200-1786627800",
+      "action": "news-start",
+      "candle_time": "2026-08-13T11:00:00Z",
+      "candle_close": 89.834
+    },
+    {
+      "rule_id": "02-news-end-1786624200-1786627800",
+      "action": "news-end",
+      "candle_time": "2026-08-13T12:00:00Z",
+      "candle_close": 89.456
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-13T13:00:00Z",
+      "candle_close": 88.618
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-13T18:00:00Z",
+      "candle_close": 89.284
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-14T09:00:00Z",
+      "candle_close": 89.658
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-14T10:00:00Z",
+      "candle_close": 89.17
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-14T12:00:00Z",
+      "candle_close": 89.09
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-17T02:00:00Z",
+      "candle_close": 90.692
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-17T03:00:00Z",
+      "candle_close": 90.445
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "action": "veto",
+      "candle_time": "2026-08-17T09:00:00Z",
+      "candle_close": 91.283
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": -4.0,
+    "tp_hits": 0,
+    "sl_hits": 4,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-08-13T14:00:00Z",
+        "entry_price": 88.59,
+        "stop_loss": 89.862,
+        "take_profit": 86.942,
+        "exit_time": "2026-08-13T15:00:00Z",
+        "exit_price": 89.862,
+        "exit_reason": "stopped_out",
+        "r": -1.0
+      },
+      {
+        "entry_time": "2026-08-14T01:00:00Z",
+        "entry_price": 89.082,
+        "stop_loss": 90.316,
+        "take_profit": 86.942,
+        "exit_time": "2026-08-14T06:00:00Z",
+        "exit_price": 90.316,
+        "exit_reason": "stopped_out",
+        "r": -1.0
+      },
+      {
+        "entry_time": "2026-08-14T10:00:00Z",
+        "entry_price": 89.605,
+        "stop_loss": 90.972,
+        "take_profit": 86.942,
+        "exit_time": "2026-08-14T18:00:00Z",
+        "exit_price": 90.972,
+        "exit_reason": "stopped_out",
+        "r": -1.0
+      },
+      {
+        "entry_time": "2026-08-17T03:00:00Z",
+        "entry_price": 90.54,
+        "stop_loss": 91.28399999999995,
+        "take_profit": 86.942,
+        "exit_time": "2026-08-17T09:00:00Z",
+        "exit_price": 91.28399999999995,
+        "exit_reason": "stopped_out",
+        "r": -1.0
+      }
+    ]
+  }
+}

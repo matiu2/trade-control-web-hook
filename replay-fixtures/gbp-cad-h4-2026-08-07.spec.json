@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785502800,
+        "price": 1.88384
+      },
+      "b": {
+        "at_epoch": 1786035600,
+        "price": 1.88492
+      }
+    },
+    "invalidation": 1.89044,
+    "fib_head_neckline": [
+      1.8954,
+      1.8845961608497608
+    ],
+    "trade_expiry_epoch": 1786942800,
+    "sr_levels": [
+      1.878063191821175,
+      1.8821929515531024,
+      1.891036360968115
+    ]
+  },
+  "resolution": "240",
+  "chart_symbol": "TRADENATION:GBPCAD",
+  "start": 1786078800,
+  "tv_arm_version": "v134-8-g43c8370-dirty"
+}

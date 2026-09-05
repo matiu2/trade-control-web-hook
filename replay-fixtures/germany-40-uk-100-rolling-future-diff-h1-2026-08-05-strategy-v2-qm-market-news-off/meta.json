@@ -1,0 +1,17 @@
+{
+  "instrument": "Germany 40 / UK 100 Rolling Future Diff",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-05T19:00:00Z",
+  "end": "2026-08-10T09:00:00Z",
+  "message": "No way to win; big fake candle near the start - counter trend",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:DE40UK100",
+    "tv_arm_version": "v133-7-g9fcfcd3",
+    "engine_version": "v133-7-g9fcfcd3"
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "fires": [
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-07T19:00:00Z",
+      "candle_close": 68.282
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-10T05:00:00Z",
+      "candle_close": 67.746
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-08-10T14:00:00Z",
+      "candle_close": 67.117
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "action": "veto",
+      "candle_time": "2026-08-13T11:00:00Z",
+      "candle_close": 67.454
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 2.0289017341041236,
+    "tp_hits": 1,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-08-07T20:00:00Z",
+        "entry_price": 68.251,
+        "stop_loss": 68.94299999999998,
+        "take_profit": 66.847,
+        "exit_time": "2026-08-10T18:00:00Z",
+        "exit_price": 66.847,
+        "exit_reason": "took_profit",
+        "r": 2.0289017341041236
+      }
+    ]
+  }
+}

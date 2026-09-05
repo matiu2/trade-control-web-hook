@@ -1,0 +1,86 @@
+{
+  "fires": [
+    {
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-08-17T07:00:00Z",
+      "candle_close": 1.6083
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "action": "prep",
+      "candle_time": "2026-08-17T08:00:00Z",
+      "candle_close": 1.60733
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-08-17T09:00:00Z",
+      "candle_close": 1.60697
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-17T12:00:00Z",
+      "candle_close": 1.60639
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-17T14:00:00Z",
+      "candle_close": 1.60679
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-17T15:00:00Z",
+      "candle_close": 1.60732
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-17T20:00:00Z",
+      "candle_close": 1.60666
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-08-18T03:00:00Z",
+      "candle_close": 1.60548
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": -2.0,
+    "tp_hits": 0,
+    "sl_hits": 2,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-08-17T13:00:00Z",
+        "entry_price": 1.60704,
+        "stop_loss": 1.6054399999999993,
+        "take_profit": 1.60952,
+        "exit_time": "2026-08-17T14:00:00Z",
+        "exit_price": 1.6054399999999993,
+        "exit_reason": "stopped_out",
+        "r": -1.0
+      },
+      {
+        "entry_time": "2026-08-17T15:00:00Z",
+        "entry_price": 1.60688,
+        "stop_loss": 1.60515,
+        "take_profit": 1.60952,
+        "exit_time": "2026-08-18T03:00:00Z",
+        "exit_price": 1.60515,
+        "exit_reason": "stopped_out",
+        "r": -1.0
+      }
+    ]
+  }
+}

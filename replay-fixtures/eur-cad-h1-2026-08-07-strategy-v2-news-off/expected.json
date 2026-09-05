@@ -1,0 +1,164 @@
+{
+  "fires": [
+    {
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-08-07T12:00:00Z",
+      "candle_close": 1.61413
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "action": "prep",
+      "candle_time": "2026-08-07T13:00:00Z",
+      "candle_close": 1.6122
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-07T13:00:00Z",
+      "candle_close": 1.6122
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-07T14:00:00Z",
+      "candle_close": 1.61082
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-07T15:00:00Z",
+      "candle_close": 1.61053
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-07T16:00:00Z",
+      "candle_close": 1.61073
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-08-07T18:00:00Z",
+      "candle_close": 1.61169
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-07T19:00:00Z",
+      "candle_close": 1.61194
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-07T20:00:00Z",
+      "candle_close": 1.61124
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-09T22:00:00Z",
+      "candle_close": 1.61146
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-10T07:00:00Z",
+      "candle_close": 1.61178
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-10T09:00:00Z",
+      "candle_close": 1.61136
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-10T10:00:00Z",
+      "candle_close": 1.61078
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-10T12:00:00Z",
+      "candle_close": 1.61054
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-10T13:00:00Z",
+      "candle_close": 1.61056
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-10T15:00:00Z",
+      "candle_close": 1.60892
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-10T15:00:00Z",
+      "candle_close": 1.60892
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-11T02:00:00Z",
+      "candle_close": 1.60802
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-11T04:00:00Z",
+      "candle_close": 1.60794
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-08-11T05:00:00Z",
+      "candle_close": 1.60746
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "action": "veto",
+      "candle_time": "2026-08-18T13:00:00Z",
+      "candle_close": 1.60668
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 2.6289030315078827,
+    "tp_hits": 1,
+    "sl_hits": 0,
+    "reversal_closes": 1,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-08-07T14:00:00Z",
+        "entry_price": 1.61215,
+        "stop_loss": 1.61792,
+        "take_profit": 1.60541,
+        "exit_time": "2026-08-07T18:00:00Z",
+        "exit_price": 1.6116899999999998,
+        "exit_reason": "reversal",
+        "r": 0.07972270363953601
+      },
+      {
+        "entry_time": "2026-08-07T20:00:00Z",
+        "entry_price": 1.61163,
+        "stop_loss": 1.6140700000000003,
+        "take_profit": 1.60541,
+        "exit_time": "2026-08-14T06:00:00Z",
+        "exit_price": 1.60541,
+        "exit_reason": "took_profit",
+        "r": 2.549180327868347
+      }
+    ]
+  }
+}

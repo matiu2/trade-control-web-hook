@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1786057200,
+        "price": 9233.2
+      },
+      "b": {
+        "at_epoch": 1786323600,
+        "price": 9213.0
+      }
+    },
+    "invalidation": 9289.7,
+    "fib_head_neckline": [
+      9318.5,
+      9223.000760975949
+    ],
+    "trade_expiry_epoch": 1786690800,
+    "sr_levels": [
+      8757.5,
+      8725.5,
+      8686.9,
+      8802.5
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:AU200AUD",
+  "start": 1786348800,
+  "tv_arm_version": "v133-7-g9fcfcd3"
+}
