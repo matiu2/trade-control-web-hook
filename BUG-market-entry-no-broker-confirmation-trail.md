@@ -79,20 +79,12 @@ future signal is a terse `close-failed` on an unrelated later fire, an
 operator has no reliable way to notice the discrepancy except by manually
 pulling broker records — which is what happened here, nine days late.
 
-## Suggested fix (not yet scoped)
+## Suggested fix — SUPERSEDED
 
-- Make `run_position_entry`'s failure path louder / harder to miss — e.g.
-  a non-zero-but-distinct exit code, and/or a persisted record (even a
-  simple KV row keyed by instrument + timestamp) so a later `plan show`-
-  style command could answer "was there a `--market-entry` fill here."
-- Consider having `close-failed` distinguish "no matching position found on
-  broker" (arguably not a failure at all — it's a no-op) from "broker
-  call errored" (a real failure), so `close-on-sr-reversal` /
-  `close-on-reversal` logs read as an intelligible signal instead of a
-  generic `close-failed` either way. Right now both cases collapse to the
-  same string (`core/src/dispatch/close.rs:251-255`), which is exactly
-  what led the operator to misread "nothing to close" as "tried and
-  failed."
+Both suggested fixes were taken in v135; see "Resolution" below for what
+shipped. The `close-failed` half was fixed at its root (`CloseOutcome`) rather
+than at the log line, and the placement-time half in the CLI. Nothing here is
+outstanding.
 
 ## Evidence
 
