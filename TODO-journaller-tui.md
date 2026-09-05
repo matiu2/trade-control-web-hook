@@ -235,7 +235,7 @@ LIST (depth 0)                     TIMELINE (depth 1)          REPLAY (depth 2) 
 | `/` | **search/filter the list** (list screen only) — see below |
 | `l` | (re)load current plan into TradingView — **operator-initiated only** |
 | `r` | (re)run replay for current plan |
-| `s` | **save fixtures** — capture the 6-cell corpus (`tv-arm --save-fixture`) |
+| `s` | **save fixtures** — capture the fixture grid (`tv-arm --save-fixture`) |
 | `c` | **copy** the full current view to the clipboard (not just the visible part) |
 | `i` | toggle the full plan-detail **popup** (overlay) |
 | `d` / `x` | **delete + done** — confirm modal; **disabled at depth 0** |
@@ -246,8 +246,34 @@ LIST (depth 0)                     TIMELINE (depth 1)          REPLAY (depth 2) 
 
 `s` runs `tv-arm-<env> --start <armed_at> [skip flags] --save-fixture
 --fixture-name <trade_id> replay`, which reads the chart **once** and writes the
-six-cell grid (normal / skip-bcr / strategy-v2 × news on/off) under
-`replay-fixtures/`.
+whole grid — **eight cells**: four entry rules (normal / skip-bcr / strategy-v2
+/ strategy-v2-qm-market) × news on/off — under `replay-fixtures/`. It was six
+before `strategy-v2-qm-market` was added; the status line reports the count that
+actually landed rather than restating a number that goes stale.
+
+### Fixture indicator in the info bar (2026-08-07)
+
+The info bar ends with `fixture <n> ✓` or a dimmed `no fixture`, answering "have
+I already captured this one?" without leaving the TUI. A finished `s` re-scans
+the corpus, so the row flips as soon as the capture lands.
+
+Matching is **instrument + granularity + window start within 24h, nearest
+wins** (`journal/src/fixtures.rs`) — not the directory name, and not a stored
+id. The reasons are load-bearing and documented in that module's header:
+
+- The **name** only links journal-captured cells (`--fixture-name <trade_id>`);
+  tv-arm's own default derives `<instrument>-<granularity>-<date>`, which is how
+  111 of the 125 cells on disk are named.
+- **`meta.arm.journal_ref`** is the field designed for this (`--trade-ref`), but
+  nothing passes it, so it is `null` in every cell.
+- **`plan.json`'s `trade_id` is a trap**: each cell is re-armed independently and
+  mints its own id, so the corpus holds 111 distinct ids and **zero** of them
+  match any live plan (measured against 46 plans, 2026-08-07).
+
+Note the corpus was captured from plans that have since been journalled and
+deleted, so **every current plan reads `no fixture`** — that's accurate, not a
+bug. The nearest near-miss is Δ1d8h, and it is a genuinely different setup (a
+third NZD/CHF plan), so widening the window would create false positives.
 
 It **replaced** the old `s` = "record the outcome to a SQLite journal DB"
 action, and `journal/src/record.rs` + the `rusqlite` dependency were deleted

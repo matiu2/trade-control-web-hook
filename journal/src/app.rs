@@ -107,6 +107,12 @@ pub struct App {
     /// [`Self::tv_load_pending`]: that one means "load the chart", this one means
     /// "capture once the chart is up". Both can be set by a single `s` press.
     save_fixture_pending: bool,
+    /// Every fixture cell found under `replay-fixtures/`, scanned once at
+    /// startup and re-scanned when a capture completes. Held on the app rather
+    /// than read per-frame because the info bar draws many times a second and
+    /// the corpus is ~125 directories — a `read_dir` + 125 file reads per frame
+    /// would make the TUI visibly stutter.
+    pub fixtures: Vec<crate::fixtures::Cell>,
 }
 
 /// Braille spinner frames for the "loading…" indicator.
@@ -136,7 +142,29 @@ impl App {
             search: SearchState::default(),
             tv_load_pending: false,
             save_fixture_pending: false,
+            fixtures: crate::fixtures::scan(&crate::fixtures::default_dir()),
         })
+    }
+
+    /// The fixture-corpus status for the currently-selected plan: which saved
+    /// capture (if any) covers this setup. Needs the plan's `armed_at`, which
+    /// lives in the detail — so a plan whose timeline hasn't been fetched yet
+    /// reports [`fixtures::Status::None`] until it lands.
+    pub fn current_fixture_status(&self) -> crate::fixtures::Status {
+        let Some(plan) = self.current_plan() else {
+            return crate::fixtures::Status::None;
+        };
+        let armed_at = self
+            .data
+            .get(&plan.trade_id)
+            .and_then(|d| d.detail.as_ref())
+            .and_then(|d| d.armed_at.as_deref());
+        crate::fixtures::status_for(
+            &self.fixtures,
+            &plan.instrument,
+            &plan.granularity,
+            armed_at,
+        )
     }
 
     /// True while any background job for the current plan is running — the UI
@@ -536,8 +564,19 @@ impl App {
                     .entry(trade_id.clone())
                     .or_default()
                     .fixture_report = Some(report);
+                // The corpus just grew — re-scan so the info-bar indicator flips
+                // to "saved" without restarting the TUI.
+                self.fixtures = crate::fixtures::scan(&crate::fixtures::default_dir());
+                // Report what actually landed rather than a hardcoded count: the
+                // grid has grown from six cells to eight (a fourth entry rule,
+                // `strategy-v2-qm-market`, joined the news on/off pair), and a
+                // baked-in number silently goes stale the next time it changes.
+                let cells = match self.current_fixture_status() {
+                    crate::fixtures::Status::Saved { cells, .. } => format!("{cells} cells"),
+                    crate::fixtures::Status::None => "saved".to_string(),
+                };
                 self.status = Status::info(format!(
-                    "{trade_id}: fixtures saved to replay-fixtures/ (6 cells)"
+                    "{trade_id}: fixtures in replay-fixtures/ ({cells})"
                 ));
             }
             JobOutcome::Failed(msg) => {
@@ -859,6 +898,9 @@ impl App {
             search: SearchState::default(),
             tv_load_pending: false,
             save_fixture_pending: false,
+            // Render tests must not depend on whatever is on the developer's
+            // disk; a test that wants a corpus sets `fixtures` explicitly.
+            fixtures: Vec::new(),
         }
     }
 
@@ -1044,6 +1086,77 @@ mod tests {
             Some("saved 6 cells")
         );
         assert_eq!(app.in_flight_len(), 0);
+    }
+
+    /// A finished capture must re-scan the corpus, so the info-bar indicator
+    /// flips from "no fixture" to a count without restarting the TUI. This is
+    /// the day-to-day path: today every live plan reads "no fixture" (the
+    /// corpus was captured from plans since deleted), so pressing `s` and
+    /// seeing the row change is how the operator knows it worked.
+    ///
+    /// The re-scan reads the real corpus directory, so this asserts the *call
+    /// happens* by pointing it at a temp dir holding one matching capture —
+    /// not at whatever is on the developer's disk.
+    #[test]
+    fn a_finished_capture_rescans_so_the_indicator_updates() {
+        let tmp =
+            std::env::temp_dir().join(format!("journal-rescan-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        for cell in ["t1-normal-news-off", "t1-normal-news-on"] {
+            let d = tmp.join(cell);
+            std::fs::create_dir_all(&d).expect("create cell dir");
+            std::fs::write(
+                d.join("meta.json"),
+                r#"{"instrument":"AUD_CAD","granularity":"h1","source":"oanda",
+                    "start":"2026-07-22T10:00:00Z","end":"2026-07-24T06:00:00Z"}"#,
+            )
+            .expect("write meta");
+        }
+        // SAFETY: single-threaded test; the override is read by `default_dir`
+        // on the next scan and removed before returning.
+        unsafe { std::env::set_var("TRADE_CONTROL_FIXTURES_DIR", &tmp) };
+
+        let mut app = App::from_rows(vec![row("t1")]);
+        app.seed_current(PlanData {
+            detail: parse_plan_export(EXPORT).ok(),
+            export_json: Some(EXPORT.to_string()),
+            timeline_json: Some(TIMELINE.to_string()),
+            replay_report: None,
+            tv_loaded: true,
+            max_depth: 1,
+            fixture_report: None,
+        });
+        // The plan row must carry the fixture's instrument/granularity for the
+        // match; `row()` already uses AUD_CAD / h1, and EXPORT's armed_at is
+        // 2026-07-22T09:12Z — inside the window of the cells written above.
+        assert!(
+            !app.current_fixture_status().is_saved(),
+            "starts with an empty corpus"
+        );
+
+        app.mark_in_flight_test("t1", JobKind::SaveFixture);
+        app.inject_job(JobResult {
+            trade_id: "t1".into(),
+            kind: JobKind::SaveFixture,
+            outcome: JobOutcome::SaveFixture("captured".into()),
+        });
+        app.drain_jobs();
+
+        let status = app.current_fixture_status();
+        assert!(
+            status.is_saved(),
+            "the completed capture must re-scan: {status:?}"
+        );
+        assert_eq!(status.label(), "fixture 2 ✓");
+        // The status line reports what actually landed, not a hardcoded count.
+        assert!(
+            app.status.text.contains("2 cells"),
+            "status names the real count: {}",
+            app.status.text
+        );
+
+        unsafe { std::env::remove_var("TRADE_CONTROL_FIXTURES_DIR") };
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// Filtering must move the SELECTION with the rows, not just hide rows: the
