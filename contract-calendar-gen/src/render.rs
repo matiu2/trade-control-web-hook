@@ -4,7 +4,7 @@
 //! # Row shape
 //!
 //! `(root, contract_month, settlement, last_trade_day, first_notice_day,
-//!   long_close_out, short_close_out)`
+//!   long_close_out, short_close_out, long_arm_by, short_arm_by)`
 //!
 //! Dates are `"YYYY-MM-DD"` strings (parsed once at lookup); `first_notice_day`
 //! is `""` for cash-settled contracts. `contract_month` is `"YYYYMM"`, matching
@@ -81,7 +81,8 @@ pub fn render_table(rows: &[ContractDates]) -> Result<String, RenderError> {
     s.push_str("// Futures contract close-out calendar.\n");
     s.push_str(
         "// (root, contract_month, settlement, last_trade_day, first_notice_day,\n\
-         //  long_close_out, short_close_out), sorted by (root, contract_month).\n",
+         //  long_close_out, short_close_out, long_arm_by, short_arm_by),\n\
+         //  sorted by (root, contract_month).\n",
     );
     s.push_str(
         "//\n// IBKR force-liquidates an expiring position during a close-out period\n\
@@ -91,7 +92,10 @@ pub fn render_table(rows: &[ContractDates]) -> Result<String, RenderError> {
          //   short = 2 business days before LAST TRADE DAY\n\
          // For a physically delivered contract First Notice Day is the last business\n\
          // day of the month PRECEDING delivery, so a December gold contract's long\n\
-         // deadline falls in NOVEMBER — about a month before its expiry date.\n",
+         // deadline falls in NOVEMBER — about a month before its expiry date.\n\
+         //\n// long_arm_by / short_arm_by are the deadlines minus the arm-time safety\n\
+         // margin: the last day a plan may still be ARMED, which is earlier than the\n\
+         // deadline because an armed plan may still open a position afterwards.\n",
     );
     s.push_str(
         "//\n// Dates are YYYY-MM-DD; first_notice_day is \"\" for cash-settled\n\
@@ -99,7 +103,9 @@ pub fn render_table(rows: &[ContractDates]) -> Result<String, RenderError> {
     );
     s.push_str("#[allow(clippy::type_complexity)]\n");
     s.push_str(
-        "pub static CONTRACT_CALENDAR_BAKED: &[(&str, &str, &str, &str, &str, &str, &str)] = &[\n",
+        "pub static CONTRACT_CALENDAR_BAKED: &[(\n\
+         \x20   &str, &str, &str, &str, &str, &str, &str, &str, &str,\n\
+         )] = &[\n",
     );
 
     for r in &sorted {
@@ -111,7 +117,7 @@ pub fn render_table(rows: &[ContractDates]) -> Result<String, RenderError> {
             .map(|s| s.settlement)
             .unwrap_or(Settlement::Cash);
         s.push_str(&format!(
-            "    ({:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}),\n",
+            "    ({:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}, {:?}),\n",
             r.root,
             contract_month(r.year, r.month),
             settlement.as_str(),
@@ -119,6 +125,8 @@ pub fn render_table(rows: &[ContractDates]) -> Result<String, RenderError> {
             fnd,
             r.long_close_out.to_string(),
             r.short_close_out.to_string(),
+            r.long_arm_by.to_string(),
+            r.short_arm_by.to_string(),
         ));
     }
     s.push_str("];\n");
@@ -142,7 +150,7 @@ mod tests {
         // root, month, settlement, last trade, FND, long, short.
         assert!(
             out.contains(
-                r#"("GC", "202612", "physical", "2026-12-29", "2026-11-30", "2026-11-25", "2026-12-24")"#
+                r#"("GC", "202612", "physical", "2026-12-29", "2026-11-30", "2026-11-25", "2026-12-24", "2026-11-11", "2026-12-10")"#
             ),
             "unexpected row rendering:\n{out}"
         );
@@ -202,8 +210,8 @@ mod tests {
             .expect("a GC row");
         assert_eq!(
             row.matches('"').count(),
-            14,
-            "seven quoted columns expected, got: {row}"
+            18,
+            "nine quoted columns expected, got: {row}"
         );
     }
 }

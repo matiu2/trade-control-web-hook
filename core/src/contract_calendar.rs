@@ -45,10 +45,18 @@
 
 use chrono::NaiveDate;
 
+// The close-out deadline differs by direction on physically delivered
+// contracts, so every accessor here takes one. Deliberately the *same*
+// `Direction` the rest of the crate uses rather than a private copy — two
+// identically-shaped enums for "which side of the market" is exactly the drift
+// hazard the four parallel broker enums already demonstrate.
+pub use crate::intent::Direction;
+
 /// The generated close-out calendar, produced offline by
 /// `contract-calendar-gen` and committed as a source file. Row shape
 /// `(root, contract_month, settlement, last_trade_day, first_notice_day,
-/// long_close_out, short_close_out)`, sorted by `(root, contract_month)`.
+/// long_close_out, short_close_out, long_arm_by, short_arm_by)`, sorted by
+/// `(root, contract_month)`.
 #[allow(clippy::type_complexity)]
 mod baked_table {
     include!("contract_calendar_baked.rs");
@@ -56,7 +64,8 @@ mod baked_table {
 use baked_table::CONTRACT_CALENDAR_BAKED;
 
 /// One row of the baked table: `(root, contract_month, settlement,
-/// last_trade_day, first_notice_day, long_close_out, short_close_out)`.
+/// last_trade_day, first_notice_day, long_close_out, short_close_out,
+/// long_arm_by, short_arm_by)`.
 type BakedRow = (
     &'static str,
     &'static str,
@@ -65,15 +74,9 @@ type BakedRow = (
     &'static str,
     &'static str,
     &'static str,
+    &'static str,
+    &'static str,
 );
-
-/// Which side of the market a position is on. The close-out deadline differs
-/// by direction on physically delivered contracts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Long,
-    Short,
-}
 
 /// How a contract settles at expiry.
 ///
@@ -101,6 +104,11 @@ pub struct ContractCalendarEntry {
     pub first_notice_day: Option<NaiveDate>,
     pub long_close_out: NaiveDate,
     pub short_close_out: NaiveDate,
+    /// Last day a **long** plan may still be armed — the deadline minus the
+    /// arm-time safety margin. See [`Self::arm_by_for`].
+    pub long_arm_by: NaiveDate,
+    /// Last day a **short** plan may still be armed.
+    pub short_arm_by: NaiveDate,
 }
 
 impl ContractCalendarEntry {
@@ -109,6 +117,21 @@ impl ContractCalendarEntry {
         match direction {
             Direction::Long => self.long_close_out,
             Direction::Short => self.short_close_out,
+        }
+    }
+
+    /// The last day a plan in `direction` may still be **armed**.
+    ///
+    /// Earlier than [`Self::close_out_for`], because arming is a licence to
+    /// open a position later: the trade window, multi-shot re-entry and a
+    /// weekend all have to fit between arming and the deadline. The margin is
+    /// baked by `contract-calendar-gen` (`ARM_SAFETY_BUSINESS_DAYS`) so the
+    /// business-day arithmetic — and its holiday table — lives in exactly one
+    /// place.
+    pub fn arm_by_for(&self, direction: Direction) -> NaiveDate {
+        match direction {
+            Direction::Long => self.long_arm_by,
+            Direction::Short => self.short_arm_by,
         }
     }
 }
@@ -177,6 +200,36 @@ pub fn is_past_close_out(
     close_out_deadline(root, contract_month, direction).map(|deadline| date >= deadline)
 }
 
+/// The last day a plan on `(root, contract_month)` may still be armed in
+/// `direction`.
+///
+/// `None` is a **refusal**, exactly as for [`close_out_deadline`].
+pub fn arm_by_deadline(
+    root: &str,
+    contract_month: &str,
+    direction: Direction,
+) -> Option<NaiveDate> {
+    lookup(root, contract_month).map(|e| e.arm_by_for(direction))
+}
+
+/// May a plan on this contract still be armed on `date`, in `direction`?
+///
+/// **`None` means refuse, not "unconstrained".** An unknown root, an unlisted
+/// contract month, a malformed row and an ambiguous key all land here, and in
+/// every one of those cases we do not know when IBKR would liquidate. The
+/// caller must not `unwrap_or(true)`.
+///
+/// `true` on the arm-by date itself — the margin already carries the head-room,
+/// so there is no reason to also lose its last day.
+pub fn is_armable_on(
+    root: &str,
+    contract_month: &str,
+    direction: Direction,
+    date: NaiveDate,
+) -> Option<bool> {
+    arm_by_deadline(root, contract_month, direction).map(|arm_by| date <= arm_by)
+}
+
 /// Every contract month listed for a root, ascending by month.
 pub fn months_for_root(root: &str) -> Vec<ContractCalendarEntry> {
     CONTRACT_CALENDAR_BAKED
@@ -189,7 +242,17 @@ pub fn months_for_root(root: &str) -> Vec<ContractCalendarEntry> {
 /// Decode one baked row. A malformed row yields `None` (and logs) rather than
 /// a partially-defaulted entry.
 fn parse_row(row: &'static BakedRow) -> Option<ContractCalendarEntry> {
-    let (root, contract_month, settlement, last_trade, fnd, long_out, short_out) = *row;
+    let (
+        root,
+        contract_month,
+        settlement,
+        last_trade,
+        fnd,
+        long_out,
+        short_out,
+        long_arm,
+        short_arm,
+    ) = *row;
     let settlement = match settlement {
         "physical" => SettlementType::Physical,
         "cash" => SettlementType::Cash,
@@ -222,6 +285,8 @@ fn parse_row(row: &'static BakedRow) -> Option<ContractCalendarEntry> {
         first_notice_day,
         long_close_out: parse_date(long_out, root, contract_month)?,
         short_close_out: parse_date(short_out, root, contract_month)?,
+        long_arm_by: parse_date(long_arm, root, contract_month)?,
+        short_arm_by: parse_date(short_arm, root, contract_month)?,
     })
 }
 
@@ -395,6 +460,8 @@ mod tests {
                 "2026-11-30",
                 "2026-11-25",
                 "2026-12-24",
+                "2026-11-11",
+                "2026-12-10",
             ),
             (
                 "GC",
@@ -404,6 +471,8 @@ mod tests {
                 "2026-11-30",
                 "2027-01-01",
                 "2027-01-01",
+                "2026-12-17",
+                "2026-12-17",
             ),
             (
                 "GC",
@@ -413,6 +482,8 @@ mod tests {
                 "2026-09-30",
                 "2026-09-28",
                 "2026-10-26",
+                "2026-09-14",
+                "2026-10-12",
             ),
         ];
         assert!(
@@ -435,6 +506,8 @@ mod tests {
             "2026-11-30",
             "2026-11-25",
             "2026-12-24",
+            "2026-11-11",
+            "2026-12-10",
         )];
         assert!(lookup_in(BAD_SETTLEMENT, "GC", "202612").is_none());
 
@@ -446,6 +519,8 @@ mod tests {
             "2026-11-30",
             "2026-11-25",
             "2026-12-24",
+            "2026-11-11",
+            "2026-12-10",
         )];
         assert!(lookup_in(BAD_DATE, "GC", "202612").is_none());
 
@@ -460,8 +535,75 @@ mod tests {
             "",
             "2026-11-25",
             "2026-12-24",
+            "2026-11-11",
+            "2026-12-10",
         )];
         assert!(lookup_in(PHYSICAL_NO_FND, "GC", "202612").is_none());
+    }
+
+    /// The arm-by date is strictly earlier than the deadline it protects, and
+    /// inherits the month-early trap: a December gold LONG stops being armable
+    /// in November.
+    #[test]
+    fn arm_by_is_head_room_before_the_deadline() {
+        let e = lookup("GC", "202612").expect("GC Dec 2026");
+        assert!(e.arm_by_for(Direction::Long) < e.close_out_for(Direction::Long));
+        assert!(e.arm_by_for(Direction::Short) < e.close_out_for(Direction::Short));
+        assert_eq!(e.arm_by_for(Direction::Long).month(), 11);
+    }
+
+    /// The direction split is the whole point: in the month between the two
+    /// arm-by dates a short is still armable and a long is not. Collapsing the
+    /// two would permit longs a month past their deadline.
+    #[test]
+    fn a_long_and_a_short_diverge_between_the_two_arm_by_dates() {
+        let between = d(2026, 11, 20);
+        assert_eq!(
+            is_armable_on("GC", "202612", Direction::Long, between),
+            Some(false),
+            "a long is already unarmable"
+        );
+        assert_eq!(
+            is_armable_on("GC", "202612", Direction::Short, between),
+            Some(true),
+            "the short still has a month"
+        );
+    }
+
+    #[test]
+    fn the_arm_by_date_itself_is_still_armable() {
+        let e = lookup("GC", "202612").expect("GC Dec 2026");
+        let arm_by = e.arm_by_for(Direction::Long);
+        assert_eq!(
+            is_armable_on("GC", "202612", Direction::Long, arm_by),
+            Some(true),
+            "the margin carries the head-room; don't also lose its last day"
+        );
+        assert_eq!(
+            is_armable_on(
+                "GC",
+                "202612",
+                Direction::Long,
+                arm_by.succ_opt().expect("next day")
+            ),
+            Some(false)
+        );
+    }
+
+    /// Unknown contracts must refuse, not answer "safe". A caller that reads
+    /// `None` as "no constraint" is the failure this whole module guards.
+    #[test]
+    fn an_unknown_contract_refuses_rather_than_permitting() {
+        assert_eq!(
+            is_armable_on("ZZ", "202612", Direction::Long, d(2026, 1, 1)),
+            None
+        );
+        assert_eq!(
+            is_armable_on("GC", "209912", Direction::Long, d(2026, 1, 1)),
+            None,
+            "an unlisted month is as unknown as an unlisted root"
+        );
+        assert_eq!(arm_by_deadline("ZZ", "202612", Direction::Long), None);
     }
 
     #[test]

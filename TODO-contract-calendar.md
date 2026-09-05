@@ -1,120 +1,106 @@
-# TODO — Stage 2: contract calendar + generator
+# TODO — Stage 3: arm-time close-out refusal
 
-Stage 2 of the IBKR futures integration (plan:
-`~/.home-claude/plans/magical-enchanting-bird.md`). Produces the **close-out
-deadline** table that Stage 3's arm-time guard reads.
+Stage 3 of the IBKR futures integration (plan:
+`~/.home-claude/plans/magical-enchanting-bird.md`). **THE GATE** — nothing that
+can place a futures order lands before it.
 
-Branch `feat/contract-calendar`, worktree
-`../trade-control-contract-calendar` (sibling — `../` path-deps resolve
-lexically, so it must not be nested).
+Stage 2 (the calendar + generator) is complete and pushed as `9d43289`; its
+TODO is preserved in that commit.
 
-## Why this exists
+Branch `feat/contract-calendar`, worktree `../trade-control-contract-calendar`.
 
-IBKR **force-liquidates** an expiring futures position without notice
-(`SCOPING-ibkr-futures-broker.md` §3b-0). The deadline is **not** the contract's
-expiry:
+## What this stage does
 
-- **Long:** end of the 2nd business day before **First Notice Day**.
-- **Short:** end of the 2nd business day before **last trade day**.
+Refuse to arm an IBKR futures plan whose `trade_expiry` runs past the
+contract's close-out deadline (minus a safety margin), and refuse outright when
+the contract is unknown. IBKR force-liquidates without notice; an armed plan
+that can still be entering positions inside the close-out window is the failure
+mode.
 
-For COMEX gold FND is the last business day of the month *preceding* delivery,
-so a **December** contract's long deadline is in **November** — ~a month before
-the expiry date anyone would read off the chain. Verified live 2026-09-06: GCU6
-(expiry 2026-09-28) was already past its long close-out deadline while still
-listed as healthy front month.
+## Ordering problem found on entry (resolved)
+
+The plan says the guard applies "only when `broker == Ibkr`", but
+`BrokerKind::Ibkr` does not exist until **Stage 4**. Rather than reorder the
+stages (Stage 4 is a ~400-line enum sweep, and landing the gate after it would
+violate "nothing order-placing lands before the guard"), the guard is written
+**broker-agnostic and driven by the instrument**: it fires when the instrument
+parses as a futures contract (`ROOT` + month code, e.g. `GCZ6`/`GC 202612`),
+which no CFD/spot instrument does. Stage 4 then adds the `BrokerKind::Ibkr`
+check as a *narrowing* condition, not a rewrite.
+
+This is strictly safer than the plan's shape: today a futures-looking
+instrument on any broker is refused, so the gate cannot be bypassed by an
+un-migrated broker field.
 
 ## Design decisions
 
-- **Pure arithmetic, no network.** Unlike `market-hours-gen` (which fetches
-  candles), every rule here is a deterministic calendar computation. The
-  generator is a renderer over a hand-maintained spec, so the whole thing is
-  offline-testable.
-- **Deadline is DIRECTION-DEPENDENT.** Long and short differ (FND vs last trade
-  day), so the row carries both and the lookup takes a direction. Collapsing
-  them to one number would silently over-permit longs on physical contracts.
-- **Key on `(root, month)`, return `None` on ambiguity.** Do *not* repeat
-  `core/src/spread_blackout/coverage.rs:87` / `core/src/intent/blackout/baked.rs:76`,
-  which match on symbol alone with the first column bound to `_` — a colliding
-  key silently takes the first row.
-- **`None` is the fail-closed refusal signal**, never "no constraint".
+- **Reuse `core::intent::Direction`**, don't keep the parallel
+  `contract_calendar::Direction`. Two identically-shaped enums for "which side
+  of the market" in one crate is the drift hazard the four parallel broker
+  enums already demonstrate. Stage 2 introduced the duplicate; collapse it now
+  while it has exactly one consumer.
+- **Direction comes from the pattern**, via the existing
+  `TradePattern → Direction` mapping (H&S/M ⇒ Short, iH&S/W ⇒ Long). The
+  deadline differs by ~a month on physical contracts, so this must not be
+  guessed.
+- **Unknown contract ⇒ refuse.** `lookup` returning `None` is a refusal signal,
+  never "no constraint" — that is the whole fail-closed contract of Stage 2.
+- **`Strict` only.** Offline `--plan-out` replay of a historical setup must
+  still build, exactly as it does for an expired `trade_expiry`.
 
 ## Tasks
 
-- [x] Scaffold the crate as a workspace member.
-  - [x] ⚠️ **Renamed to `contract-calendar-gen`.** The plan's suggested name
-        `trade-calendar-maker` was **already taken by a real, unrelated
-        project** at `/home/matiu/projects/trade-calendar-maker` — an
-        economic-calendar / news-blackout tool that `cli` and `tv-arm` already
-        depend on. `cargo add` refused with a lockfile collision. The dangling
-        root symlink was just a broken convenience link to it, not a
-        placeholder for this work. The new name also matches the sibling
-        generators (`market-hours-gen`, `spread-baseline-gen`).
-- [x] `holiday.rs` — US exchange holiday calendar + business-day arithmetic.
-- [x] `rules.rs` — last-trade-day / FND / close-out derivation per contract root.
-- [x] Deadlines are **direction-dependent** (long counts from FND, short from
-      last trade day) — a single collapsed number would permit longs a month
-      past their deadline.
-- [x] `render.rs` — emit `core/src/contract_calendar_baked.rs`.
-- [x] `bin/generate.rs` — CLI driver.
-- [x] `core/src/contract_calendar.rs` — the `include!`-ing lookup module.
-- [x] Wire into `core/src/lib.rs`.
+- [x] Collapse `contract_calendar::Direction` onto `core::intent::Direction`.
+- [x] `cli/src/futures_symbol.rs` — parse an instrument into
+      `(root, contract_month)`; `None` for anything that isn't futures.
+- [x] Safety margin constant + business-day arithmetic reachable from `core`.
+- [x] The guard itself in `build_trade_from_spec`, at the `trade_expiry` seam.
+- [x] README section.
 
 ## Tests (the correctness anchors)
 
-- [x] **GC December ⇒ long deadline in November.** The single most important
-      test in this stage — the month-early trap.
-- [x] ES cash-settled ⇒ no FND; long and short deadlines coincide.
-- [x] Unknown root ⇒ `None` (fail closed).
-- [x] Business-day arithmetic across a US holiday (Thanksgiving, Good Friday).
-- [x] Duplicate `(root, month)` key rejected at render time.
-- [x] Ambiguous lookup returns `None` rather than the first match.
-- [x] Malformed row (bad settlement / bad date / physical-without-FND) refuses
-      rather than decoding to a defaulted entry.
-- [x] Live fixtures from the paper Gateway 2026-09-06: GC 202609 last trade
-      2026-09-28, MGC 202610 → 2026-10-28, ES/MES 202609 → 2026-09-18.
+- [x] GC plan whose window runs into the close-out ⇒ operator rejection
+      (an `Err`, not a panic).
+- [x] The same plan 30 days earlier ⇒ builds.
+- [x] Unknown futures contract ⇒ refuses.
+- [x] A **long** and a **short** on the same physical contract get different
+      verdicts in the month between the two deadlines. This is the
+      month-early trap reaching the operator.
+- [x] An OANDA/CFD plan with identical geometry is unaffected (proves the
+      guard is scoped, per the plan's verification section).
+- [x] `Lenient` (`--plan-out`) still builds.
 
 ## Mutation verification
 
-Per `verify_new_analysis_code_by_mutation` — green tests prove nothing. Break
-the source, confirm red:
+Per `verify_new_analysis_code_by_mutation`:
 
-- [x] Flip FND from "last business day of PRIOR month" to "of the delivery
-      month" ⇒ the GC-December test must fail.
-- [x] Drop the 2-business-day close-out offset ⇒ deadline tests fail.
-- [x] Remove a holiday from the table ⇒ business-day test fails.
-- [x] Make ambiguous lookup return the first match ⇒ ambiguity test fails.
-- [x] Collapse long/short into one deadline ⇒ 3 tests fail.
-- [x] `is_past_close_out` answers "safe" for unknown contracts ⇒ test fails.
-- [x] Unrecognised settlement defaults to cash ⇒ test fails.
-
-⚠️ **Mutation 7 initially SURVIVED.** The generator makes duplicate keys
-impossible, so no test could reach the lookup's ambiguity guard — it was
-untested defence-in-depth, exactly the kind a later refactor deletes without a
-red test. Fixed by splitting `lookup_in` to take an explicit table so the guard
-runs against a synthetic ambiguous one.
-
-## Open gaps (cannot be closed offline)
-
-- **IBKR documents per-product close-out overrides** — *"certain contracts use
-  a different time ahead of the Close-Out deadline as specified in the
-  following table"*. That table is behind an anti-scraping block; unconfirmed
-  whether GC/MGC/ES/MES override the standard 2 business days. An override
-  would make these deadlines **too late**. Verify before real money; Stage 3's
-  safety margin absorbs it meanwhile.
-- **MGC settlement** — recorded `Physical` on the strength of CME's
-  micro-metals literature (deliverable via an Accumulated Certificate of
-  Exchange) and IBKR's own COMEX docs grouping MGC with GC. Several secondary
-  sources say cash-settled; not followed. Error is asymmetric, so the
-  conservative reading is also the better-sourced one.
-- **Safety margin** (Stage 3's `deadline − margin`) still needs operator
-  sign-off. Not this stage's code.
+- [x] Drop the safety margin ⇒ a boundary test must fail.
+- [x] Treat unknown contract as safe ⇒ the unknown test must fail.
+- [x] Ignore direction (always long / always short) ⇒ the pair test must fail.
+- [x] Apply the guard in `Lenient` too ⇒ the plan-out test must fail.
+- [x] Make the symbol parser accept a CFD name ⇒ the OANDA test must fail.
 
 ## Gate
 
 `cargo test`, `cargo clippy`, `cargo fmt` before commit.
 
+## Open gaps carried into Stage 4
+
+- **The guard is instrument-keyed, not broker-keyed.** Stage 4 should add
+  `broker == Ibkr` as a *narrowing* condition once `BrokerKind::Ibkr` exists —
+  not replace the instrument check, which is what stops a futures contract
+  slipping past on an un-migrated broker field.
+- **The instrument spelling for futures is not yet fixed anywhere else.**
+  `instrument-lookup` has no contract-month dimension (scoping §3b), so
+  `futures_symbol` is currently the only reader of the contract month. Stage 5
+  bakes the multiplier and will need the same key; keep the two agreeing.
+- **The safety margin (10 business days) has not been signed off by the
+  operator.** It is a one-constant change plus a regenerate if they want
+  another number.
+
 ## Status: COMPLETE
 
-All tasks and mutation checks done — see the mutation table at the bottom of
-`contract-calendar-gen/README.md`. Stage 3 (arm-time refusal in
-`build_trade_from_spec`) consumes `close_out_deadline()` from here.
+Stage 3 is the gate; nothing order-placing may land before it. Next is Stage 4
+(`BrokerKind::Ibkr` + the parallel-enum sweep), which is what makes
+`trade-control-accounts`, `tv-arm-staging`, `trade-control-staging` and
+`journal-staging` IBKR-aware.

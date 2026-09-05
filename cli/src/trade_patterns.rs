@@ -20,13 +20,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, Utc};
 use color_eyre::eyre::{Context, Result, eyre};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{FuzzySelect, Input};
 use serde::{Deserialize, Serialize};
 
 use trade_control_conventions::AlertBasename;
+use trade_control_core::contract_calendar;
 use trade_control_core::intent::{
     Action, BlackoutCloseAction, BrokerKind, Direction, EntrySpec, Intent, MW_CANCEL_VETO_NAME,
     MW_OVERSHOOT_VETO_NAME, PriceAnchor, PriceRef, RecoverEntry, RecoverEntryAction, TakeProfit,
@@ -38,6 +39,7 @@ use crate::control::{
     wrap_signed_direct_enter, wrap_signed_template, wrap_signed_template_drawing,
 };
 use crate::expiry;
+use crate::futures_symbol;
 use crate::instruments::validate_instrument;
 
 /// Default lifetime of the entry window expressed as a percentage of the
@@ -78,6 +80,20 @@ impl TradePattern {
             Self::Ihs => "ihs — Inverse Head & Shoulders (long)",
             Self::M => "m — M-top (short)",
             Self::W => "w — W-bottom (long)",
+        }
+    }
+
+    /// Which side of the market this pattern trades.
+    ///
+    /// Total over all four patterns, unlike
+    /// [`PatternGeometry::for_pattern`], which is H&S-only and panics on M/W
+    /// (its callers dispatch those away first). The close-out guard runs
+    /// *before* that dispatch and needs an answer for every pattern, because
+    /// a physical contract's long and short deadlines are ~a month apart.
+    pub fn direction(self) -> Direction {
+        match self {
+            Self::Hs | Self::M => Direction::Short,
+            Self::Ihs | Self::W => Direction::Long,
         }
     }
 
@@ -825,6 +841,7 @@ pub fn build_trade_from_spec(
             }
         }
     }
+    check_futures_close_out(&spec, now, strictness)?;
     if !spec.tp_price.is_finite() {
         return Err(eyre!("tp_price must be a finite number"));
     }
@@ -1375,6 +1392,122 @@ fn assemble_trade(
 }
 
 // ===== M / W (double-top / double-bottom) assembly =====
+
+/// Refuse to arm a futures plan that could still be opening a position inside
+/// its contract's close-out window.
+///
+/// # The hazard
+///
+/// IBKR force-liquidates an expiring futures position during a close-out
+/// period preceding expiry, **without additional prior notice**, and does not
+/// roll positions. The deadline is not the expiry date on the contract chain:
+/// for a physically delivered contract a *long* must be out two business days
+/// before First Notice Day, which is the last business day of the month
+/// *preceding* delivery — so a December gold long's deadline is in November,
+/// about a month earlier than the chain suggests. Verified live on 2026-09-06:
+/// GCU6 was already past its long deadline while still listed as front month.
+///
+/// # Why this fires at arm time and not at entry
+///
+/// Arming is a licence to open a position later. By the time an entry fires
+/// there is nothing useful to say — the operator has walked away and the plan
+/// is running. So the guard reads the calendar's **arm-by** date, which is the
+/// deadline minus a safety margin sized to cover the trade window, multi-shot
+/// re-entry and a weekend (`ARM_SAFETY_BUSINESS_DAYS` in
+/// `contract-calendar-gen`).
+///
+/// # Scope
+///
+/// Fires only for instruments that parse as futures ([`futures_symbol`]); every
+/// CFD and spot instrument the system trades today is untouched. It is
+/// deliberately **not** keyed on [`BrokerKind`]: `BrokerKind::Ibkr` does not
+/// exist yet, and keying on the instrument means a futures contract cannot slip
+/// past by carrying a not-yet-migrated broker field. When the IBKR variant
+/// lands it narrows this condition rather than replacing it.
+///
+/// # Fail-closed
+///
+/// An unknown contract is a **refusal**, not an absent constraint — if the
+/// calendar cannot say when IBKR would liquidate, we must not arm. That is the
+/// whole contract of `core::contract_calendar`'s `Option`.
+///
+/// [`BuildStrictness::Lenient`] warns instead, matching how the sibling
+/// `trade_expiry` check treats offline `--plan-out` replay of historical
+/// setups.
+fn check_futures_close_out(
+    spec: &TradeSpec,
+    now: DateTime<Utc>,
+    strictness: BuildStrictness,
+) -> Result<()> {
+    let Some(contract) = futures_symbol::parse(&spec.instrument, now.year()) else {
+        return Ok(());
+    };
+    let direction = spec.pattern.direction();
+    // The whole window has to fit, so the question is asked about the last
+    // moment the plan can still enter, not about now.
+    let expiry_day = spec.trade_expiry.date_naive();
+    let armable = contract_calendar::is_armable_on(
+        &contract.root,
+        &contract.contract_month,
+        direction,
+        expiry_day,
+    );
+    let side = match direction {
+        Direction::Long => "long",
+        Direction::Short => "short",
+    };
+    let refusal = match armable {
+        Some(true) => return Ok(()),
+        Some(false) => {
+            let arm_by = contract_calendar::arm_by_deadline(
+                &contract.root,
+                &contract.contract_month,
+                direction,
+            );
+            let deadline = contract_calendar::close_out_deadline(
+                &contract.root,
+                &contract.contract_month,
+                direction,
+            );
+            eyre!(
+                "{} {} is past its close-out arming window for a {side}: trade_expiry \
+                 {} runs beyond the last armable day {}, and IBKR force-liquidates \
+                 without notice from {}. Arm the next contract month instead.",
+                contract.root,
+                contract.contract_month,
+                expiry_day,
+                arm_by
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                deadline
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            )
+        }
+        None => eyre!(
+            "{} {} is not in the contract calendar, so its close-out deadline is \
+             unknown — refusing to arm. IBKR force-liquidates expiring positions \
+             without notice, so an unknown contract is never safe. Regenerate the \
+             calendar with `contract-calendar-gen` if the month should be listed.",
+            contract.root,
+            contract.contract_month,
+        ),
+    };
+    match strictness {
+        BuildStrictness::Strict => Err(refusal),
+        BuildStrictness::Lenient => {
+            tracing::warn!(
+                instrument = %spec.instrument,
+                root = %contract.root,
+                contract_month = %contract.contract_month,
+                side,
+                "close-out check failed but allowed because this is an offline \
+                 --plan-out build (would be rejected on the live worker path): {refusal}",
+            );
+            Ok(())
+        }
+    }
+}
 
 /// Assemble an M / W trade bundle. Structurally distinct from H&S: no
 /// prep chain, no drawing-bound invalidation vetos, and the worker — not
@@ -3418,6 +3551,124 @@ mod tests {
             breakeven_pct: default_breakeven_pct(),
             spread_window: None,
         }
+    }
+
+    // ---- Stage 3: futures close-out refusal --------------------------------
+    //
+    // GC 202612 in the baked calendar:
+    //   last trade   2026-12-29
+    //   FND          2026-11-30
+    //   long  close-out 2026-11-25, arm-by 2026-11-11
+    //   short close-out 2026-12-24, arm-by 2026-12-10
+    // The month between the two arm-by dates is where direction matters.
+
+    /// A December gold LONG whose window reaches past the November arm-by date
+    /// must be refused — the month-early trap reaching the operator.
+    #[test]
+    fn a_futures_long_past_its_arm_by_date_is_refused() {
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-11-20T00:00:00Z"));
+        spec.instrument = "GCZ6".into();
+        let err = build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Strict)
+            .expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("GC"), "{msg}");
+        assert!(msg.contains("202612"), "{msg}");
+        assert!(msg.contains("long"), "{msg}");
+        // The operator needs both the date they blew and what to do instead.
+        assert!(
+            msg.contains("2026-11-11"),
+            "must name the arm-by date: {msg}"
+        );
+        assert!(msg.contains("next contract month"), "{msg}");
+    }
+
+    /// The same contract, armed well before the window, builds normally.
+    #[test]
+    fn the_same_futures_plan_earlier_in_the_month_builds() {
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-10-20T00:00:00Z"));
+        spec.instrument = "GCZ6".into();
+        build_trade_from_spec(spec, ts("2026-10-18T00:00:00Z"), BuildStrictness::Strict)
+            .expect("a plan whose window ends a month before the arm-by date must build");
+    }
+
+    /// The pair test: on one date, in one contract, a short is still armable
+    /// and a long is not. Collapsing the two deadlines would let a long run a
+    /// month past its own — the single most expensive mistake available here.
+    #[test]
+    fn direction_decides_the_verdict_between_the_two_arm_by_dates() {
+        let now = ts("2026-11-18T00:00:00Z");
+        let expiry = ts("2026-11-20T00:00:00Z");
+
+        let mut long = sample_spec(TradePattern::Ihs, expiry);
+        long.instrument = "GCZ6".into();
+        assert!(
+            build_trade_from_spec(long, now, BuildStrictness::Strict).is_err(),
+            "the long is already past its arm-by date"
+        );
+
+        let mut short = sample_spec(TradePattern::Hs, expiry);
+        short.instrument = "GCZ6".into();
+        build_trade_from_spec(short, now, BuildStrictness::Strict)
+            .expect("the short still has until December");
+    }
+
+    /// An unknown contract is a refusal, never an absent constraint: if the
+    /// calendar cannot say when IBKR would liquidate, arming is not safe.
+    #[test]
+    fn an_unknown_futures_contract_is_refused() {
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.instrument = "ZZZ 202612".into();
+        let err = build_trade_from_spec(spec, ts("2026-05-20T00:00:00Z"), BuildStrictness::Strict)
+            .expect_err("an unknown contract must refuse");
+        assert!(err.to_string().contains("not in the contract calendar"));
+    }
+
+    /// The guard must be invisible to the CFD/spot plans that are all the
+    /// system trades today — the plan's own verification asks for exactly this.
+    #[test]
+    fn a_cfd_plan_with_the_same_geometry_is_unaffected() {
+        // Identical dates to the refused futures long above; only the
+        // instrument differs.
+        let spec = sample_spec(TradePattern::Ihs, ts("2026-11-20T00:00:00Z"));
+        assert_eq!(spec.instrument, "EUR_USD");
+        build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Strict)
+            .expect("a CFD plan must be untouched by the futures close-out guard");
+    }
+
+    /// Offline `--plan-out` replay of a historical setup must still build,
+    /// exactly as it does for an already-expired `trade_expiry`.
+    #[test]
+    fn lenient_plan_out_warns_instead_of_refusing() {
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-11-20T00:00:00Z"));
+        spec.instrument = "GCZ6".into();
+        build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Lenient)
+            .expect("offline builds warn rather than refusing");
+    }
+
+    /// The guard asks about the end of the trade window, not about now — an
+    /// armed plan can still be entering right up to `trade_expiry`.
+    #[test]
+    fn the_window_end_is_what_is_checked_not_the_arming_moment() {
+        // Armed on the arm-by date itself, but with a window running past it.
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-11-13T00:00:00Z"));
+        spec.instrument = "GCZ6".into();
+        assert!(
+            build_trade_from_spec(spec, ts("2026-11-11T00:00:00Z"), BuildStrictness::Strict)
+                .is_err(),
+            "arming on the last armable day with a window that outlives it must refuse"
+        );
+    }
+
+    /// M/W patterns reach the guard too — they dispatch to `build_mw_pattern`
+    /// *after* it, and `PatternGeometry::for_pattern` panics on them, which is
+    /// why the direction mapping is on `TradePattern` rather than the geometry.
+    #[test]
+    fn mw_patterns_are_covered_by_the_guard_without_panicking() {
+        let mut spec = mw_spec(TradePattern::W, ts("2026-11-20T00:00:00Z"));
+        spec.instrument = "GCZ6".into();
+        let err = build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Strict)
+            .expect_err("a W-bottom is a long, so it is past its arm-by date");
+        assert!(err.to_string().contains("long"), "{}", err);
     }
 
     #[test]

@@ -68,6 +68,31 @@ Multipliers verified live against the paper Gateway 2026-09-06. They are
 recorded for cross-checking only — the sizing path bakes its own value onto the
 signed intent.
 
+## The arm-by margin
+
+The table carries two dates per direction:
+
+| column | meaning |
+|---|---|
+| `long_close_out` / `short_close_out` | the deadline — when IBKR may liquidate |
+| `long_arm_by` / `short_arm_by` | the last day a plan may still be **armed** |
+
+The gap is `ARM_SAFETY_BUSINESS_DAYS` (**10**). Arming is not holding a
+position — it is a licence to open one later, so everything between arming and
+the deadline has to fit: the trade window (`trade_expiry`, default 48h),
+multi-shot re-entry after a stop-out, a weekend, and the unread per-product
+override table below. Ten business days clears all four.
+
+It costs coverage — roughly a fortnight at the end of each contract month
+during which new plans on the front month are refused and the operator arms the
+next month instead. That is the intended trade: rolling forward is free, a
+forced liquidation is not.
+
+The margin is applied **here**, at generation time, so the business-day
+arithmetic and its holiday table live in exactly one place; `core` reads the
+result rather than recomputing it. Changing the margin means regenerating the
+table, which is deliberate — the value then shows up as a reviewable diff.
+
 ## Fail closed
 
 Every fallible path returns `None`/`Err` rather than a default: unknown
@@ -116,6 +141,18 @@ the suite confirmed red.
 | 8 | `is_past_close_out` answers "safe" for unknown contracts | 1 test fails |
 | 9 | long/short deadlines collapsed into one | 3 tests fail |
 | 10 | unrecognised settlement defaults to cash | 1 test fails |
+| 11 | arm-by margin 10 → 0 business days | 3 tests fail |
+
+Stage 3's guard (in `trade-control-cli`) was mutated the same way:
+
+| # | mutation | result |
+|---|---|---|
+| 12 | `arm_by_for` returns the deadline, dropping the margin | 3 tests fail |
+| 13 | unknown contract treated as armable | 1 test fails |
+| 14 | direction ignored (always short) | 2 tests fail |
+| 15 | guard applied under `Lenient` too | 1 test fails |
+| 16 | futures-symbol root length bound removed | 1 test fails |
+| 17 | any letter accepted as a month code | 4 tests fail |
 
 Mutation 7 initially **survived** — the generator makes duplicates impossible,
 so no test could reach the lookup's ambiguity guard. `lookup_in` was split out

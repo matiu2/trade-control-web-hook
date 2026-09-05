@@ -44,6 +44,26 @@ use crate::holiday::{
 /// Stage 3 safety margin is what absorbs the uncertainty.
 pub const CLOSE_OUT_BUSINESS_DAYS: u32 = 2;
 
+/// Business days of head-room between the last moment a plan may still be
+/// *entering* and the close-out deadline itself.
+///
+/// The deadline is when IBKR may liquidate. Arming right up to it would be
+/// wrong, because an armed plan is not a position — it is a *licence to open
+/// one*, and everything between arming and the deadline has to fit:
+///
+/// - the trade window itself (`trade_expiry`, default 48h from arming),
+/// - multi-shot re-entry, which may place again after a stop-out,
+/// - a weekend, during which nothing can be closed,
+/// - and the unread per-product override table above, which could move the
+///   real deadline earlier than [`CLOSE_OUT_BUSINESS_DAYS`] assumes.
+///
+/// Ten business days clears all four with room to spare. It costs coverage —
+/// roughly a fortnight at the end of each contract month during which new
+/// plans on the front month are refused and the operator arms the next month
+/// instead — which is the intended trade, since rolling forward is free and a
+/// forced liquidation is not.
+pub const ARM_SAFETY_BUSINESS_DAYS: u32 = 10;
+
 /// How a contract settles at expiry.
 ///
 /// This is the single fact that decides whether a contract has a First Notice
@@ -195,6 +215,13 @@ pub struct ContractDates {
     /// Deadline for a **short** position: 2 business days before last trade
     /// day, regardless of settlement type.
     pub short_close_out: NaiveDate,
+    /// Last day a **long** plan may still be armed:
+    /// [`ARM_SAFETY_BUSINESS_DAYS`] before [`Self::long_close_out`]. The guard
+    /// reads this, not the deadline — see the constant's docs for why the
+    /// head-room is needed.
+    pub long_arm_by: NaiveDate,
+    /// Last day a **short** plan may still be armed.
+    pub short_arm_by: NaiveDate,
 }
 
 /// Compute the last trade day for a contract month.
@@ -241,6 +268,10 @@ pub fn contract_dates(spec: &ContractSpec, year: i32, month: u32) -> Option<Cont
     let long_reference = fnd.unwrap_or(last_trade);
     let long_close_out = business_days_before(long_reference, CLOSE_OUT_BUSINESS_DAYS)?;
     let short_close_out = business_days_before(last_trade, CLOSE_OUT_BUSINESS_DAYS)?;
+    // The arm-by dates carry the head-room the arm-time guard needs; deriving
+    // them here keeps one holiday table rather than duplicating it into `core`.
+    let long_arm_by = business_days_before(long_close_out, ARM_SAFETY_BUSINESS_DAYS)?;
+    let short_arm_by = business_days_before(short_close_out, ARM_SAFETY_BUSINESS_DAYS)?;
     Some(ContractDates {
         root: spec.root,
         year,
@@ -249,6 +280,8 @@ pub fn contract_dates(spec: &ContractSpec, year: i32, month: u32) -> Option<Cont
         first_notice_day: fnd,
         long_close_out,
         short_close_out,
+        long_arm_by,
+        short_arm_by,
     })
 }
 
@@ -295,6 +328,46 @@ mod tests {
 
     /// THE anchor test for this stage: a December gold contract's long
     /// close-out deadline must land in NOVEMBER, ~a month before expiry.
+    #[test]
+    fn arm_by_leaves_ten_business_days_of_head_room() {
+        // The guard reads arm_by, not the deadline. Pin the gap in the unit
+        // that matters — business days — rather than re-asserting a date the
+        // implementation just produced.
+        let gc = contract_dates(spec_for("GC").expect("GC known"), 2026, 12).expect("derivable");
+        assert_eq!(
+            business_days_before(gc.long_close_out, ARM_SAFETY_BUSINESS_DAYS),
+            Some(gc.long_arm_by),
+        );
+        assert_eq!(
+            business_days_before(gc.short_close_out, ARM_SAFETY_BUSINESS_DAYS),
+            Some(gc.short_arm_by),
+        );
+        // And it really is head-room: strictly earlier than the deadline.
+        assert!(gc.long_arm_by < gc.long_close_out);
+        assert!(gc.short_arm_by < gc.short_close_out);
+    }
+
+    #[test]
+    fn arm_by_inherits_the_month_early_trap() {
+        // The whole point of Stage 3: a December gold LONG must stop being
+        // armable in NOVEMBER, well before anyone reading the chain's expiry
+        // date would expect. Verified by hand: 10 business days back from
+        // 2026-11-25, skipping Thanksgiving week's weekends, is 2026-11-11.
+        let gc = contract_dates(spec_for("GC").expect("GC known"), 2026, 12).expect("derivable");
+        assert_eq!(
+            gc.long_arm_by.month(),
+            11,
+            "long arm-by must land in November"
+        );
+        assert_eq!(
+            gc.long_arm_by,
+            NaiveDate::from_ymd_opt(2026, 11, 11).expect("valid"),
+        );
+        // The short is a month later — the two must not collapse.
+        assert_eq!(gc.short_arm_by.month(), 12);
+        assert!(gc.long_arm_by < gc.short_arm_by);
+    }
+
     #[test]
     fn gc_december_long_deadline_is_in_november() {
         let dates = contract_dates(spec("GC"), 2026, 12).expect("GC Dec 2026 derivable");

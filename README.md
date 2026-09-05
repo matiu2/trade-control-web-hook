@@ -2227,6 +2227,52 @@ instrument: EUR/USD
 # ...
 ```
 
+### Futures contracts and the close-out guard
+
+**Not yet tradable — the guard lands ahead of the broker.** IBKR futures are
+being wired in stages; what exists today is the refusal, deliberately built
+before anything that can place a futures order.
+
+IBKR **force-liquidates** an expiring futures position during a close-out
+period preceding expiry, *without additional prior notice*, and does not roll
+positions ("Automatic Futures Rollover" is a charting feature that rolls
+nothing). The deadline is **not** the expiry date on the contract chain:
+
+- **long** — 2 business days before **First Notice Day**
+- **short** — 2 business days before **last trade day**
+
+For a physically delivered contract First Notice Day is the last business day
+of the month *preceding* delivery, so a **December gold long's deadline is in
+November** — about a month before the expiry anyone would read off the chain.
+Observed live on 2026-09-06: GCU6 (last trade 2026-09-28) was already past its
+long deadline while still listed as the healthy front month.
+
+So `build-trade` / `tv-arm` **refuse to arm** a plan on a futures instrument
+whose `trade_expiry` runs past the contract's *arm-by* date — the deadline
+minus a safety margin covering the trade window, multi-shot re-entry and a
+weekend. An **unknown** contract is also a refusal: if the calendar cannot say
+when IBKR would liquidate, arming is never safe.
+
+An instrument is treated as futures when it parses as either IBKR's own
+`local_symbol` (`GCZ6`) or an explicit contract month (`GC 202612`). Every
+CFD/spot instrument the system trades today is untouched — the guard is a
+complete no-op for them.
+
+```
+$ trade-control build-trade --from-file trade.yaml ...
+Error: GC 202612 is past its close-out arming window for a long: trade_expiry
+2026-11-20 runs beyond the last armable day 2026-11-11, and IBKR
+force-liquidates without notice from 2026-11-25. Arm the next contract month
+instead.
+```
+
+Offline `--plan-out` builds warn instead of refusing, matching how an expired
+`trade_expiry` is treated there — historical setups must still replay.
+
+The calendar itself is a generated table (`core/src/contract_calendar_baked.rs`,
+GC/MGC/ES/MES, 2026–2028); see [`contract-calendar-gen/README.md`](contract-calendar-gen/README.md)
+for the rules, the margin and how to regenerate.
+
 ### Broker trait surface (contributor note)
 
 Each broker crate implements the `Broker` trait in `core/src/broker.rs`.
