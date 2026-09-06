@@ -33,6 +33,7 @@ use chrono::{DateTime, Utc};
 
 use super::promote::{PromoteOutcome, promote_stored_order};
 use super::sl_target::{SlAction, SpreadInputs, sl_target};
+use super::stored::StoredCheck;
 use crate::broker::Broker;
 use crate::pending_lifecycle::{EnterConfigProvider, VerifiedSource};
 use crate::spread_blackout::spread_forecast_frac;
@@ -153,10 +154,14 @@ where
             parked.tp_distance,
             parked.min_r,
         );
-        let clears_min_r = target.action != SlAction::BelowMinR;
-        match promote_stored_order(broker, store, cfg, src, &record.trade_id, clears_min_r, now)
-            .await
-        {
+        // `now` is the bar identity this pass has: the loop ticks faster than a
+        // bar, so `stored_verdict` buckets it against the parked order's own bar
+        // clock rather than comparing raw instants. A spread park ignores it.
+        let check = StoredCheck {
+            clears_min_r: target.action != SlAction::BelowMinR,
+            bar_time: Some(now),
+        };
+        match promote_stored_order(broker, store, cfg, src, &record.trade_id, check, now).await {
             Ok(outcome) => {
                 if outcome != PromoteOutcome::StillWaiting {
                     tracing::info!(

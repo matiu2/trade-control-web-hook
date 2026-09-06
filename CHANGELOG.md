@@ -1,6 +1,6 @@
 # Changelog
 
-## v137 — 2026-09-06 — IBKR futures: close-out gate, broker enum, contract multiplier
+## v137 — 2026-09-06 — IBKR futures: close-out gate, broker enum, contract multiplier, size park
 
 **Why.** Interactive Brokers is being added as a third broker for exchange-traded
 futures, where measured cost is ~43–52% below CFD venues on gold and ~38–44% on
@@ -9,7 +9,7 @@ things the codebase had no concept of had to land first — a contract *calendar
 a *broker* identity, and a contract *multiplier* — and in that order, because
 nothing that can place a futures order may land before the close-out guard.
 
-Covers Stages 2–5 of the plan. **No order can be placed on IBKR at the end of
+Covers Stages 2–5 and 7 of the plan. **No order can be placed on IBKR at the end of
 this**: there is no broker implementation, and every path that would reach the
 venue refuses loudly rather than falling back (a fallback would trade a
 *different instrument*).
@@ -37,6 +37,27 @@ venue refuses loudly rather than falling back (a fallback would trade a
   `InstrumentSizing { pip_size, tick_size, contract_multiplier }` groups the
   three at the builder seam.
 
+- **A trade too small to place is parked, not retried forever.**
+  `EntryError::UnitsBelowMinimum` (raised by **both** existing brokers) fell
+  through to `ActionResult::Failed` — a `SeenDecision::Skip` — so the identical
+  computation re-ran every bar, failed identically, and gave the operator no
+  signal and no termination. Position size is a deterministic function of
+  (equity, stop distance, contract multiplier), so that retry could never
+  succeed. It now parks as `StoredReason::BelowMinSize`, beside the existing
+  sub-min-R park. Benefits OANDA and TradeNation today, ahead of futures where
+  one contract is 100% granularity.
+
+  The promote gate became **per-reason**, which the plan did not anticipate: the
+  two spread reasons are re-asked every tick (the spread genuinely moves and a
+  fresh quote can answer), but a size park cannot be — nothing it depends on
+  changes faster than a bar, and the `Broker` trait exposes no equity to re-test
+  against. Since the order-control loop deliberately ticks *faster* than a bar,
+  parking a size rejection under the spread gate would have promoted it back into
+  the same rejection every few seconds: **strictly worse than the bug**, while
+  looking like a fix. So `rechecked_per_bar()` selects the question, and a size
+  park waits for a bar strictly newer than the one that parked it — compared by
+  bar bucket, not elapsed time.
+
 **Breaking.** None on the wire. `Intent` gains one `skip_serializing_if`-elided
 field, so a CFD alert body is byte-identical to pre-feature — load-bearing,
 because `sig::canonical_form` writes a `keys:` fingerprint over every top-level
@@ -51,7 +72,7 @@ legitimately correct against a stale catalog, the multiplier is an exchange-set
 contract property and a hand-typed override is a 50× sizing error waiting to
 happen.
 
-**Tests.** 2889 pass (2874 before). Highlights: a GC plan inside its close-out
+**Tests.** 2902 pass (2874 before). Highlights: a GC plan inside its close-out
 window is refused while the same plan 30 days earlier builds; a **long and a
 short on the same physical contract get different verdicts** in the month
 between the two deadlines; the multiplier round-trips through sign→parse and a
@@ -59,11 +80,24 @@ post-signing edit (50 → 1) fails verification; a zero/negative/NaN multiplier 
 rejected at parse time — unlike `tick_size`, which has no validation and whose
 omission was deliberately not inherited.
 
-Mutations were applied at every stage and all killed, including
-`tick_size`/`contract_multiplier` **transposed at the call site** — the reason
-those three are a named struct rather than three positional `Option<f64>`s.
+For the size park: a size-parked order does **not** promote on a same-bar tick
+but does on the next bar, still drops at its deadline, and keeps waiting when it
+has no bar clock (a legacy body); `EntryTooCloseToMarket` still plain-fails and
+parks nothing; and neither arm changes seen-id behaviour, since both are already
+a `Skip`.
 
-**Follow-up.** Sizing does not yet *consume* the multiplier — that is Stage 6b
+Mutations were applied at every stage and all killed — eight for the size park
+alone, including `tick_size`/`contract_multiplier` **transposed at the call
+site** (the reason those three are a named struct rather than three positional
+`Option<f64>`s) and a raw-instant bar comparison in place of bucketing, which
+reads as correct and is caught by three tests.
+
+**Follow-up.** The size park does not change replay: `ReplayBroker` reports
+`size: None` by design and raises only `RiskCapExceeded` /
+`OpenPositionsCapExceeded`, never `UnitsBelowMinimum`, so no fixture shifts. That
+sizing gap is Stage 8's accepted, documented divergence.
+
+Sizing does not yet *consume* the multiplier — that is Stage 6b
 (`broker-ibkr`'s private `risk.rs`), where `contracts = budget / (stop_distance ×
 multiplier × fx)` lands with the broker that reports `min_size`/`size_increment`.
 The 10-business-day arm-time safety margin is the plan's proposed default and is

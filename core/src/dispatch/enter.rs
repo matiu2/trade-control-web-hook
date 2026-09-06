@@ -805,6 +805,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 let parked = park_stored_entry(
                     store,
                     verified,
+                    crate::order_control::StoredReason::BelowMinR,
                     trade_id,
                     &resolved.instrument,
                     sl_distance,
@@ -963,6 +964,52 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 ))
             }
         }
+        // Sizing floored to nothing. Unlike every other `EntryError` this is a
+        // deterministic function of (equity, stop distance, contract multiplier)
+        // — none of which can change before the next bar — so leaving it to the
+        // generic `Failed` arm below means re-running the identical computation
+        // on every fire, failing identically, with no operator signal and no
+        // termination. Futures make it acute: one contract is 100% granularity.
+        //
+        // PARK instead, exactly as the sub-min-R rejection above does: the
+        // setup is preserved with its signed body, re-checked once per new bar
+        // (see `StoredReason::rechecked_per_bar` — the *only* honest cadence,
+        // because the `Broker` trait exposes no equity to re-test against), and
+        // dropped at its own `drop_at` rather than retried forever.
+        //
+        // Still `Rejected`, not `Ok`: nothing was placed. 422 rather than the
+        // generic 502 because the request is well-formed and the broker is
+        // healthy — the account simply cannot carry this trade at this size.
+        Err(EntryError::UnitsBelowMinimum) => {
+            let parked = park_stored_entry(
+                store,
+                verified,
+                crate::order_control::StoredReason::BelowMinSize,
+                trade_id,
+                &resolved.instrument,
+                r_distance,
+                tp_distance,
+                resolved.min_r,
+                raw_body,
+                enter_granularity,
+                now,
+            )
+            .await;
+            tracing::info!(
+                "entry rejected: units-below-minimum instrument={} sl_distance={r_distance} \
+                 (id={}){parked}",
+                resolved.instrument,
+                verified.intent.id,
+            );
+            ActionResult::Rejected {
+                status: 422,
+                body: format!(
+                    "entry blocked: computed position size is below the broker minimum \
+                     (sl_distance {r_distance})",
+                ),
+                outcome: format!("rejected: units-below-minimum{parked}"),
+            }
+        }
         Err(err) => {
             // Stays `ActionResult::Failed` (a Skip in `seen_decision`):
             // a too-close / broker failure must never poison the seen-id
@@ -992,6 +1039,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
 async fn park_stored_entry<S: StateStore>(
     store: &S,
     verified: &incoming::Verified,
+    reason: crate::order_control::StoredReason,
     trade_id: &str,
     instrument: &str,
     original_sl_distance: f64,
@@ -1030,7 +1078,7 @@ async fn park_stored_entry<S: StateStore>(
     let drop_at = crate::order_control::drop_at(verified.intent.not_after, bar_seconds, now);
     let order = crate::order_control::StoredOrder {
         signed_intent: body,
-        reason: crate::order_control::StoredReason::BelowMinR,
+        reason,
         original_sl_distance,
         // The R numerator + threshold the promotion re-check re-tests every
         // candle. Captured here because the cron has no intent in hand, and
@@ -1040,6 +1088,11 @@ async fn park_stored_entry<S: StateStore>(
         stored_at: now,
         drop_at,
         shell_time: verified.shell.time,
+        // The clock a per-bar re-check counts in. `enter_granularity` is None on
+        // the webhook path, and a size park then keeps waiting rather than
+        // promoting on a guessed cadence — the `bar_seconds` docs spell out why
+        // that is the safe direction.
+        bar_seconds: enter_granularity.map(crate::broker::Granularity::seconds),
     };
     match crate::order_control::park_order(
         store,
@@ -1481,5 +1534,259 @@ mod fmt_tests {
         assert_eq!(fmt_price_trim(1.10345), "1.10345");
         // Non-finite falls back to the default float render, not a panic.
         assert_eq!(fmt_price_trim(f64::NAN), "NaN");
+    }
+}
+
+#[cfg(test)]
+mod units_below_minimum_tests {
+    //! Pins the [`EntryError::UnitsBelowMinimum`] arm of [`run_enter`].
+    //!
+    //! Before this, the error fell through to the generic `Err(err)` arm and
+    //! became `ActionResult::Failed` — a `SeenDecision::Skip`, so the identical
+    //! fire re-ran every bar, failed identically, and produced no operator
+    //! signal and no termination. Position size is a deterministic function of
+    //! (equity, stop distance, contract multiplier), so nothing about that retry
+    //! could ever succeed. Futures make it acute: one contract is 100%
+    //! granularity.
+
+    use super::*;
+    use crate::broker::{
+        AttemptState, CancelError, Candle, CloseOutcome, EntryRequest, Granularity, LookupError,
+        OpenPosition, PendingOrder, Placement, Quote,
+    };
+    use crate::dispatch_config::DispatchConfig;
+    use crate::order_control::{StoredReason, stored_order};
+    use crate::state::MemStateStore;
+    use chrono::{DateTime, Utc};
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s)
+            .expect("valid test timestamp")
+            .with_timezone(&Utc)
+    }
+
+    /// Returns whichever entry error the test asked for, so the arm under test
+    /// is selected by the broker's verdict exactly as it is live.
+    struct FailingBroker(fn() -> EntryError);
+
+    impl Broker for FailingBroker {
+        async fn place_entry(
+            &self,
+            _max_risk_pct: f64,
+            _max_open_positions: u32,
+            _req: &EntryRequest<'_>,
+        ) -> Result<Placement, EntryError> {
+            Err((self.0)())
+        }
+        async fn close_positions(&self, _instrument: &str) -> CloseOutcome {
+            CloseOutcome::NothingOpen
+        }
+        async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
+            0
+        }
+        async fn lookup_attempt_state(
+            &self,
+            _instrument: &str,
+            _broker_order_id: &str,
+            _broker_trade_id: Option<&str>,
+        ) -> Result<AttemptState, LookupError> {
+            Ok(AttemptState::Unknown)
+        }
+        async fn cancel_order(
+            &self,
+            _account_id: &str,
+            _broker_order_id: &str,
+        ) -> Result<(), CancelError> {
+            Ok(())
+        }
+        async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
+            // A tight spread, so the SL-spread floor never fires and the
+            // dispatch reaches the broker — the arm under test.
+            Ok(Quote {
+                bid: 1.0999,
+                ask: 1.1001,
+            })
+        }
+        async fn list_open_positions(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<OpenPosition>, LookupError> {
+            Ok(vec![])
+        }
+        async fn amend_stop(
+            &self,
+            _account_id: &str,
+            _position_or_order_id: &str,
+            _new_stop: f64,
+        ) -> Result<(), crate::broker::AmendError> {
+            Ok(())
+        }
+        async fn list_pending_orders(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<PendingOrder>, LookupError> {
+            Ok(vec![])
+        }
+        async fn get_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<Candle>, crate::broker::CandleError> {
+            Ok(vec![])
+        }
+    }
+
+    fn cfg() -> DispatchConfig {
+        DispatchConfig {
+            worker_max_risk_pct: 100.0,
+            worker_max_open_positions: 100,
+            pip_size: 0.0001,
+            tick_size: None,
+            caps: Default::default(),
+        }
+    }
+
+    /// A market enter for `t-1`, so the entry resolves with no pending-order
+    /// machinery in the way.
+    fn enter_verified() -> incoming::Verified {
+        use crate::intent::Shell;
+        let intent: crate::intent::Intent = serde_json::from_str(
+            r#"{
+                "v": 1,
+                "id": "t-1-enter",
+                "not_after": "2026-07-24T00:00:00Z",
+                "action": "enter",
+                "instrument": "EUR_USD",
+                "direction": "long",
+                "entry": { "type": "market" },
+                "stop_loss": { "absolute": 1.0980 },
+                "take_profit": { "absolute": 1.1200 },
+                "broker": "oanda",
+                "trade_id": "t-1",
+                "pip_size": 0.0001
+            }"#,
+        )
+        .expect("valid enter intent");
+        let shell = Shell::from_candle(&Candle {
+            time: at("2026-07-22T13:00:00Z"),
+            o: 1.0990,
+            h: 1.1005,
+            l: 1.0985,
+            c: 1.1000,
+        });
+        incoming::Verified { shell, intent }
+    }
+
+    fn dispatch(err: fn() -> EntryError, store: &MemStateStore) -> ActionResult {
+        pollster::block_on(run_enter(
+            &FailingBroker(err),
+            store,
+            &enter_verified(),
+            &cfg(),
+            at("2026-07-22T13:00:30Z"),
+            None,
+            Some(Granularity::H1),
+            false,
+        ))
+    }
+
+    /// The fix: the setup is PARKED, not thrown away, and the outcome says so.
+    ///
+    /// Mutation check: delete the `UnitsBelowMinimum` arm so it falls through to
+    /// the generic `Failed` arm, and this goes red.
+    #[test]
+    fn units_below_minimum_parks_the_setup() {
+        let store = MemStateStore::default();
+        let out = dispatch(|| EntryError::UnitsBelowMinimum, &store);
+
+        let ActionResult::Rejected {
+            status, outcome, ..
+        } = &out
+        else {
+            panic!("expected a rejection that parks, got {}", out.describe());
+        };
+        assert_eq!(*status, 422, "well-formed request, healthy broker");
+        assert!(
+            outcome.starts_with("rejected: units-below-minimum"),
+            "the operator greps this string: {outcome}",
+        );
+        assert!(
+            outcome.contains("stored until"),
+            "a park that left no trace is the bug, not the fix: {outcome}",
+        );
+
+        let parked = pollster::block_on(stored_order(&store, "t-1"))
+            .expect("read")
+            .expect("the setup must be parked, not discarded");
+        assert_eq!(parked.reason, StoredReason::BelowMinSize);
+        assert!(
+            parked.reason.rechecked_per_bar(),
+            "a size park must be re-checked per BAR — the order-control loop \
+             ticks faster than a bar, so the spread gate would retry it in seconds",
+        );
+        assert_eq!(
+            parked.bar_seconds,
+            Some(3600),
+            "the enter granularity must reach the park, or it can never promote",
+        );
+    }
+
+    /// The neighbouring arm must be untouched: a too-close rejection stays a
+    /// plain `Failed` and parks nothing. It is genuinely retryable next bar —
+    /// price moves — so parking it would be wrong.
+    ///
+    /// Mutation check: park on `EntryTooCloseToMarket` too, and this goes red.
+    #[test]
+    fn entry_too_close_to_market_still_plain_fails_and_parks_nothing() {
+        let store = MemStateStore::default();
+        let out = dispatch(|| EntryError::EntryTooCloseToMarket, &store);
+
+        assert!(
+            matches!(out, ActionResult::Failed(ref o) if o.contains("too-close-to-market")),
+            "expected the unchanged Failed arm, got {}",
+            out.describe(),
+        );
+        assert!(
+            pollster::block_on(stored_order(&store, "t-1"))
+                .expect("read")
+                .is_none(),
+            "a too-close rejection must not park",
+        );
+    }
+
+    /// Every other broker failure keeps the generic `Failed` arm too — the park
+    /// is scoped to the one error that cannot change within a bar.
+    #[test]
+    fn an_unrelated_broker_failure_still_plain_fails() {
+        let store = MemStateStore::default();
+        let out = dispatch(|| EntryError::OrderRejected, &store);
+        assert!(
+            matches!(out, ActionResult::Failed(_)),
+            "got {}",
+            out.describe()
+        );
+        assert!(
+            pollster::block_on(stored_order(&store, "t-1"))
+                .expect("read")
+                .is_none(),
+        );
+    }
+
+    /// Both arms are a `Skip`, so NEITHER poisons the seen-id and the next bar
+    /// may fire again. That is unchanged by this stage and load-bearing: the
+    /// park adds a retry *cadence* and an audit trail, it does not change
+    /// replay protection. Pinned so a future "tidy-up" doesn't mark the
+    /// rejection seen and strand the setup.
+    #[test]
+    fn parking_does_not_change_seen_id_behaviour() {
+        use crate::dispatch::seen::{SeenDecision, seen_decision};
+        let store = MemStateStore::default();
+        let parked = dispatch(|| EntryError::UnitsBelowMinimum, &store);
+        assert!(matches!(seen_decision(&parked), SeenDecision::Skip { .. }));
+        let store2 = MemStateStore::default();
+        let failed = dispatch(|| EntryError::EntryTooCloseToMarket, &store2);
+        assert!(matches!(seen_decision(&failed), SeenDecision::Skip { .. }));
     }
 }

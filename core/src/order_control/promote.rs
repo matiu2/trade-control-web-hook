@@ -36,7 +36,7 @@
 use chrono::{DateTime, Utc};
 
 use super::park::{clear_stored_order, stored_order};
-use super::stored::{StoredVerdict, stored_verdict};
+use super::stored::{StoredCheck, StoredVerdict, stored_verdict};
 use crate::broker::Broker;
 use crate::dispatch::run_enter;
 use crate::pending_lifecycle::{EnterConfigProvider, Recovered, VerifiedSource};
@@ -58,10 +58,11 @@ pub enum PromoteOutcome {
 
 /// Re-check this trade's parked order and place it if it now clears its R-floor.
 ///
-/// `clears_min_r` is the caller's verdict from
-/// [`sl_target`](super::sl_target) against the **current** spread — passed in
-/// rather than recomputed here so the R decision lives in exactly one place and
-/// this stays a thin orchestration layer.
+/// `check` carries what the caller observed this tick — the spread verdict from
+/// [`sl_target`](super::sl_target) and the signal bar in hand — passed in rather
+/// than recomputed here so those decisions live in exactly one place and this
+/// stays a thin orchestration layer. Which field is read depends on why the
+/// order was parked; see [`StoredReason::rechecked_per_bar`](super::StoredReason::rechecked_per_bar).
 ///
 /// Errors are returned as `Err(String)` for the caller to log; a parked order is
 /// left in place on any failure, so a transient store/broker problem defers the
@@ -73,7 +74,7 @@ pub async fn promote_stored_order<B, S, P, V>(
     cfg_provider: &P,
     src: &V,
     trade_id: &str,
-    clears_min_r: bool,
+    check: StoredCheck,
     now: DateTime<Utc>,
 ) -> Result<PromoteOutcome, String>
 where
@@ -89,7 +90,7 @@ where
         return Ok(PromoteOutcome::NothingParked);
     };
 
-    match stored_verdict(&order, now, clears_min_r) {
+    match stored_verdict(&order, now, check) {
         StoredVerdict::KeepWaiting => return Ok(PromoteOutcome::StillWaiting),
         StoredVerdict::Drop => {
             tracing::info!(
@@ -164,6 +165,15 @@ mod tests {
     use crate::order_control::{StoredOrder, StoredReason, park_order};
     use crate::state::MemStateStore;
 
+    /// The spread-reason check the pre-existing tests all use: a `BelowMinR`
+    /// park reads only `clears_min_r`, so the bar half is deliberately absent.
+    fn spread_check(clears_min_r: bool) -> StoredCheck {
+        StoredCheck {
+            clears_min_r,
+            bar_time: None,
+        }
+    }
+
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s)
             .expect("valid test timestamp")
@@ -185,6 +195,7 @@ mod tests {
                 stored_at: now,
                 drop_at: at(drop_at),
                 shell_time: now,
+                bar_seconds: Some(3600),
             },
             at("2026-07-24T00:00:00Z"),
             now,
@@ -201,7 +212,7 @@ mod tests {
             &TestCfg,
             &TestSrc::Unrecoverable,
             "t-1",
-            true,
+            spread_check(true),
             at("2026-07-22T13:30:00Z"),
         ))
         .expect("no park is benign");
@@ -220,7 +231,7 @@ mod tests {
             &TestCfg,
             &TestSrc::Unrecoverable,
             "t-1",
-            false,
+            spread_check(false),
             now,
         ))
         .expect("still waiting");
@@ -246,7 +257,7 @@ mod tests {
             &TestCfg,
             &TestSrc::Unrecoverable,
             "t-1",
-            true,
+            spread_check(true),
             at("2026-07-22T15:00:00Z"),
         ))
         .expect("dropped");
@@ -272,7 +283,7 @@ mod tests {
             &TestCfg,
             &TestSrc::Unrecoverable,
             "t-1",
-            true,
+            spread_check(true),
             now,
         ))
         .expect_err("must not silently promote an unverifiable body");
@@ -298,7 +309,7 @@ mod tests {
             &TestCfg,
             &TestSrc::Expired,
             "t-1",
-            true,
+            spread_check(true),
             now,
         ))
         .expect("dropped");

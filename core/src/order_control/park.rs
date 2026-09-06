@@ -125,6 +125,7 @@ mod tests {
             stored_at: at(shell),
             drop_at: at("2026-07-23T21:00:00Z"),
             shell_time: at(shell),
+            bar_seconds: Some(3600),
         }
     }
 
@@ -316,5 +317,44 @@ mod tests {
             at("2026-07-22T13:30:00Z"),
         ))
         .expect("absent record is not an error");
+    }
+
+    /// A size park must survive the store round-trip carrying BOTH its reason
+    /// and its bar clock. `bar_seconds` is `skip_serializing_if`, so a body
+    /// written without it decodes to `None` — and `is_a_later_bar` then never
+    /// promotes. Losing the field would silently strand the setup until its
+    /// `drop_at`, which looks exactly like "parked correctly" in the logs.
+    #[test]
+    fn a_size_park_round_trips_with_its_bar_clock() {
+        let store = MemStateStore::default();
+        let now = at("2026-07-22T13:30:00Z");
+        let mut o = order("2026-07-22T13:30:00Z", 0.0020);
+        o.reason = StoredReason::BelowMinSize;
+        o.bar_seconds = Some(900);
+        pollster::block_on(park_order(
+            &store,
+            "t-size",
+            "XAU_USD",
+            None,
+            o,
+            at("2026-07-24T00:00:00Z"),
+            now,
+        ))
+        .expect("park");
+
+        let got = pollster::block_on(stored_order(&store, "t-size"))
+            .expect("read")
+            .expect("a parked order");
+        assert_eq!(got.reason, StoredReason::BelowMinSize);
+        assert_eq!(got.bar_seconds, Some(900), "the bar clock must persist");
+        assert!(got.reason.rechecked_per_bar());
+        assert!(
+            !got.is_a_later_bar(Some(at("2026-07-22T13:44:00Z"))),
+            "still inside the 13:30 M15 bar",
+        );
+        assert!(
+            got.is_a_later_bar(Some(at("2026-07-22T13:45:00Z"))),
+            "the next M15 bar",
+        );
     }
 }

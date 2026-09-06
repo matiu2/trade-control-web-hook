@@ -1161,6 +1161,31 @@ path. If it doesn't, it is dropped 3 bars before expiry.
 You'll see this in a replay as an entry decline that later turns into a placement,
 and in the worker logs as `order-control promote[<trade_id>]`.
 
+### ...and so is a trade too small to place
+
+A position that sizes to **zero units** (`UnitsBelowMinimum`, raised by both OANDA
+and TradeNation) is parked the same way, as `below-min-size`. Previously it was a
+plain failure, which meant the identical computation re-ran on every fire, failed
+identically, and produced no operator signal and no termination — position size is a
+deterministic function of (equity, stop distance, contract multiplier), so nothing
+about that retry could ever succeed. Futures make it acute: one contract is 100%
+granularity.
+
+**The re-check runs once per bar, not once per tick.** The two spread reasons are
+re-asked every tick because the spread genuinely moves within a bar and a fresh quote
+can answer "it has calmed". A size park cannot: nothing it depends on changes faster
+than a bar, and the `Broker` trait exposes no equity to re-test against (sizing is
+private inside each broker's `place_entry`, by design). Since the order-control loop
+deliberately ticks faster than a bar, gating a size park on the spread check would
+promote it straight back into the same rejection every few seconds — strictly worse
+than the plain failure it replaces, while looking like a fix.
+
+So `StoredReason::rechecked_per_bar()` decides which question gets asked, and a size
+park waits for a bar strictly newer than the one that parked it (compared by **bar
+bucket**, not elapsed time). It still drops at its own deadline, so it cannot retry
+forever either. The operator sees `rejected: units-below-minimum stored until <t>`
+rather than silence.
+
 ### The spread floor is a forward-looking max
 
 The stop floor is the **maximum** of three spreads, not just the one measured now:

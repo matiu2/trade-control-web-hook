@@ -2404,6 +2404,7 @@ mod tests {
             stored_at: now,
             drop_at: ts("2026-07-09T21:00:00Z"),
             shell_time: now,
+            bar_seconds: Some(3600),
         }];
 
         assert!(run(clear(&store, &rec)), "clear reports success");
