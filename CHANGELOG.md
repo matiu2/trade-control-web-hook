@@ -1,5 +1,68 @@
 # Changelog
 
+## v139 — 2026-09-06 — replay parity for futures: close-out offline, sizing gap named and measured
+
+**Why.** Offline replay does not size. `ReplayBroker` reports `size: None` *by
+design* — sizing needs live account equity and an FX rate, which an offline
+replay has by definition not got, and replay economics are pure R-multiples off
+a synthetic account. So a futures replay is **optimistic**: it books R for
+entries a live account could not have afforded. The scoping doc wanted contract
+sizing built into the replayer; that was decided against, because it means
+inventing an equity model and then reporting contract counts derived from
+invented inputs — a wrong number that looks like a measurement.
+
+This is Stage 8: accept the gap, but make it impossible to be misled by it.
+
+**What changed.**
+
+- **A — the close-out check runs offline.** Pure calendar arithmetic, no equity
+  or broker dependency, so replay reaches the same verdict as the arm-time
+  guard — through the *same* `close_out_check::verdict`, one function with two
+  callers rather than two implementations that must agree by hand. This matters
+  because `tv-arm --plan-out` builds Lenient: a plan handed to the replay has
+  only ever been **warned** about, so without this a backtest could look
+  profitable on a trade IBKR would have force-liquidated.
+- **B — the bias is named, with its direction.** A `FUTURES CAVEATS` block
+  above the summary line, in the spirit of the `IMPLAUSIBLE_R` warning. Kept
+  off the `Done:` / `Net R:` line, which batch drivers scrape.
+- **C — `--probe-account <amount>` measures the gap.** Counts how many fills
+  would floor to 0 contracts at an account size the operator **states** — a
+  coverage statistic, not a simulation. It answers the promotion-ladder
+  question: the same GC trade is unplaceable at $10k and placeable at $100k,
+  and MGC (multiplier 10 vs 100) moves that line tenfold. An unknown multiplier
+  reports **CANNOT JUDGE** rather than assuming `1.0`, which would under-report
+  floor-outs by 100× on gold.
+- The arm-time guard was refactored onto the shared verdict with **no behaviour
+  change** (all 328 cli lib tests unchanged), so the two cannot drift.
+- Corrected README's Stage 4 refusal table, stale since v138 gave IBKR a real
+  broker (worker dispatch and broker-check no longer refuse).
+
+**Breaking:** none. `report::render` takes one more argument (internal to the
+replay binary). No wire, plan or fixture format changed.
+
+**Config:** new `--probe-account <AMOUNT>` on `replay-candles` (and therefore
+on `tv-arm ... replay`). Optional; ignored for CFD/spot replays.
+
+**Tests:** 2961 workspace tests (2940 before), 0 failures. **910/910 golden
+fixtures pass at Net R +294.32, unchanged** — the scope proof that no CFD
+replay is affected. 9 mutations applied, 9 killed.
+
+Two findings worth keeping. **Mutation 4 survived the first pass**: the
+production entry point `context_for` had no test of its own — `Caveats::new`
+caught the mutation downstream, so behaviour was safe by a coincidence of
+layering that nothing asserted, and a refactor trusting `context_for` would
+have printed a futures block on all 910 CFD fixtures. And the multiplier lookup
+was **wrong in a way no unit test could see**: it keyed on the plan's
+instrument string (`GC 202612`) while `instrument-lookup` has no contract-month
+dimension and holds the multiplier on the root row (`GC`), so every probe
+answered CANNOT JUDGE. Found by running the real binary; now pinned by a test.
+
+**Follow-up:** the accepted divergence is recorded in `PARITY.md` for a future
+refactorer — if you are tempted to implement sizing in `ReplayBroker`, answer
+first where the equity and FX rate come from. Stage 9 (paper demo month) still
+needs the market-data entitlement decision and IBC, neither of which is a code
+change.
+
 ## v138 — 2026-09-06 — IBKR broker: futures sized in contracts, wired end to end
 
 **Why.** v137 baked `contract_multiplier` onto the signed intent and validated
