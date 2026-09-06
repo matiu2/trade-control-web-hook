@@ -24,6 +24,7 @@ them.
 | 2 | The limit rests unfilled — price moves away | real limit-entry risk, not a bug |
 | 3 | Next fire's retry gate finds it `Pending` and **cancels it** to place a fresh one (`retry_gate.rs:227`) | by design (2316 cancelled 16:00:38, 2318 placed 16:00:41) |
 | 4 | 17:00:01 — `05-enter` runs the gate **first** (`enter.rs:139`), which cancels 2318; **then** the prep gate rejects the fire (`enter.rs:204`, `prep-order-violated (retest)`) | **BUG A — this is the loss.** Order destroyed, nothing placed, no restore |
+| 4b | That prep rejection was **spurious** — both preps carry an identical wall-clock `set_at`, so the strict `>` ordering check failed on correct geometry | **BUG C — the trigger.** See Stage 5 |
 | 5 | 2318 is now cancelled-never-filled ⇒ `broker_trade_id` is `None` ⇒ resolves `Unknown` (`oanda.rs:632`) ⇒ all 12 later fires hard-rejected | **BUG B — prevents recovery** |
 
 Fix A and the setup recovers on the next golden bar. Fix B only and the order is
@@ -153,13 +154,57 @@ Scope guard: only what is needed to model cancel-without-replace. Resist
 re-simulating broker internals — `[[replay_sizing_gap_accepted]]` is the
 precedent for naming a gap rather than faking it.
 
-### Stage 5 — trace Gap 1 (why replay never fires the QM leg)
+### Stage 5 — RESOLVED, and re-scoped: preps are stamped with WALL-CLOCK
 
-Investigation, not yet a fix. Determine whether the replay's signal source
-never sets `signal_confirmed`, or `last_confirmed_enter_at` advances
-differently offline. Until this closes, **a replay of a strategy-v2 plan is not
-evidence about its QM leg** — worth stating in the README, since the corpus
-analysis leans on exactly these numbers.
+**Gap 1's premise was wrong.** The replay DOES fire the QM leg: across all 452
+strategy-v2 fixtures `09-enter-qm` fires 1684 times in 278 fixtures and places
+216 orders in 178 — marginally more than `05-enter`'s 215. `signal_confirmed` is
+computed inside the shared engine (`core/src/signals/state_machine.rs:98,261`),
+not supplied by the harness, so it was never absent; it simply is not *named* in
+`replay_candles/`.
+
+**The real divergence is Bug C, and it sits AHEAD of Bug A in the causal chain.**
+
+`handle_prep` stamps `set_at = now` — wall-clock (`core/src/dispatch/control.rs:193`)
+— while the prep gate requires **strictly increasing** `set_at`
+(`core/src/intent/prep_req.rs:123`). Live's cron hands **every bar closed since
+the watermark** to one `evaluate_plan` call (`trade-control-cron/src/engine.rs:181`,
+looped at `engine/src/evaluate.rs:284`) under a **single** `Utc::now()`. So a
+multi-bar catch-up stamps both preps identically and the entry is rejected
+`prep-order-violated` despite correct geometry.
+
+**PROVEN against the incident, not inferred** — the two stored prep rows are
+byte-identical to the microsecond:
+
+```
+break-and-close | 2026-08-08 00:07:05.759557+10
+retest          | 2026-08-08 00:07:05.759557+10
+```
+
+So live's rejection of `05-enter` was a **false negative**. `05-enter` should
+have placed; the QM limit filled the vacuum; and the spurious rejection is
+exactly what made the retry gate's cancel (Bug A) destroy a resting order for
+nothing. Bug C **triggers** Bug A.
+
+Replay cannot reproduce it: one bar per `evaluate_plan` call, each with its own
+`now` (`replay.rs:261,267`). `prep-order-violated` occurs **zero** times across
+all 452 fixtures. Replay's correct verdict here is accidental immunity, not
+fidelity — **no fixture is evidence about any timing-sensitive gate.**
+
+**Fix:** stamp preps with the bar time (available on `verified.shell`), keeping
+`now` for the TTL only. ~20 lines plus tests. Do NOT weaken the check to `>=` —
+that permits a genuine same-bar retest and discards real ordering information.
+Check the TTL and `is_prep_blocked` paths don't rely on `set_at` being wall-clock.
+
+**Corpus blast radius — narrower than feared.** The QM columns are genuinely
+exercised (`strategy-v2` QM limit: 132 orders in 98 of 226 fixtures;
+`strategy-v2-qm-market`: 84 in 80), so the entry-rule comparison, the `skip-bcr`
+choice and the broker/asset-class findings all stand. Two real caveats: any claim
+resting on the *relative* frequency of `05-enter` vs `09-enter-qm` is biased
+toward `05-enter` (rule order gives the stop leg the tie —
+`engine/src/evaluate.rs:816` — and the QM leg then eats `trade-already-open`),
+and live's spurious prep rejections hand the QM leg extra wins offline replay
+never grants, so replay **under-counts QM participation relative to live**.
 
 ### Stage 6 — placement is not a fill (operator honesty)
 
