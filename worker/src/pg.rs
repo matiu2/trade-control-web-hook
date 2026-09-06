@@ -25,7 +25,7 @@ use trade_control_core::plan_state::PlanState;
 use trade_control_core::settlement::Settlement;
 use trade_control_core::state::{
     ArchivedPlan, EntryAttempt, HeldTradeRecord, MIN_TTL_SECONDS, MwState, NewsEntry, PauseEntry,
-    SeenEntry, Snapshot, SpreadBlackoutWindow, StateError, StateStore, StoredPlan,
+    PrepStamp, SeenEntry, Snapshot, SpreadBlackoutWindow, StateError, StateStore, StoredPlan,
 };
 use trade_control_core::trade_plan::TradePlan;
 
@@ -353,11 +353,13 @@ impl PgStateStore {
         account: Option<&str>,
         instrument: &str,
         step: &str,
-        now: DateTime<Utc>,
+        stamp: PrepStamp,
         ttl_seconds: u64,
         setter_id: &str,
     ) -> Result<(), StateError> {
-        let expires_at = control_expires_at(now, ttl_seconds);
+        // `set_at` is the triggering BAR's time (what the ordered prep gate
+        // compares); `expires_at` is wall-clock + TTL. See `PrepStamp`.
+        let expires_at = control_expires_at(stamp.now, ttl_seconds);
         sqlx::query(
             "DELETE FROM prep
              WHERE account IS NOT DISTINCT FROM $1 AND instrument = $2 AND step = $3",
@@ -375,7 +377,7 @@ impl PgStateStore {
         .bind(account)
         .bind(instrument)
         .bind(step)
-        .bind(now)
+        .bind(stamp.set_at)
         .bind(setter_id)
         .bind(expires_at)
         .execute(&self.pool)
@@ -1610,11 +1612,11 @@ impl StateStore for PgStateStore {
         account: Option<&str>,
         instrument: &str,
         step: &str,
-        now: DateTime<Utc>,
+        stamp: PrepStamp,
         ttl_seconds: u64,
         setter_id: &str,
     ) -> Result<(), StateError> {
-        self.set_prep_impl(account, instrument, step, now, ttl_seconds, setter_id)
+        self.set_prep_impl(account, instrument, step, stamp, ttl_seconds, setter_id)
             .await
     }
     async fn get_prep(

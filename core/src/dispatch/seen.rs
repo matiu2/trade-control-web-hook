@@ -219,7 +219,7 @@ mod dispatcher_outcome_tests {
             _account: Option<&str>,
             _instrument: &str,
             _step: &str,
-            _now: DateTime<Utc>,
+            _stamp: crate::state::PrepStamp,
             _ttl_seconds: u64,
             _setter_id: &str,
         ) -> Result<(), StateError> {

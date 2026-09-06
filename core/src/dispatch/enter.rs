@@ -1551,7 +1551,7 @@ mod gate_order_tests {
     };
     use crate::dispatch_config::DispatchConfig;
     use crate::intent::{Direction, Intent, Shell};
-    use crate::state::{EntryAttempt, MemStateStore, StateStore};
+    use crate::state::{EntryAttempt, MemStateStore, PrepStamp, StateStore};
     use chrono::{DateTime, Utc};
     use std::cell::RefCell;
 
@@ -1783,7 +1783,14 @@ mod gate_order_tests {
             // `break-and-close` is set but `retest` never was → `Missing`, the
             // same slot failure the incident logged as `prep-order-violated`.
             store
-                .set_prep(None, "EUR_CAD", "break-and-close", now(), TTL, "test")
+                .set_prep(
+                    None,
+                    "EUR_CAD",
+                    "break-and-close",
+                    PrepStamp::at(now()),
+                    TTL,
+                    "test",
+                )
                 .await
                 .expect("set prep");
             let result =
@@ -1820,7 +1827,7 @@ mod gate_order_tests {
                     None,
                     "EUR_CAD",
                     "retest",
-                    at("2026-08-07T15:00:00Z"),
+                    PrepStamp::at(at("2026-08-07T15:00:00Z")),
                     TTL,
                     "test",
                 )
@@ -1831,7 +1838,7 @@ mod gate_order_tests {
                     None,
                     "EUR_CAD",
                     "break-and-close",
-                    at("2026-08-07T16:00:00Z"),
+                    PrepStamp::at(at("2026-08-07T16:00:00Z")),
                     TTL,
                     "test",
                 )
@@ -1986,7 +1993,7 @@ mod gate_order_tests {
                     None,
                     "EUR_CAD",
                     "break-and-close",
-                    at("2026-08-07T15:00:00Z"),
+                    PrepStamp::at(at("2026-08-07T15:00:00Z")),
                     TTL,
                     "test",
                 )
@@ -1997,7 +2004,7 @@ mod gate_order_tests {
                     None,
                     "EUR_CAD",
                     "retest",
-                    at("2026-08-07T16:00:00Z"),
+                    PrepStamp::at(at("2026-08-07T16:00:00Z")),
                     TTL,
                     "test",
                 )
@@ -2048,5 +2055,109 @@ mod gate_order_tests {
             assert_eq!(attempts[1].broker_order_id, "order-new");
         });
         assert_eq!(broker.cancelled(), vec!["2318".to_string()]);
+    }
+
+    /// BUG C, END TO END through the two real entry points. The preps are set
+    /// by `handle_prep` (not by poking the store), both under the SINGLE `now`
+    /// a multi-bar catch-up tick dispatches every fire with, and then
+    /// `run_enter` is asked for the entry.
+    ///
+    /// Because `handle_prep` now stamps `set_at` from the triggering bar rather
+    /// than wall-clock, the chain is strictly increasing and the entry is
+    /// PLACED. Under the wall-clock stamp both rows carried an identical
+    /// timestamp and this returned `rejected: prep-order-violated (retest)` —
+    /// the incident's literal outcome, on perfectly correct geometry.
+    #[test]
+    fn multi_bar_catch_up_preps_let_the_entry_through() {
+        let broker = SpyBroker::pending_prior();
+        let store = store_at_incident();
+        let verified = enter_verified("[]", r#"["break-and-close", "retest"]"#);
+        pollster::block_on(async {
+            seed_prior_attempt(&store).await;
+            // Two bars, ONE wall-clock `now()` — exactly what the cron does when
+            // a tick catches up over more than one closed bar.
+            for (step, bar) in [
+                ("break-and-close", "2026-08-07T15:00:00Z"),
+                ("retest", "2026-08-07T16:00:00Z"),
+            ] {
+                let result =
+                    crate::dispatch::handle_prep(&store, &prep_verified(step, bar), now()).await;
+                assert!(result.is_success(), "prep {step}: {}", result.body);
+            }
+            let result =
+                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            assert!(
+                matches!(&result, ActionResult::Ok(o) if o.starts_with("entered: order=")),
+                "BUG C: a two-bar prep chain caught up in one tick must place, \
+                 got {}",
+                describe(&result)
+            );
+        });
+        assert_eq!(
+            broker.placed(),
+            vec!["EUR_CAD".to_string()],
+            "the entry the incident lost must actually reach the broker"
+        );
+    }
+
+    /// The same end-to-end route must keep rejecting a genuinely stale chain:
+    /// `retest` on an EARLIER bar than `break-and-close`. Bar-time stamping is a
+    /// re-stamp, not a loosened comparison, so the gate keeps its teeth — and
+    /// per the Stage 1 rail the rejected fire still costs no resting order.
+    #[test]
+    fn genuinely_stale_prep_chain_still_rejects_end_to_end() {
+        let broker = SpyBroker::pending_prior();
+        let store = store_at_incident();
+        let verified = enter_verified("[]", r#"["break-and-close", "retest"]"#);
+        pollster::block_on(async {
+            seed_prior_attempt(&store).await;
+            for (step, bar) in [
+                ("retest", "2026-08-07T15:00:00Z"),
+                ("break-and-close", "2026-08-07T16:00:00Z"),
+            ] {
+                crate::dispatch::handle_prep(&store, &prep_verified(step, bar), now()).await;
+            }
+            let result =
+                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            assert!(
+                matches!(&result, ActionResult::Rejected { outcome, .. }
+                    if outcome == "rejected: prep-order-violated (retest)"),
+                "a genuinely out-of-order chain must still reject, got {}",
+                describe(&result)
+            );
+        });
+        assert!(broker.placed().is_empty(), "a rejected fire places nothing");
+        assert!(
+            broker.cancelled().is_empty(),
+            "RAIL: a rejected fire must not cost the resting order (cancelled {:?})",
+            broker.cancelled()
+        );
+    }
+
+    /// A `prep` intent for `step`, triggered by the bar at `bar_time`. Built by
+    /// deserialising the wire JSON and synthesising the shell with
+    /// [`Shell::from_candle`], exactly as the cron's `dispatch_fired` does.
+    fn prep_verified(step: &str, bar_time: &str) -> crate::incoming::Verified {
+        let json = format!(
+            r#"{{
+                "v": 1,
+                "id": "t-1-prep-{step}",
+                "not_after": "2026-08-09T00:00:00Z",
+                "action": "prep",
+                "instrument": "EUR_CAD",
+                "step": "{step}",
+                "trade_id": "t-1",
+                "ttl_hours": 24
+            }}"#
+        );
+        let intent: Intent = serde_json::from_str(&json).expect("valid prep intent");
+        let shell = Shell::from_candle(&Candle {
+            time: at(bar_time),
+            o: 1.5880,
+            h: 1.5905,
+            l: 1.5875,
+            c: 1.5895,
+        });
+        crate::incoming::Verified { shell, intent }
     }
 }
