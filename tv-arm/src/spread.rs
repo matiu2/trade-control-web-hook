@@ -44,10 +44,7 @@ pub async fn read_spread_pips(broker: Broker, instrument: &str, pip_size: f64) -
             "pip_size must be positive to convert spread to pips; got {pip_size}"
         ));
     }
-    let (bid, ask) = match broker {
-        Broker::Oanda => read_oanda_bid_ask(instrument).await?,
-        Broker::TradeNation => read_tradenation_bid_ask(instrument).await?,
-    };
+    let (bid, ask) = read_bid_ask(broker, instrument).await?;
     let spread_price = spread_from_bid_ask(bid, ask)?;
     let spread_pips = spread_price / pip_size;
     info!(
@@ -64,10 +61,7 @@ pub async fn read_spread_pips(broker: Broker, instrument: &str, pip_size: f64) -
 /// bid/ask read as [`read_spread_pips`]; hard-errors on a stale/degenerate quote
 /// (a bad anchor would silently mis-fire every pullback).
 pub async fn read_mid(broker: Broker, instrument: &str) -> Result<f64> {
-    let (bid, ask) = match broker {
-        Broker::Oanda => read_oanda_bid_ask(instrument).await?,
-        Broker::TradeNation => read_tradenation_bid_ask(instrument).await?,
-    };
+    let (bid, ask) = read_bid_ask(broker, instrument).await?;
     // Reuse the spread validation to reject non-finite / inverted quotes.
     spread_from_bid_ask(bid, ask)?;
     let mid = (bid + ask) / 2.0;
@@ -76,6 +70,26 @@ pub async fn read_mid(broker: Broker, instrument: &str) -> Result<f64> {
         instrument, bid, ask, mid, "live broker mid read (pullback anchor)",
     );
     Ok(mid)
+}
+
+/// Dispatch the live bid/ask read to the broker's own source.
+///
+/// One match for both readers above, so a new broker cannot be wired into the
+/// spread read and forgotten in the mid read (they had to agree by hand).
+///
+/// IBKR errors rather than reading: market-data entitlements are unresolved
+/// (plan §"Cannot be verified offline"), and this module's contract is to
+/// refuse rather than fall back — a guessed futures spread would mis-size
+/// every entry it touched.
+async fn read_bid_ask(broker: Broker, instrument: &str) -> Result<(f64, f64)> {
+    match broker {
+        Broker::Oanda => read_oanda_bid_ask(instrument).await,
+        Broker::TradeNation => read_tradenation_bid_ask(instrument).await,
+        Broker::Ibkr => Err(eyre!(
+            "no live spread source for ibkr ({instrument}): IBKR market data is not \
+             wired up, and refusing to arm beats baking a guessed spread"
+        )),
+    }
 }
 
 /// Validate a bid/ask pair and return the spread in price units. A

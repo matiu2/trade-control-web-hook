@@ -2258,6 +2258,12 @@ An instrument is treated as futures when it parses as either IBKR's own
 CFD/spot instrument the system trades today is untouched — the guard is a
 complete no-op for them.
 
+`broker: ibkr` is an **additional trigger, not a filter**. A futures symbol is
+guarded whatever broker it names, so a contract cannot escape the check by
+carrying a CFD broker field; and an `ibkr` plan whose instrument does *not*
+parse as a contract is refused too, because on that broker there is nothing else
+to trade and an unidentifiable symbol has no deadline to honour.
+
 ```
 $ trade-control build-trade --from-file trade.yaml ...
 Error: GC 202612 is past its close-out arming window for a long: trade_expiry
@@ -2268,6 +2274,28 @@ instead.
 
 Offline `--plan-out` builds warn instead of refusing, matching how an expired
 `trade_expiry` is treated there — historical setups must still replay.
+
+#### `--broker ibkr` today
+
+`oanda`, `tradenation` and `ibkr` are accepted wherever a broker is named —
+`trade-control-accounts add --broker ibkr`, `tv-arm --broker ibkr`,
+`trade-control ... --broker ibkr` — and an IBKR account stores and round-trips
+like any other. **No IBKR broker is implemented yet**, so anything that would
+actually reach the venue refuses loudly rather than falling back:
+
+| Path | Behaviour |
+|---|---|
+| worker dispatch | `501 ibkr broker not implemented` |
+| cron broker acquisition | plan skipped, error logged |
+| `trade-control-broker-check` | refuses — nothing to check |
+| live spread read (`tv-arm`) | refuses rather than guess a spread |
+| `--replay` | refuses — there is no IBKR candle feed |
+| `instruments` subcommands | refuse — no IBKR catalog |
+| account default | none; `--account-id` is required |
+
+Each is a refusal rather than a silent fallback because the fallback would trade
+a *different instrument* — an OANDA symbol resolved for a futures plan, or CFD
+prices replayed as if they were the contract's.
 
 The calendar itself is a generated table (`core/src/contract_calendar_baked.rs`,
 GC/MGC/ES/MES, 2026–2028); see [`contract-calendar-gen/README.md`](contract-calendar-gen/README.md)

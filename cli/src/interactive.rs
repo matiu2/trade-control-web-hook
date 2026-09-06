@@ -18,6 +18,7 @@ use super::prompts::{
 };
 use super::templates::templates_root;
 use trade_control_core::intent::Action;
+use trade_control_core::intent::BrokerKind;
 use trade_control_core::intent::Intent;
 
 /// Name reserved for the per-instrument trade-expiry anchor veto.
@@ -700,13 +701,17 @@ fn prompt_action(theme: &ColorfulTheme) -> Result<Value> {
 }
 
 fn prompt_broker(theme: &ColorfulTheme) -> Result<Value> {
-    let choices = ["oanda", "tradenation"];
+    // Driven from `BrokerKind::ALL` so the picker can't fall behind the enum.
+    let choices: Vec<&str> = BrokerKind::ALL.iter().map(|b| b.as_str()).collect();
     let idx = Select::with_theme(theme)
         .with_prompt("broker")
-        .items(choices)
+        .items(&choices)
         .default(0)
         .interact()?;
-    Ok(Value::String(choices[idx].into()))
+    let picked = choices
+        .get(idx)
+        .ok_or_else(|| eyre!("broker pick returned index {idx}, which is not a known broker"))?;
+    Ok(Value::String((*picked).into()))
 }
 
 fn prompt_direction(theme: &ColorfulTheme) -> Result<Value> {

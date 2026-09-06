@@ -291,8 +291,15 @@ fn slugify(s: &str) -> String {
 /// `~/.config/instrument-lookup/mappings.toml`) rather than silently
 /// mis-deriving its news currencies from a string heuristic.
 pub fn parse_instrument(raw: &str, broker: BrokerKind) -> Result<Instrument> {
-    let asset = instrument_lookup::by_broker_symbol(broker_for(broker), raw)
-        .map_err(|e| eyre!("instrument-lookup overlay error resolving {raw:?}: {e}"))?
+    // IBKR has no catalog broker column, so the by-broker-symbol step is
+    // skipped rather than aimed at another broker; the broker-agnostic
+    // `resolve` below still gets its chance.
+    let by_broker = match broker_for(broker) {
+        Some(b) => instrument_lookup::by_broker_symbol(b, raw)
+            .map_err(|e| eyre!("instrument-lookup overlay error resolving {raw:?}: {e}"))?,
+        None => None,
+    };
+    let asset = by_broker
         .or(instrument_lookup::resolve(raw)
             .map_err(|e| eyre!("instrument-lookup overlay error resolving {raw:?}: {e}"))?)
         .ok_or_else(|| {
@@ -310,10 +317,17 @@ pub fn parse_instrument(raw: &str, broker: BrokerKind) -> Result<Instrument> {
 }
 
 /// Map our [`BrokerKind`] onto `instrument-lookup`'s [`Broker`].
-fn broker_for(broker: BrokerKind) -> instrument_lookup::Broker {
+///
+/// `None` for IBKR: the catalog has no futures broker and no contract-month
+/// dimension, so there is no symbol to look up. Callers must treat that as
+/// "cannot resolve", never as a fallback to another broker's symbol — an
+/// OANDA symbol resolved for an IBKR trade would name a different instrument
+/// entirely.
+fn broker_for(broker: BrokerKind) -> Option<instrument_lookup::Broker> {
     match broker {
-        BrokerKind::Oanda => instrument_lookup::Broker::Oanda,
-        BrokerKind::TradeNation => instrument_lookup::Broker::TradeNation,
+        BrokerKind::Oanda => Some(instrument_lookup::Broker::Oanda),
+        BrokerKind::TradeNation => Some(instrument_lookup::Broker::TradeNation),
+        BrokerKind::Ibkr => None,
     }
 }
 

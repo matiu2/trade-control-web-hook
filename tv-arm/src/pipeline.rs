@@ -610,7 +610,7 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
     } = setup;
 
     let key = read_key()?;
-    let account = resolve_account(args, broker);
+    let account = resolve_account(args, broker)?;
     let out_dir = arm_out_dir(&raw_symbol)?;
     let now = Utc::now();
     // The time this arm treats as "now" for everything time-derived on the plan:
@@ -1009,6 +1009,14 @@ fn resolve_with_recovery(
     let il_broker = match broker {
         Broker::Oanda => instrument_lookup::Broker::Oanda,
         Broker::TradeNation => instrument_lookup::Broker::TradeNation,
+        // The catalog has no IBKR column, so there is nothing to recover a
+        // futures symbol from. Stage 5 adds `Broker::Ibkr` + rows there.
+        Broker::Ibkr => {
+            return Err(eyre!(
+                "cannot recover chart symbol {tv_symbol:?} for ibkr: the instrument-lookup \
+                 catalog has no IBKR listing yet"
+            ));
+        }
     };
     let broker_symbol = patched
         .asset
@@ -1041,17 +1049,30 @@ fn resolve_with_recovery(
 }
 
 /// `--account-id` > `TRADE_CONTROL_ACCOUNT` env > per-broker default.
-fn resolve_account(args: &Args, broker: Broker) -> String {
+///
+/// Errors when the broker has no default and the operator named no account.
+/// Substituting a placeholder would put a blank account name on the plan and
+/// fail at dispatch instead of here, where the cause is obvious.
+fn resolve_account(args: &Args, broker: Broker) -> Result<String> {
     if let Some(a) = &args.account_id {
-        return a.clone();
+        return Ok(a.clone());
     }
     if let Ok(env_val) = env::var("TRADE_CONTROL_ACCOUNT") {
         let trimmed = env_val.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return Ok(trimmed.to_string());
         }
     }
-    broker.default_account_index().to_string()
+    broker
+        .default_account_index()
+        .map(str::to_string)
+        .ok_or_else(|| {
+            eyre!(
+                "{} has no default account, so one must be named explicitly: \
+             pass --account-id <name> or set TRADE_CONTROL_ACCOUNT",
+                broker.as_str()
+            )
+        })
 }
 
 /// H&S / IH&S path: validate the constellation of drawings, read

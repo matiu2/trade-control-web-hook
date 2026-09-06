@@ -492,6 +492,20 @@ async fn dispatch_broker(
                 );
             }
         },
+        // Stage 4 of the IBKR integration adds the variant so the compiler can
+        // enumerate the work; the broker itself lands in Stage 6. Refusing
+        // loudly here is the point — a fallback to another broker would place
+        // a futures-sized order against a CFD account.
+        BrokerKind::Ibkr => {
+            tracing::error!(
+                "ibkr dispatch refused for account '{}': no IBKR broker implementation yet",
+                meta.name
+            );
+            return DispatchOutcome::plain(
+                StatusCode::NOT_IMPLEMENTED,
+                "ibkr broker not implemented",
+            );
+        }
     };
 
     // Shared seen-index write (only `Ok` marks; `Failed`/`Rejected` log only).

@@ -65,7 +65,14 @@ pub fn resolve_for_broker(tv_symbol: &str, broker: ConvBroker) -> Result<Resolve
         )
     })?;
 
-    let il_broker = to_il_broker(broker);
+    let il_broker = to_il_broker(broker).ok_or_else(|| {
+        eyre!(
+            "asset {} cannot be resolved for {}: the instrument-lookup catalog has no \
+             listing for that broker",
+            asset.id,
+            broker.as_str(),
+        )
+    })?;
     let broker_symbol = asset.symbol_for(il_broker).ok_or_else(|| {
         let carriers = brokers_carrying(asset);
         let listed = if carriers.is_empty() {
@@ -190,10 +197,14 @@ fn strip_exchange(tv_symbol: &str) -> &str {
     }
 }
 
-fn to_il_broker(broker: ConvBroker) -> IlBroker {
+/// `None` for IBKR: the catalog has no futures broker column, so there is no
+/// symbol to resolve. Substituting another broker's column would resolve to a
+/// different instrument, which is worse than not resolving at all.
+fn to_il_broker(broker: ConvBroker) -> Option<IlBroker> {
     match broker {
-        ConvBroker::Oanda => IlBroker::Oanda,
-        ConvBroker::TradeNation => IlBroker::TradeNation,
+        ConvBroker::Oanda => Some(IlBroker::Oanda),
+        ConvBroker::TradeNation => Some(IlBroker::TradeNation),
+        ConvBroker::Ibkr => None,
     }
 }
 
@@ -254,7 +265,8 @@ mod tests {
         let bare = strip_exchange(tv_symbol);
         let asset = instrument_lookup::resolve(bare)?
             .ok_or_else(|| eyre!("{tv_symbol:?} not in catalog"))?;
-        let il_broker = to_il_broker(broker);
+        let il_broker = to_il_broker(broker)
+            .ok_or_else(|| eyre!("{} has no catalog column", broker.as_str()))?;
         let broker_symbol = asset
             .symbol_for(il_broker)
             .ok_or_else(|| eyre!("{} not listed on {}", asset.id, broker.as_str()))?;

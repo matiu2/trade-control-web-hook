@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
     println!(
         "account '{}' → broker={} kind={:?}",
         meta.name,
-        broker_str(meta.broker),
+        meta.broker.as_str(),
         meta.kind
     );
 
@@ -97,6 +97,16 @@ async fn main() -> Result<()> {
             let broker =
                 acquire_oanda(&meta, &secrets).map_err(|e| eyre!("acquire_oanda failed: {e}"))?;
             broker.get_quote(&cli.instrument).await
+        }
+        // Stage 6 adds the broker. Until then this check cannot say anything
+        // truthful about an IBKR account, so it refuses rather than reporting
+        // a session it never opened.
+        BrokerKind::Ibkr => {
+            return Err(eyre!(
+                "account '{}' is an IBKR account; no IBKR broker is implemented yet, \
+                 so there is nothing to check",
+                meta.name
+            ));
         }
     };
 
@@ -118,13 +128,6 @@ async fn main() -> Result<()> {
              try --instrument with a symbol the broker trades",
             cli.instrument
         )),
-    }
-}
-
-fn broker_str(b: BrokerKind) -> &'static str {
-    match b {
-        BrokerKind::Oanda => "oanda",
-        BrokerKind::TradeNation => "tradenation",
     }
 }
 

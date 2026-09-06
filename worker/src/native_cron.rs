@@ -89,6 +89,16 @@ impl CronEnv for NativeCronEnv {
                     None
                 }
             },
+            // No IBKR broker until Stage 6. `None` skips the plan with a loud
+            // log rather than routing it to a broker that would trade a
+            // different instrument entirely.
+            BrokerKind::Ibkr => {
+                tracing::error!(
+                    "cron: ibkr broker not implemented, skipping account '{}'",
+                    meta.name
+                );
+                None
+            }
         }
     }
 

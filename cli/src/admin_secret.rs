@@ -31,11 +31,13 @@ use trade_control_core::intent::BrokerKind;
 /// Rules:
 /// - `TN_ACCOUNT_<NAME>` for TradeNation
 /// - `OANDA_ACCOUNT_<NAME>` for OANDA
+/// - `IBKR_ACCOUNT_<NAME>` for Interactive Brokers
 /// - `<NAME>` is uppercased with `-` mapped to `_`
 pub fn secret_binding_for(broker: BrokerKind, account_name: &str) -> String {
     let prefix = match broker {
         BrokerKind::TradeNation => "TN_ACCOUNT_",
         BrokerKind::Oanda => "OANDA_ACCOUNT_",
+        BrokerKind::Ibkr => "IBKR_ACCOUNT_",
     };
     let normalised = account_name.to_ascii_uppercase().replace('-', "_");
     format!("{prefix}{normalised}")

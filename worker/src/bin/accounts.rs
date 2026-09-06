@@ -152,11 +152,13 @@ enum Command {
     },
 }
 
-/// CLI mirror of [`BrokerKind`] so clap can derive `--broker oanda|tradenation`.
+/// CLI mirror of [`BrokerKind`] so clap can derive
+/// `--broker oanda|tradenation|ibkr`.
 #[derive(Clone, Copy, ValueEnum)]
 enum BrokerArg {
     Oanda,
     Tradenation,
+    Ibkr,
 }
 
 impl From<BrokerArg> for BrokerKind {
@@ -164,6 +166,7 @@ impl From<BrokerArg> for BrokerKind {
         match b {
             BrokerArg::Oanda => BrokerKind::Oanda,
             BrokerArg::Tradenation => BrokerKind::TradeNation,
+            BrokerArg::Ibkr => BrokerKind::Ibkr,
         }
     }
 }
@@ -305,10 +308,7 @@ async fn remove(accounts: &PgMetadataStore, name: &str) -> Result<()> {
 
 /// One-line operator-facing rendering of an account's metadata.
 fn render(m: &AccountMetadata) -> String {
-    let broker = match m.broker {
-        BrokerKind::Oanda => "oanda",
-        BrokerKind::TradeNation => "tradenation",
-    };
+    let broker = m.broker.as_str();
     let kind = match m.kind {
         AccountKind::Demo => "demo",
         AccountKind::Live => "live",

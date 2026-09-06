@@ -1418,12 +1418,16 @@ fn assemble_trade(
 ///
 /// # Scope
 ///
-/// Fires only for instruments that parse as futures ([`futures_symbol`]); every
-/// CFD and spot instrument the system trades today is untouched. It is
-/// deliberately **not** keyed on [`BrokerKind`]: `BrokerKind::Ibkr` does not
-/// exist yet, and keying on the instrument means a futures contract cannot slip
-/// past by carrying a not-yet-migrated broker field. When the IBKR variant
-/// lands it narrows this condition rather than replacing it.
+/// Fires for instruments that parse as futures ([`futures_symbol`]); every CFD
+/// and spot instrument the system trades today is untouched.
+///
+/// [`BrokerKind::Ibkr`] is an **additional trigger, not a filter.** The obvious
+/// reading of "scope this to IBKR" is `is_futures && broker == Ibkr`, which is
+/// wrong in the dangerous direction: it lets a futures symbol escape the guard
+/// by carrying a CFD broker field. So an IBKR plan whose instrument does not
+/// parse as a futures contract is *also* refused — on that broker there is
+/// nothing else to trade, so an unparseable symbol means the calendar cannot
+/// vouch for it, and fail-closed applies.
 ///
 /// # Fail-closed
 ///
@@ -1439,8 +1443,27 @@ fn check_futures_close_out(
     now: DateTime<Utc>,
     strictness: BuildStrictness,
 ) -> Result<()> {
-    let Some(contract) = futures_symbol::parse(&spec.instrument, now.year()) else {
-        return Ok(());
+    let contract = match futures_symbol::parse(&spec.instrument, now.year()) {
+        Some(c) => c,
+        // Not a futures symbol. On a CFD broker that is the overwhelmingly
+        // common case and there is nothing to check. On IBKR it means we cannot
+        // identify the contract at all, so there is no deadline to honour.
+        None if spec.broker == BrokerKind::Ibkr => {
+            let refusal = eyre!(
+                "this is an IBKR plan, but {:?} does not name a futures contract \
+                 (expected a form like `GCZ6` or `GC 202612`), so its close-out \
+                 deadline cannot be checked — refusing to arm.",
+                spec.instrument,
+            );
+            return match strictness {
+                BuildStrictness::Strict => Err(refusal),
+                BuildStrictness::Lenient => {
+                    tracing::warn!("{refusal}");
+                    Ok(())
+                }
+            };
+        }
+        None => return Ok(()),
     };
     let direction = spec.pattern.direction();
     // The whole window has to fit, so the question is asked about the last
@@ -1866,17 +1889,21 @@ fn prompt_instrument(theme: &ColorfulTheme) -> Result<String> {
 }
 
 fn prompt_broker(theme: &ColorfulTheme) -> Result<BrokerKind> {
-    let options = ["oanda", "tradenation"];
+    // Menu and result both come from `BrokerKind::ALL`, so a new broker shows
+    // up in the picker and maps to itself. The previous shape listed the labels
+    // by hand and mapped `_ => TradeNation`, which would have silently returned
+    // TradeNation for every entry after the first.
+    let options: Vec<&str> = BrokerKind::ALL.iter().map(|b| b.as_str()).collect();
     let idx = FuzzySelect::with_theme(theme)
         .with_prompt("broker")
-        .items(options)
+        .items(&options)
         .default(0)
         .interact()
         .map_err(|e| eyre!("broker pick aborted: {e}"))?;
-    Ok(match idx {
-        0 => BrokerKind::Oanda,
-        _ => BrokerKind::TradeNation,
-    })
+    BrokerKind::ALL
+        .get(idx)
+        .copied()
+        .ok_or_else(|| eyre!("broker pick returned index {idx}, which is not a known broker"))
 }
 
 fn prompt_trade_expiry(
@@ -3657,6 +3684,62 @@ mod tests {
                 .is_err(),
             "arming on the last armable day with a window that outlives it must refuse"
         );
+    }
+
+    /// The IBKR broker field is an *additional trigger*, not a filter. The
+    /// tempting `is_futures && broker == Ibkr` scoping would let a futures
+    /// contract escape the guard entirely by carrying a CFD broker field, so a
+    /// futures symbol is refused whatever broker it names.
+    #[test]
+    fn a_futures_symbol_is_guarded_even_on_a_cfd_broker() {
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-11-20T00:00:00Z"));
+        spec.instrument = "GCZ6".into();
+        spec.broker = BrokerKind::Oanda;
+        assert!(
+            build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Strict)
+                .is_err(),
+            "a futures contract must not escape the guard via its broker field"
+        );
+    }
+
+    /// On IBKR there is nothing but futures to trade, so an instrument that
+    /// does not parse as a contract cannot be checked against the calendar —
+    /// and fail-closed means that is a refusal, not a pass.
+    #[test]
+    fn an_ibkr_plan_naming_a_non_futures_instrument_is_refused() {
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-11-20T00:00:00Z"));
+        spec.broker = BrokerKind::Ibkr;
+        assert_eq!(spec.instrument, "EUR_USD");
+        let err = build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Strict)
+            .expect_err("an IBKR plan must name a futures contract");
+        assert!(
+            err.to_string().contains("does not name a futures contract"),
+            "{err}"
+        );
+    }
+
+    /// …and that refusal degrades to a warning offline, like every other arm
+    /// of this guard, so historical `--plan-out` replay still builds.
+    #[test]
+    fn the_ibkr_non_futures_refusal_is_lenient_offline() {
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-11-20T00:00:00Z"));
+        spec.broker = BrokerKind::Ibkr;
+        build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Lenient)
+            .expect("offline builds warn rather than refusing");
+    }
+
+    /// A CFD plan on a CFD broker stays untouched — the narrowing must not have
+    /// widened the guard onto the instruments the system actually trades.
+    ///
+    /// OANDA only: the TradeNation arm of `validate_instrument` reads the local
+    /// encrypted account store, so covering it here would test the developer's
+    /// machine rather than the guard.
+    #[test]
+    fn a_cfd_plan_on_a_cfd_broker_is_still_unaffected() {
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-11-20T00:00:00Z"));
+        spec.broker = BrokerKind::Oanda;
+        build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Strict)
+            .expect("an OANDA CFD plan must build");
     }
 
     /// M/W patterns reach the guard too — they dispatch to `build_mw_pattern`

@@ -14,11 +14,27 @@
 //!   account *name*. The whole wasm redirect-chain login (`src/tn_login.rs`) is
 //!   unnecessary off-wasm — `tradenation_api::login_demo_named` does it.
 //!
-//! Like the wasm worker, this does **not** type-erase the broker (the `Broker`
-//! trait is not object-safe — its methods return `impl Future`). The native
+//! Like the wasm worker, this does **not** box the broker: the `Broker` trait
+//! is not object-safe, because its methods return `impl Future`. The native
 //! dispatcher branches on [`BrokerKind`] and calls the matching `acquire_*`,
 //! then monomorphizes the generic dispatch per arm — exactly as the wasm
 //! worker's `main` does.
+//!
+//! Monomorphization is **not** the only way to dispatch, though — `dyn Broker`
+//! is what's unavailable, not type erasure as such. The cron engine erases the
+//! same brokers behind an enum (`trade_control_cron::BrokerHandle`) and matches
+//! on it. Both strategies cost one arm per broker; this module uses the
+//! generic one because each caller here knows its concrete broker at the call
+//! site, while the cron engine has to *return* a broker across an async
+//! boundary, where `impl Trait` will not do.
+//!
+//! # Adding a broker
+//!
+//! Each `acquire_*` guards with `meta.broker != <its kind>` rather than an
+//! exhaustive match. That is deliberate and safe: the guard rejects *every*
+//! other broker, including ones added later, so a new [`BrokerKind`] cannot
+//! silently acquire the wrong client. `each_factory_rejects_every_foreign_broker`
+//! walks [`BrokerKind::ALL`] to keep that true without a per-broker test.
 
 use broker_oanda::OandaBroker;
 use broker_tradenation_adapter::TradeNationAdapter;
@@ -182,6 +198,28 @@ mod tests {
         secrets.oanda_api_key = None;
         let result = acquire_oanda(&meta, &secrets);
         assert!(matches!(result, Err(BrokerError::MissingOandaApiKey)));
+    }
+
+    /// The `!=` guards must reject **every** other broker, not just the one
+    /// other broker that existed when they were written. Driving this off
+    /// `ALL` means a new `BrokerKind` is covered the moment it is added, with
+    /// no test to remember to write — which is what makes leaving the guards
+    /// as `!=` (rather than exhaustive matches) safe.
+    #[test]
+    fn each_factory_rejects_every_foreign_broker() {
+        for &kind in BrokerKind::ALL {
+            let mut meta = oanda_meta(Some("x"), AccountKind::Demo);
+            meta.broker = kind;
+            let got = acquire_oanda(&meta, &secrets_with_oanda());
+            if kind == BrokerKind::Oanda {
+                assert!(got.is_ok(), "oanda must accept its own account");
+            } else {
+                assert!(
+                    matches!(got, Err(BrokerError::BrokerMismatch { .. })),
+                    "acquire_oanda must reject a {kind:?} account"
+                );
+            }
+        }
     }
 
     #[test]

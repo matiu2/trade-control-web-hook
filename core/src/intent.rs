@@ -1511,14 +1511,49 @@ pub enum EventWindow {
 }
 
 /// Which broker fulfils an intent. The serialised form is the
-/// lowercase variant name (`oanda`, `tradenation`); absent on the wire
+/// lowercase variant name (`oanda`, `tradenation`, `ibkr`); absent on the wire
 /// means [`BrokerKind::Oanda`].
+///
+/// # `Oanda` is the default for wire compatibility, not because it is special
+///
+/// Bodies signed before a broker field existed carry no `broker:` line, and the
+/// HMAC covers the body as written — so the default cannot be changed without
+/// invalidating them. [`ALL`](BrokerKind::ALL) exists so code that needs to
+/// enumerate brokers (menus, validation lists) reads the variants from one
+/// place rather than hardcoding a pair that goes stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BrokerKind {
     #[default]
     Oanda,
     TradeNation,
+    /// Interactive Brokers — **futures only**, and no broker implementation
+    /// exists yet. An account carrying this kind resolves to a loud error at
+    /// the broker factory rather than falling back to another venue.
+    Ibkr,
+}
+
+impl BrokerKind {
+    /// Every variant, in menu order.
+    ///
+    /// The one source of truth for "which brokers exist". Anything that renders
+    /// a picker or validates a broker string reads this; the hardcoded
+    /// `["oanda", "tradenation"]` arrays this replaced were invisible to the
+    /// compiler and each had to be found by hand.
+    pub const ALL: &'static [BrokerKind] =
+        &[BrokerKind::Oanda, BrokerKind::TradeNation, BrokerKind::Ibkr];
+
+    /// The lowercase wire form — the same string serde produces.
+    ///
+    /// Exhaustive on purpose: a new broker fails to compile here, and this is
+    /// the cheapest place to be told.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Oanda => "oanda",
+            Self::TradeNation => "tradenation",
+            Self::Ibkr => "ibkr",
+        }
+    }
 }
 
 /// Escalation level for a `veto` action. Vetos always set the named
@@ -2218,6 +2253,65 @@ impl PriceRef {
             } => Ok(shell.anchor_price(*from)
                 + resolve_offset(*from, *offset_pips, *offset_atr_pct, shell, pip_size)?),
         }
+    }
+}
+
+#[cfg(test)]
+mod broker_kind_tests {
+    use super::*;
+
+    /// A body signed before the `broker:` field existed carries no broker line,
+    /// and the HMAC covers the body as written — so changing this default
+    /// silently re-routes every such intent to a different venue. Pinned
+    /// explicitly rather than left to `#[derive(Default)]`'s first variant.
+    #[test]
+    fn an_absent_broker_field_still_means_oanda() {
+        let parsed: BrokerKind = serde_json::from_str("null").unwrap_or_default();
+        assert_eq!(parsed, BrokerKind::Oanda);
+        assert_eq!(BrokerKind::default(), BrokerKind::Oanda);
+    }
+
+    /// `as_str` is what the account row is written with, while reads parse back
+    /// through serde. If the two spellings ever disagree, an account round-trips
+    /// as a *different broker* — or fails to decode at all.
+    #[test]
+    fn broker_wire_form_matches_serde() {
+        for &kind in BrokerKind::ALL {
+            let via_serde = serde_json::to_value(kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned));
+            assert_eq!(
+                via_serde.as_deref(),
+                Some(kind.as_str()),
+                "as_str and serde disagree for {kind:?}"
+            );
+            let back: BrokerKind = serde_json::from_value(serde_json::json!(kind.as_str()))
+                .unwrap_or_else(|e| panic!("{kind:?} must parse back from its own string: {e}"));
+            assert_eq!(back, kind);
+        }
+    }
+
+    /// `ALL` is the single source of truth for menus and validation lists, so a
+    /// variant missing from it is invisible to every consumer that walks it.
+    #[test]
+    fn all_lists_every_variant() {
+        assert_eq!(
+            BrokerKind::ALL.len(),
+            3,
+            "a new broker must be added to ALL"
+        );
+        assert!(BrokerKind::ALL.contains(&BrokerKind::Oanda));
+        assert!(BrokerKind::ALL.contains(&BrokerKind::TradeNation));
+        assert!(BrokerKind::ALL.contains(&BrokerKind::Ibkr));
+    }
+
+    #[test]
+    fn ibkr_serialises_as_ibkr() {
+        assert_eq!(BrokerKind::Ibkr.as_str(), "ibkr");
+        assert_eq!(
+            serde_json::to_string(&BrokerKind::Ibkr).unwrap_or_default(),
+            r#""ibkr""#
+        );
     }
 }
 
