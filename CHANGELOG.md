@@ -1,5 +1,138 @@
 # Changelog
 
+## v138 — 2026-09-06 — IBKR broker: futures sized in contracts, wired end to end
+
+**Why.** v137 baked `contract_multiplier` onto the signed intent and validated
+it, but **nothing read it** — the field reached `run_enter` and stopped, because
+`EntryRequest` had no multiplier at all. This is Stage 6: the broker that
+consumes it, and the wiring that lets an IBKR account resolve to a real broker
+instead of a loud refusal.
+
+**An IBKR account can now hold a live Gateway session and size a futures entry
+correctly. It still cannot place an order** — transmission is deliberately not
+implemented, and every Gateway-touching path refuses loudly rather than
+answering plausibly.
+
+**What changed.**
+
+- **`broker-ibkr`** — a new workspace member mirroring `broker-oanda`'s layout,
+  with sizing private (`mod risk`, not `pub mod`) so it stays implementation
+  detail rather than trait surface. Path-depends on `ibkr-client` (Stage 1,
+  merged; its directory renamed from `ibkr-spike` to match the crate).
+
+- **Futures sizing** — `contracts = budget / (stop_distance × multiplier × fx)`,
+  floored. Three rules that are not obvious:
+
+  - **A missing multiplier is refused, never defaulted to `1.0`.** Substituting
+    `1.0` for ES places a **50× oversized** position — a perfectly valid order,
+    just enormous, so nothing downstream would flag it. New
+    `EntryError::ContractSizeUnavailable`, distinct from `UnitsBelowMinimum`
+    because the two want opposite responses: a below-minimum size is a
+    legitimate small-account outcome that v137 parks and re-checks each bar,
+    whereas a missing multiplier is a plumbing defect no waiting can fix.
+  - **Sizes floor, never round.** Rounding up risks more than authorised — for
+    ES, up to half a contract, which on a 20-point stop is $500 unrequested.
+  - **A literal `size_units` means CONTRACTS**, so its implied risk goes through
+    the multiplier too. Omit it there and a 2-contract ES order reports 0.04%
+    risk instead of 2%, slipping the cap fifty-fold.
+
+  The order-size grid reads IBKR's own `min_size` / `size_increment` per
+  contract rather than a bare `units == 0` check — the distinction OANDA's
+  `units == 0` misses.
+
+- **The multiplier landed on `Resolved`, not read off the intent per call site.**
+  `run_enter` builds **four** `EntryRequest`s (the initial placement plus three
+  recovery re-placements) and they must all agree: a recovery that re-places on
+  a different multiplier silently re-sizes the trade. One field, one source —
+  the drift `pip_size` created by living in both `Intent` and `MwParams`.
+
+- **`BrokerHandle::Ibkr` + `Credentials::Ibkr` + `acquire_ibkr`**, plus 16
+  compile-enforced cron match arms. `Credentials::Ibkr` was deferred from Stage
+  4 on the grounds that IBKR authenticates via the Gateway socket rather than a
+  token; that held up — `IbkrCreds` carries **no secret at all**, so an IBKR
+  account's security boundary is the Gateway process and the loopback socket.
+
+- **The Gateway address is derived from the account's `kind`**, not configured:
+  demo ⇒ paper port, live ⇒ live port. A configurable field would introduce the
+  failure mode of a live account pointed at paper — or, far worse, the reverse.
+
+- **`trade-control-broker-check` gained a real IBKR arm.** Stage 4 made it
+  refuse outright; it now verifies the **connection**, which is the thing that
+  actually breaks (the Gateway force-restarts daily and re-authenticates
+  weekly), and says plainly that it did not fetch a quote.
+
+**What deliberately refuses.** Sizing is complete; transmission is not. Order
+submission, the account snapshot, quotes, positions, pending orders and candles
+all fail loudly. This is not a stub-vs-implementation nicety — a broker adapter's
+caller cannot tell a polite lie from the truth. An empty `list_open_positions`
+reads as "the account is flat", and the breakeven watch, pending sweep and
+blackout apply all act on that. A close returns `Errored`, **not** `NothingOpen`,
+because v135 made the latter a *success* that consumes the intent id — it would
+mark a close fulfilled while a real position kept running.
+
+⚠️ **Market data is not optional.** `get_quote` feeds the SL-spread floor, a hard
+entry gate requiring the stop distance to clear 10× the live spread. Delayed
+COMEX/CME data would make that gate read a stale spread — either blocking every
+entry or waving through a trade whose stop sits inside the real spread — so it
+fails closed until a live entitlement is confirmed.
+
+**Breaking.** None on the wire. `EntryRequest` and `Resolved` each gain a
+`contract_multiplier: Option<f64>`; downstream literals must add it (a compile
+error, not a silent change). Replay passes `None` — it does not size, by design.
+
+**Config.** No new env vars or secrets. An IBKR account needs a local IB Gateway
+running and logged in, and `--oanda-account-id` (the generic "which sub-account
+under this login" slot, which IBKR reuses) is now **required** for `--broker
+ibkr`; its `--help` said "ignored for TradeNation" and did not mention IBKR.
+
+**Tests.** 2940 pass (2902 before).
+
+**Verified against the live paper Gateway**, not only unit tests: an account
+created, read back, and `broker-check` reporting a live session through the
+whole path — account row → `BrokerKind::Ibkr` → `acquire_ibkr` → derived paper
+port → hashed client id → real Gateway. A `--kind live` account correctly routed
+to the live port and failed with `Connection refused`, which is what proves the
+derivation. Contract chains re-confirmed live: GC 100, MGC 10, ES 50, MES 5,
+`min_size` and `size_increment` both 1.
+
+Three operator-facing error defects were found by **running the binary**, none by
+a test: a "connecting…" announcement printed before a check that fails without
+connecting (so a config error read as a connection problem), a doubled "connect
+failed" prefix, and a Gateway hint appended to config errors it did not apply to.
+
+**Mutations: 15 applied, 15 killed.** Two are worth recording:
+
+- Reordering the multiplier check to *after* the account fetch initially
+  **survived** — the ordering had no coverage. It is not cosmetic: a Gateway
+  that is merely down would mask a missing multiplier, sending the operator
+  after a connection problem during an incident. Closing it made the Gateway
+  read a named `AccountSource` seam so `place_entry` is callable offline,
+  separating the money math (complete) from the I/O (not).
+- Removing the client-id floor also survived, so the test was widened to sweep
+  2,000 names — **and that sweep went red on a real bug**: hashing client ids
+  into a 60,000-wide range collides across a few hundred accounts (birthday
+  paradox), and IBKR rejects a duplicate client id outright, so the second
+  account cannot connect while the first is up. An outage visible only once both
+  are live. Widened to the full positive `i32`. The sweep still could not kill
+  the floor mutation — over a range that wide, names never land near the floor,
+  so it asserted a guarantee it had no power to check; the mapping is now a pure
+  `client_id_from_hash` tested at `0`, `1` and `u64::MAX`.
+
+**Follow-up.** ⚠️ **`ibkr-client` has no git remote and is not a submodule** —
+`broker-ibkr` path-depends on it, so a fresh `trading-libraries` checkout cannot
+build the workspace. It needs a GitHub repo and a submodule registration before
+anyone else clones this.
+
+Remaining for IBKR: the **order path** (never exercised — `ibapi`'s
+`BracketOrderBuilder` offers market and limit entries but **no `entry_stop()`**,
+while this system's primary entry mode is a stop entry, so it needs a parent stop
+order with children attached by `parent_id` — pinned as `bracket_can_carry`);
+the **account snapshot** (equity + FX); **market-data entitlement**; and **IBC**,
+which is not installed, so the daily-restart cycle is unproven over 48h+. Stage 8
+is replay parity, Stage 9 the paper demo month. The 10-business-day arm-time
+safety margin remains the plan's proposed default and is **not
+operator-signed-off**.
+
 ## v137 — 2026-09-06 — IBKR futures: close-out gate, broker enum, contract multiplier, size park
 
 **Why.** Interactive Brokers is being added as a third broker for exchange-traded
