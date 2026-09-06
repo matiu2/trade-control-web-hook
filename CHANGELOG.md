@@ -1,5 +1,74 @@
 # Changelog
 
+## v137 — 2026-09-06 — IBKR futures: close-out gate, broker enum, contract multiplier
+
+**Why.** Interactive Brokers is being added as a third broker for exchange-traded
+futures, where measured cost is ~43–52% below CFD venues on gold and ~38–44% on
+the S&P (the saving is overnight financing, which futures do not charge). Three
+things the codebase had no concept of had to land first — a contract *calendar*,
+a *broker* identity, and a contract *multiplier* — and in that order, because
+nothing that can place a futures order may land before the close-out guard.
+
+Covers Stages 2–5 of the plan. **No order can be placed on IBKR at the end of
+this**: there is no broker implementation, and every path that would reach the
+venue refuses loudly rather than falling back (a fallback would trade a
+*different instrument*).
+
+**What changed.**
+
+- **Futures close-out calendar** (`contract-calendar-gen` → baked
+  `core/src/contract_calendar_baked.rs`). IBKR force-liquidates an expiring
+  position without notice, and **the deadline is not the expiry date**: for a
+  physically delivered contract the *long* deadline is 2 business days before
+  First Notice Day, which is the last business day of the month *preceding*
+  delivery — so a December gold contract's long deadline falls in **November**.
+  Lookup is fail-closed: unknown contract or ambiguous key ⇒ `None` ⇒ refuse.
+- **Arm-time refusal** (`build_trade_from_spec`) when a plan's `trade_expiry`
+  runs past that deadline. Scoped by **instrument**, with IBKR as an *additional*
+  trigger — not `is_futures && broker == Ibkr`, which would let a futures
+  contract escape the guard by carrying a CFD broker field.
+- **`BrokerKind::Ibkr`** plus every parallel enum, deliberately before the broker
+  exists so the compiler enumerated the work. All four operator binaries accept
+  `ibkr`. Broker lists are now driven from `BrokerKind::ALL` / `Broker::ALL`,
+  which killed a live `_ => TradeNation` catch-all on a menu index.
+- **`Intent.contract_multiplier`** — the money one full point of price is worth
+  (ES 50, GC 100), read from `instrument-lookup` at arm time and baked onto the
+  signed intent, never looked up worker-side (the worker links no catalog). New
+  `InstrumentSizing { pip_size, tick_size, contract_multiplier }` groups the
+  three at the builder seam.
+
+**Breaking.** None on the wire. `Intent` gains one `skip_serializing_if`-elided
+field, so a CFD alert body is byte-identical to pre-feature — load-bearing,
+because `sig::canonical_form` writes a `keys:` fingerprint over every top-level
+key, so an emitted `contract_multiplier: null` would change the signature of
+every existing CFD alert. Downstream `Intent` struct literals must add
+`contract_multiplier: None` (a compile error, not a silent change).
+
+**Config.** `instrument-lookup` bumped 0.4 → 0.5 across the six crates pinning
+it. No new env vars or secrets. There is deliberately **no
+`--contract-multiplier` flag**: unlike pip and tick, which an operator may
+legitimately correct against a stale catalog, the multiplier is an exchange-set
+contract property and a hand-typed override is a 50× sizing error waiting to
+happen.
+
+**Tests.** 2889 pass (2874 before). Highlights: a GC plan inside its close-out
+window is refused while the same plan 30 days earlier builds; a **long and a
+short on the same physical contract get different verdicts** in the month
+between the two deadlines; the multiplier round-trips through sign→parse and a
+post-signing edit (50 → 1) fails verification; a zero/negative/NaN multiplier is
+rejected at parse time — unlike `tick_size`, which has no validation and whose
+omission was deliberately not inherited.
+
+Mutations were applied at every stage and all killed, including
+`tick_size`/`contract_multiplier` **transposed at the call site** — the reason
+those three are a named struct rather than three positional `Option<f64>`s.
+
+**Follow-up.** Sizing does not yet *consume* the multiplier — that is Stage 6b
+(`broker-ibkr`'s private `risk.rs`), where `contracts = budget / (stop_distance ×
+multiplier × fx)` lands with the broker that reports `min_size`/`size_increment`.
+The 10-business-day arm-time safety margin is the plan's proposed default and is
+**not operator-signed-off**; changing it is one constant plus a regenerate.
+
 ## v136 — 2026-09-02 — `--save-fixture` wrote to the tree the binary was BUILT in
 
 **Why.** A capture died after the chart had already been read:

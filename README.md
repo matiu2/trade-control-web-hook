@@ -623,6 +623,33 @@ for JPY pairs or indices; the correct pip is baked in. The baked `pip_size`
 is also bound as a variable in gate scripts (`allow_entry`, `min_r`,
 `risk_pct`, …) alongside `entry_price`, `r_multiple`, etc.
 
+**Contract multiplier (futures only) — a THIRD number.** An exchange-traded
+futures enter also carries **`contract_multiplier`**: the money one full point
+of price is worth. It travels the same path as `pip_size` and `tick_size` —
+read from `instrument-lookup` (`Asset::contract_multiplier()`) by `tv-arm` at
+arm time, baked onto the signed intent, covered by the whole-body HMAC. It is
+**absent on every spot/CFD intent**, whose wire body is therefore byte-identical
+to a pre-feature one, and absent means an implicit `1.0` (spot is sized in
+units).
+
+⚠️ The three are genuinely different numbers, and conflating any two is the
+classic futures sizing bug. For ES:
+
+| field | meaning | ES |
+|---|---|---|
+| `tick_size` | smallest price increment | `0.25` |
+| `pip_size` | trade-*sizing* unit | `1.0` |
+| `contract_multiplier` | **money per 1.0 of price** | **`50`** |
+
+Sizing reads it as `contracts = budget / (stop_distance × multiplier × fx)`, so
+substituting `1.0` for ES places a **50× oversized** position. That is why there
+is deliberately **no `--contract-multiplier` flag**: unlike pip and tick, which
+an operator may legitimately correct against a stale catalog row, the multiplier
+is an exchange-set contract property and a hand-typed override is a sizing error
+waiting to happen. Unlike `tick_size` it is also **validated** — a zero or
+non-finite multiplier is rejected at parse time rather than dividing the sizing
+math to infinity.
+
 **How a catalog change reaches each binary.** The `instrument-lookup`
 catalog (`instrument-lookup/src/catalog.toml`) is `include_str!`-compiled
 into the `instrument-lookup` library, which the **CLIs** (`tv-arm`,
@@ -632,7 +659,8 @@ into the `instrument-lookup` library, which the **CLIs** (`tv-arm`,
   (its default `import` feature pulls in `reqwest` blocking) and was
   deliberately kept catalog-free. **Recompiling/redeploying the worker
   does *not* teach it a catalog change.** The worker only sees catalog
-  facts (`pip_size`, …) that `tv-arm` baked onto each *signed intent* at
+  facts (`pip_size`, `contract_multiplier`, …) that `tv-arm` baked onto each
+  *signed intent* at
   **arm time**. To make a catalog edit affect a live setup you re-**arm**
   it (re-run `tv-arm` with the new catalog) — you do not redeploy the
   worker.

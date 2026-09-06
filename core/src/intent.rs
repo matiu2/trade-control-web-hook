@@ -859,6 +859,30 @@ pub struct Intent {
     /// `instrument-lookup`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tick_size: Option<f64>,
+    /// Contract multiplier for an exchange-traded futures instrument — the
+    /// factor turning a price move into money — baked by `tv-arm` at arm time
+    /// from `instrument-lookup` (`Asset::contract_multiplier()`): `50` for ES,
+    /// `100` for GC. Absent on every spot/CFD intent, which is sized in units
+    /// and therefore has an implicit multiplier of `1.0`.
+    ///
+    /// Baked rather than looked up for the same reason as
+    /// [`pip_size`](Self::pip_size): the worker links no instrument catalog.
+    /// It is covered by the whole-body HMAC, so a baked multiplier cannot be
+    /// tampered in flight.
+    ///
+    /// ⚠️ **This is neither [`pip_size`](Self::pip_size) nor
+    /// [`tick_size`](Self::tick_size)** — three distinct numbers. For ES:
+    /// tick `0.25` (price grid), pip `1.0` (sizing unit), multiplier `50`
+    /// (money per 1.0 of price, so one tick is worth $12.50). Sizing reads it
+    /// as `contracts = budget / (stop_distance × multiplier × fx)`, so
+    /// substituting `1.0` for ES places a **50× oversized** position.
+    ///
+    /// Unlike `tick_size`, this **is** validated ([`validate`](Self::validate)):
+    /// a zero or non-finite multiplier would divide sizing to infinity or
+    /// poison it with `NaN`, and `tick_size`'s lack of validation is an
+    /// omission not worth inheriting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_multiplier: Option<f64>,
     /// Number of trailing candles the **entry SL-spread floor** averages the
     /// bid-ask spread over (see [`sl_spread_floor::mean_spread`]).
     ///
@@ -1095,6 +1119,12 @@ pub enum IntentValidationError {
     /// anchor price was non-finite, `spread_pips` was negative or
     /// non-finite, or `pip_size` was non-positive or non-finite.
     MwFieldInvalid,
+    /// The baked `contract_multiplier` was present but non-positive or
+    /// non-finite. A `0.0` multiplier divides the sizing math to infinity (or
+    /// zeroes the position) and a `NaN` propagates silently through every
+    /// downstream number, so this is rejected at parse time rather than
+    /// reaching a broker.
+    ContractMultiplierInvalid,
     /// The top-level `pip_size` was present but non-positive or
     /// non-finite. A baked pip drives every `offset_pips`→price scale, so
     /// a zero/negative/NaN value would silently zero or invert the trade
@@ -1185,6 +1215,9 @@ impl core::fmt::Display for IntentValidationError {
                 "mw params invalid: anchor prices must be finite, spread_pips >= 0, pip_size > 0",
             ),
             Self::PipSizeInvalid => f.write_str("pip_size must be finite and > 0"),
+            Self::ContractMultiplierInvalid => {
+                f.write_str("contract_multiplier must be finite and > 0")
+            }
             Self::OffsetSpecInvalid(e) => write!(f, "invalid anchored offset: {e}"),
             Self::MissingTradeId => {
                 f.write_str("trade_id is required on action: enter | veto | clear-veto")
@@ -1403,6 +1436,16 @@ impl Intent {
             && !(pip.is_finite() && pip > 0.0)
         {
             return Err(IntentValidationError::PipSizeInvalid);
+        }
+        // Baked futures multiplier: it divides the sizing math, so a zero
+        // would yield an infinite (or zero) position and a NaN would poison
+        // every number downstream of it. Deliberately validated even though
+        // the neighbouring `tick_size` is not — tick only rounds a price, a
+        // wrong multiplier mis-sizes the trade.
+        if let Some(mult) = self.contract_multiplier
+            && !(mult.is_finite() && mult > 0.0)
+        {
+            return Err(IntentValidationError::ContractMultiplierInvalid);
         }
         // recover_entry: a `market` recovery no longer requires an explicit
         // `max_slippage_pips` — the resolver derives the bound from the
@@ -4994,6 +5037,111 @@ mod tests {
         assert!(
             !out.contains("pip_size:"),
             "pip_size key leaked into wire form:\n{out}"
+        );
+    }
+
+    /// A futures enter carrying a baked multiplier. Kept next to the
+    /// `pip_size` fixtures so the three sizing numbers stay visibly distinct.
+    fn contract_multiplier_enter_yaml() -> &'static str {
+        "
+            v: 1
+            id: hs-es-abc
+            trade_id: es-hs-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: ES
+            direction: long
+            entry: { type: stop, from: high, offset_pips: 1.0 }
+            stop_loss: { from: low, offset_pips: -1.0 }
+            take_profit: { absolute: 5900.0 }
+            pip_size: 1.0
+            tick_size: 0.25
+            contract_multiplier: 50.0
+        "
+    }
+
+    #[test]
+    fn validate_accepts_a_baked_contract_multiplier() {
+        let intent: Intent = serde_yaml::from_str(contract_multiplier_enter_yaml()).unwrap();
+        assert_eq!(intent.contract_multiplier, Some(50.0));
+        // All three numbers survive independently — conflating any two of them
+        // is the classic futures sizing bug.
+        assert_eq!(intent.tick_size, Some(0.25));
+        assert_eq!(intent.pip_size, Some(1.0));
+        assert_eq!(intent.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_a_zero_contract_multiplier() {
+        // Zero divides the sizing math to infinity (or zeroes the position).
+        let yaml = contract_multiplier_enter_yaml()
+            .replace("contract_multiplier: 50.0", "contract_multiplier: 0.0");
+        let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::ContractMultiplierInvalid)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_negative_contract_multiplier() {
+        let yaml = contract_multiplier_enter_yaml()
+            .replace("contract_multiplier: 50.0", "contract_multiplier: -50.0");
+        let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::ContractMultiplierInvalid)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_nan_contract_multiplier() {
+        // NaN propagates silently through every downstream number.
+        let yaml = contract_multiplier_enter_yaml()
+            .replace("contract_multiplier: 50.0", "contract_multiplier: .nan");
+        let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::ContractMultiplierInvalid)
+        );
+    }
+
+    #[test]
+    fn contract_multiplier_elided_when_none() {
+        // The wire-compat anchor: a CFD intent must serialise byte-identically
+        // to a pre-feature one — no `contract_multiplier:` key at all. This
+        // matters beyond tidiness: `sig::canonical_form` writes a `keys:`
+        // schema-fingerprint line over every top-level key, so an emitted
+        // `contract_multiplier: null` would change the signature of every
+        // existing CFD alert.
+        //
+        // Asserted in YAML (the actual wire encoding), which emits `null` for
+        // a bare `Option` — so removing `skip_serializing_if` genuinely fails
+        // this. A TOML-based assertion would not; see the sibling
+        // instrument-lookup note.
+        let yaml = "
+            v: 1
+            id: hs-eurusd-abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(intent.contract_multiplier.is_none());
+        let out = serde_yaml::to_string(&intent).unwrap();
+        assert!(
+            !out.contains("contract_multiplier"),
+            "contract_multiplier key leaked into wire form:\n{out}"
+        );
+        // Positive control: a futures intent must still emit it, so this test
+        // cannot pass by the field never serialising at all.
+        let futures: Intent = serde_yaml::from_str(contract_multiplier_enter_yaml()).unwrap();
+        let futures_out = serde_yaml::to_string(&futures).unwrap();
+        assert!(
+            futures_out.contains("contract_multiplier: 50.0"),
+            "futures intent lost its multiplier:\n{futures_out}"
         );
     }
 

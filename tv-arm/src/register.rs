@@ -325,6 +325,8 @@ mod tests {
             false,
             0.0001,
             0.0001,
+            // Spot fixture: no futures multiplier.
+            None,
             Vec::new(),
             None,
         );

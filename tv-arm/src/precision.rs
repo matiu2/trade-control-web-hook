@@ -27,6 +27,15 @@ pub struct CatalogPrecision {
     pub pip_size: f64,
     pub decimal_places: u8,
     pub class: AssetClass,
+    /// Contract multiplier for a futures series (money per 1.0 of price), or
+    /// `None` for a spot/CFD instrument, which is sized in units.
+    ///
+    /// ⚠️ **Deliberately not taken from TradingView.** Unlike tick, where the
+    /// live chart is the source of truth, the multiplier comes only from the
+    /// catalog: TV's `point_value` is a CFD per-point value for the *chart's*
+    /// instrument, not the exchange contract size, and letting it win would
+    /// mis-size a futures order by whatever the chart happened to report.
+    pub contract_multiplier: Option<f64>,
 }
 
 impl CatalogPrecision {
@@ -38,6 +47,10 @@ impl CatalogPrecision {
             pip_size: i.pip_size,
             decimal_places: i.decimal_places,
             class: i.class,
+            // `point_value` is the multiplier on a futures leg (the catalog
+            // populates it from the series' `FuturesSpec`) and `None` on an
+            // un-audited spot leg. Both map straight onto our `Option`.
+            contract_multiplier: i.point_value,
         }
     }
 
@@ -49,6 +62,12 @@ impl CatalogPrecision {
             pip_size: a.pip_size,
             decimal_places: a.decimal_places,
             class: a.class,
+            // `a.futures` is `Some` only on the four futures series, so a spot
+            // asset yields `None` and nothing is baked onto its intent. This
+            // is the path futures actually take: they have no native
+            // instrument row (no per-month TradingView key exists), so
+            // `precision_for` falls back here.
+            contract_multiplier: a.futures.map(|f| f.multiplier),
         }
     }
 }
@@ -61,6 +80,30 @@ pub struct EffectivePrecision {
     pub tick_size: f64,
     /// True when the tick was taken from live TradingView (vs the catalog).
     pub tick_from_tv: bool,
+    /// Contract multiplier, passed through from the catalog unchanged — see
+    /// [`CatalogPrecision::contract_multiplier`] for why TradingView never
+    /// overrides it. `None` for spot/CFD.
+    pub contract_multiplier: Option<f64>,
+}
+
+impl EffectivePrecision {
+    /// The catalog's precision, used as-is — the answer whenever live
+    /// TradingView Symbol-info is unavailable (no chart on a `--spec-in`
+    /// re-arm, or tv-mcp unreachable).
+    ///
+    /// A constructor rather than three hand-written struct literals: every
+    /// caller previously had to remember each field, so a new one (the
+    /// multiplier) would have been silently dropped on the fallback paths —
+    /// and futures *always* take a fallback path, since they have no native
+    /// instrument row. Adding a field here is now a single edit.
+    pub fn from_catalog(cat: CatalogPrecision) -> Self {
+        Self {
+            pip_size: cat.pip_size,
+            tick_size: cat.tick_size,
+            tick_from_tv: false,
+            contract_multiplier: cat.contract_multiplier,
+        }
+    }
 }
 
 /// Decide the effective pip/tick from the catalog precision and the live
@@ -73,7 +116,6 @@ pub struct EffectivePrecision {
 /// fractional-pip FX / index-point conventions intact.
 pub fn resolve_effective_precision(cat: CatalogPrecision, tv: &SymbolInfo) -> EffectivePrecision {
     let catalog_tick = cat.tick_size;
-    let catalog_pip = cat.pip_size;
 
     match tv.tick_size {
         Some(tv_tick) if tv_tick.is_finite() && tv_tick > 0.0 => {
@@ -94,16 +136,13 @@ pub fn resolve_effective_precision(cat: CatalogPrecision, tv: &SymbolInfo) -> Ef
                 pip_size: tv_pip,
                 tick_size: tv_tick,
                 tick_from_tv: true,
+                contract_multiplier: cat.contract_multiplier,
             }
         }
         _ => {
             // TV gave no usable numeric tick (older build, or a symbol it
             // couldn't fully resolve) — fall back to the catalog.
-            EffectivePrecision {
-                pip_size: catalog_pip,
-                tick_size: catalog_tick,
-                tick_from_tv: false,
-            }
+            EffectivePrecision::from_catalog(cat)
         }
     }
 }
@@ -131,12 +170,23 @@ mod tests {
             decimal_places: dp,
             pip_size: pip,
             spread_schedule: "none".into(),
+            futures: None,
             symbols: AssetSymbols {
                 oanda: Some("TEST".into()),
                 tradenation: None,
                 tradingview: Some("TEST".into()),
+                ibkr: None,
             },
         }
+    }
+
+    /// A futures series asset, shaped like the catalog's ES row.
+    fn futures_asset(multiplier: f64) -> Asset {
+        let mut a = asset(AssetClass::Index, 0.25, 2, 1.0);
+        a.id = "ES".into();
+        a.futures = Some(instrument_lookup::FuturesSpec { multiplier });
+        a.symbols.ibkr = Some("ES".into());
+        a
     }
 
     fn tv_info(tick: Option<f64>, dp: Option<u8>) -> SymbolInfo {
@@ -205,6 +255,53 @@ mod tests {
         let eff = resolve_effective_precision(CatalogPrecision::from_asset(&a), &tv);
         assert_eq!(eff.tick_size, 0.001);
         assert_eq!(eff.pip_size, 0.01); // corrected, not the wrong 0.5
+    }
+
+    #[test]
+    fn a_spot_asset_carries_no_multiplier() {
+        let a = asset(AssetClass::Forex, 0.00001, 5, 0.0001);
+        let cat = CatalogPrecision::from_asset(&a);
+        assert_eq!(cat.contract_multiplier, None);
+        let eff = resolve_effective_precision(cat, &tv_info(Some(0.00001), Some(5)));
+        assert_eq!(eff.contract_multiplier, None);
+    }
+
+    #[test]
+    fn a_futures_asset_carries_its_catalog_multiplier() {
+        let a = futures_asset(50.0);
+        let cat = CatalogPrecision::from_asset(&a);
+        assert_eq!(cat.contract_multiplier, Some(50.0));
+        let eff = resolve_effective_precision(cat, &tv_info(Some(0.25), Some(2)));
+        assert_eq!(eff.contract_multiplier, Some(50.0));
+    }
+
+    #[test]
+    fn tradingview_never_overrides_the_multiplier() {
+        // TV reports `point_value: 1.0` for this chart (see `tv_info`), which
+        // is a CFD per-point value and wrong for an exchange contract. The
+        // catalog multiplier must survive it — TV wins on tick, never here.
+        let a = futures_asset(50.0);
+        let tv = tv_info(Some(0.25), Some(2));
+        assert_eq!(tv.point_value, Some(1.0), "fixture must exercise the clash");
+        let eff = resolve_effective_precision(CatalogPrecision::from_asset(&a), &tv);
+        assert!(eff.tick_from_tv, "tick still comes from TV");
+        assert_eq!(
+            eff.contract_multiplier,
+            Some(50.0),
+            "TV point_value must not override the catalog multiplier"
+        );
+    }
+
+    #[test]
+    fn the_multiplier_survives_the_catalog_fallback_path() {
+        // No usable TV tick: the whole precision falls back to the catalog.
+        // The multiplier must come through that arm too, since futures have no
+        // native instrument row and always take a fallback path.
+        let a = futures_asset(100.0);
+        let eff =
+            resolve_effective_precision(CatalogPrecision::from_asset(&a), &tv_info(None, None));
+        assert!(!eff.tick_from_tv);
+        assert_eq!(eff.contract_multiplier, Some(100.0));
     }
 
     #[test]
