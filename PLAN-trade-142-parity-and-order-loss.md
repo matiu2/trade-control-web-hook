@@ -77,6 +77,24 @@ conformance suite below is not a nice-to-have guard — it is the only test rout
 
 ---
 
+## Status (2026-09-06)
+
+| Stage | What | State |
+|---|---|---|
+| 1 | Retry gate runs LAST (Bug A) | **DONE** `2c86afa` — 13 reject-capable gates found, not 1 |
+| 2 | Cancelled resolves from the broker (Bug B) | **DONE** `5ab48ee` — `GET /orders/{id}`, verified vs the live 2316/2318 records |
+| 3 | `AttemptState` conformance suite | **DONE** `0334da3` — 7 scenarios, both resolvers, bites on either side |
+| 5 | Preps stamped with bar time (Bug C — the ROOT) | **DONE** `2184292` — `PrepStamp` splits `set_at` from the TTL |
+| — | Pre-deploy poisoned-prep check | **DONE** `c8cbba6` |
+| 4 | Replay multi-bar cadence | in progress |
+| 6 | Placement is not a fill | in progress |
+| 7 | `ORDER_DOESNT_EXIST` storms | in progress (investigation) |
+
+**Corpus gate re-run with Bugs A+B+C all fixed: every fixture still matches.**
+That is a no-regression result, NOT a verification — replay cannot reach any of
+the three failure states. The real guards are the `run_enter` mutation tests and
+the conformance suite.
+
 ## Plan
 
 Ordered by what stops losing money first. Each stage is independently
@@ -225,8 +243,30 @@ incident reached the journal as **WIN +2.63R**.
 
 `BROKER-EVIDENCE` §6 logs bursts of 2-3 cancels one second apart against orders
 that no longer exist (10 of 17 transactions in range 2300-2316 are failures).
-Almost certainly the same gate arm cancelling an order the broker no longer has.
-Confirm, then fold into Stage 1's ordering fix if it shares the root.
+
+**DIAGNOSED — see `FINDINGS-order-cancel-reject-storms.md`. It does NOT share a
+root with Stage 1, and `2c86afa` does not reduce it.** Two independent
+mechanisms, kept apart:
+
+* **The burst is ONE `cancel_order` call**, retried 3× inside `oanda-client`
+  (conservative trading policy: `max_attempts: 2` over `0..=max_attempts`,
+  `base_delay: 1s`, `×1.5` ⇒ 1.0s then 1.5s — exactly the observed spacing).
+  A 404 `ORDER_DOESNT_EXIST` misses every arm of `classify_error` and lands on
+  its fall-through default `RetryError::Network`, which is retryable. No
+  scheduler here can fire twice in a second — the engine tick is 15s, upkeep
+  900s — so an in-call retry was the only candidate.
+* **The dead id comes from STORED state**, never from a live listing. The retry
+  gate is ruled out: its cancel arm is reached only after `lookup_attempt_state`
+  says `Pending`, and order 2302 had *filled* (trade 2303). The real sources are
+  the `cron sweep` (cancels `attempt.broker_order_id` with no state check, and
+  deletes the row regardless of outcome while logging "will retry next tick")
+  and pre-v121 `pending_lifecycle`, whose swallowed cancel failure re-cancelled
+  the same id every tick. `374ae98` (2026-07-30) fixed the latter and postdates
+  all three storm dates.
+
+Two residual bugs are described in the findings with proposed fixes,
+**deliberately not implemented** — one lives in the separate `oanda-client`
+repo and changes retry behaviour fleet-wide; the other needs its own tests.
 
 ---
 
