@@ -996,9 +996,13 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 // `DispatchOutcome.outcome` into `plan-timeline` / `journal`),
                 // so the size + requested rate go here rather than only into
                 // the broker's own log line. Empty when the broker reported
-                // neither, keeping the historic `entered: order=…` shape.
+                // neither.
+                //
+                // The VERB is chosen from the order type, because a placement is
+                // not a fill — see `placement_verb`.
                 ActionResult::Ok(format!(
-                    "entered: order={order_id}{}",
+                    "{}: order={order_id}{}",
+                    placement_verb(&resolved.entry),
                     placed.describe_fill()
                 ))
             }
@@ -1011,6 +1015,72 @@ pub async fn run_enter<B: Broker, S: StateStore>(
             let outcome = recover_entry::outcome_for_entry_error(&err);
             tracing::error!("entry failed: {err} ({outcome})");
             ActionResult::Failed(outcome)
+        }
+    }
+}
+
+/// The verb for a successful placement's operator-facing outcome string:
+/// `entered` for an order that has **filled**, `placed` for one that is merely
+/// **resting**.
+///
+/// # Why this is not one word
+///
+/// `run_enter` reported `entered: order=<id>` for every order type the moment
+/// `place_entry` returned. For a **market** order that is true — the broker
+/// fills it on receipt, and a position exists. For a **stop** or **limit** order
+/// it is not: the order rests on the book at a trigger price and may never fill
+/// at all. Both produced a byte-identical line, so no reader — human or code —
+/// could tell a live position from an untouched resting order.
+///
+/// That is exactly how the 2026-08-07 incident (OANDA
+/// `101-011-31142393-003`, plan `hs-eur-cad-08ca0693`) reached the operator's
+/// journal as a **WIN +2.63R**. Two limit orders were placed, both logged
+/// `entered:`, both rested about an hour unfilled, and both were cancelled. No
+/// position ever existed; the realised result was 0R. The only later signal was
+/// a `close-failed` on a reversal fire, which reads as a *closing* problem
+/// rather than an entry one, and the discrepancy stood for eleven days.
+///
+/// The manual CLI path learned the same lesson in v135
+/// (`BUG-market-entry-no-broker-confirmation-trail.md`): a terse, overstated
+/// line had an operator believe a position existed for nine days. The rule
+/// distilled from it — **never let the log claim more than the broker
+/// confirmed** — is what this encodes for the engine path.
+///
+/// # Why the ORDER TYPE, and not a fill price from the broker
+///
+/// The type is the honest discriminator available at this moment, and it is
+/// exact: [`ResolvedEntry`] is the same value handed to `place_entry`, so the
+/// verb cannot drift from the order actually sent.
+///
+/// A fill price is *not* available here, on either adapter, and inventing one
+/// would recreate the very overstatement this fixes:
+///
+/// * [`Placement::price`](crate::broker::Placement::price) is documented as the
+///   **requested** rate — the market reference, or the stop/limit trigger — and
+///   never the fill.
+/// * The OANDA adapter returns the pre-computed `reference_price` for all three
+///   order types (`broker-oanda/src/oanda.rs`), and its order id is the
+///   *submission* transaction; a fill is a separate later transaction.
+/// * The TradeNation adapter reports `price: None` for a market entry outright,
+///   since TN fills at its own live bid/ask.
+///
+/// So the outcome states what is known — an order of a given type reached the
+/// book — and leaves the fill to be confirmed by the paths that can actually
+/// observe one (`lookup_attempt_state`, `plan timeline`).
+///
+/// # Consumers
+///
+/// `journal`'s `derive_entry_ts` / `derive_outcome` key on the leading verb to
+/// decide whether a plan ever entered and whether to colour the result as a
+/// success. Feeding them `placed` for a resting order is the point: a rested,
+/// never-filled attempt stops counting as a fill.
+fn placement_verb(entry: &crate::intent::ResolvedEntry) -> &'static str {
+    match entry {
+        // Filled on receipt — a position exists by the time we log.
+        crate::intent::ResolvedEntry::Market { .. } => "entered",
+        // Resting on the book at a trigger. May never fill.
+        crate::intent::ResolvedEntry::Stop { .. } | crate::intent::ResolvedEntry::Limit { .. } => {
+            "placed"
         }
     }
 }
@@ -1564,7 +1634,7 @@ mod gate_order_tests {
     /// Records the broker traffic the entry path produced. The assertions in
     /// this module are all about *which* calls reached the broker and in what
     /// order — a cancel with no matching place is the bug.
-    struct SpyBroker {
+    pub(super) struct SpyBroker {
         cancels: RefCell<Vec<String>>,
         places: RefCell<Vec<String>>,
         /// What `lookup_attempt_state` reports for a prior attempt. `Pending`
@@ -1580,6 +1650,19 @@ mod gate_order_tests {
                 cancels: RefCell::new(Vec::new()),
                 places: RefCell::new(Vec::new()),
                 attempt_state: AttemptState::Pending,
+            }
+        }
+        /// A broker with no prior attempt to resolve. The Stage 6 wording
+        /// tests fire single-shot enters, so the retry gate is skipped and
+        /// `attempt_state` is never consulted — it is set to a terminal,
+        /// non-blocking value rather than `Pending` so that if a future change
+        /// DID route these through the gate, the test would still exercise the
+        /// placement path rather than silently start cancelling.
+        pub(super) fn no_prior() -> Self {
+            Self {
+                cancels: RefCell::new(Vec::new()),
+                places: RefCell::new(Vec::new()),
+                attempt_state: AttemptState::Cancelled,
             }
         }
         fn cancelled(&self) -> Vec<String> {
@@ -1661,7 +1744,7 @@ mod gate_order_tests {
         }
     }
 
-    fn cfg() -> DispatchConfig {
+    pub(super) fn cfg() -> DispatchConfig {
         DispatchConfig {
             worker_max_risk_pct: 1.0,
             worker_max_open_positions: 3,
@@ -1677,6 +1760,31 @@ mod gate_order_tests {
     /// Built by DESERIALISING the wire JSON rather than by struct literal, so a
     /// test can't quietly diverge from what a signed alert actually carries.
     fn enter_verified(vetos: &str, requires_preps: &str) -> crate::incoming::Verified {
+        enter_verified_full(
+            vetos,
+            requires_preps,
+            r#"{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.5900 }"#,
+        )
+    }
+
+    /// The same enter with a caller-chosen `entry` block, so a test can vary
+    /// the ORDER TYPE (market / stop / limit) — the axis Stage 6 turns on —
+    /// without a second copy of the wire JSON drifting from this one.
+    ///
+    /// Single-shot (`max_retries` is left at its default `0`): these tests are
+    /// about the outcome WORDING on a plain first placement, so the retry gate
+    /// and its prior-attempt lookup stay out of the picture entirely.
+    pub(super) fn enter_verified_with_entry(entry: &str) -> crate::incoming::Verified {
+        let mut v = enter_verified_full("[]", "[]", entry);
+        v.intent.max_retries = crate::tunable::Tunable::Static(0);
+        v
+    }
+
+    fn enter_verified_full(
+        vetos: &str,
+        requires_preps: &str,
+        entry: &str,
+    ) -> crate::incoming::Verified {
         let json = format!(
             r#"{{
                 "v": 1,
@@ -1685,7 +1793,7 @@ mod gate_order_tests {
                 "action": "enter",
                 "instrument": "EUR_CAD",
                 "direction": "long",
-                "entry": {{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.5900 }},
+                "entry": {entry},
                 "stop_loss": {{ "absolute": 1.5850 }},
                 "take_profit": {{ "absolute": 1.6100 }},
                 "broker": "oanda",
@@ -1733,7 +1841,7 @@ mod gate_order_tests {
     /// A store whose clock is pinned to the incident's timeline. Without this
     /// the store judges TTLs against real wall-clock, so a prep/veto stamped in
     /// 2026-08 is already expired and the gate under test never runs.
-    fn store_at_incident() -> MemStateStore {
+    pub(super) fn store_at_incident() -> MemStateStore {
         let store = MemStateStore::new();
         store.set_clock(now());
         store
@@ -1746,7 +1854,7 @@ mod gate_order_tests {
             .expect("record prior attempt");
     }
 
-    fn now() -> DateTime<Utc> {
+    pub(super) fn now() -> DateTime<Utc> {
         at("2026-08-07T17:00:01Z")
     }
 
@@ -1758,7 +1866,7 @@ mod gate_order_tests {
     /// `ActionResult` deliberately carries no `Debug` (it is the dispatch
     /// outcome carrier, not a diagnostic type), so render it here rather than
     /// widening the public type just for these assertions.
-    fn describe(r: &ActionResult) -> String {
+    pub(super) fn describe(r: &ActionResult) -> String {
         match r {
             ActionResult::Ok(o) => format!("Ok({o})"),
             ActionResult::Failed(o) => format!("Failed({o})"),
@@ -2012,8 +2120,11 @@ mod gate_order_tests {
                 .expect("set retest");
             let result =
                 run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            // `placed:`, not `entered:` — this enter is a STOP order, which
+            // rests rather than filling (Stage 6). The assertion here is about
+            // a placement having HAPPENED, so it tracks the resting verb.
             assert!(
-                matches!(&result, ActionResult::Ok(o) if o.starts_with("entered: order=")),
+                matches!(&result, ActionResult::Ok(o) if o.starts_with("placed: order=")),
                 "expected a placement, got {}",
                 describe(&result)
             );
@@ -2086,8 +2197,9 @@ mod gate_order_tests {
             }
             let result =
                 run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            // Again `placed:` — a resting stop entry (Stage 6).
             assert!(
-                matches!(&result, ActionResult::Ok(o) if o.starts_with("entered: order=")),
+                matches!(&result, ActionResult::Ok(o) if o.starts_with("placed: order=")),
                 "BUG C: a two-bar prep chain caught up in one tick must place, \
                  got {}",
                 describe(&result)
@@ -2159,5 +2271,167 @@ mod gate_order_tests {
             c: 1.5895,
         });
         crate::incoming::Verified { shell, intent }
+    }
+}
+
+/// Stage 6 — **a placement is not a fill.**
+///
+/// `run_enter` used to report `entered: order=<id>` the moment `place_entry`
+/// returned, for every order type. For a **market** order that is honest: the
+/// broker fills it there and then. For a **stop** or **limit** order it is not —
+/// the order merely *rests*, and may sit unfilled for hours before being
+/// cancelled, having never opened a position at all.
+///
+/// The two cases produced a byte-identical log line, so nothing downstream could
+/// tell them apart. That is how the incident of 2026-08-07 (OANDA
+/// `101-011-31142393-003`, plan `hs-eur-cad-08ca0693`) reached the operator's
+/// trade journal as a **WIN +2.63R**: two limit orders (2316, 2318) were placed,
+/// each logged `entered:`, each rested ~1h unfilled, and each was cancelled.
+/// No position ever existed. The only later signal was `close-failed`, which
+/// reads as a *closing* problem rather than an entry one, and the discrepancy
+/// went unnoticed for eleven days.
+///
+/// The same class of overstatement was fixed for the manual CLI path in v135
+/// (`BUG-market-entry-no-broker-confirmation-trail.md`), where a terse
+/// wrong-sounding line led an operator to believe a position existed for nine
+/// days. This is the engine path's half of that lesson.
+///
+/// These tests assert at the `run_enter` entry point rather than on the helper
+/// below it — a guard one level down would mask a survivor
+/// (`[[mutation_test_the_entry_point_not_just_the_layer_below]]`).
+#[cfg(test)]
+mod placement_is_not_a_fill_tests {
+    use super::gate_order_tests::{
+        SpyBroker, cfg, describe, enter_verified_with_entry, now, store_at_incident,
+    };
+    use super::*;
+
+    /// A **stop** entry rests at the broker. It has not filled, so the outcome
+    /// must not claim it did.
+    #[test]
+    fn a_resting_stop_order_is_placed_not_entered() {
+        let broker = SpyBroker::no_prior();
+        let store = store_at_incident();
+        let verified = enter_verified_with_entry(
+            r#"{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.5900 }"#,
+        );
+        let result = pollster::block_on(run_enter(
+            &broker,
+            &store,
+            &verified,
+            &cfg(),
+            now(),
+            None,
+            None,
+            false,
+        ));
+        let outcome = match &result {
+            ActionResult::Ok(o) => o.clone(),
+            other => panic!("expected a placement, got {}", describe(other)),
+        };
+        assert!(
+            outcome.starts_with("placed: order="),
+            "a resting stop must report `placed:`, got {outcome}"
+        );
+        assert!(
+            !outcome.contains("entered"),
+            "a resting stop must not claim it entered, got {outcome}"
+        );
+    }
+
+    /// A **limit** entry rests too — this is the incident's own order type
+    /// (2316 and 2318 were both `LIMIT_ORDER`, `opened_trade_id: null`).
+    #[test]
+    fn a_resting_limit_order_is_placed_not_entered() {
+        let broker = SpyBroker::no_prior();
+        let store = store_at_incident();
+        let verified = enter_verified_with_entry(
+            r#"{ "type": "limit", "from": "close", "offset_pips": 0.0, "at": 1.5900 }"#,
+        );
+        let result = pollster::block_on(run_enter(
+            &broker,
+            &store,
+            &verified,
+            &cfg(),
+            now(),
+            None,
+            None,
+            false,
+        ));
+        let outcome = match &result {
+            ActionResult::Ok(o) => o.clone(),
+            other => panic!("expected a placement, got {}", describe(other)),
+        };
+        assert!(
+            outcome.starts_with("placed: order="),
+            "a resting limit must report `placed:`, got {outcome}"
+        );
+        assert!(
+            !outcome.contains("entered"),
+            "THE INCIDENT: a resting limit must not read like a fill, got {outcome}"
+        );
+    }
+
+    /// A **market** entry fills immediately, so `entered:` is the honest word.
+    /// This is the other half of the discrimination: the change must not simply
+    /// rename every placement.
+    #[test]
+    fn a_market_order_is_entered_not_merely_placed() {
+        let broker = SpyBroker::no_prior();
+        let store = store_at_incident();
+        let verified = enter_verified_with_entry(
+            r#"{ "type": "market", "from": "close", "offset_pips": 0.0 }"#,
+        );
+        let result = pollster::block_on(run_enter(
+            &broker,
+            &store,
+            &verified,
+            &cfg(),
+            now(),
+            None,
+            None,
+            false,
+        ));
+        let outcome = match &result {
+            ActionResult::Ok(o) => o.clone(),
+            other => panic!("expected a placement, got {}", describe(other)),
+        };
+        assert!(
+            outcome.starts_with("entered: order="),
+            "a market order does fill, so it keeps `entered:`, got {outcome}"
+        );
+    }
+
+    /// The order id is still carried in both wordings — every downstream
+    /// consumer (`plan timeline`, the journal, the broker-evidence pull) joins
+    /// on it, so a rename must not drop it.
+    #[test]
+    fn both_wordings_still_carry_the_broker_order_id() {
+        let store = store_at_incident();
+        for entry in [
+            r#"{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.5900 }"#,
+            r#"{ "type": "market", "from": "close", "offset_pips": 0.0 }"#,
+        ] {
+            let broker = SpyBroker::no_prior();
+            let verified = enter_verified_with_entry(entry);
+            let result = pollster::block_on(run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                false,
+            ));
+            let outcome = match &result {
+                ActionResult::Ok(o) => o.clone(),
+                other => panic!("expected a placement for {entry}, got {}", describe(other)),
+            };
+            assert!(
+                outcome.contains("order=order-new"),
+                "the broker order id must survive the rename, got {outcome}"
+            );
+        }
     }
 }

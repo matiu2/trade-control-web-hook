@@ -301,12 +301,35 @@ pub async fn evaluate<B: Broker, S: StateStore>(
                     outcome: "rejected: trade-already-open".into(),
                 };
             }
-            Ok(AttemptState::ClosedWin { .. })
-            | Ok(AttemptState::ClosedLossOrBreakeven { .. })
-            | Ok(AttemptState::Cancelled) => {
+            Ok(AttemptState::ClosedWin { .. }) | Ok(AttemptState::ClosedLossOrBreakeven { .. }) => {
                 // Collapsed state — this attempt is provably done. Look
                 // at the next-older attempt; if none remain, fall
                 // through to the cap check.
+                continue;
+            }
+            Ok(AttemptState::Cancelled) => {
+                // Also collapsed, so the walk continues exactly as above — but
+                // this one gets its own line, because it is the state nobody
+                // could see.
+                //
+                // A `Cancelled` attempt is an order that reached the broker's
+                // book and came off it **without ever filling**: no position was
+                // opened, and no fill or exit will ever be recorded against it.
+                // That is a materially different history from a closed win or
+                // loss, and it is the state the 2026-08-07 incident produced
+                // (plan `hs-eur-cad-08ca0693`: limit orders 2316 and 2318, both
+                // rested ~1h, both cancelled, `opened_trade_id: null`).
+                //
+                // It was previously folded into the silent `continue` above, so
+                // the plan sat blocked for eleven days with nothing in the log
+                // naming the entry as the problem — the only visible signal was
+                // a later `close-failed`, which reads as a *closing* fault. This
+                // line is the entry-side counterpart the operator was missing.
+                tracing::info!(
+                    "retry: prior attempt #{} was CANCELLED WITHOUT EVER FILLING — no position                      was ever opened by it (trade_id={trade_id} order_id={}); continuing to the                      next-older attempt",
+                    attempt.attempt_no,
+                    attempt.broker_order_id,
+                );
                 continue;
             }
             Ok(AttemptState::Unknown) => {
