@@ -13,6 +13,25 @@ mod risk;
 
 pub use oanda::OANDA_ACCOUNT_ID;
 
+/// The live `AttemptState` resolver, exposed for the cross-implementation
+/// conformance suite ONLY.
+///
+/// [`oanda::compute_attempt_state`] is one of **two** independent answers to
+/// "what became of this entry attempt?" — the other is `held_attempt_state`
+/// in the `replay-candles` binary. They agreed on five categories and
+/// disagreed on cancelled-never-filled, which forfeited a live trade
+/// (`PLAN-trade-142-parity-and-order-loss.md`, Gap 3). The suite that pins
+/// them together must see both, and the replay one is reachable only from
+/// inside that binary's own module tree — so this half has to travel to it.
+///
+/// Gated behind `test-support` (the same pattern `trade-control-core` uses
+/// for `MemStateStore`) so it is absent from every runtime build: the worker
+/// and cron link `broker-oanda` with default features and get nothing extra.
+#[cfg(feature = "test-support")]
+pub mod conformance_support {
+    pub use crate::oanda::{OrderFate, compute_attempt_state};
+}
+
 use chrono::{DateTime, Utc};
 use oanda::{
     amend_stop as amend_stop_impl, cancel_order as cancel_order_impl,

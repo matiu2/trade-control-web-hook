@@ -4415,6 +4415,7 @@ dependencies = [
 name = "trade-control-cli"
 version = "0.2.0"
 dependencies = [
+ "broker-oanda",
  "candle-cache",
  "candle-model",
  "chrono",

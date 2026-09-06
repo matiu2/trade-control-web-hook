@@ -40,6 +40,8 @@
 mod replay_candles {
     pub mod annotate;
     pub mod arm_record;
+    #[cfg(test)]
+    pub mod attempt_state_conformance;
     pub mod baseline;
     pub mod batch;
     pub mod brisbane;

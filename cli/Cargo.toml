@@ -48,4 +48,10 @@ tradenation-instrument-cache = { git = "https://github.com/matiu2/tradenation-ap
 trading-view = { version = "0.1.0", path = "../trading-view" }
 
 [dev-dependencies]
+# TEST-ONLY. The `AttemptState` conformance suite
+# (`src/bin/replay_candles/attempt_state_conformance.rs`) drives BOTH resolvers
+# from one scenario table: the replay one lives in this binary, the live one in
+# `broker-oanda`. `test-support` re-exports the live half; it is off in every
+# runtime build, and this is a dev-dep so `cli`'s binaries never link OANDA.
+broker-oanda = { version = "0.1.0", path = "../broker-oanda", features = ["test-support"] }
 tempfile = "3.27.0"

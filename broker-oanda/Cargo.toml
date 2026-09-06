@@ -8,3 +8,11 @@ chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
 oanda-client = { version = "0.4.0", path = "../../oanda-client", default-features = false }
 trade-control-core = { version = "0.1.0", path = "../core" }
 tracing = "0.1"
+
+[features]
+default = []
+# Re-exports the pure `compute_attempt_state` resolver (and its `OrderFate`
+# input) via `conformance_support`, so the cross-implementation conformance
+# suite in the `trade-control-cli` replay binary can drive the LIVE resolver
+# alongside the REPLAY one. Off by default — no runtime build enables it.
+test-support = []

@@ -648,7 +648,7 @@ fn oanda_order_to_pending(o: &PendingOrder) -> Option<CorePendingOrder> {
 /// [`compute_attempt_state`], so that function stays pure and every
 /// branch stays unit-testable without a live client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OrderFate {
+pub enum OrderFate {
     /// The broker's record says the order reached a terminal state
     /// without filling (`CANCELLED`). This attempt is provably dead.
     TerminallyUnfilled,
@@ -673,7 +673,14 @@ enum OrderFate {
 /// `fate` is the broker's own record of what became of
 /// `broker_order_id`, fetched by the caller only when the three
 /// snapshots all miss. It is passed in as data so this stays pure.
-fn compute_attempt_state(
+///
+/// `pub` inside a **private** module, so it stays invisible outside the
+/// crate except through the `test-support`-gated `conformance_support`
+/// re-export in `lib.rs`. That door exists for the cross-implementation
+/// conformance suite: this is one of two independent `AttemptState`
+/// resolvers, and the other lives inside the `replay-candles` binary
+/// where nothing can travel *to*, so this half travels *there*.
+pub fn compute_attempt_state(
     broker_order_id: &str,
     broker_trade_id: Option<&str>,
     pending: &[PendingOrder],
