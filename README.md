@@ -2333,14 +2333,16 @@ Offline `--plan-out` builds warn instead of refusing, matching how an expired
 `oanda`, `tradenation` and `ibkr` are accepted wherever a broker is named —
 `trade-control-accounts add --broker ibkr`, `tv-arm --broker ibkr`,
 `trade-control ... --broker ibkr` — and an IBKR account stores and round-trips
-like any other. **No IBKR broker is implemented yet**, so anything that would
-actually reach the venue refuses loudly rather than falling back:
+like any other. The broker is wired end to end and sizes correctly, but
+**cannot place an order**; everything it cannot yet do refuses loudly rather
+than falling back:
 
 | Path | Behaviour |
 |---|---|
-| worker dispatch | `501 ibkr broker not implemented` |
-| cron broker acquisition | plan skipped, error logged |
-| `trade-control-broker-check` | refuses — nothing to check |
+| worker dispatch / cron | acquires a real IBKR broker; a Gateway failure is a `503` |
+| `trade-control-broker-check` | verifies a live Gateway session |
+| order submission | refuses — never exercised, see the sizing section below |
+| account snapshot, quotes, positions | refuse — no Gateway reads implemented |
 | live spread read (`tv-arm`) | refuses rather than guess a spread |
 | `--replay` | refuses — there is no IBKR candle feed |
 | `instruments` subcommands | refuse — no IBKR catalog |
@@ -2348,7 +2350,10 @@ actually reach the venue refuses loudly rather than falling back:
 
 Each is a refusal rather than a silent fallback because the fallback would trade
 a *different instrument* — an OANDA symbol resolved for a futures plan, or CFD
-prices replayed as if they were the contract's.
+prices replayed as if they were the contract's. An unimplemented broker method
+that answered plausibly would be worse than one that fails: an empty
+`list_open_positions` reads as *"the account is flat"*, and a close that reports
+`NothingOpen` is a **success** that consumes the intent id.
 
 The calendar itself is a generated table (`core/src/contract_calendar_baked.rs`,
 GC/MGC/ES/MES, 2026–2028); see [`contract-calendar-gen/README.md`](contract-calendar-gen/README.md)
@@ -2401,6 +2406,58 @@ hard entry gate requiring the stop distance to clear 10× the live spread.
 Delayed COMEX/CME data would make that gate read a stale spread — either
 blocking every entry or waving through a trade whose stop sits inside the real
 spread — so it fails closed until a live entitlement is confirmed.
+
+### Replaying a futures plan — what the numbers do and don't say
+
+Offline replay **does not size**. `ReplayBroker` reports `size: None` by
+design: sizing needs live account equity and an FX rate, which an offline
+replay has by definition not got, and replay economics are pure R-multiples off
+a synthetic $100k account. Building an equity model into the replayer to
+produce contract counts would make the numbers *less* honest, not more — so the
+gap is accepted, and named rather than left for a reader to discover.
+
+A futures replay therefore prints a caveats block above its summary line:
+
+```
+FUTURES CAVEATS
+  sizing not simulated — live may reject entries that floor to 0 contracts
+  close-out: PAST WINDOW — GC 202606 could only be armed through 2026-06-09, but
+  this replay runs to 2026-07-24 and IBKR may liquidate without notice from
+  2026-06-24. Live, this plan would have been refused.
+```
+
+Three things are going on:
+
+- **The close-out check runs offline too.** It is pure calendar arithmetic, so
+  the replay reaches the same verdict the arm-time guard does — via the same
+  `close_out_check::verdict`, not a second copy. This matters because `tv-arm
+  --plan-out` builds *lenient*: a plan handed to the replay has only ever been
+  **warned** about, so without this a backtest could look profitable on a trade
+  IBKR would have liquidated out from under it.
+- **The sizing bias is named, with its direction.** The replay is *optimistic*:
+  every entry fills here regardless of whether a live account could afford a
+  single contract.
+- **`--probe-account <amount>` measures the gap** instead of simulating it:
+
+  ```sh
+  replay-candles --plan plan.json --probe-account 10000
+  #   granularity probe: 1 of 1 fill(s) would floor to 0 contracts at a stated
+  #   $10000 account (0 placeable)
+  ```
+
+  A **coverage statistic, not a simulation** — it consumes an account size you
+  state rather than inventing equity, which is what keeps it honest. It answers
+  the promotion-ladder question directly: the same GC trade above is unplaceable
+  at $10k and placeable at $100k, and switching to MGC (multiplier 10 instead of
+  100) moves that line by a factor of ten.
+
+  If the catalog has no multiplier for the contract, the probe reports **CANNOT
+  JUDGE** rather than assuming `1.0` — a substituted `1.0` would under-report
+  floor-outs by 100× on gold.
+
+None of this appears for CFD or spot replays, which is every fixture in the
+corpus today: the block renders only when the plan's instrument parses as a
+futures contract.
 
 ### Setting up an IBKR account
 

@@ -109,3 +109,58 @@ called out so it is not mistaken for full tick parity.
 - Any change to a *decision* must land in shared `core`/`engine`/`cron` (per
   `[[strategy_changes_in_both_replayer_and_worker]]`), never only in a broker
   impl — the brokers are I/O adapters, not decision sites.
+
+---
+
+## Futures sizing — an ACCEPTED divergence, with mitigations
+
+Added for the IBKR futures work (Stage 8). Every other divergence in this
+document is argued to be faithful or conservative. **This one is neither, and is
+accepted anyway** — so it is recorded here rather than left to be rediscovered.
+
+**The divergence.** A live futures entry is sized in whole contracts:
+`contracts = budget / (stop_distance × multiplier × fx)`, floored, and an entry
+that floors to **0 contracts** is rejected (`EntryError::UnitsBelowMinimum`,
+which since v137 parks the setup). `ReplayBroker` reports `size: None` and fills
+regardless. So the replay is **optimistic**: it books R for entries a live
+account could not have placed.
+
+**Why it is not closed.** Sizing needs live account equity and an FX rate. An
+offline replay has neither — by design, not by omission: replay economics are
+pure R-multiples off a synthetic `START_ACCOUNT`, and `size: None` is the
+documented honest answer (`replay_broker::replay_placement`). Implementing
+sizing here means inventing an equity model and an FX model, and then reporting
+contract counts derived from invented inputs. That is a worse failure than the
+gap: a wrong number that looks like a measurement.
+
+Note this divergence **pre-dates IBKR** and is structural — the `Amount` and
+`Units` risk budgets are already unchecked offline for the same reason (only the
+`Percent` cap is a pure comparison). Futures make it *visible*, not new.
+
+**Three mitigations, all shipped** (`cli/src/bin/replay_candles/futures_caveats.rs`):
+
+- **A — the closeable half IS closed.** The close-out deadline is pure calendar
+  arithmetic with no equity or broker dependency, so the replay checks it and
+  reaches the *same* verdict as the arm-time guard, through the same
+  `close_out_check::verdict` — one function, two callers, no hand-agreement.
+  This matters because `tv-arm --plan-out` builds **lenient**, so a plan reaching
+  the replay has only ever been *warned* about; without this, a backtest could
+  look profitable on a trade IBKR would have force-liquidated.
+- **B — the bias is named, with its direction.** A `FUTURES CAVEATS` block above
+  the summary line, in the same spirit as the `IMPLAUSIBLE_R` warning. "Sizing
+  not simulated" alone would leave a reader guessing which way the error runs.
+- **C — the gap is measured, not simulated.** `--probe-account <amount>` counts
+  how many fills would have floored to 0 contracts at an account size the
+  operator **states**. A coverage statistic: it consumes a supplied number
+  rather than inventing equity. An unknown multiplier reports *cannot judge*
+  rather than assuming `1.0`, which would under-report floor-outs by 100× on
+  gold.
+
+**For a future refactorer.** The `[[strategy_changes_in_both_replayer_and_worker]]`
+rule is satisfied by *the guard* (a decision, shared in one function), not by the
+sizing (an I/O-dependent quantity). If you are tempted to implement sizing in
+`ReplayBroker`, the question to answer first is where the equity and FX rate come
+from — and "a constant" is the answer that makes the numbers dishonest. The
+caveats block renders only for instruments that parse as futures, so all 910
+existing CFD fixtures are byte-identical; a change that starts printing it on
+CFD replays has broken that scoping.

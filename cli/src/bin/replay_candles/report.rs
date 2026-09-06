@@ -31,6 +31,7 @@ use trade_control_engine::{BidAskCandle as EngineCandle, SweepReason, TradePlan}
 
 use super::brisbane::bne;
 use super::economics::ReplayEconomics;
+use super::futures_caveats::FuturesContext;
 use super::replay::{Fire, Replay};
 use trade_control_cli::replay_args::DetectorMarkConfig;
 
@@ -334,6 +335,12 @@ pub struct Rendered {
 /// Also returns the [`ReplayEconomics`] booked during the render. With
 /// `simulate` off nothing is booked and it is left at its zero value (no legs,
 /// net 0R) — matching the report, which prints no summary in that mode.
+///
+/// `futures` renders the futures-only block (sizing gap, close-out verdict,
+/// granularity probe) just above the summary line, resolving its probe against
+/// the legs booked here so the probe and the printed Net R describe the same
+/// trades. `None` for every CFD and spot replay, which is all of them today —
+/// see [`futures_caveats`](super::futures_caveats).
 pub fn render(
     plan: &TradePlan,
     replay: &Replay,
@@ -341,6 +348,7 @@ pub fn render(
     verbose: bool,
     sentiment: Option<&PlanSentiment>,
     mark_cfg: &DetectorMarkConfig,
+    futures: Option<FuturesContext>,
 ) -> Rendered {
     let mut out = String::new();
     out.push_str(&format!(
@@ -415,6 +423,12 @@ pub fn render(
     // recompute every tick against a growing window (one distinct string per
     // bar) and are low-signal for a normal replay. They're emitted at debug
     // level in `replay.rs` (RUST_LOG=debug) and recorded on the fixture.
+
+    // Above the summary line, never appended to it: batch drivers scrape
+    // `Net R:` off that line, so anything added there changes what they parse.
+    if let Some(caveats) = futures.and_then(|f| f.resolve(&tally.legs)) {
+        out.push_str(&caveats.render());
+    }
 
     out.push_str(&format!(
         "\nDone: {}  |  final phase: {:?}  |  fires: {}",
@@ -1566,7 +1580,16 @@ mod tests {
             warnings: Vec::new(),
             traces: Vec::new(),
         };
-        let out = render(&plan_for(0.0001), &replay, true, false, None, &no_marks()).text;
+        let out = render(
+            &plan_for(0.0001),
+            &replay,
+            true,
+            false,
+            None,
+            &no_marks(),
+            None,
+        )
+        .text;
 
         // Top-level event lines, each naming entry #1 — no "bars (entry
         // timeline):" sub-heading, no OHLC dump, no leading-indent nested

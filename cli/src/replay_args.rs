@@ -415,6 +415,20 @@ pub struct ReplayArgs {
     #[arg(long)]
     pub fixtures_dir: Option<PathBuf>,
 
+    /// Report how many fills would floor to 0 contracts at this account size,
+    /// for a **futures** replay.
+    ///
+    /// Offline replay does not size — `ReplayBroker` reports `size: None` by
+    /// design, because sizing needs live equity and an FX rate it hasn't got.
+    /// So this is a **coverage statistic, not a simulation**: it consumes an
+    /// account size you state rather than inventing one, and answers "at this
+    /// size, how many of these entries could the live broker actually have
+    /// placed?" — the promotion-ladder question (is $10k enough to trade MGC?).
+    ///
+    /// Ignored for CFD/spot replays, which are not sized in contracts.
+    #[arg(long, value_name = "AMOUNT")]
+    pub probe_account: Option<f64>,
+
     /// Score this batch against a blessed baseline file and report what moved:
     /// aggregate Net R, which fixtures changed, and by how much.
     ///
