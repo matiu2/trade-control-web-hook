@@ -45,6 +45,7 @@ mod replay_candles {
     pub mod baseline;
     pub mod batch;
     pub mod brisbane;
+    pub mod cadence;
     pub mod candles;
     pub mod economics;
     pub mod fill_sim;
@@ -78,6 +79,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use replay_candles::arm_record;
 use replay_candles::baseline;
 use replay_candles::batch;
+use replay_candles::cadence::CronCadence;
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::tv::TvDefaults;
 use replay_candles::{
@@ -264,6 +266,19 @@ async fn run() -> Result<()> {
     // Keep the state TTL past the window so nothing expires mid-replay.
     let expires_at = end + Duration::days(365);
 
+    // How many freshly-closed bars each tick batches into one `evaluate_plan`
+    // call. `--cron-gap 1` (the default) is the historical bar-for-bar walk;
+    // anything wider reproduces a live cron catch-up. Both zoom passes must use
+    // the SAME cadence or pass 2 would evaluate a different bar sequence than the
+    // pass whose ambiguous windows it is resolving.
+    let cadence = CronCadence::new(args.cron_gap);
+    if !cadence.is_per_bar() {
+        tracing::info!(
+            bars = cadence.bars(),
+            "cron-gap: batching bars per evaluate_plan call, one shared `now` each              — simulating a live cron catch-up"
+        );
+    }
+
     // Sub-bar zoom (PR-2), run LAZILY in two passes (see `lazy_zoom`).
     //
     // PASS 1: replay with a recorder that serves no finer candles — behaviourally
@@ -291,6 +306,7 @@ async fn run() -> Result<()> {
         expires_at,
         mark_cfg,
         Some(Box::new(std::rc::Rc::clone(&recorder))),
+        cadence,
     )
     .await;
 
@@ -349,6 +365,7 @@ async fn run() -> Result<()> {
                         expires_at,
                         mark_cfg,
                         Some(Box::new(lazy_zoom::WindowSubBars::new(fetched))),
+                        cadence,
                     )
                     .await
                 }
@@ -947,6 +964,7 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
         mark_cfg,
         &inputs.sub_bars,
         Some(&refetch),
+        CronCadence::new(args.cron_gap),
     )
     .await;
 
@@ -1028,6 +1046,11 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
 /// window's own end isn't needed — the candles are fixed). `live_start` is the
 /// saved window start: frozen candles include the warm-up prefix pulled before
 /// it, so the plan goes live at `live_start` exactly as it did at save time.
+// Each argument is a distinct, differently-typed concept (plan, candles,
+// granularity, window start, mark config, saved sub-bars, refetch, cadence), so
+// grouping them into a struct would only rename the same eight fields. Matches
+// `replay::run`, which this is a thin frozen-fixture wrapper around.
+#[allow(clippy::too_many_arguments)]
 async fn run_frozen(
     plan: &TradePlan,
     candles: &[EngineCandle],
@@ -1042,6 +1065,13 @@ async fn run_frozen(
     // asks about. `None` keeps the replay fully offline (the pessimistic stop
     // stands, with a warning).
     refetch: Option<&FixtureRefetch<'_>>,
+    // How many freshly-closed bars each tick batches (see `cadence`). The
+    // default `PER_BAR` reproduces the fixture exactly as it was saved — the
+    // no-op every golden depends on. A wider cadence deliberately replays the
+    // frozen window under a live cron catch-up, which is the whole point of
+    // being able to regression-test the corpus against a timing-sensitive gate;
+    // the goldens will diverge, and that divergence IS the signal.
+    cadence: CronCadence,
 ) -> replay::Replay {
     let expires_at = candles.last().map(|c| c.time).unwrap_or_else(Utc::now) + Duration::days(365);
     // The market-hours gate reads the baked mask keyed on the instrument, so a
@@ -1069,6 +1099,7 @@ async fn run_frozen(
         expires_at,
         mark_cfg,
         Some(Box::new(std::rc::Rc::clone(&provider))),
+        cadence,
     )
     .await;
 
@@ -1128,6 +1159,7 @@ async fn run_frozen(
         expires_at,
         mark_cfg,
         Some(Box::new(lazy_zoom::WindowSubBars::new(merged))),
+        cadence,
     )
     .await
 }
@@ -1726,6 +1758,7 @@ mod tests {
             baseline: None,
             bless_baseline: None,
             baseline_label: None,
+            cron_gap: 1,
             json: false,
             warmup_bars: 200,
             cache_dir: None,
