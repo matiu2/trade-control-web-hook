@@ -29,9 +29,19 @@
 //! When the operator opts a setup into multi-shot mode by setting
 //! `max_retries: N` (any non-default Tunable, i.e. anything that isn't
 //! `Static(0)`) and a `trade_id`, the alert may legitimately fire on
-//! multiple firing bars within the `not_after` window. Each arrival
-//! flows through this gate before reaching the cooldown / prep / veto
-//! checks and the broker placement.
+//! multiple firing bars within the `not_after` window.
+//!
+//! **Where this gate runs, and why it must stay there.** It is the LAST thing
+//! `run_enter` does before `place_entry` — *after* the cooldown / prep / veto /
+//! `allow_entry` / blackout / spread-floor gates, not before them. Job 2 below
+//! **cancels a resting order at the broker**, on the understanding that the
+//! caller immediately places a fresh one. If any gate could still reject the
+//! fire after that cancel, the order is destroyed with nothing to replace it —
+//! the rail `order_control::reprice` states as "never cancel an order you
+//! cannot re-place". This gate ran first until 2026-09; the ordering bug
+//! forfeited a live EUR/CAD setup on 2026-08-07 (resting limit 2318 cancelled,
+//! fire then rejected `prep-order-violated (retest)`, nothing re-placed). See
+//! the rail comment at the call site in `dispatch::enter::run_enter`.
 //!
 //! The gate has three jobs:
 //!
