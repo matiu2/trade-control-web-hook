@@ -1028,6 +1028,27 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
                 )),
             );
         }
+        // Same shape of silent corruption, different cause: a non-default
+        // `--cron-gap` deliberately replays the frozen window under a live cron
+        // catch-up, so the goldens diverge — that divergence is the SIGNAL this
+        // flag exists to produce, never a new baseline. The cadence is not
+        // recorded in `meta.json`, so a golden written under `--cron-gap 6` is
+        // indistinguishable from a default one afterwards: the corpus would
+        // silently adopt catch-up numbers as its baseline. Refuse.
+        let cadence = CronCadence::new(args.cron_gap);
+        if !cadence.is_per_bar() {
+            return FixtureRun::failed(
+                name,
+                outcome::bad_input(eyre!(
+                    "refusing to re-bless {name} under --cron-gap {}: a wider cadence replays \
+                     the frozen window as a live cron catch-up, so its numbers are the \
+                     divergence signal, not a baseline. The cadence is not recorded in \
+                     meta.json, so this would silently become the corpus's new expected \
+                     output. Re-bless at the default cadence (1).",
+                    cadence.bars()
+                )),
+            );
+        }
         if let Err(e) = fixture::save_expected(dir, &computed) {
             return FixtureRun::failed(name, e);
         }
