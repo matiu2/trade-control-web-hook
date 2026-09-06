@@ -77,7 +77,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // Blackout gate — if any pause for this trade_id is active, reject
     // before doing any other work. Pauses are intentionally cheap to
     // check (one prefix list on the trade's own keys) so they can sit
-    // ahead of the retry/cooldown/prep/veto chain. Trades minted
+    // ahead of the cooldown/prep/veto chain. Trades minted
     // without a `trade_id` (legacy single-shot entries) bypass this
     // gate entirely — there's no key to look pauses up by.
     if let Some(tid) = verified.intent.trade_id.as_deref() {
@@ -111,50 +111,6 @@ pub async fn run_enter<B: Broker, S: StateStore>(
             }
         }
     }
-
-    // Retry gate — when the intent opts into multi-shot mode via
-    // `max_retries`, the gate inspects prior attempts (cancel-and-
-    // replace a still-pending one, reject a fresh placement when an
-    // earlier attempt is still open, allow another placement when
-    // earlier attempts have closed) and enforces the placement cap.
-    // "Retry" here means re-entry into a setup after a prior fill
-    // closed (typically at SL), *not* a re-attempt of a failed
-    // placement — broker failures are terminal and 502 out. See
-    // `core::retry_gate` for the full semantics. The single-shot
-    // path (`max_retries: Static(0)`, the default) skips this branch
-    // entirely so no new KV/broker calls land on the byte-identical
-    // baseline.
-    // A restore re-places an order the lifecycle already cancelled — it is
-    // neither a fresh fire nor a new multi-shot re-entry, so it skips the retry
-    // gate entirely (like single-shot). This is what un-blocks the cancel→restore
-    // sequence: without it, the re-drive of a multi-shot resting order is
-    // `retry-fire-replay`-rejected on its own already-seen `shell.time` and the
-    // order is never re-placed (a live-money bug for multi-shot resting orders,
-    // hidden until now behind the replay's phantom fill).
-    let retry_attempt_no = if !restore
-        && !matches!(
-            verified.intent.max_retries,
-            crate::tunable::Tunable::Static(0)
-        ) {
-        match crate::retry_gate::evaluate(broker, store, &verified.intent, &verified.shell).await {
-            crate::retry_gate::RetryGateOutcome::Proceed { next_attempt_no } => {
-                Some(next_attempt_no)
-            }
-            crate::retry_gate::RetryGateOutcome::Rejected {
-                status,
-                message,
-                outcome,
-            } => {
-                return ActionResult::Rejected {
-                    status,
-                    body: message.to_string(),
-                    outcome,
-                };
-            }
-        }
-    } else {
-        None
-    };
 
     // Cooldown gate — scoped to this intent's account so a cooldown on
     // a different account doesn't pause this one. A global cooldown
@@ -573,8 +529,10 @@ pub async fn run_enter<B: Broker, S: StateStore>(
         // System 1 of the spread blackout: reject a brand-new entry that
         // fires during the post-NY-close liquidity trough when the live
         // spread on THIS instrument is elevated. Runs here — after every
-        // gate (retry/cooldown/prep/veto/allow_entry) and `Resolved::from_intent`,
-        // immediately before the broker order. The pure decision lives in
+        // reject-capable gate (cooldown/prep/veto/allow_entry) and
+        // `Resolved::from_intent`. It is itself reject-capable, so it stays
+        // ABOVE the retry gate, which is now last (see the rail there). The
+        // pure decision lives in
         // `spread_blackout::spread_blackout_decision`; this is the thin
         // KV-read + quote-sample wrapper around it.
         //
@@ -861,6 +819,88 @@ pub async fn run_enter<B: Broker, S: StateStore>(
         r_multiple,
     );
 
+    // Retry gate — when the intent opts into multi-shot mode via
+    // `max_retries`, the gate inspects prior attempts (cancel-and-
+    // replace a still-pending one, reject a fresh placement when an
+    // earlier attempt is still open, allow another placement when
+    // earlier attempts have closed) and enforces the placement cap.
+    // "Retry" here means re-entry into a setup after a prior fill
+    // closed (typically at SL), *not* a re-attempt of a failed
+    // placement — broker failures are terminal and 502 out. See
+    // `core::retry_gate` for the full semantics. The single-shot
+    // path (`max_retries: Static(0)`, the default) skips this branch
+    // entirely so no new KV/broker calls land on the byte-identical
+    // baseline.
+    //
+    // ## Why this gate is LAST — the rail: never cancel an order you cannot
+    // re-place
+    //
+    // This gate is the only one on the entry path with a **broker side effect**:
+    // its `AttemptState::Pending` arm CANCELS the prior attempt's still-resting
+    // order (`retry_gate::evaluate`) on the understanding that the caller will
+    // immediately place a fresh one in its stead. That bargain only holds if the
+    // placement is actually attempted — so every gate that can *reject* the fire
+    // must have already run by the time we get here.
+    //
+    // It used to sit at the top of `run_enter`, ahead of the cooldown, prep,
+    // veto, entry-level-veto, `allow_entry`, expiry-bars, market-hours,
+    // spread-blackout and SL-spread-floor gates. Any one of them rejecting after
+    // the gate had cancelled destroyed a live resting order with nothing placed
+    // and no restore. That is what happened on 2026-08-07 (OANDA
+    // `101-011-31142393-003`, plan `hs-eur-cad-08ca0693`): the 17:00:01 `05-enter`
+    // fire cancelled resting limit order 2318 at 17:00:23Z and was then rejected
+    // by the prep gate with `prep-order-violated (retest)`. 2318 was never
+    // replaced and the setup was forfeited.
+    //
+    // The rail itself is not new — `order_control::reprice`'s module docs state
+    // it outright ("never cancel an order you cannot re-place": the signed body
+    // is recovered and verified *before* the cancel, and a body that won't verify
+    // aborts with the order left resting), and `pending_lifecycle`'s cancel pass
+    // follows the same store-first ordering. The retry gate was the one path that
+    // did not honour it.
+    //
+    // Reordering rather than compensating is deliberate: an "un-cancel" is
+    // another failure mode (the re-place can itself be rejected, and the broker
+    // may have filled in between), whereas moving the gate removes the window
+    // entirely. Nothing between here and `place_entry` can reject, and nothing
+    // above depends on the gate's output — `retry_attempt_no` is read only
+    // *after* a successful placement, to stamp the `EntryAttempt` row.
+    //
+    // Adding a new reject-capable gate BELOW this point reopens the hole. Put it
+    // above, with the others.
+    //
+    // A restore re-places an order the lifecycle already cancelled — it is
+    // neither a fresh fire nor a new multi-shot re-entry, so it skips the retry
+    // gate entirely (like single-shot). This is what un-blocks the cancel→restore
+    // sequence: without it, the re-drive of a multi-shot resting order is
+    // `retry-fire-replay`-rejected on its own already-seen `shell.time` and the
+    // order is never re-placed (a live-money bug for multi-shot resting orders,
+    // hidden until now behind the replay's phantom fill).
+    let retry_attempt_no = if !restore
+        && !matches!(
+            verified.intent.max_retries,
+            crate::tunable::Tunable::Static(0)
+        ) {
+        match crate::retry_gate::evaluate(broker, store, &verified.intent, &verified.shell).await {
+            crate::retry_gate::RetryGateOutcome::Proceed { next_attempt_no } => {
+                Some(next_attempt_no)
+            }
+            crate::retry_gate::RetryGateOutcome::Rejected {
+                status,
+                message,
+                outcome,
+            } => {
+                return ActionResult::Rejected {
+                    status,
+                    body: message.to_string(),
+                    outcome,
+                };
+            }
+        }
+    } else {
+        None
+    };
+
     // First placement. On `EntryTooCloseToMarket` (TN `#19-10`), the
     // stop trigger was overtaken by price; the optional `recover_entry`
     // policy may recover with a *single* synchronous market re-place
@@ -956,9 +996,13 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 // `DispatchOutcome.outcome` into `plan-timeline` / `journal`),
                 // so the size + requested rate go here rather than only into
                 // the broker's own log line. Empty when the broker reported
-                // neither, keeping the historic `entered: order=…` shape.
+                // neither.
+                //
+                // The VERB is chosen from the order type, because a placement is
+                // not a fill — see `placement_verb`.
                 ActionResult::Ok(format!(
-                    "entered: order={order_id}{}",
+                    "{}: order={order_id}{}",
+                    placement_verb(&resolved.entry),
                     placed.describe_fill()
                 ))
             }
@@ -971,6 +1015,72 @@ pub async fn run_enter<B: Broker, S: StateStore>(
             let outcome = recover_entry::outcome_for_entry_error(&err);
             tracing::error!("entry failed: {err} ({outcome})");
             ActionResult::Failed(outcome)
+        }
+    }
+}
+
+/// The verb for a successful placement's operator-facing outcome string:
+/// `entered` for an order that has **filled**, `placed` for one that is merely
+/// **resting**.
+///
+/// # Why this is not one word
+///
+/// `run_enter` reported `entered: order=<id>` for every order type the moment
+/// `place_entry` returned. For a **market** order that is true — the broker
+/// fills it on receipt, and a position exists. For a **stop** or **limit** order
+/// it is not: the order rests on the book at a trigger price and may never fill
+/// at all. Both produced a byte-identical line, so no reader — human or code —
+/// could tell a live position from an untouched resting order.
+///
+/// That is exactly how the 2026-08-07 incident (OANDA
+/// `101-011-31142393-003`, plan `hs-eur-cad-08ca0693`) reached the operator's
+/// journal as a **WIN +2.63R**. Two limit orders were placed, both logged
+/// `entered:`, both rested about an hour unfilled, and both were cancelled. No
+/// position ever existed; the realised result was 0R. The only later signal was
+/// a `close-failed` on a reversal fire, which reads as a *closing* problem
+/// rather than an entry one, and the discrepancy stood for eleven days.
+///
+/// The manual CLI path learned the same lesson in v135
+/// (`BUG-market-entry-no-broker-confirmation-trail.md`): a terse, overstated
+/// line had an operator believe a position existed for nine days. The rule
+/// distilled from it — **never let the log claim more than the broker
+/// confirmed** — is what this encodes for the engine path.
+///
+/// # Why the ORDER TYPE, and not a fill price from the broker
+///
+/// The type is the honest discriminator available at this moment, and it is
+/// exact: [`ResolvedEntry`] is the same value handed to `place_entry`, so the
+/// verb cannot drift from the order actually sent.
+///
+/// A fill price is *not* available here, on either adapter, and inventing one
+/// would recreate the very overstatement this fixes:
+///
+/// * [`Placement::price`](crate::broker::Placement::price) is documented as the
+///   **requested** rate — the market reference, or the stop/limit trigger — and
+///   never the fill.
+/// * The OANDA adapter returns the pre-computed `reference_price` for all three
+///   order types (`broker-oanda/src/oanda.rs`), and its order id is the
+///   *submission* transaction; a fill is a separate later transaction.
+/// * The TradeNation adapter reports `price: None` for a market entry outright,
+///   since TN fills at its own live bid/ask.
+///
+/// So the outcome states what is known — an order of a given type reached the
+/// book — and leaves the fill to be confirmed by the paths that can actually
+/// observe one (`lookup_attempt_state`, `plan timeline`).
+///
+/// # Consumers
+///
+/// `journal`'s `derive_entry_ts` / `derive_outcome` key on the leading verb to
+/// decide whether a plan ever entered and whether to colour the result as a
+/// success. Feeding them `placed` for a resting order is the point: a rested,
+/// never-filled attempt stops counting as a fill.
+fn placement_verb(entry: &crate::intent::ResolvedEntry) -> &'static str {
+    match entry {
+        // Filled on receipt — a position exists by the time we log.
+        crate::intent::ResolvedEntry::Market { .. } => "entered",
+        // Resting on the book at a trigger. May never fill.
+        crate::intent::ResolvedEntry::Stop { .. } | crate::intent::ResolvedEntry::Limit { .. } => {
+            "placed"
         }
     }
 }
@@ -1481,5 +1591,847 @@ mod fmt_tests {
         assert_eq!(fmt_price_trim(1.10345), "1.10345");
         // Non-finite falls back to the default float render, not a panic.
         assert_eq!(fmt_price_trim(f64::NAN), "NaN");
+    }
+}
+
+/// Gate-ordering rail: **never cancel an order you cannot re-place.**
+///
+/// The retry gate cancels a still-`Pending` prior attempt at the broker on its
+/// way to a fresh placement (`retry_gate::evaluate`, the `AttemptState::Pending`
+/// arm). That cancel is only defensible if the placement is then actually
+/// attempted. These tests pin the ordering that makes it so: every gate that can
+/// *reject* a fire runs BEFORE the retry gate, so a rejected fire never reaches
+/// the cancel.
+///
+/// The incident (2026-08-07, OANDA `101-011-31142393-003`, plan
+/// `hs-eur-cad-08ca0693`): `05-enter` fired at 17:00:01, the retry gate cancelled
+/// resting limit order 2318 at 17:00:23Z, and the prep gate then rejected the
+/// fire with `prep-order-violated (retest)`. Nothing was re-placed and nothing
+/// restored the order — the setup was forfeited by that one cancel.
+///
+/// The rail itself is stated in `order_control::reprice`'s module docs and
+/// followed by `pending_lifecycle`'s store-first cancel pass; the retry gate is
+/// the one path that did not honour it.
+#[cfg(test)]
+mod gate_order_tests {
+    use super::*;
+    use crate::broker::{
+        AmendError, AttemptState, CancelError, Candle, CandleError, EntryError, EntryRequest,
+        Granularity, LookupError, OpenPosition, PendingOrder, Placement, Quote,
+    };
+    use crate::dispatch_config::DispatchConfig;
+    use crate::intent::{Direction, Intent, Shell};
+    use crate::state::{EntryAttempt, MemStateStore, PrepStamp, StateStore};
+    use chrono::{DateTime, Utc};
+    use std::cell::RefCell;
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s)
+            .expect("valid test timestamp")
+            .with_timezone(&Utc)
+    }
+
+    /// Records the broker traffic the entry path produced. The assertions in
+    /// this module are all about *which* calls reached the broker and in what
+    /// order — a cancel with no matching place is the bug.
+    pub(super) struct SpyBroker {
+        cancels: RefCell<Vec<String>>,
+        places: RefCell<Vec<String>>,
+        /// What `lookup_attempt_state` reports for a prior attempt. `Pending`
+        /// is the state that makes the retry gate cancel.
+        attempt_state: AttemptState,
+    }
+
+    impl SpyBroker {
+        /// A broker holding one still-resting prior order — the state that
+        /// makes the retry gate issue a cancel.
+        fn pending_prior() -> Self {
+            Self {
+                cancels: RefCell::new(Vec::new()),
+                places: RefCell::new(Vec::new()),
+                attempt_state: AttemptState::Pending,
+            }
+        }
+        /// A broker with no prior attempt to resolve. The Stage 6 wording
+        /// tests fire single-shot enters, so the retry gate is skipped and
+        /// `attempt_state` is never consulted — it is set to a terminal,
+        /// non-blocking value rather than `Pending` so that if a future change
+        /// DID route these through the gate, the test would still exercise the
+        /// placement path rather than silently start cancelling.
+        pub(super) fn no_prior() -> Self {
+            Self {
+                cancels: RefCell::new(Vec::new()),
+                places: RefCell::new(Vec::new()),
+                attempt_state: AttemptState::Cancelled,
+            }
+        }
+        fn cancelled(&self) -> Vec<String> {
+            self.cancels.borrow().clone()
+        }
+        fn placed(&self) -> Vec<String> {
+            self.places.borrow().clone()
+        }
+    }
+
+    impl Broker for SpyBroker {
+        async fn place_entry(
+            &self,
+            _max_risk_pct: f64,
+            _max_open_positions: u32,
+            req: &EntryRequest<'_>,
+        ) -> Result<Placement, EntryError> {
+            self.places.borrow_mut().push(req.instrument.to_string());
+            Ok(Placement::id_only("order-new"))
+        }
+        async fn close_positions(&self, _instrument: &str) -> crate::broker::CloseOutcome {
+            crate::broker::CloseOutcome::NothingOpen
+        }
+        async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
+            0
+        }
+        async fn lookup_attempt_state(
+            &self,
+            _instrument: &str,
+            _broker_order_id: &str,
+            _broker_trade_id: Option<&str>,
+        ) -> Result<AttemptState, LookupError> {
+            Ok(self.attempt_state.clone())
+        }
+        async fn cancel_order(
+            &self,
+            _account_id: &str,
+            broker_order_id: &str,
+        ) -> Result<(), CancelError> {
+            self.cancels.borrow_mut().push(broker_order_id.to_string());
+            Ok(())
+        }
+        async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
+            // A tight spread, so the SL-spread floor neither widens nor rejects
+            // and the tests stay about gate ORDER.
+            Ok(Quote {
+                bid: 1.10000,
+                ask: 1.10002,
+            })
+        }
+        async fn list_open_positions(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<OpenPosition>, LookupError> {
+            Ok(vec![])
+        }
+        async fn amend_stop(
+            &self,
+            _account_id: &str,
+            _position_or_order_id: &str,
+            _new_stop: f64,
+        ) -> Result<(), AmendError> {
+            Ok(())
+        }
+        async fn list_pending_orders(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<PendingOrder>, LookupError> {
+            Ok(vec![])
+        }
+        async fn get_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<Candle>, CandleError> {
+            Ok(vec![])
+        }
+    }
+
+    pub(super) fn cfg() -> DispatchConfig {
+        DispatchConfig {
+            worker_max_risk_pct: 1.0,
+            worker_max_open_positions: 3,
+            pip_size: 0.0001,
+            tick_size: None,
+            caps: Default::default(),
+        }
+    }
+
+    /// A multi-shot (`max_retries: 2`) long enter for trade `t-1` requiring the
+    /// `retest` prep — the shape of the incident's `05-enter`.
+    ///
+    /// Built by DESERIALISING the wire JSON rather than by struct literal, so a
+    /// test can't quietly diverge from what a signed alert actually carries.
+    fn enter_verified(vetos: &str, requires_preps: &str) -> crate::incoming::Verified {
+        enter_verified_full(
+            vetos,
+            requires_preps,
+            r#"{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.5900 }"#,
+        )
+    }
+
+    /// The same enter with a caller-chosen `entry` block, so a test can vary
+    /// the ORDER TYPE (market / stop / limit) — the axis Stage 6 turns on —
+    /// without a second copy of the wire JSON drifting from this one.
+    ///
+    /// Single-shot (`max_retries` is left at its default `0`): these tests are
+    /// about the outcome WORDING on a plain first placement, so the retry gate
+    /// and its prior-attempt lookup stay out of the picture entirely.
+    pub(super) fn enter_verified_with_entry(entry: &str) -> crate::incoming::Verified {
+        let mut v = enter_verified_full("[]", "[]", entry);
+        v.intent.max_retries = crate::tunable::Tunable::Static(0);
+        v
+    }
+
+    fn enter_verified_full(
+        vetos: &str,
+        requires_preps: &str,
+        entry: &str,
+    ) -> crate::incoming::Verified {
+        let json = format!(
+            r#"{{
+                "v": 1,
+                "id": "t-1-enter",
+                "not_after": "2026-08-09T00:00:00Z",
+                "action": "enter",
+                "instrument": "EUR_CAD",
+                "direction": "long",
+                "entry": {entry},
+                "stop_loss": {{ "absolute": 1.5850 }},
+                "take_profit": {{ "absolute": 1.6100 }},
+                "broker": "oanda",
+                "trade_id": "t-1",
+                "pip_size": 0.0001,
+                "max_retries": 2,
+                "vetos": {vetos},
+                "requires_preps": {requires_preps}
+            }}"#
+        );
+        let intent: Intent = serde_json::from_str(&json).expect("valid multi-shot enter intent");
+        let shell = Shell::from_candle(&Candle {
+            time: at("2026-08-07T17:00:00Z"),
+            o: 1.5880,
+            h: 1.5905,
+            l: 1.5875,
+            c: 1.5895,
+        });
+        crate::incoming::Verified { shell, intent }
+    }
+
+    /// The prior attempt whose resting order the retry gate would cancel —
+    /// order `2318` in the incident.
+    fn prior_attempt() -> EntryAttempt {
+        EntryAttempt {
+            trade_id: "t-1".into(),
+            account: None,
+            instrument: "EUR_CAD".into(),
+            attempt_no: 1,
+            broker_order_id: "2318".into(),
+            broker_trade_id: None,
+            direction: Direction::Long,
+            placed_at: at("2026-08-07T16:00:41Z"),
+            shell_time: at("2026-08-07T16:00:00Z"),
+            expires_at: at("2026-08-09T01:00:00Z"),
+            stop_loss_price: Some(1.5850),
+            cancel_at: None,
+            pip_size: Some(0.0001),
+            blackout_close: Default::default(),
+            breakeven: None,
+            order_control: None,
+        }
+    }
+
+    /// A store whose clock is pinned to the incident's timeline. Without this
+    /// the store judges TTLs against real wall-clock, so a prep/veto stamped in
+    /// 2026-08 is already expired and the gate under test never runs.
+    pub(super) fn store_at_incident() -> MemStateStore {
+        let store = MemStateStore::new();
+        store.set_clock(now());
+        store
+    }
+
+    async fn seed_prior_attempt(store: &MemStateStore) {
+        store
+            .record_entry_attempt(prior_attempt())
+            .await
+            .expect("record prior attempt");
+    }
+
+    pub(super) fn now() -> DateTime<Utc> {
+        at("2026-08-07T17:00:01Z")
+    }
+
+    /// A day, so state stamped hours before the fire is still live at it. A
+    /// short TTL would silently expire the prep/veto and the gate under test
+    /// would never run — a green-for-the-wrong-reason trap.
+    const TTL: u64 = 86_400;
+
+    /// `ActionResult` deliberately carries no `Debug` (it is the dispatch
+    /// outcome carrier, not a diagnostic type), so render it here rather than
+    /// widening the public type just for these assertions.
+    pub(super) fn describe(r: &ActionResult) -> String {
+        match r {
+            ActionResult::Ok(o) => format!("Ok({o})"),
+            ActionResult::Failed(o) => format!("Failed({o})"),
+            ActionResult::Rejected {
+                status, outcome, ..
+            } => {
+                format!("Rejected({status}, {outcome})")
+            }
+        }
+    }
+
+    /// THE INCIDENT. A fire whose prep chain is unsatisfiable must not cost the
+    /// resting order: the prep gate rejects, and because it now runs ahead of
+    /// the retry gate, `cancel_order` is never reached.
+    #[test]
+    fn prep_reject_leaves_the_prior_resting_order_untouched() {
+        let broker = SpyBroker::pending_prior();
+        let store = store_at_incident();
+        let verified = enter_verified("[]", r#"["break-and-close", "retest"]"#);
+        pollster::block_on(async {
+            seed_prior_attempt(&store).await;
+            // `break-and-close` is set but `retest` never was → `Missing`, the
+            // same slot failure the incident logged as `prep-order-violated`.
+            store
+                .set_prep(
+                    None,
+                    "EUR_CAD",
+                    "break-and-close",
+                    PrepStamp::at(now()),
+                    TTL,
+                    "test",
+                )
+                .await
+                .expect("set prep");
+            let result =
+                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            assert!(
+                matches!(&result, ActionResult::Rejected { outcome, .. }
+                    if outcome.starts_with("rejected: missing-prep")),
+                "expected the prep gate to reject, got {}",
+                describe(&result)
+            );
+        });
+        assert!(
+            broker.cancelled().is_empty(),
+            "RAIL: a rejected fire must not cancel the prior resting order, \
+             but cancel_order was called for {:?}",
+            broker.cancelled()
+        );
+        assert!(broker.placed().is_empty(), "a rejected fire places nothing");
+    }
+
+    /// Same rail, the ORDER-VIOLATED arm — the incident's literal outcome
+    /// (`prep-order-violated (retest)`): both preps are set, but out of order.
+    #[test]
+    fn prep_out_of_order_reject_leaves_the_prior_resting_order_untouched() {
+        let broker = SpyBroker::pending_prior();
+        let store = store_at_incident();
+        let verified = enter_verified("[]", r#"["break-and-close", "retest"]"#);
+        pollster::block_on(async {
+            seed_prior_attempt(&store).await;
+            // `retest` stamped BEFORE `break-and-close` ⇒ the chain is not
+            // strictly increasing ⇒ `prep-order-violated (retest)`.
+            store
+                .set_prep(
+                    None,
+                    "EUR_CAD",
+                    "retest",
+                    PrepStamp::at(at("2026-08-07T15:00:00Z")),
+                    TTL,
+                    "test",
+                )
+                .await
+                .expect("set retest");
+            store
+                .set_prep(
+                    None,
+                    "EUR_CAD",
+                    "break-and-close",
+                    PrepStamp::at(at("2026-08-07T16:00:00Z")),
+                    TTL,
+                    "test",
+                )
+                .await
+                .expect("set break-and-close");
+            let result =
+                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            assert!(
+                matches!(&result, ActionResult::Rejected { outcome, .. }
+                    if outcome == "rejected: prep-order-violated (retest)"),
+                "expected the incident's exact outcome, got {}",
+                describe(&result)
+            );
+        });
+        assert!(
+            broker.cancelled().is_empty(),
+            "RAIL: `prep-order-violated` must not cost the resting order \
+             (cancelled {:?})",
+            broker.cancelled()
+        );
+    }
+
+    /// The veto gate — same hazard, same rail.
+    #[test]
+    fn veto_reject_leaves_the_prior_resting_order_untouched() {
+        let broker = SpyBroker::pending_prior();
+        let store = store_at_incident();
+        let verified = enter_verified(r#"["too-low"]"#, "[]");
+        pollster::block_on(async {
+            seed_prior_attempt(&store).await;
+            store
+                .set_veto(None, "t-1", "EUR_CAD", "too-low", TTL)
+                .await
+                .expect("set veto");
+            let result =
+                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            assert!(
+                matches!(&result, ActionResult::Rejected { outcome, .. }
+                    if outcome == "rejected: veto-active (too-low)"),
+                "expected the veto gate to reject, got {}",
+                describe(&result)
+            );
+        });
+        assert!(
+            broker.cancelled().is_empty(),
+            "RAIL: an active veto must not cost the resting order (cancelled {:?})",
+            broker.cancelled()
+        );
+    }
+
+    /// The cooldown gate — same hazard, same rail.
+    #[test]
+    fn cooldown_reject_leaves_the_prior_resting_order_untouched() {
+        let broker = SpyBroker::pending_prior();
+        let store = store_at_incident();
+        let verified = enter_verified("[]", "[]");
+        pollster::block_on(async {
+            seed_prior_attempt(&store).await;
+            store
+                .set_cooldown(None, "EUR_CAD", 24, now())
+                .await
+                .expect("set cooldown");
+            let result =
+                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            assert!(
+                matches!(&result, ActionResult::Rejected { outcome, .. }
+                    if outcome == "rejected: cooled-down"),
+                "expected the cooldown gate to reject, got {}",
+                describe(&result)
+            );
+        });
+        assert!(
+            broker.cancelled().is_empty(),
+            "RAIL: a cooldown must not cost the resting order (cancelled {:?})",
+            broker.cancelled()
+        );
+    }
+
+    /// The `allow_entry` script gate — a Phase-2 gate, so it needs the resolved
+    /// geometry and cannot move above `Resolved::from_intent`. It still must
+    /// sit ahead of the retry gate, which is what this pins.
+    #[test]
+    fn allow_entry_false_leaves_the_prior_resting_order_untouched() {
+        let broker = SpyBroker::pending_prior();
+        let store = store_at_incident();
+        let mut verified = enter_verified("[]", "[]");
+        verified.intent.allow_entry = Some(crate::tunable::Tunable::Static(false));
+        pollster::block_on(async {
+            seed_prior_attempt(&store).await;
+            let result =
+                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            assert!(
+                matches!(&result, ActionResult::Rejected { outcome, .. }
+                    if outcome == "rejected: allow-entry-false"),
+                "expected allow_entry to block, got {}",
+                describe(&result)
+            );
+        });
+        assert!(
+            broker.cancelled().is_empty(),
+            "RAIL: allow_entry=false must not cost the resting order (cancelled {:?})",
+            broker.cancelled()
+        );
+    }
+
+    /// The entry-level veto gate (Bug #12) — also Phase 2, also ahead of the
+    /// retry gate.
+    #[test]
+    fn entry_level_veto_leaves_the_prior_resting_order_untouched() {
+        let broker = SpyBroker::pending_prior();
+        let store = store_at_incident();
+        let mut verified = enter_verified("[]", "[]");
+        // The resolved long entry is 1.5900; a `too-high` cap at 1.5800 is
+        // already breached, so the continuous veto rejects.
+        verified.intent.entry_level_vetos = vec![crate::intent::EntryLevelVeto {
+            name: "too-high".into(),
+            level: 1.5800,
+            past: crate::intent::VetoSide::Above,
+        }];
+        pollster::block_on(async {
+            seed_prior_attempt(&store).await;
+            let result =
+                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            assert!(
+                matches!(&result, ActionResult::Rejected { outcome, .. }
+                    if outcome == "rejected: veto-active (too-high)"),
+                "expected the entry-level veto to reject, got {}",
+                describe(&result)
+            );
+        });
+        assert!(
+            broker.cancelled().is_empty(),
+            "RAIL: an entry-level veto must not cost the resting order (cancelled {:?})",
+            broker.cancelled()
+        );
+    }
+
+    /// REGRESSION — the legitimate multi-shot path must keep working. A fire
+    /// that clears every gate and finds a prior `Pending` attempt still cancels
+    /// it and places a fresh order. This is 2316→2318 in the incident, which was
+    /// correct behaviour and must not be broken by the reordering.
+    #[test]
+    fn all_gates_pass_still_cancels_the_pending_prior_and_places_fresh() {
+        let broker = SpyBroker::pending_prior();
+        let store = store_at_incident();
+        let verified = enter_verified("[]", r#"["break-and-close", "retest"]"#);
+        pollster::block_on(async {
+            seed_prior_attempt(&store).await;
+            // A satisfied, strictly-increasing prep chain.
+            store
+                .set_prep(
+                    None,
+                    "EUR_CAD",
+                    "break-and-close",
+                    PrepStamp::at(at("2026-08-07T15:00:00Z")),
+                    TTL,
+                    "test",
+                )
+                .await
+                .expect("set break-and-close");
+            store
+                .set_prep(
+                    None,
+                    "EUR_CAD",
+                    "retest",
+                    PrepStamp::at(at("2026-08-07T16:00:00Z")),
+                    TTL,
+                    "test",
+                )
+                .await
+                .expect("set retest");
+            let result =
+                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            // `placed:`, not `entered:` — this enter is a STOP order, which
+            // rests rather than filling (Stage 6). The assertion here is about
+            // a placement having HAPPENED, so it tracks the resting verb.
+            assert!(
+                matches!(&result, ActionResult::Ok(o) if o.starts_with("placed: order=")),
+                "expected a placement, got {}",
+                describe(&result)
+            );
+        });
+        assert_eq!(
+            broker.cancelled(),
+            vec!["2318".to_string()],
+            "the superseded resting order is still cancelled when placement follows"
+        );
+        assert_eq!(
+            broker.placed(),
+            vec!["EUR_CAD".to_string()],
+            "and a fresh order is placed in its stead"
+        );
+    }
+
+    /// The cancel must be *paired* with a placement, which is only true if the
+    /// gate sits last. Asserting on the counts alone (as above) would pass even
+    /// if the cancel happened first and the place merely also happened; this
+    /// asserts the fire that gets cancelled is the fire that gets placed, by
+    /// checking the attempt row the placement recorded.
+    #[test]
+    fn a_cancel_is_always_followed_by_a_recorded_new_attempt() {
+        let broker = SpyBroker::pending_prior();
+        let store = store_at_incident();
+        let verified = enter_verified("[]", "[]");
+        pollster::block_on(async {
+            seed_prior_attempt(&store).await;
+            run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            let attempts = store
+                .list_entry_attempts(None, "t-1")
+                .await
+                .expect("list attempts");
+            assert_eq!(
+                attempts.len(),
+                2,
+                "the cancelled attempt #1 is superseded by a recorded attempt #2"
+            );
+            assert_eq!(attempts[1].broker_order_id, "order-new");
+        });
+        assert_eq!(broker.cancelled(), vec!["2318".to_string()]);
+    }
+
+    /// BUG C, END TO END through the two real entry points. The preps are set
+    /// by `handle_prep` (not by poking the store), both under the SINGLE `now`
+    /// a multi-bar catch-up tick dispatches every fire with, and then
+    /// `run_enter` is asked for the entry.
+    ///
+    /// Because `handle_prep` now stamps `set_at` from the triggering bar rather
+    /// than wall-clock, the chain is strictly increasing and the entry is
+    /// PLACED. Under the wall-clock stamp both rows carried an identical
+    /// timestamp and this returned `rejected: prep-order-violated (retest)` —
+    /// the incident's literal outcome, on perfectly correct geometry.
+    #[test]
+    fn multi_bar_catch_up_preps_let_the_entry_through() {
+        let broker = SpyBroker::pending_prior();
+        let store = store_at_incident();
+        let verified = enter_verified("[]", r#"["break-and-close", "retest"]"#);
+        pollster::block_on(async {
+            seed_prior_attempt(&store).await;
+            // Two bars, ONE wall-clock `now()` — exactly what the cron does when
+            // a tick catches up over more than one closed bar.
+            for (step, bar) in [
+                ("break-and-close", "2026-08-07T15:00:00Z"),
+                ("retest", "2026-08-07T16:00:00Z"),
+            ] {
+                let result =
+                    crate::dispatch::handle_prep(&store, &prep_verified(step, bar), now()).await;
+                assert!(result.is_success(), "prep {step}: {}", result.body);
+            }
+            let result =
+                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            // Again `placed:` — a resting stop entry (Stage 6).
+            assert!(
+                matches!(&result, ActionResult::Ok(o) if o.starts_with("placed: order=")),
+                "BUG C: a two-bar prep chain caught up in one tick must place, \
+                 got {}",
+                describe(&result)
+            );
+        });
+        assert_eq!(
+            broker.placed(),
+            vec!["EUR_CAD".to_string()],
+            "the entry the incident lost must actually reach the broker"
+        );
+    }
+
+    /// The same end-to-end route must keep rejecting a genuinely stale chain:
+    /// `retest` on an EARLIER bar than `break-and-close`. Bar-time stamping is a
+    /// re-stamp, not a loosened comparison, so the gate keeps its teeth — and
+    /// per the Stage 1 rail the rejected fire still costs no resting order.
+    #[test]
+    fn genuinely_stale_prep_chain_still_rejects_end_to_end() {
+        let broker = SpyBroker::pending_prior();
+        let store = store_at_incident();
+        let verified = enter_verified("[]", r#"["break-and-close", "retest"]"#);
+        pollster::block_on(async {
+            seed_prior_attempt(&store).await;
+            for (step, bar) in [
+                ("retest", "2026-08-07T15:00:00Z"),
+                ("break-and-close", "2026-08-07T16:00:00Z"),
+            ] {
+                crate::dispatch::handle_prep(&store, &prep_verified(step, bar), now()).await;
+            }
+            let result =
+                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            assert!(
+                matches!(&result, ActionResult::Rejected { outcome, .. }
+                    if outcome == "rejected: prep-order-violated (retest)"),
+                "a genuinely out-of-order chain must still reject, got {}",
+                describe(&result)
+            );
+        });
+        assert!(broker.placed().is_empty(), "a rejected fire places nothing");
+        assert!(
+            broker.cancelled().is_empty(),
+            "RAIL: a rejected fire must not cost the resting order (cancelled {:?})",
+            broker.cancelled()
+        );
+    }
+
+    /// A `prep` intent for `step`, triggered by the bar at `bar_time`. Built by
+    /// deserialising the wire JSON and synthesising the shell with
+    /// [`Shell::from_candle`], exactly as the cron's `dispatch_fired` does.
+    fn prep_verified(step: &str, bar_time: &str) -> crate::incoming::Verified {
+        let json = format!(
+            r#"{{
+                "v": 1,
+                "id": "t-1-prep-{step}",
+                "not_after": "2026-08-09T00:00:00Z",
+                "action": "prep",
+                "instrument": "EUR_CAD",
+                "step": "{step}",
+                "trade_id": "t-1",
+                "ttl_hours": 24
+            }}"#
+        );
+        let intent: Intent = serde_json::from_str(&json).expect("valid prep intent");
+        let shell = Shell::from_candle(&Candle {
+            time: at(bar_time),
+            o: 1.5880,
+            h: 1.5905,
+            l: 1.5875,
+            c: 1.5895,
+        });
+        crate::incoming::Verified { shell, intent }
+    }
+}
+
+/// Stage 6 — **a placement is not a fill.**
+///
+/// `run_enter` used to report `entered: order=<id>` the moment `place_entry`
+/// returned, for every order type. For a **market** order that is honest: the
+/// broker fills it there and then. For a **stop** or **limit** order it is not —
+/// the order merely *rests*, and may sit unfilled for hours before being
+/// cancelled, having never opened a position at all.
+///
+/// The two cases produced a byte-identical log line, so nothing downstream could
+/// tell them apart. That is how the incident of 2026-08-07 (OANDA
+/// `101-011-31142393-003`, plan `hs-eur-cad-08ca0693`) reached the operator's
+/// trade journal as a **WIN +2.63R**: two limit orders (2316, 2318) were placed,
+/// each logged `entered:`, each rested ~1h unfilled, and each was cancelled.
+/// No position ever existed. The only later signal was `close-failed`, which
+/// reads as a *closing* problem rather than an entry one, and the discrepancy
+/// went unnoticed for eleven days.
+///
+/// The same class of overstatement was fixed for the manual CLI path in v135
+/// (`BUG-market-entry-no-broker-confirmation-trail.md`), where a terse
+/// wrong-sounding line led an operator to believe a position existed for nine
+/// days. This is the engine path's half of that lesson.
+///
+/// These tests assert at the `run_enter` entry point rather than on the helper
+/// below it — a guard one level down would mask a survivor
+/// (`[[mutation_test_the_entry_point_not_just_the_layer_below]]`).
+#[cfg(test)]
+mod placement_is_not_a_fill_tests {
+    use super::gate_order_tests::{
+        SpyBroker, cfg, describe, enter_verified_with_entry, now, store_at_incident,
+    };
+    use super::*;
+
+    /// A **stop** entry rests at the broker. It has not filled, so the outcome
+    /// must not claim it did.
+    #[test]
+    fn a_resting_stop_order_is_placed_not_entered() {
+        let broker = SpyBroker::no_prior();
+        let store = store_at_incident();
+        let verified = enter_verified_with_entry(
+            r#"{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.5900 }"#,
+        );
+        let result = pollster::block_on(run_enter(
+            &broker,
+            &store,
+            &verified,
+            &cfg(),
+            now(),
+            None,
+            None,
+            false,
+        ));
+        let outcome = match &result {
+            ActionResult::Ok(o) => o.clone(),
+            other => panic!("expected a placement, got {}", describe(other)),
+        };
+        assert!(
+            outcome.starts_with("placed: order="),
+            "a resting stop must report `placed:`, got {outcome}"
+        );
+        assert!(
+            !outcome.contains("entered"),
+            "a resting stop must not claim it entered, got {outcome}"
+        );
+    }
+
+    /// A **limit** entry rests too — this is the incident's own order type
+    /// (2316 and 2318 were both `LIMIT_ORDER`, `opened_trade_id: null`).
+    #[test]
+    fn a_resting_limit_order_is_placed_not_entered() {
+        let broker = SpyBroker::no_prior();
+        let store = store_at_incident();
+        let verified = enter_verified_with_entry(
+            r#"{ "type": "limit", "from": "close", "offset_pips": 0.0, "at": 1.5900 }"#,
+        );
+        let result = pollster::block_on(run_enter(
+            &broker,
+            &store,
+            &verified,
+            &cfg(),
+            now(),
+            None,
+            None,
+            false,
+        ));
+        let outcome = match &result {
+            ActionResult::Ok(o) => o.clone(),
+            other => panic!("expected a placement, got {}", describe(other)),
+        };
+        assert!(
+            outcome.starts_with("placed: order="),
+            "a resting limit must report `placed:`, got {outcome}"
+        );
+        assert!(
+            !outcome.contains("entered"),
+            "THE INCIDENT: a resting limit must not read like a fill, got {outcome}"
+        );
+    }
+
+    /// A **market** entry fills immediately, so `entered:` is the honest word.
+    /// This is the other half of the discrimination: the change must not simply
+    /// rename every placement.
+    #[test]
+    fn a_market_order_is_entered_not_merely_placed() {
+        let broker = SpyBroker::no_prior();
+        let store = store_at_incident();
+        let verified = enter_verified_with_entry(
+            r#"{ "type": "market", "from": "close", "offset_pips": 0.0 }"#,
+        );
+        let result = pollster::block_on(run_enter(
+            &broker,
+            &store,
+            &verified,
+            &cfg(),
+            now(),
+            None,
+            None,
+            false,
+        ));
+        let outcome = match &result {
+            ActionResult::Ok(o) => o.clone(),
+            other => panic!("expected a placement, got {}", describe(other)),
+        };
+        assert!(
+            outcome.starts_with("entered: order="),
+            "a market order does fill, so it keeps `entered:`, got {outcome}"
+        );
+    }
+
+    /// The order id is still carried in both wordings — every downstream
+    /// consumer (`plan timeline`, the journal, the broker-evidence pull) joins
+    /// on it, so a rename must not drop it.
+    #[test]
+    fn both_wordings_still_carry_the_broker_order_id() {
+        let store = store_at_incident();
+        for entry in [
+            r#"{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.5900 }"#,
+            r#"{ "type": "market", "from": "close", "offset_pips": 0.0 }"#,
+        ] {
+            let broker = SpyBroker::no_prior();
+            let verified = enter_verified_with_entry(entry);
+            let result = pollster::block_on(run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                false,
+            ));
+            let outcome = match &result {
+                ActionResult::Ok(o) => o.clone(),
+                other => panic!("expected a placement for {entry}, got {}", describe(other)),
+            };
+            assert!(
+                outcome.contains("order=order-new"),
+                "the broker order id must survive the rename, got {outcome}"
+            );
+        }
     }
 }

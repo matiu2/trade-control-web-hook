@@ -1,5 +1,91 @@
 # Changelog
 
+## v137 — 2026-09-07 — a whole setup was forfeited by three bugs in sequence
+
+**Why.** EUR/CAD H1 H&S short, 2026-08-07 (plan `hs-eur-cad-08ca0693`, OANDA
+practice `101-011-31142393-003`). The worker logged two successful entries,
+rejected the next **twelve** signals, failed three closes, and banked **0R**.
+No position ever existed at the broker. The trading journal recorded it as a
+**WIN +2.63R**.
+
+Three independent bugs, in causal order:
+
+**C — preps were stamped with wall-clock, not bar time.** The live cron hands
+*every* bar closed since the watermark to one `evaluate_plan` call under a
+**single** `Utc::now()`. The entry gate requires **strictly increasing** prep
+`set_at`. So any multi-bar catch-up — a gap, a restart, a slow tick, the first
+tick after seeding — stamped two preps identically and the entry was rejected
+`prep-order-violated` on *perfectly correct geometry*. Proven, not inferred: the
+two stored rows are byte-identical to the microsecond
+(`2026-08-08 00:07:05.759557+10`). Measured on staging: **9 of 61 instruments**
+carry this signature across 4 distinct catch-up events — 2026-07-08 poisoned
+four instruments in one tick.
+
+**A — the retry gate cancelled a resting order for a fire it then rejected.**
+The gate ran *first* in `run_enter`, ahead of **thirteen** reject-capable gates,
+and cancels a prior attempt's resting order on its way to placing a fresh one.
+When C's spurious rejection landed, order 2318 had already been cancelled —
+destroyed with nothing placed and no restore. `order_control/reprice.rs` had
+documented this rail in prose all along ("never cancel an order you cannot
+re-place"); the gate was the one cancel path not honouring it.
+
+**B — a cancelled-never-filled order resolved to `Unknown`.** `Cancelled` was
+inferred from `broker_trade_id.is_some()`, but that is only ever set for an
+attempt that reached an *open position*. So an order cancelled before filling
+resolved `Unknown`, which fails safe and **hard-blocks re-entry for the life of
+the plan** — the twelve rejected signals.
+
+**What changed.**
+
+- Preps stamp `set_at` from `verified.shell.time`. `StateStore::set_prep` now
+  takes a `PrepStamp { set_at, now }` — split rather than repurposed, because
+  the single `now` also drove `expires_at`, and reusing it would have silently
+  shortened every prep's life by the catch-up lag.
+- `retry_gate::evaluate` moved to immediately before `place_entry`, so a cancel
+  is only issued when placement is otherwise certain to be attempted.
+- `compute_attempt_state` consults the broker's own order record via a new
+  `oanda_client::get_order` (`GET /v3/accounts/{id}/orders/{id}` → `state`).
+  Passed in as an `OrderFate` so the resolver stays pure and testable.
+- A placement is no longer reported as a fill: `entered:` for market, `placed:`
+  for a resting stop/limit. The journal's `derive_entry_ts` no longer stamps an
+  entry time for a resting order — *that line is what turned this trade into a
+  WIN*.
+- `replay-candles --cron-gap N` batches N bars into one `evaluate_plan` under one
+  `now`, mirroring the live cron.
+
+**Breaking.** `StateStore::set_prep` takes a `PrepStamp` instead of a bare
+`now`. `Broker` implementors are unaffected (`Placement` gained no field).
+
+**Config.** None. `--cron-gap` defaults to `1` (today's behaviour).
+
+**Tests.** core 1105, broker-oanda 44, journal 124. Every fix is
+mutation-verified at its entry point. New `AttemptState` conformance suite
+drives **both** resolvers — live and replay — from one scenario table and fails
+on either side's drift; the divergence that caused this had gone undetected
+across 60+ fixtures because nothing compared the two implementations.
+
+⚠️ **The fixture corpus cannot verify any of these fixes.** It passes unchanged
+with all three in — a no-regression result, not a verification. Replay dispatched
+one bar per tick, so `prep-order-violated` occurred **zero** times across all 910
+fixtures while the bug was live in production. With `--cron-gap 6` and bug C
+reintroduced it fires **1002** times. That gap is now closable, but a green
+corpus is still not evidence about a timing-sensitive gate.
+
+**Follow-up.**
+
+- Run `scripts/check-poisoned-preps.sh` **before deploying**. The code fix stops
+  new poisoning but preps carry ~100-year TTLs, so already-written pairs survive.
+  Exit 0 today (none belongs to a live plan); exit 3 lists what to clear.
+- `engine/src/evaluate.rs` already uses a per-candle `control_clock_for` for
+  *control* rules, added for an earlier version of this same divergence. Audit
+  whatever else reads the batch-wide `now` where it means "this bar" — cooldowns
+  and TTLs are the candidates.
+- `oanda-client` retries a permanent 404 (`FINDINGS-order-cancel-reject-storms.md`).
+  Not fixed here: the tempting fix would stop retrying genuine transients on the
+  money path.
+- The `not-taken` corpus bucket likely contains setups blocked by bug C rather
+  than genuinely declined.
+
 ## v136 — 2026-09-02 — `--save-fixture` wrote to the tree the binary was BUILT in
 
 **Why.** A capture died after the chart had already been read:

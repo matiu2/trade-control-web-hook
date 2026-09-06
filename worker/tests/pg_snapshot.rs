@@ -13,7 +13,7 @@
 
 use chrono::{SubsecRound, Utc};
 use trade_control_core::intent::Action;
-use trade_control_core::state::StateStore;
+use trade_control_core::state::{PrepStamp, StateStore};
 use trade_control_worker::PgStateStore;
 
 fn test_db_url() -> String {
@@ -51,7 +51,7 @@ async fn snapshot_surfaces_active_rows_and_omits_expired() {
         .await
         .unwrap();
     store
-        .set_prep(None, &prep_i, "break", now, 3600, "id-1")
+        .set_prep(None, &prep_i, "break", PrepStamp::at(now), 3600, "id-1")
         .await
         .unwrap();
     store

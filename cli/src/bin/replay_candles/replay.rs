@@ -24,6 +24,7 @@ use trade_control_core::signals::{
     DetectFlags, DetectorConfig, atr_length_for, detect_at, first_confirmed_signal_at, wilder_atr,
 };
 
+use super::cadence::CronCadence;
 use super::replay_broker::{ExitReason, RealizedOutcome, ReplayBroker};
 use super::verbose::{BarTrace, DetectedMark};
 use trade_control_cli::replay_args::DetectorMarkConfig;
@@ -165,6 +166,11 @@ const SEED_BARS: usize = 10;
 /// retired by a stale veto-level touch that happened earlier (which would
 /// otherwise end the plan before the entry it exists to protect). The warm-up
 /// bars are pulled by the caller (`--warmup-bars`).
+///
+/// `cadence` is how many freshly-closed bars each tick batches into a single
+/// `evaluate_plan` call. The default ([`CronCadence::PER_BAR`]) walks the window
+/// one bar at a time; a wider cadence mirrors a live cron catch-up, where every
+/// bar closed since the watermark is evaluated under one wall-clock instant.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     plan: &TradePlan,
@@ -186,6 +192,11 @@ pub async fn run(
     // when the plan is already M1, the finer pull failed, or the caller is the
     // frozen-fixture re-sim.
     sub_bars: Option<Box<dyn super::fill_sim::SubBars>>,
+    // How many freshly-closed bars each tick hands to ONE `evaluate_plan` call.
+    // `CronCadence::PER_BAR` (the default) is bar-for-bar — today's behaviour,
+    // byte-identical. A wider cadence reproduces a live cron catch-up: N bars in
+    // one call under one `now`. See `super::cadence`.
+    cadence: CronCadence,
 ) -> Replay {
     // The engine evaluates on MID (matching the live worker, whose
     // `Broker::get_candles` is contractually mid); the bid/ask books are only
@@ -256,30 +267,54 @@ pub async fn run(
 
     // The detector window grows with each tick: Pine / trendline triggers need
     // the full back-window of closed candles, not just the single new bar.
-    for i in seed_end..candles.len() {
+    //
+    // `lo..=i` is the batch of freshly-closed bars this tick hands to ONE
+    // `evaluate_plan` call. At the default `CronCadence::PER_BAR` the batch is
+    // always `i..=i` — bar for bar, byte-identical to the pre-cadence loop. A
+    // wider cadence reproduces a live cron catch-up (a gap, a restart, a slow
+    // tick, the first tick after seeding), where every bar closed since the
+    // watermark is evaluated under a SINGLE wall-clock instant. See `cadence`.
+    let mut lo = seed_end;
+    while lo < candles.len() {
+        // Inclusive index of the batch's LAST (newest) bar. Everything that is
+        // once-per-tick live — the broker advance, the resting-order lifecycle,
+        // the order-control pass, the verbose trace — keys on this bar, because
+        // live runs each of those once per cron tick against the newest closed
+        // bar, not once per bar in the batch.
+        let i = cadence.batch_end(lo, candles.len()) - 1;
         // The engine sees MID; the fill simulator's forward path stays bid/ask.
-        let new = &mid[i..=i];
+        let new = &mid[lo..=i];
         let detector_window = &mid[..=i];
         // Candle timestamps are bar *open* times; the live cron tick that first
         // observes this closed bar fires at (or after) its *close*. Use the
         // close time as `now` so wall-clock-derived state (TTLs, logging) lines
         // up with the live worker, which ticks on wall-clock, not bar-open.
+        //
+        // For a batch it is the LAST bar's close — ONE `now` shared by every bar
+        // in the batch, exactly as the live cron's single `Utc::now()` (taken at
+        // or after the newest closed bar, `worker/src/scheduler.rs:216`) is
+        // shared by the whole `fresh` slice and by every intent dispatched from
+        // it (`trade-control-cron/src/engine.rs:181,253`). Derived from the
+        // candle series, never from wall-clock, so a replay stays reproducible
+        // (`[[wallclock_now_leaks_into_replayable_plans]]`).
         let now = candles[i].time + bar;
 
         // Sub-bar control ticks: before this bar's close, replay any pause/news
-        // window edge whose wall-clock epoch fell *inside* the just-elapsed bar
+        // window edge whose wall-clock epoch fell *inside* the just-elapsed span
         // (a 14:30 event on an H1 chart, between the 14:00 and 15:00 closes). The
         // live worker's 5s cron opens/closes it there; the replay's virtual clock
         // reproduces that exactly by running the SAME `evaluate_controls_only` at
-        // each such epoch. `i >= seed_end >= 1`, so `i - 1` is always valid — the
-        // prior close and the last-closed bar (`mid[i - 1]`) are the shell.
-        let prev_close = candles[i - 1].time + bar;
+        // each such epoch. `lo >= seed_end >= 1`, so `lo - 1` is always valid —
+        // the prior close and the last-closed bar (`mid[lo - 1]`) are the shell.
+        // The span is the whole batch (`candles[lo - 1]`'s close → this tick's
+        // `now`), so a wider cadence doesn't skip an epoch that fell inside it.
+        let prev_close = candles[lo - 1].time + bar;
         inject_control_ticks(
             plan,
             &mut state,
             &store,
             &mut fires,
-            &mid[i - 1],
+            &mid[lo - 1],
             &candles[i..],
             prev_close,
             now,
@@ -675,6 +710,11 @@ pub async fn run(
             done = true;
             break;
         }
+
+        // Advance past the whole batch. `i` is the batch's last bar (inclusive),
+        // so the next tick starts at `i + 1`; `batch_end` guarantees `i >= lo`,
+        // so this always makes progress.
+        lo = i + 1;
     }
 
     // S5b: the report reads each placed enter's outcome from the broker's HELD
@@ -1053,6 +1093,38 @@ mod tests {
     use trade_control_cli::replay_args::{DirectionFilter, GoldenFilter};
     use trade_control_engine::intent::Direction;
 
+    /// [`super::run`] at the DEFAULT cadence (`CronCadence::PER_BAR`), shadowing
+    /// the real `run` for every test below.
+    ///
+    /// Every one of these tests predates `--cron-gap` and asserts the historical
+    /// one-bar-per-tick behaviour. Routing them through this shim — rather than
+    /// threading `PER_BAR` into each call — keeps them literally unchanged, so
+    /// they stay a standing proof that the default cadence is a genuine no-op.
+    /// A test that WANTS a catch-up calls [`super::run`] explicitly with a wider
+    /// cadence (see `multi_bar_catch_up_*` below).
+    #[allow(clippy::too_many_arguments)]
+    async fn run(
+        plan: &TradePlan,
+        candles: &[EngineCandle],
+        granularity: Granularity,
+        live_start: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        mark_cfg: DetectorMarkConfig,
+        sub_bars: Option<Box<dyn super::super::fill_sim::SubBars>>,
+    ) -> Replay {
+        super::run(
+            plan,
+            candles,
+            granularity,
+            live_start,
+            expires_at,
+            mark_cfg,
+            sub_bars,
+            CronCadence::PER_BAR,
+        )
+        .await
+    }
+
     /// The detector-mark config for tests that don't exercise marking: feature
     /// off (either axis `None`), so `run` records no marks and behaves exactly as
     /// before this feature landed.
@@ -1062,7 +1134,7 @@ mod tests {
 
     /// A bid==ask==mid bar (zero spread): the engine sees the mid OHLC, the fill
     /// simulator's books equal it, so these wiring tests need no spread.
-    fn candle(epoch: i64, c: f64) -> EngineCandle {
+    pub(super) fn candle(epoch: i64, c: f64) -> EngineCandle {
         let (o, h, l) = (c, c + 0.5, c - 0.5);
         EngineCandle {
             time: Utc.timestamp_opt(epoch, 0).unwrap(),
@@ -1726,7 +1798,7 @@ mod tests {
 
     /// A candle with explicit OHLC (so we can place a wick across a level).
     /// A bid==ask==mid bar with explicit OHLC (zero spread).
-    fn ohlc(epoch: i64, o: f64, h: f64, l: f64, c: f64) -> EngineCandle {
+    pub(super) fn ohlc(epoch: i64, o: f64, h: f64, l: f64, c: f64) -> EngineCandle {
         EngineCandle {
             time: Utc.timestamp_opt(epoch, 0).unwrap(),
             o,
@@ -3209,5 +3281,270 @@ mod tests {
             report.contains("TP: 1  SL: 0"),
             "exactly one taken position (the deferred order's TP):\n{report}"
         );
+    }
+}
+
+/// The **cron catch-up** tests: the one live shape the replay could not
+/// construct before `--cron-gap`, and the failure mode it hides.
+///
+/// See `super::super::cadence` for the full account. In short: the live cron
+/// takes ONE `Utc::now()` per tick, fetches every bar closed since the plan's
+/// watermark, and hands the whole slice to a SINGLE `evaluate_plan` call, then
+/// dispatches every intent that batch fired under that same `now`. Replay walked
+/// one bar per call with a per-bar `now`, so it had accidental immunity to
+/// anything that depends on two fires sharing a wall-clock instant.
+#[cfg(test)]
+mod catch_up_tests {
+    use super::tests::*;
+    use super::*;
+    use chrono::TimeZone;
+    use trade_control_cli::replay_args::{DirectionFilter, GoldenFilter};
+    use trade_control_engine::intent::Direction;
+
+    fn no_marks() -> DetectorMarkConfig {
+        DetectorMarkConfig::new(DirectionFilter::None, GoldenFilter::None, Direction::Long)
+    }
+
+    fn all_live() -> DateTime<Utc> {
+        Utc.timestamp_opt(0, 0).unwrap()
+    }
+
+    fn expires() -> DateTime<Utc> {
+        Utc.timestamp_opt(99 * 3600, 0).unwrap()
+    }
+
+    /// A LONG setup whose entry requires an **ordered** prep chain
+    /// (`break-and-close` then `retest`), both stamped off **horizontal** lines
+    /// so the geometry is exact — a flat neckline has slope 0, so the retest
+    /// tolerance is 0 and the bar must genuinely reach the line.
+    ///
+    /// - `03-prep-break-and-close`: closes **above** 1.1050 (the break).
+    /// - `04-prep-retest`: wicks back **down** to 1.1050 (the retest).
+    /// - `05-enter`: a stop entry above 1.1100, gated on both preps in order.
+    fn ordered_prep_plan() -> TradePlan {
+        serde_json::from_str(
+            r#"{
+                "trade_id": "t-catchup",
+                "instrument": "CAD_CHF",
+                "direction": "long",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {
+                        "rule_id": "03-prep-break-and-close",
+                        "trigger": { "type": "horizontal_cross", "level": 1.1050, "dir": "up", "bar": "on_close" },
+                        "fire_mode": "once",
+                        "kind": "prep_break_and_close",
+                        "intent": {
+                            "v": 1, "id": "t-catchup-bcr", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "prep", "instrument": "CAD_CHF", "trade_id": "t-catchup",
+                            "step": "break-and-close", "ttl_hours": 876000, "clears": ["retest"]
+                        }
+                    },
+                    {
+                        "rule_id": "04-prep-retest",
+                        "trigger": { "type": "horizontal_cross", "level": 1.1050, "dir": "down", "bar": "intrabar" },
+                        "fire_mode": "once",
+                        "kind": "prep_retest",
+                        "intent": {
+                            "v": 1, "id": "t-catchup-retest", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "prep", "instrument": "CAD_CHF", "trade_id": "t-catchup",
+                            "step": "retest", "ttl_hours": 876000
+                        }
+                    },
+                    {
+                        "rule_id": "05-enter",
+                        "trigger": { "type": "horizontal_cross", "level": 1.1090, "dir": "up", "bar": "on_close" },
+                        "fire_mode": "once",
+                        "kind": "enter",
+                        "intent": {
+                            "v": 1, "id": "t-catchup-enter", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter", "instrument": "CAD_CHF", "direction": "long",
+                            "entry": { "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.1100 },
+                            "stop_loss": { "absolute": 1.1000 },
+                            "take_profit": { "absolute": 1.1300 },
+                            "broker": "tradenation", "trade_id": "t-catchup", "max_retries": 0,
+                            "requires_preps": ["break-and-close", "retest"]
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse ordered-prep plan")
+    }
+
+    /// Bars 0..9 seed below the line; bar 10 breaks and closes above it; bar 11
+    /// wicks back down to it (the retest); bar 12 closes above 1.1090 and fires
+    /// the enter. Three consecutive bars, each carrying one step of the chain —
+    /// which is exactly what a 3-bar live catch-up folds into one tick.
+    fn break_retest_enter_candles() -> Vec<EngineCandle> {
+        let mut candles: Vec<EngineCandle> = (0..10).map(|i| candle(i * 3600, 1.1040)).collect();
+        // bar 10: break-and-close ABOVE 1.1050.
+        candles.push(ohlc(10 * 3600, 1.1042, 1.1070, 1.1040, 1.1065));
+        // bar 11: retest — wicks back DOWN to touch 1.1050, closes above.
+        candles.push(ohlc(11 * 3600, 1.1065, 1.1070, 1.1048, 1.1062));
+        // bar 12: closes above 1.1090 — the enter's OnClose cross.
+        candles.push(ohlc(12 * 3600, 1.1062, 1.1095, 1.1060, 1.1093));
+        // bars 13-14: run through the 1.1100 stop entry up to TP.
+        candles.push(ohlc(13 * 3600, 1.1095, 1.1150, 1.1090, 1.1140));
+        candles.push(ohlc(14 * 3600, 1.1140, 1.1310, 1.1135, 1.1300));
+        candles
+    }
+
+    /// Both preps fire and the enter is accepted — the geometry is correct, so
+    /// this is the control case for the catch-up test below.
+    #[tokio::test]
+    async fn per_bar_cadence_stamps_the_preps_apart_and_enters() {
+        let plan = ordered_prep_plan();
+        let r = super::run(
+            &plan,
+            &break_retest_enter_candles(),
+            Granularity::H1,
+            all_live(),
+            expires(),
+            no_marks(),
+            None,
+            CronCadence::PER_BAR,
+        )
+        .await;
+
+        let steps: Vec<&str> = r
+            .fires
+            .iter()
+            .filter(|f| f.fired.intent.action == Action::Prep)
+            .filter_map(|f| f.fired.intent.step.as_deref())
+            .collect();
+        assert_eq!(
+            steps,
+            vec!["break-and-close", "retest"],
+            "both preps fire, in order"
+        );
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("the enter fired");
+        assert!(
+            matches!(enter.gate_outcome, EnterGateOutcome::Placed { .. }),
+            "correct geometry + ordered preps ⇒ the enter places: {:?}",
+            enter.gate_outcome
+        );
+    }
+
+    /// **This is the test the whole flag exists for.**
+    ///
+    /// It pins the LIVE SHAPE, not a particular verdict: a 3-bar cron catch-up
+    /// must fold the break-and-close bar, the retest bar and the entry bar into
+    /// ONE `evaluate_plan` call sharing ONE `now`, so all three intents dispatch
+    /// under the same wall-clock instant — precisely the state that stamped two
+    /// preps identically on `hs-eur-cad-08ca0693` and rejected a
+    /// geometrically-correct entry with `prep-order-violated`.
+    ///
+    /// The verdict it asserts is the one the FIXED stamping produces: preps are
+    /// stamped with the **triggering bar's** time (`verified.shell.time`,
+    /// `core/src/dispatch/control.rs`), not wall-clock `now`, so the two stamps
+    /// stay an hour apart even inside one tick and the enter still places.
+    ///
+    /// Against the UNFIXED stamping (`set_at: now`) this test FAILS: the two
+    /// preps land on the identical `set_at`, `intent::resolve_slot`'s strict `>`
+    /// finds no qualifying alternative for the `retest` slot, and the enter is
+    /// rejected `prep-order-violated (retest)`. That is the regression this
+    /// pins — and it is only reachable offline because of the batching.
+    #[tokio::test]
+    async fn multi_bar_catch_up_shares_one_now_and_still_enters() {
+        let plan = ordered_prep_plan();
+        let candles = break_retest_enter_candles();
+        // Wide enough to swallow the break bar, the retest bar and the entry bar
+        // in a single tick — the live catch-up after a gap or a restart.
+        let r = super::run(
+            &plan,
+            &candles,
+            Granularity::H1,
+            all_live(),
+            expires(),
+            no_marks(),
+            None,
+            CronCadence::new(5),
+        )
+        .await;
+
+        // The batching genuinely happened: all three fires belong to ONE
+        // `evaluate_plan` call, so they share this tick's `now`. Nothing here
+        // depends on the fix — it is the precondition the fix is tested under.
+        let steps: Vec<&str> = r
+            .fires
+            .iter()
+            .filter(|f| f.fired.intent.action == Action::Prep)
+            .filter_map(|f| f.fired.intent.step.as_deref())
+            .collect();
+        assert_eq!(
+            steps,
+            vec!["break-and-close", "retest"],
+            "both preps must still fire inside the batch — otherwise this test \
+             is not exercising the catch-up at all"
+        );
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect(
+                "the enter must fire inside the batch; without it there is no \
+                 prep-ordering decision to test",
+            );
+        assert!(
+            !matches!(
+                enter.rejected_reason(),
+                Some(reason) if reason.contains("prep-order-violated")
+            ),
+            "a multi-bar catch-up must NOT reject a geometrically-correct entry \
+             for prep ordering — preps are stamped with the BAR time, so two \
+             fires in one tick keep their real order. Got: {:?}",
+            enter.gate_outcome
+        );
+        assert!(
+            matches!(enter.gate_outcome, EnterGateOutcome::Placed { .. }),
+            "and the entry places, exactly as at PER_BAR cadence: {:?}",
+            enter.gate_outcome
+        );
+    }
+
+    /// The batching must not change *which* bars the engine sees, only how many
+    /// per call: every cadence must fire the same rules against the same bars.
+    ///
+    /// Note this plan's enter is single-shot, so the plan retires on the entry
+    /// bar and the loop stops there at every cadence — which is itself the
+    /// assertion that a wide batch doesn't run past a terminal state.
+    #[tokio::test]
+    async fn every_cadence_fires_the_same_rules_against_the_same_bars() {
+        let plan = ordered_prep_plan();
+        let candles = break_retest_enter_candles();
+        let mut baseline: Option<Vec<(String, DateTime<Utc>)>> = None;
+        for width in 1..=6 {
+            let r = super::run(
+                &plan,
+                &candles,
+                Granularity::H1,
+                all_live(),
+                expires(),
+                no_marks(),
+                None,
+                CronCadence::new(width),
+            )
+            .await;
+            let fired: Vec<(String, DateTime<Utc>)> = r
+                .fires
+                .iter()
+                .map(|f| (f.fired.rule_id.clone(), f.fired.candle.time))
+                .collect();
+            match &baseline {
+                None => baseline = Some(fired),
+                Some(want) => assert_eq!(
+                    &fired, want,
+                    "cadence {width} must fire the same rules on the same bars                      as the per-bar walk"
+                ),
+            }
+        }
     }
 }

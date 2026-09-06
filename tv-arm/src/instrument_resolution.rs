@@ -214,6 +214,7 @@ fn broker_label(b: IlBroker) -> &'static str {
         IlBroker::Oanda => "oanda",
         IlBroker::TradeNation => "tradenation",
         IlBroker::TradingView => "tradingview",
+        IlBroker::Ibkr => "ibkr",
     }
 }
 

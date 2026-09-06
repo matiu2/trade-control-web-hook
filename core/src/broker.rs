@@ -85,9 +85,10 @@ impl Placement {
 
     /// Render the size + rate for a human-facing outcome line, e.g.
     /// `" size=1000 @ 1.10250"`. Empty when the broker reported neither, so
-    /// the caller's `entered: order=…` line is unchanged rather than growing a
-    /// dangling `size=?`. Deliberately says nothing about *fills*: `price` is
-    /// the requested rate (see the type docs).
+    /// the caller's `placed:`/`entered: order=…` line is unchanged rather than
+    /// growing a dangling `size=?`. Deliberately says nothing about *fills*:
+    /// `price` is the requested rate (see the type docs), and the caller picks
+    /// the verb from the ORDER TYPE (`core::dispatch::enter::placement_verb`).
     pub fn describe_fill(&self) -> String {
         let size = self
             .size
@@ -631,7 +632,7 @@ mod quote_tests {
     #[test]
     fn describe_fill_is_empty_when_the_broker_reported_nothing() {
         // The offline replay and a dry-run can't size. The outcome line must
-        // stay exactly `entered: order=…` rather than growing a dangling
+        // stay exactly `placed:`/`entered: order=…` rather than growing a dangling
         // `size=` the operator would read as a real (zero) size.
         assert_eq!(Placement::id_only("42").describe_fill(), "");
     }

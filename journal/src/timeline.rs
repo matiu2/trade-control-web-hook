@@ -262,7 +262,16 @@ fn compact_outcome(outcome: &str) -> String {
 }
 
 /// Derive the entry timestamp (Brisbane) — the ts of the first record whose
-/// outcome indicates a fill (`entered`). `None` if the plan never entered.
+/// outcome indicates a **fill** (`entered`). `None` if the plan never entered.
+///
+/// Deliberately does **not** match `placed:` — that is a resting stop/limit
+/// order sitting on the broker's book, which may never fill (Stage 6, see
+/// `placement_verb` in `core::dispatch::enter`). Stamping an entry time for one
+/// is how the 2026-08-07 incident (plan `hs-eur-cad-08ca0693`) reached the
+/// operator's journal as a WIN for a trade that never opened: two limit orders
+/// rested unfilled for an hour each and were cancelled, and the log called both
+/// `entered:`. When a resting order does later fill, that fill's own `entered:`
+/// record supplies the timestamp.
 pub fn derive_entry_ts(json: &str) -> Option<String> {
     let v: Value = serde_json::from_str(json).ok()?;
     let records = v.get("records")?.as_array()?;
@@ -277,7 +286,7 @@ pub fn derive_entry_ts(json: &str) -> Option<String> {
 }
 
 /// Derive the final outcome for the info bar: the last non-trivial record
-/// outcome (`entered`, `rejected: …`, `closed …`). Returns `(text, is_ok)`
+/// outcome (`entered`, `placed`, `rejected: …`, `closed …`). Returns `(text, is_ok)`
 /// where `is_ok` drives green vs red. Falls back to the plan's phase when no
 /// dispatch outcome is recorded.
 pub fn derive_outcome(json: &str) -> (String, bool) {
@@ -296,7 +305,14 @@ pub fn derive_outcome(json: &str) -> (String, bool) {
             if outcome.is_empty() {
                 continue;
             }
-            let ok = outcome.starts_with("entered") || outcome.starts_with("closed");
+            // `placed` (a resting stop/limit accepted onto the broker's book)
+            // is a SUCCESS as much as `entered` (a fill) — the fire did what it
+            // set out to do. Only the *fill* question is different, and that is
+            // `derive_entry_ts`'s job, not this one's. Omitting `placed` here
+            // would paint every good resting-order placement red.
+            let ok = outcome.starts_with("entered")
+                || outcome.starts_with("placed")
+                || outcome.starts_with("closed");
             result = Some((outcome.to_string(), ok));
         }
     }
@@ -588,6 +604,63 @@ mod tests {
 
         let (text, ok) = derive_outcome(&timeline("close-failed: broker-errored"));
         assert!(!ok, "a broker error must render red, got {text:?}");
+    }
+
+    /// Stage 6: a resting stop/limit reports `placed: order=…` rather than
+    /// `entered: order=…`, because a placement is not a fill. Both are
+    /// SUCCESSES — the order reached the broker's book — so both must colour
+    /// green. Leaving `placed` off the success list would paint a perfectly
+    /// good resting-limit placement red, which is the same misreading this
+    /// module's `close_outcome_strings_colour_correctly` guards against.
+    #[test]
+    fn a_placed_resting_order_colours_green_like_an_entry() {
+        let timeline = |outcome: &str| format!(r#"{{"records":[{{"outcome":"{outcome}"}}]}}"#);
+        for success in [
+            "placed: order=2318 size=672809 @ 1.59",
+            "entered: order=2318 size=672809 @ 1.59",
+        ] {
+            let (text, ok) = derive_outcome(&timeline(success));
+            assert!(ok, "{success:?} reached the broker and must render green");
+            assert_eq!(text, success);
+        }
+    }
+
+    /// …but only a FILL sets the entry timestamp. This is the whole point of
+    /// the Stage 6 split: the 2026-08-07 incident logged two resting limits as
+    /// `entered:`, and the journal stamped an entry time for a position that
+    /// never existed, which is how it reached the operator as a WIN +2.63R.
+    ///
+    /// A `placed:` record must NOT stamp an entry time. When a later fill
+    /// follows, that `entered:` record is the one that does.
+    #[test]
+    fn a_placed_resting_order_does_not_stamp_an_entry_time() {
+        let one = |outcome: &str| {
+            format!(r#"{{"records":[{{"outcome":"{outcome}","ts":"2026-08-07T16:00:41Z"}}]}}"#)
+        };
+        assert_eq!(
+            derive_entry_ts(&one("placed: order=2318")),
+            None,
+            "THE INCIDENT: a resting order never filled, so there is no entry time"
+        );
+        assert!(
+            derive_entry_ts(&one("entered: order=2318")).is_some(),
+            "a real fill still stamps an entry time"
+        );
+    }
+
+    /// And when a resting order later fills, the entry time is the FILL's, not
+    /// the placement's — the two records differ by an hour in the incident.
+    #[test]
+    fn a_fill_after_a_placement_stamps_the_fills_time() {
+        let json = r#"{"records":[
+            {"outcome":"placed: order=2318","ts":"2026-08-07T16:00:41Z"},
+            {"outcome":"entered: order=2318","ts":"2026-08-07T17:30:00Z"}
+        ]}"#;
+        let ts = derive_entry_ts(json).expect("the fill stamps an entry time");
+        assert!(
+            ts.contains("17:30") || ts.contains("03:30"),
+            "the FILL's ts must win over the placement's, got {ts}"
+        );
     }
 
     #[test]

@@ -217,7 +217,14 @@ pub async fn prep(store: &impl StateStore, tag: &str) {
 
     // Scoped per account — the 2026-06 bug fix.
     store
-        .set_prep(Some("acct-a"), &instr, "break-and-close", now, 3600, "id-a")
+        .set_prep(
+            Some("acct-a"),
+            &instr,
+            "break-and-close",
+            PrepStamp::at(now),
+            3600,
+            "id-a",
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -247,7 +254,14 @@ pub async fn prep(store: &impl StateStore, tag: &str) {
 
     // Scoped clear returns the setter id and is per-scope.
     store
-        .set_prep(Some("acct-b"), &instr, "break-and-close", now, 3600, "id-b")
+        .set_prep(
+            Some("acct-b"),
+            &instr,
+            "break-and-close",
+            PrepStamp::at(now),
+            3600,
+            "id-b",
+        )
         .await
         .unwrap();
     let cleared = store
@@ -271,7 +285,7 @@ pub async fn prep(store: &impl StateStore, tag: &str) {
     // Global prep satisfies every account.
     let g = format!("{tag}-PREPG");
     store
-        .set_prep(None, &g, "break", now, 3600, "id-g")
+        .set_prep(None, &g, "break", PrepStamp::at(now), 3600, "id-g")
         .await
         .unwrap();
     assert_eq!(
@@ -283,11 +297,11 @@ pub async fn prep(store: &impl StateStore, tag: &str) {
     // Re-set overwrites the timestamp.
     let later = now + chrono::Duration::minutes(5);
     store
-        .set_prep(None, &g, "retest", now, 3600, "id-1")
+        .set_prep(None, &g, "retest", PrepStamp::at(now), 3600, "id-1")
         .await
         .unwrap();
     store
-        .set_prep(None, &g, "retest", later, 3600, "id-2")
+        .set_prep(None, &g, "retest", PrepStamp::at(later), 3600, "id-2")
         .await
         .unwrap();
     assert_eq!(

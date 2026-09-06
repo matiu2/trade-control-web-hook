@@ -135,7 +135,9 @@ mod tests {
                 oanda: Some("TEST".into()),
                 tradenation: None,
                 tradingview: Some("TEST".into()),
+                ibkr: None,
             },
+            futures: None,
         }
     }
 
