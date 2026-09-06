@@ -4,6 +4,7 @@
 mod admin_client;
 mod admin_secret;
 mod calendar_bars;
+pub mod close_out_check;
 mod control;
 mod expiry;
 pub mod fixtures_dir;

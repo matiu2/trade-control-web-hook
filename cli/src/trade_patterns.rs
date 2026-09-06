@@ -27,7 +27,6 @@ use dialoguer::{FuzzySelect, Input};
 use serde::{Deserialize, Serialize};
 
 use trade_control_conventions::AlertBasename;
-use trade_control_core::contract_calendar;
 use trade_control_core::intent::{
     Action, BlackoutCloseAction, BrokerKind, Direction, EntrySpec, Intent, MW_CANCEL_VETO_NAME,
     MW_OVERSHOOT_VETO_NAME, PriceAnchor, PriceRef, RecoverEntry, RecoverEntryAction, TakeProfit,
@@ -35,11 +34,11 @@ use trade_control_core::intent::{
 };
 use trade_control_core::sig::KEY_LEN;
 
+use crate::close_out_check::{self, CloseOutVerdict};
 use crate::control::{
     wrap_signed_direct_enter, wrap_signed_template, wrap_signed_template_drawing,
 };
 use crate::expiry;
-use crate::futures_symbol;
 use crate::instruments::validate_instrument;
 
 /// Default lifetime of the entry window expressed as a percentage of the
@@ -1464,71 +1463,40 @@ fn check_futures_close_out(
     now: DateTime<Utc>,
     strictness: BuildStrictness,
 ) -> Result<()> {
-    let contract = match futures_symbol::parse(&spec.instrument, now.year()) {
-        Some(c) => c,
-        // Not a futures symbol. On a CFD broker that is the overwhelmingly
-        // common case and there is nothing to check. On IBKR it means we cannot
-        // identify the contract at all, so there is no deadline to honour.
-        None if spec.broker == BrokerKind::Ibkr => {
-            let refusal = eyre!(
-                "this is an IBKR plan, but {:?} does not name a futures contract \
-                 (expected a form like `GCZ6` or `GC 202612`), so its close-out \
-                 deadline cannot be checked — refusing to arm.",
-                spec.instrument,
-            );
-            return match strictness {
-                BuildStrictness::Strict => Err(refusal),
-                BuildStrictness::Lenient => {
-                    tracing::warn!("{refusal}");
-                    Ok(())
-                }
-            };
-        }
-        None => return Ok(()),
-    };
-    let direction = spec.pattern.direction();
     // The whole window has to fit, so the question is asked about the last
     // moment the plan can still enter, not about now.
     let expiry_day = spec.trade_expiry.date_naive();
-    let armable = contract_calendar::is_armable_on(
-        &contract.root,
-        &contract.contract_month,
-        direction,
-        expiry_day,
-    );
+    let direction = spec.pattern.direction();
+    let verdict = close_out_check::verdict(&spec.instrument, direction, expiry_day, now.year());
     let side = match direction {
         Direction::Long => "long",
         Direction::Short => "short",
     };
-    let refusal = match armable {
-        Some(true) => return Ok(()),
-        Some(false) => {
-            let arm_by = contract_calendar::arm_by_deadline(
-                &contract.root,
-                &contract.contract_month,
-                direction,
-            );
-            let deadline = contract_calendar::close_out_deadline(
-                &contract.root,
-                &contract.contract_month,
-                direction,
-            );
-            eyre!(
-                "{} {} is past its close-out arming window for a {side}: trade_expiry \
-                 {} runs beyond the last armable day {}, and IBKR force-liquidates \
-                 without notice from {}. Arm the next contract month instead.",
-                contract.root,
-                contract.contract_month,
-                expiry_day,
-                arm_by
-                    .map(|d| d.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                deadline
-                    .map(|d| d.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-            )
-        }
-        None => eyre!(
+    let refusal = match &verdict {
+        // Not a futures symbol. On a CFD broker that is the overwhelmingly
+        // common case and there is nothing to check. On IBKR it means we cannot
+        // identify the contract at all, so there is no deadline to honour.
+        CloseOutVerdict::NotFutures if spec.broker == BrokerKind::Ibkr => eyre!(
+            "this is an IBKR plan, but {:?} does not name a futures contract \
+             (expected a form like `GCZ6` or `GC 202612`), so its close-out \
+             deadline cannot be checked — refusing to arm.",
+            spec.instrument,
+        ),
+        CloseOutVerdict::NotFutures | CloseOutVerdict::Armable { .. } => return Ok(()),
+        CloseOutVerdict::PastArmingWindow {
+            contract,
+            arm_by,
+            close_out,
+            acts_until,
+        } => eyre!(
+            "{} {} is past its close-out arming window for a {side}: trade_expiry \
+             {acts_until} runs beyond the last armable day {arm_by}, and IBKR \
+             force-liquidates without notice from {close_out}. Arm the next \
+             contract month instead.",
+            contract.root,
+            contract.contract_month,
+        ),
+        CloseOutVerdict::UnknownContract { contract } => eyre!(
             "{} {} is not in the contract calendar, so its close-out deadline is \
              unknown — refusing to arm. IBKR force-liquidates expiring positions \
              without notice, so an unknown contract is never safe. Regenerate the \
@@ -1542,8 +1510,6 @@ fn check_futures_close_out(
         BuildStrictness::Lenient => {
             tracing::warn!(
                 instrument = %spec.instrument,
-                root = %contract.root,
-                contract_month = %contract.contract_month,
                 side,
                 "close-out check failed but allowed because this is an offline \
                  --plan-out build (would be rejected on the live worker path): {refusal}",
