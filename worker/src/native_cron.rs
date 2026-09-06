@@ -24,7 +24,7 @@ use trade_control_core::tick_bundle::TickBundle;
 use trade_control_cron::{BrokerHandle, CronEnv};
 
 use crate::http::AppState;
-use crate::{acquire_oanda, acquire_tn, build_dispatch_config_native};
+use crate::{acquire_ibkr, acquire_oanda, acquire_tn, build_dispatch_config_native};
 
 /// Native [`CronEnv`]: resolves the engine's three backend ops from Postgres +
 /// `Secrets`. Cheap to clone (an `Arc` bump); the scheduler holds one and drives
@@ -89,16 +89,13 @@ impl CronEnv for NativeCronEnv {
                     None
                 }
             },
-            // No IBKR broker until Stage 6. `None` skips the plan with a loud
-            // log rather than routing it to a broker that would trade a
-            // different instrument entirely.
-            BrokerKind::Ibkr => {
-                tracing::error!(
-                    "cron: ibkr broker not implemented, skipping account '{}'",
-                    meta.name
-                );
-                None
-            }
+            BrokerKind::Ibkr => match acquire_ibkr(&meta).await {
+                Ok(b) => Some(BrokerHandle::Ibkr(b)),
+                Err(err) => {
+                    tracing::error!("cron: ibkr acquire failed for '{}': {err}", meta.name);
+                    None
+                }
+            },
         }
     }
 

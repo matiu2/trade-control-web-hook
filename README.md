@@ -2402,6 +2402,43 @@ Delayed COMEX/CME data would make that gate read a stale spread — either
 blocking every entry or waving through a trade whose stop sits inside the real
 spread — so it fails closed until a live entitlement is confirmed.
 
+### Setting up an IBKR account
+
+IBKR needs a **local IB Gateway** running and logged in — it issues no bearer
+token to a retail account, so a Java process holds the session and the worker
+connects to its socket. Consequences worth knowing up front:
+
+- The Gateway forces a **daily restart** and a **weekly re-authentication**, so
+  a long-running worker must tolerate a disconnect window. (A supervisor — IBC
+  — is not installed yet.)
+- The Gateway address is **derived from the account's kind**, not configured:
+  demo ⇒ `127.0.0.1:4002` (paper), live ⇒ `127.0.0.1:4001`. Deriving it removes
+  the failure mode a configurable field would add — a live account pointed at
+  the paper port, or the reverse.
+- An IBKR account's security boundary is the Gateway process and the loopback
+  socket. `Credentials::Ibkr` holds no secret, which is not an omission.
+
+```sh
+# the account id is the one the Gateway login fronts (DU… paper, U… live)
+trade-control-accounts add --broker ibkr --kind demo \
+    --oanda-account-id DUR300718 ibkr-paper
+
+# verify the session — this checks the CONNECTION, which is the thing that
+# actually breaks; it does not fetch a quote (see the market-data note above)
+trade-control-broker-check ibkr-paper
+```
+
+```
+account 'ibkr-paper' → broker=ibkr kind=Demo
+OK — IB Gateway session is live for account 'ibkr-paper'.
+NOTE: no quote was fetched — IBKR market data is not wired up yet
+(entitlement unconfirmed), so this checked the connection only.
+```
+
+⚠️ `--oanda-account-id` is the metadata slot IBKR reuses for its own account id.
+The name is historical; it is the generic "which sub-account under this login"
+field, and IBKR **requires** it just as OANDA does.
+
 ### Broker trait surface (contributor note)
 
 Each broker crate implements the `Broker` trait in `core/src/broker.rs`.

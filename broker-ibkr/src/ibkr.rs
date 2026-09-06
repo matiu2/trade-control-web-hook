@@ -67,7 +67,10 @@ pub enum IbkrError {
 impl std::fmt::Display for IbkrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Connect(msg) => write!(f, "ibkr gateway connect failed: {msg}"),
+            // Deliberately unprefixed: every caller wraps this in its own
+            // "connect failed" context, and prefixing here stutters
+            // ("connect failed: connect failed: …") in the operator's error.
+            Self::Connect(msg) => f.write_str(msg),
         }
     }
 }

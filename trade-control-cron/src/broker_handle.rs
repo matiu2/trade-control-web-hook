@@ -12,4 +12,8 @@
 pub enum BrokerHandle {
     Oanda(broker_oanda::OandaBroker),
     TradeNation(broker_tradenation_adapter::TradeNationAdapter),
+    /// IBKR futures. Sizing is implemented; order transmission is not, so every
+    /// Gateway-touching call on this arm currently fails loudly rather than
+    /// answering plausibly — see `broker-ibkr`'s module docs.
+    Ibkr(broker_ibkr::IbkrBroker),
 }

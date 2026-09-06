@@ -39,6 +39,32 @@ pub struct OandaCreds {
     pub account_id: String,
 }
 
+/// Credentials for an IBKR account.
+///
+/// **There is no secret here, and that is not an omission.** IBKR issues no
+/// bearer token to a retail account: a local IB Gateway process holds the
+/// authenticated session and this system connects to its socket. So what
+/// identifies an IBKR account is *where the Gateway is* and *which sub-account
+/// to trade*, not a credential.
+///
+/// The consequence worth knowing: an IBKR account's security boundary is the
+/// Gateway process and the loopback socket, not anything stored here. Nothing
+/// in this struct is sensitive, and nothing in it can authenticate on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IbkrCreds {
+    /// `host:port` of the Gateway — conventionally `127.0.0.1:4002` for paper
+    /// and `127.0.0.1:4001` for live. Carried per-account rather than baked as
+    /// a constant so paper and live accounts can be configured side by side.
+    pub gateway: String,
+    /// The IBKR account id to trade (e.g. `DU1234567` for paper). A Gateway
+    /// login can front several accounts, so this is required, not derived.
+    pub account_id: String,
+    /// API client id. Must be unique among everything connected to that
+    /// Gateway — the Gateway rejects a duplicate outright — so each configured
+    /// account carries its own.
+    pub client_id: i32,
+}
+
 /// Tagged credential payload. The tag matches the account's
 /// `broker` field in metadata; the worker enforces consistency at the
 /// boundary so a TradeNation account never resolves OANDA creds.
@@ -47,6 +73,7 @@ pub struct OandaCreds {
 pub enum Credentials {
     TradeNation(TradeNationCreds),
     Oanda(OandaCreds),
+    Ibkr(IbkrCreds),
 }
 
 /// Async resolver for an account's credentials.
@@ -140,6 +167,47 @@ mod tests {
         let json = serde_json::to_string(&creds).unwrap();
         let back: Credentials = serde_json::from_str(&json).unwrap();
         assert_eq!(back, creds);
+    }
+
+    #[test]
+    fn ibkr_creds_serialise_with_tag() {
+        let creds = Credentials::Ibkr(IbkrCreds {
+            gateway: "127.0.0.1:4002".into(),
+            account_id: "DU1234567".into(),
+            client_id: 100,
+        });
+        let json = serde_json::to_string(&creds).unwrap();
+        assert!(json.contains(r#""broker":"ibkr""#), "{json}");
+        assert!(json.contains(r#""account_id":"DU1234567""#), "{json}");
+    }
+
+    #[test]
+    fn round_trip_ibkr() {
+        let creds = Credentials::Ibkr(IbkrCreds {
+            gateway: "127.0.0.1:4001".into(),
+            account_id: "U7654321".into(),
+            client_id: 7,
+        });
+        let json = serde_json::to_string(&creds).unwrap();
+        let back: Credentials = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, creds);
+    }
+
+    /// The broker tag is the discriminator, so an IBKR payload must never
+    /// deserialise as another broker's credentials (or vice versa). A tag
+    /// collision would resolve the wrong client for an account.
+    #[test]
+    fn an_ibkr_payload_does_not_parse_as_another_broker() {
+        let json =
+            r#"{"broker":"ibkr","gateway":"127.0.0.1:4002","account_id":"DU1","client_id":1}"#;
+        let parsed: Credentials = serde_json::from_str(json).unwrap();
+        assert!(matches!(parsed, Credentials::Ibkr(_)), "{parsed:?}");
+
+        // And an OANDA payload keeps parsing as OANDA — the new variant must
+        // not shadow an existing one.
+        let oanda = r#"{"broker":"oanda","api_key":"k","account_id":"001"}"#;
+        let parsed: Credentials = serde_json::from_str(oanda).unwrap();
+        assert!(matches!(parsed, Credentials::Oanda(_)), "{parsed:?}");
     }
 
     #[test]

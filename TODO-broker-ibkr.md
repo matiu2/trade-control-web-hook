@@ -59,13 +59,51 @@ to `EntryRequest` (6 construction sites).
 - [x] `get_quote` fails closed. Market data is not optional: `sl_spread_floor`
       is a hard entry gate reading live spread as a safety signal.
 
-## 6c — wiring
+## 6c — wiring — **DONE**
 
-- [ ] `BrokerHandle::Ibkr` + the cron match sites (~66 refs across 12 files).
-- [ ] `Credentials::Ibkr` — deferred from Stage 4 deliberately, because IBKR
-      authenticates via the Gateway socket, not a token. Now the broker exists
-      to say what it needs.
-- [ ] `broker_factory::acquire_ibkr` + `native_cron.rs` / `http.rs`.
+- [x] `BrokerHandle::Ibkr` + **16** cron match arms across 7 files, every one
+      compile-enforced. Each arm delegates to the same generic body, so they
+      were generated from the TradeNation arm rather than hand-written — arms
+      that must stay identical are exactly where hand-writing drifts.
+- [x] `Credentials::Ibkr` / `IbkrCreds` — deferred from Stage 4 deliberately,
+      because IBKR issues no bearer token. **There is no secret in it**: the
+      Gateway process holds the session, so what identifies an account is
+      *where the Gateway is* and *which sub-account to trade*. An IBKR
+      account's security boundary is the Gateway process and the loopback
+      socket, not anything stored here.
+- [x] `broker_factory::acquire_ibkr` + `native_cron.rs` + `http.rs`.
+- [x] `trade-control-broker-check` gained a real IBKR arm — see below.
+
+### Two decisions worth knowing
+
+**The Gateway address is derived from `kind`, not configured.** Demo ⇒ paper
+port 4002, live ⇒ live port 4001. A configurable field would introduce the
+failure mode of a live account pointed at paper — or, far worse, the reverse.
+This matches how OANDA already picks its host from `kind.is_live()`.
+
+**IBKR reuses the `oanda_account_id` metadata slot.** Not ideal naming, but a
+third broker-specific field answering the same question ("which sub-account
+under this login") would be worse. `DUR300718` for paper, `U…` for live.
+
+### `broker-check` now checks what it actually can
+
+Stage 4 made it refuse outright. But IBKR's liveness question is the
+**connection**, not a quote: the Gateway is a local Java process that
+force-restarts daily and re-authenticates weekly, so it is precisely the thing
+that breaks — while `get_quote` is unimplemented pending market data. It now
+verifies the session and says plainly what it did *not* check.
+
+Two error-message details, both found by running the binary rather than by a
+test:
+
+- The "connecting to the IB Gateway…" announcement was printed *before* the
+  check that fails without connecting, so a missing account id read as a
+  connection problem. Removed.
+- `IbkrError::Connect` and `BrokerError::IbkrConnect` both prefixed "ibkr
+  gateway connect failed", so the operator saw it twice. The inner type now
+  carries only the cause.
+- The "is IB Gateway running?" hint is scoped to `IbkrConnect` alone; appending
+  it to a config error points the operator at the wrong thing.
 
 ## Tests (the correctness anchors)
 
@@ -94,6 +132,25 @@ Per `verify_new_analysis_code_by_mutation` — **10 applied, 10 killed**:
 - [x] Zero size mapped to `ContractSizeUnavailable` ⇒ 2 tests.
 - [x] The size-grid fit skipped entirely ⇒ its test.
 - [x] Open-positions cap `>=` -> `>` ⇒ its test.
+- [x] Paper and live Gateway ports swapped ⇒ `the_gateway_port_follows_the_account_kind`.
+- [x] Missing IBKR account id defaulted instead of refused ⇒ its test.
+- [x] Client-id floor dropped ⇒ `the_client_id_floor_holds_at_the_extremes`.
+- [x] Client-id span narrowed back to 60k ⇒ `ibkr_client_ids_do_not_collide_across_many_accounts`.
+
+### A mutation that found a real bug, not a missing test
+
+Removing the client-id floor initially survived, so the test was widened to
+sweep 2,000 generated names — **and that sweep went red on the collision
+check**: hashing into a 60,000-wide range collides across a few hundred
+accounts (the birthday paradox), and a duplicate client id is rejected by the
+Gateway outright, so the second account simply cannot connect while the first
+is up. An outage that only appears once both are live. The range is now the
+full positive `i32` above the floor.
+
+The widened sweep still could not kill the floor mutation — over a range that
+wide, random names never land near the floor, so it asserted a guarantee it had
+no power to check. The mapping is now a pure `client_id_from_hash` tested at
+`0`, `1` and `u64::MAX`, where the floor is actually falsifiable.
 
 ### The one that got away first time
 
@@ -154,4 +211,25 @@ Pinned as `bracket_can_carry` + `only_market_and_limit_entries_fit_a_bracket` so
 the order path starts from the constraint rather than rediscovering it against a
 live Gateway.
 
-## Status: 6a + 6b DONE, 6c IN PROGRESS
+## Verified against real binaries, against the LIVE paper Gateway
+
+Not just unit tests. The Gateway was up on `127.0.0.1:4002` throughout:
+
+- `trade-control-accounts add --broker ibkr --kind demo --oanda-account-id DUR300718 ibkr-paper`
+  ⇒ stored, and `list` reads it back as `ibkr`.
+- `trade-control-broker-check ibkr-paper` ⇒ **`OK — IB Gateway session is
+  live`**. The whole path works end to end: account row → `BrokerKind::Ibkr` →
+  `acquire_ibkr` → derived paper port → hashed client id → a real Gateway
+  session.
+- An IBKR account with no account id ⇒ refused *before* any socket work, with
+  a message naming the actual fault.
+- A `--kind live` account ⇒ routed to port 4001 (nothing listening) ⇒
+  `Connection refused` **plus** the Gateway hint. This also proves the
+  demo/live port derivation, which no unit test can.
+- The account id's `--help` said "ignored for TradeNation" and did not mention
+  IBKR needs it. Corrected.
+
+`ibkr-paper` (`DUR300718`) is left configured — it is a working paper account
+Stage 9 needs, and nothing can place an order through it yet.
+
+## Status: 6a + 6b + 6c DONE — Stage 6 complete

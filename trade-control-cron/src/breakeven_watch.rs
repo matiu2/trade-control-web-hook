@@ -239,6 +239,7 @@ async fn fetch_candles(
     let res = match broker {
         BrokerHandle::Oanda(b) => b.get_candles(instrument, granularity, since, now).await,
         BrokerHandle::TradeNation(b) => b.get_candles(instrument, granularity, since, now).await,
+        BrokerHandle::Ibkr(b) => b.get_candles(instrument, granularity, since, now).await,
     };
     match res {
         Ok(c) => Some(c),
@@ -256,6 +257,7 @@ async fn list_positions(
     let res = match broker {
         BrokerHandle::Oanda(b) => b.list_open_positions(account_id).await,
         BrokerHandle::TradeNation(b) => b.list_open_positions(account_id).await,
+        BrokerHandle::Ibkr(b) => b.list_open_positions(account_id).await,
     };
     res.map_err(|e| e.to_string())
 }
@@ -269,6 +271,7 @@ async fn amend(
     match broker {
         BrokerHandle::Oanda(b) => b.amend_stop(account_id, id, new_stop).await,
         BrokerHandle::TradeNation(b) => b.amend_stop(account_id, id, new_stop).await,
+        BrokerHandle::Ibkr(b) => b.amend_stop(account_id, id, new_stop).await,
     }
 }
 

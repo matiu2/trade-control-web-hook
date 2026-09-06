@@ -4672,6 +4672,7 @@ dependencies = [
 name = "trade-control-cron"
 version = "0.1.0"
 dependencies = [
+ "broker-ibkr",
  "broker-oanda",
  "broker-tradenation",
  "broker-tradenation-adapter",
@@ -4720,6 +4721,7 @@ name = "trade-control-worker"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "broker-ibkr",
  "broker-oanda",
  "broker-tradenation",
  "broker-tradenation-adapter",

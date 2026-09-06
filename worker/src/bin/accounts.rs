@@ -134,8 +134,10 @@ enum Command {
         /// Demo or live.
         #[arg(long)]
         kind: KindArg,
-        /// OANDA sub-account id (required for `--broker oanda`; ignored for
-        /// TradeNation, where the session identifies the account).
+        /// Broker sub-account id. **Required** for `--broker oanda` (the
+        /// sub-account under the shared API key) and for `--broker ibkr` (the
+        /// account under the Gateway login, e.g. `DUR300718` for paper).
+        /// Ignored for TradeNation, where the session identifies the account.
         #[arg(long)]
         oanda_account_id: Option<String>,
         /// Optional per-account max risk % (tighter than the worker-wide cap).
