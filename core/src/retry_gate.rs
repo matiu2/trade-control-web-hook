@@ -29,9 +29,19 @@
 //! When the operator opts a setup into multi-shot mode by setting
 //! `max_retries: N` (any non-default Tunable, i.e. anything that isn't
 //! `Static(0)`) and a `trade_id`, the alert may legitimately fire on
-//! multiple firing bars within the `not_after` window. Each arrival
-//! flows through this gate before reaching the cooldown / prep / veto
-//! checks and the broker placement.
+//! multiple firing bars within the `not_after` window.
+//!
+//! **Where this gate runs, and why it must stay there.** It is the LAST thing
+//! `run_enter` does before `place_entry` — *after* the cooldown / prep / veto /
+//! `allow_entry` / blackout / spread-floor gates, not before them. Job 2 below
+//! **cancels a resting order at the broker**, on the understanding that the
+//! caller immediately places a fresh one. If any gate could still reject the
+//! fire after that cancel, the order is destroyed with nothing to replace it —
+//! the rail `order_control::reprice` states as "never cancel an order you
+//! cannot re-place". This gate ran first until 2026-09; the ordering bug
+//! forfeited a live EUR/CAD setup on 2026-08-07 (resting limit 2318 cancelled,
+//! fire then rejected `prep-order-violated (retest)`, nothing re-placed). See
+//! the rail comment at the call site in `dispatch::enter::run_enter`.
 //!
 //! The gate has three jobs:
 //!
@@ -291,12 +301,35 @@ pub async fn evaluate<B: Broker, S: StateStore>(
                     outcome: "rejected: trade-already-open".into(),
                 };
             }
-            Ok(AttemptState::ClosedWin { .. })
-            | Ok(AttemptState::ClosedLossOrBreakeven { .. })
-            | Ok(AttemptState::Cancelled) => {
+            Ok(AttemptState::ClosedWin { .. }) | Ok(AttemptState::ClosedLossOrBreakeven { .. }) => {
                 // Collapsed state — this attempt is provably done. Look
                 // at the next-older attempt; if none remain, fall
                 // through to the cap check.
+                continue;
+            }
+            Ok(AttemptState::Cancelled) => {
+                // Also collapsed, so the walk continues exactly as above — but
+                // this one gets its own line, because it is the state nobody
+                // could see.
+                //
+                // A `Cancelled` attempt is an order that reached the broker's
+                // book and came off it **without ever filling**: no position was
+                // opened, and no fill or exit will ever be recorded against it.
+                // That is a materially different history from a closed win or
+                // loss, and it is the state the 2026-08-07 incident produced
+                // (plan `hs-eur-cad-08ca0693`: limit orders 2316 and 2318, both
+                // rested ~1h, both cancelled, `opened_trade_id: null`).
+                //
+                // It was previously folded into the silent `continue` above, so
+                // the plan sat blocked for eleven days with nothing in the log
+                // naming the entry as the problem — the only visible signal was
+                // a later `close-failed`, which reads as a *closing* fault. This
+                // line is the entry-side counterpart the operator was missing.
+                tracing::info!(
+                    "retry: prior attempt #{} was CANCELLED WITHOUT EVER FILLING — no position                      was ever opened by it (trade_id={trade_id} order_id={}); continuing to the                      next-older attempt",
+                    attempt.attempt_no,
+                    attempt.broker_order_id,
+                );
                 continue;
             }
             Ok(AttemptState::Unknown) => {
@@ -717,7 +750,7 @@ mod tests {
             _account: Option<&str>,
             _instrument: &str,
             _step: &str,
-            _now: DateTime<Utc>,
+            _stamp: crate::state::PrepStamp,
             _ttl_seconds: u64,
             _setter_id: &str,
         ) -> Result<(), StateError> {

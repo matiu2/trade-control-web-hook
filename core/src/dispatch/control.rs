@@ -26,8 +26,8 @@ use super::veto::format_veto_set_outcome;
 use crate::control_event::ControlKind;
 use crate::incoming::{self, Verified};
 use crate::state::{
-    ArchivedPlan, StateError, StateStore, StoredPlan, clear_named_preps, clear_named_vetos,
-    veto_ttl_seconds,
+    ArchivedPlan, PrepStamp, StateError, StateStore, StoredPlan, clear_named_preps,
+    clear_named_vetos, veto_ttl_seconds,
 };
 
 /// Response body for the `unlock` action. Serialised as YAML.
@@ -189,12 +189,22 @@ pub async fn handle_prep<S: StateStore>(
             Vec::new()
         }
     };
+    // Stamp the prep with the TRIGGERING BAR's time, not wall-clock. The live
+    // cron dispatches every fire of a multi-bar catch-up under one `Utc::now()`,
+    // so wall-clock stamped two preps identically and the enter's
+    // strictly-increasing chain (`intent::resolve_slot`) rejected the entry with
+    // `prep-order-violated` on correct geometry. `now` still drives the TTL,
+    // which legitimately is wall-clock. See `state::PrepStamp`.
+    let stamp = PrepStamp {
+        set_at: verified.shell.time,
+        now,
+    };
     if let Err(err) = store
         .set_prep(
             account,
             &verified.intent.instrument,
             step,
-            now,
+            stamp,
             ttl_seconds,
             &verified.intent.id,
         )
@@ -1123,5 +1133,287 @@ mod plan_show_tests {
         pollster::block_on(store.put_trade_plan(None, &sample_plan("hs-live-1"))).expect("put");
         let details = pollster::block_on(collect_plan_details(&store, "nope")).expect("collect");
         assert!(details.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod prep_bar_time_tests {
+    //! BUG C — a prep must be stamped with the **triggering bar's** time, not
+    //! wall-clock.
+    //!
+    //! The live cron hands *every* bar closed since the watermark to a single
+    //! `evaluate_plan` call, and dispatches every resulting fire under **one**
+    //! `Utc::now()` (`trade-control-cron/src/engine.rs`, looped in
+    //! `engine/src/evaluate.rs`). So a multi-bar catch-up — a gap, a restart, a
+    //! slow tick, the first tick after seeding — stamped two preps with an
+    //! identical `set_at`. The enter's prep gate requires **strictly
+    //! increasing** `set_at` across the ordered chain
+    //! ([`crate::intent::resolve_slot`]), so the entry was rejected
+    //! `prep-order-violated` on perfectly correct geometry.
+    //!
+    //! The incident (plan `hs-eur-cad-08ca0693`, 2026-08-07) left two rows
+    //! byte-identical to the microsecond:
+    //!
+    //! ```text
+    //! break-and-close | 2026-08-08 00:07:05.759557+10
+    //! retest          | 2026-08-08 00:07:05.759557+10
+    //! ```
+    //!
+    //! That spurious rejection is what made the retry gate destroy a resting
+    //! limit order with nothing placed. The fix stamps `set_at` from
+    //! `verified.shell.time`; `now` still drives the TTL, which legitimately is
+    //! wall-clock.
+    use super::*;
+    use crate::broker::Candle;
+    use crate::incoming::Verified;
+    use crate::intent::{Intent, Shell};
+    use crate::state::{MemStateStore, StateStore};
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s)
+            .expect("valid test timestamp")
+            .with_timezone(&Utc)
+    }
+
+    /// The single wall-clock instant a multi-bar catch-up tick dispatches
+    /// every one of its fires under.
+    fn tick_now() -> DateTime<Utc> {
+        at("2026-08-07T17:00:01Z")
+    }
+
+    /// A `prep` intent for `step`, deserialised from the wire JSON so a test
+    /// can't diverge from what a signed alert actually carries, with its shell
+    /// synthesised from the bar at `bar_time` — exactly as
+    /// `dispatch_fired` does via [`Shell::from_candle`].
+    fn prep_verified(step: &str, bar_time: &str) -> Verified {
+        let json = format!(
+            r#"{{
+                "v": 1,
+                "id": "t-1-prep-{step}",
+                "not_after": "2026-08-09T00:00:00Z",
+                "action": "prep",
+                "instrument": "EUR_CAD",
+                "step": "{step}",
+                "trade_id": "t-1",
+                "ttl_hours": 24
+            }}"#
+        );
+        let intent: Intent = serde_json::from_str(&json).expect("valid prep intent");
+        let shell = Shell::from_candle(&Candle {
+            time: at(bar_time),
+            o: 1.5880,
+            h: 1.5905,
+            l: 1.5875,
+            c: 1.5895,
+        });
+        Verified { shell, intent }
+    }
+
+    fn store_at_tick() -> MemStateStore {
+        let store = MemStateStore::new();
+        store.set_clock(tick_now());
+        store
+    }
+
+    /// THE BUG. Two preps dispatched inside ONE multi-bar catch-up share a
+    /// single `now`, but land on different bars. Their stored `set_at`s must
+    /// still be strictly increasing, or the ordered chain rejects.
+    #[test]
+    fn preps_in_one_multi_bar_tick_get_distinct_set_ats() {
+        let store = store_at_tick();
+        pollster::block_on(async {
+            // The 15:00 bar broke and closed; the 16:00 bar retested. The cron
+            // caught up over both and dispatched them under ONE `tick_now()`.
+            let bc = handle_prep(
+                &store,
+                &prep_verified("break-and-close", "2026-08-07T15:00:00Z"),
+                tick_now(),
+            )
+            .await;
+            assert!(bc.is_success(), "break-and-close prep: {}", bc.body);
+            let rt = handle_prep(
+                &store,
+                &prep_verified("retest", "2026-08-07T16:00:00Z"),
+                tick_now(),
+            )
+            .await;
+            assert!(rt.is_success(), "retest prep: {}", rt.body);
+
+            let bc_at = store
+                .get_prep(None, "EUR_CAD", "break-and-close")
+                .await
+                .expect("get break-and-close");
+            let rt_at = store
+                .get_prep(None, "EUR_CAD", "retest")
+                .await
+                .expect("get retest");
+            assert_eq!(
+                bc_at,
+                Some(at("2026-08-07T15:00:00Z")),
+                "a prep must be stamped with its triggering BAR's time"
+            );
+            assert_eq!(rt_at, Some(at("2026-08-07T16:00:00Z")));
+            assert!(
+                rt_at > bc_at,
+                "BUG C: preps from one multi-bar catch-up must be strictly \
+                 increasing, got break-and-close={bc_at:?} retest={rt_at:?}"
+            );
+        });
+    }
+
+    /// The gate the timestamps feed. Stamped by bar time, the incident's chain
+    /// SATISFIES rather than rejecting — this is the assertion that fails
+    /// under the wall-clock stamp.
+    #[test]
+    fn multi_bar_tick_preps_satisfy_the_ordered_chain() {
+        let store = store_at_tick();
+        let outcome = pollster::block_on(async {
+            handle_prep(
+                &store,
+                &prep_verified("break-and-close", "2026-08-07T15:00:00Z"),
+                tick_now(),
+            )
+            .await;
+            handle_prep(
+                &store,
+                &prep_verified("retest", "2026-08-07T16:00:00Z"),
+                tick_now(),
+            )
+            .await;
+            let mut alt_set_ats = Vec::new();
+            for step in ["break-and-close", "retest"] {
+                alt_set_ats.push(
+                    store
+                        .get_prep(None, "EUR_CAD", step)
+                        .await
+                        .expect("get prep"),
+                );
+            }
+            let first = crate::intent::resolve_slot(&alt_set_ats[..1], None);
+            let prev = match first {
+                crate::intent::SlotOutcome::Satisfied(t) => Some(t),
+                other => panic!("first slot must be satisfied, got {other:?}"),
+            };
+            crate::intent::resolve_slot(&alt_set_ats[1..], prev)
+        });
+        assert!(
+            matches!(outcome, crate::intent::SlotOutcome::Satisfied(_)),
+            "BUG C: a correct two-bar prep chain caught up in one tick must \
+             satisfy the ordered gate, got {outcome:?}"
+        );
+    }
+
+    /// The gate must keep its teeth: a chain whose preps genuinely landed out
+    /// of order still rejects. Stamping by bar time must not become a way to
+    /// launder a stale prep.
+    #[test]
+    fn genuinely_out_of_order_bars_still_reject() {
+        let store = store_at_tick();
+        let outcome = pollster::block_on(async {
+            // `retest` on the EARLIER bar than `break-and-close` — a real
+            // ordering violation, not a same-tick artefact.
+            handle_prep(
+                &store,
+                &prep_verified("retest", "2026-08-07T15:00:00Z"),
+                tick_now(),
+            )
+            .await;
+            handle_prep(
+                &store,
+                &prep_verified("break-and-close", "2026-08-07T16:00:00Z"),
+                tick_now(),
+            )
+            .await;
+            let bc = store
+                .get_prep(None, "EUR_CAD", "break-and-close")
+                .await
+                .expect("get break-and-close");
+            let rt = store
+                .get_prep(None, "EUR_CAD", "retest")
+                .await
+                .expect("get retest");
+            let prev = match crate::intent::resolve_slot(&[bc], None) {
+                crate::intent::SlotOutcome::Satisfied(t) => Some(t),
+                other => panic!("first slot must be satisfied, got {other:?}"),
+            };
+            crate::intent::resolve_slot(&[rt], prev)
+        });
+        assert_eq!(
+            outcome,
+            crate::intent::SlotOutcome::OutOfOrder,
+            "the ordered gate must keep rejecting a genuinely stale prep"
+        );
+    }
+
+    /// Two preps that really did fire on the SAME bar are still an ordering
+    /// violation. The fix must not be a `>=` in disguise: a same-bar retest
+    /// carries no ordering information and the gate is right to reject it.
+    #[test]
+    fn same_bar_preps_still_reject() {
+        let store = store_at_tick();
+        let outcome = pollster::block_on(async {
+            handle_prep(
+                &store,
+                &prep_verified("break-and-close", "2026-08-07T16:00:00Z"),
+                tick_now(),
+            )
+            .await;
+            handle_prep(
+                &store,
+                &prep_verified("retest", "2026-08-07T16:00:00Z"),
+                tick_now(),
+            )
+            .await;
+            let bc = store
+                .get_prep(None, "EUR_CAD", "break-and-close")
+                .await
+                .expect("get break-and-close");
+            let rt = store
+                .get_prep(None, "EUR_CAD", "retest")
+                .await
+                .expect("get retest");
+            let prev = match crate::intent::resolve_slot(&[bc], None) {
+                crate::intent::SlotOutcome::Satisfied(t) => Some(t),
+                other => panic!("first slot must be satisfied, got {other:?}"),
+            };
+            crate::intent::resolve_slot(&[rt], prev)
+        });
+        assert_eq!(
+            outcome,
+            crate::intent::SlotOutcome::OutOfOrder,
+            "a genuine same-bar retest must still be OutOfOrder — the fix is \
+             a re-stamp, not a loosened comparison"
+        );
+    }
+
+    /// The TTL stays on **wall-clock**. A bar is always at or behind `now`, so
+    /// deriving expiry from the bar time would silently shorten every prep's
+    /// life by the catch-up lag — hours, after a restart. Read back through a
+    /// clock advanced to just inside the wall-clock window: the prep is still
+    /// live.
+    #[test]
+    fn ttl_is_measured_from_wall_clock_not_the_bar() {
+        let store = store_at_tick();
+        pollster::block_on(async {
+            // A bar 20 hours behind the tick, with a 24h TTL. Measured from the
+            // bar it would already be within 4h of expiry; measured from `now`
+            // it has the full 24h.
+            let v = prep_verified("break-and-close", "2026-08-06T21:00:01Z");
+            let result = handle_prep(&store, &v, tick_now()).await;
+            assert!(result.is_success(), "prep set: {}", result.body);
+            // 23h after the tick — inside a wall-clock 24h TTL, far outside a
+            // bar-time one.
+            store.set_clock(tick_now() + chrono::Duration::hours(23));
+            let read = store
+                .get_prep(None, "EUR_CAD", "break-and-close")
+                .await
+                .expect("get prep");
+            assert_eq!(
+                read,
+                Some(at("2026-08-06T21:00:01Z")),
+                "the TTL must be measured from wall-clock `now`, so a prep set \
+                 off a lagging bar is not expired early"
+            );
+        });
     }
 }

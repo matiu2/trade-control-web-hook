@@ -115,7 +115,9 @@ pub struct DispatchOutcome {
     pub rule_id: String,
     /// The fired intent's `id` (the roadmap's `intent_id` — the fire key).
     pub intent_id: String,
-    /// The dispatch result string (e.g. `Ok(entered)`, `rejected: veto-active`),
+    /// The dispatch result string (e.g. `Ok(placed: order=…)` for a resting
+    /// stop/limit, `Ok(entered: order=…)` for a market fill,
+    /// `rejected: veto-active`),
     /// from `ActionResult::describe()`.
     pub outcome: String,
     /// Intra-tick fire ordering (the roadmap's `seq`) — wall-clock can't order

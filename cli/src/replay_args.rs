@@ -440,6 +440,23 @@ pub struct ReplayArgs {
     #[arg(long, value_name = "FILE", requires = "fixtures_glob")]
     pub bless_baseline: Option<PathBuf>,
 
+    /// Simulate a live cron **catch-up**: batch this many freshly-closed bars
+    /// into a SINGLE `evaluate_plan` call, sharing ONE `now` (the last bar's
+    /// close), instead of the default one-bar-per-tick walk.
+    ///
+    /// This is the live shape the replay could not otherwise construct. The live
+    /// cron takes one `Utc::now()` per tick (`worker/src/scheduler.rs`), fetches
+    /// every bar closed since the plan's watermark, and hands the whole slice to
+    /// one `evaluate_plan` call (`trade-control-cron/src/engine.rs`) — so a gap,
+    /// a worker restart, a slow tick, or the first tick after seeding processes N
+    /// bars under a single wall-clock instant. Anything timing-sensitive (prep
+    /// ordering, TTLs, cooldowns) behaves differently there, and no fixture was
+    /// ever evidence about it.
+    ///
+    /// `1` (the default) is exactly the historical behaviour, bar for bar.
+    #[arg(long, value_name = "BARS", default_value_t = 1)]
+    pub cron_gap: usize,
+
     /// Label recorded in a blessed baseline (e.g. `v113`), shown in later diffs
     /// as the "from" side. Defaults to the engine version the fixtures carry.
     #[arg(long, value_name = "LABEL", requires = "bless_baseline")]

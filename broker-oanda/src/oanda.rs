@@ -408,13 +408,64 @@ pub async fn lookup_attempt_state(
         None
     };
 
+    // Resolve against the snapshots first, with the fate unknown. The
+    // fate lookup is an extra round-trip, so only pay for it when the
+    // snapshots have actually come up empty — which is exactly the
+    // cancelled-before-filling case.
+    let from_snapshots = compute_attempt_state(
+        broker_order_id,
+        broker_trade_id,
+        &pending,
+        &open,
+        closed.as_deref(),
+        OrderFate::Unresolved,
+    );
+    if from_snapshots != AttemptState::Unknown {
+        return Ok(from_snapshots);
+    }
+
+    let fate = fetch_order_fate(client, account_id, broker_order_id).await;
     Ok(compute_attempt_state(
         broker_order_id,
         broker_trade_id,
         &pending,
         &open,
         closed.as_deref(),
+        fate,
     ))
+}
+
+/// Ask the broker what became of `broker_order_id`, for an order that
+/// is absent from every present-tense snapshot.
+///
+/// Never fails: a lookup that errors (network, 404 `NO_SUCH_ORDER`,
+/// unparseable body) yields [`OrderFate::Unresolved`], which the
+/// caller maps to [`AttemptState::Unknown`] — the fail-safe. The one
+/// thing this must never do is turn "I could not find out" into an
+/// optimistic `Cancelled`, which would let the retry gate stack a
+/// duplicate entry on a position it cannot see.
+async fn fetch_order_fate(
+    client: &OandaClient,
+    account_id: &str,
+    broker_order_id: &str,
+) -> OrderFate {
+    match client.get_order(account_id, broker_order_id).await {
+        Ok(record) if record.order.state.is_terminally_unfilled() => OrderFate::TerminallyUnfilled,
+        Ok(record) => {
+            tracing::info!(
+                "oanda get_order({broker_order_id}): state {:?} is not terminally unfilled",
+                record.order.state
+            );
+            OrderFate::Live
+        }
+        Err(err) => {
+            // An unknown id (404 NO_SUCH_ORDER) and a transient 5xx are
+            // not cheaply distinguishable here, and neither is evidence
+            // the order died — stay unresolved either way.
+            tracing::error!("oanda get_order({broker_order_id}): {err:?}");
+            OrderFate::Unresolved
+        }
+    }
 }
 
 /// Cancel a specific pending order by id. Wraps the OANDA REST call
@@ -582,6 +633,35 @@ fn oanda_order_to_pending(o: &PendingOrder) -> Option<CorePendingOrder> {
     })
 }
 
+/// What the broker's own order record says became of an order, for an
+/// order that is absent from all three present-tense snapshots.
+///
+/// The three snapshots ([`AttemptState`] steps 1-3) are all present
+/// tense: what is resting *now*, what is open *now*, what closed
+/// recently. Cancellation is a **historical** event, so an order
+/// cancelled before it ever filled appears in none of them — it has
+/// simply vanished, and no amount of care with those three lists can
+/// recover its fate. `GET /v3/accounts/{id}/orders/{id}` can, because
+/// the order record carries a terminal `state`.
+///
+/// Kept as data rather than an I/O call inside
+/// [`compute_attempt_state`], so that function stays pure and every
+/// branch stays unit-testable without a live client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderFate {
+    /// The broker's record says the order reached a terminal state
+    /// without filling (`CANCELLED`). This attempt is provably dead.
+    TerminallyUnfilled,
+    /// The broker answered, but not with a terminal-unfilled state —
+    /// e.g. `PENDING` / `FILLED` / `TRIGGERED` while the snapshots
+    /// disagree. Genuinely ambiguous; must not be collapsed.
+    Live,
+    /// We could not ask, or the answer did not arrive: no order id to
+    /// look up, the request failed, the id is unknown to the broker.
+    /// Deliberately **not** optimistic — see [`AttemptState::Unknown`].
+    Unresolved,
+}
+
 /// Pure helper running the four-step algorithm against pre-fetched
 /// data. Split out from [`lookup_attempt_state`] so unit tests can
 /// exercise every branch without needing a live OANDA client.
@@ -589,12 +669,24 @@ fn oanda_order_to_pending(o: &PendingOrder) -> Option<CorePendingOrder> {
 /// `closed` is `None` when no `broker_trade_id` is available — the
 /// caller skips the fetch entirely in that case (cheaper, and step
 /// 3 cannot match anyway).
-fn compute_attempt_state(
+///
+/// `fate` is the broker's own record of what became of
+/// `broker_order_id`, fetched by the caller only when the three
+/// snapshots all miss. It is passed in as data so this stays pure.
+///
+/// `pub` inside a **private** module, so it stays invisible outside the
+/// crate except through the `test-support`-gated `conformance_support`
+/// re-export in `lib.rs`. That door exists for the cross-implementation
+/// conformance suite: this is one of two independent `AttemptState`
+/// resolvers, and the other lives inside the `replay-candles` binary
+/// where nothing can travel *to*, so this half travels *there*.
+pub fn compute_attempt_state(
     broker_order_id: &str,
     broker_trade_id: Option<&str>,
     pending: &[PendingOrder],
     open: &[Trade],
     closed: Option<&[Trade]>,
+    fate: OrderFate,
 ) -> AttemptState {
     // 1. Pending → resting unfilled.
     if pending.iter().any(|o| o.id == broker_order_id) {
@@ -629,12 +721,37 @@ fn compute_attempt_state(
         };
     }
 
-    // 4. Nowhere to be found. Distinguish so logs can tell us
-    //    whether we lost a snapshot or never had one.
+    // 4. Nowhere to be found in any present-tense snapshot.
+    //
+    //    A snapshotted broker_trade_id means the attempt reached an
+    //    open position at some point, so it is provably done — it has
+    //    merely aged out of the closed-trade scan window.
     if broker_trade_id.is_some() {
-        AttemptState::Cancelled
-    } else {
-        AttemptState::Unknown
+        return AttemptState::Cancelled;
+    }
+
+    // No trade id was ever snapshotted, which is the normal shape of
+    // an order that was cancelled *before it ever filled* — it never
+    // became a trade, so nothing ever set one. That is not evidence of
+    // anything on its own, so ask the broker what became of the order.
+    match fate {
+        OrderFate::TerminallyUnfilled => {
+            tracing::info!(
+                "oanda lookup {broker_order_id}: absent from pending/open/closed, broker record \
+                 says terminally unfilled — Cancelled"
+            );
+            AttemptState::Cancelled
+        }
+        // Either we couldn't ask, or the broker's answer doesn't
+        // settle it. Fail SAFE: `Unknown` blocks re-entry rather than
+        // risking a duplicate stacked on a position we can't see.
+        OrderFate::Live | OrderFate::Unresolved => {
+            tracing::info!(
+                "oanda lookup {broker_order_id}: absent from pending/open/closed and fate \
+                 {fate:?} — Unknown"
+            );
+            AttemptState::Unknown
+        }
     }
 }
 
@@ -684,7 +801,7 @@ mod attempt_state_tests {
     #[test]
     fn pending_when_order_id_in_pending_list() {
         let pending = vec![make_pending("ord-1"), make_pending("ord-2")];
-        let s = compute_attempt_state("ord-1", None, &pending, &[], None);
+        let s = compute_attempt_state("ord-1", None, &pending, &[], None, OrderFate::Unresolved);
         assert_eq!(s, AttemptState::Pending);
     }
 
@@ -693,7 +810,7 @@ mod attempt_state_tests {
         // OANDA: trade.id == originating order id, so the returned
         // broker_trade_id equals the lookup's order id.
         let open = vec![make_trade("ord-7", TradeState::Open, 0.0)];
-        let s = compute_attempt_state("ord-7", None, &[], &open, None);
+        let s = compute_attempt_state("ord-7", None, &[], &open, None, OrderFate::Unresolved);
         assert_eq!(
             s,
             AttemptState::OpenPosition {
@@ -705,7 +822,14 @@ mod attempt_state_tests {
     #[test]
     fn closed_win_when_positive_realized_pl() {
         let closed = vec![make_trade("ord-3", TradeState::Closed, 12.5)];
-        let s = compute_attempt_state("ord-3", Some("ord-3"), &[], &[], Some(&closed));
+        let s = compute_attempt_state(
+            "ord-3",
+            Some("ord-3"),
+            &[],
+            &[],
+            Some(&closed),
+            OrderFate::Unresolved,
+        );
         assert_eq!(s, AttemptState::ClosedWin { realized_pl: 12.5 });
     }
 
@@ -715,12 +839,26 @@ mod attempt_state_tests {
             make_trade("ord-4", TradeState::Closed, -7.0),
             make_trade("ord-5", TradeState::Closed, 0.0),
         ];
-        let loss = compute_attempt_state("ord-4", Some("ord-4"), &[], &[], Some(&closed));
+        let loss = compute_attempt_state(
+            "ord-4",
+            Some("ord-4"),
+            &[],
+            &[],
+            Some(&closed),
+            OrderFate::Unresolved,
+        );
         assert_eq!(
             loss,
             AttemptState::ClosedLossOrBreakeven { realized_pl: -7.0 }
         );
-        let breakeven = compute_attempt_state("ord-5", Some("ord-5"), &[], &[], Some(&closed));
+        let breakeven = compute_attempt_state(
+            "ord-5",
+            Some("ord-5"),
+            &[],
+            &[],
+            Some(&closed),
+            OrderFate::Unresolved,
+        );
         assert_eq!(
             breakeven,
             AttemptState::ClosedLossOrBreakeven { realized_pl: 0.0 }
@@ -732,7 +870,14 @@ mod attempt_state_tests {
         // We had a broker_trade_id (so it was open at some point) but
         // it isn't pending, isn't open, and isn't in the closed-trade
         // scan window. Treat as cancelled.
-        let s = compute_attempt_state("ord-9", Some("ord-9"), &[], &[], Some(&[]));
+        let s = compute_attempt_state(
+            "ord-9",
+            Some("ord-9"),
+            &[],
+            &[],
+            Some(&[]),
+            OrderFate::Unresolved,
+        );
         assert_eq!(s, AttemptState::Cancelled);
     }
 
@@ -741,7 +886,7 @@ mod attempt_state_tests {
         // No broker_trade_id snapshot and nothing to be found anywhere.
         // We lost track; distinct from Cancelled because the cause is
         // "we never snapshotted" rather than "it aged out of history".
-        let s = compute_attempt_state("ord-X", None, &[], &[], None);
+        let s = compute_attempt_state("ord-X", None, &[], &[], None, OrderFate::Unresolved);
         assert_eq!(s, AttemptState::Unknown);
     }
 
@@ -752,7 +897,7 @@ mod attempt_state_tests {
         // list (shouldn't happen, but ordering matters).
         let pending = vec![make_pending("ord-1")];
         let open = vec![make_trade("ord-1", TradeState::Open, 0.0)];
-        let s = compute_attempt_state("ord-1", None, &pending, &open, None);
+        let s = compute_attempt_state("ord-1", None, &pending, &open, None, OrderFate::Unresolved);
         assert_eq!(s, AttemptState::Pending);
     }
 
@@ -761,8 +906,103 @@ mod attempt_state_tests {
         // Different ids, no snapshot → Unknown.
         let pending = vec![make_pending("other-1")];
         let open = vec![make_trade("other-2", TradeState::Open, 0.0)];
-        let s = compute_attempt_state("ord-target", None, &pending, &open, None);
+        let s = compute_attempt_state(
+            "ord-target",
+            None,
+            &pending,
+            &open,
+            None,
+            OrderFate::Unresolved,
+        );
         assert_eq!(s, AttemptState::Unknown);
+    }
+
+    /// The incident (OANDA practice 101-011-31142393-003, 2026-08-07):
+    /// limit orders 2316 / 2318 were placed, rested ~1h each, and were
+    /// cancelled without ever filling. A never-filled order never
+    /// becomes a trade, so nothing ever snapshotted a broker_trade_id —
+    /// and it is absent from all three present-tense snapshots. Before
+    /// the fix that landed in `Unknown`, which the retry gate fails
+    /// safe on, hard-blocking every later entry for the life of the
+    /// plan (12 fires rejected `prior-attempt-unknown` over 4 days).
+    ///
+    /// The broker's own order record settles it: `state: CANCELLED`.
+    #[test]
+    fn cancelled_never_filled_resolves_cancelled_not_unknown() {
+        let s = compute_attempt_state(
+            "2318",
+            // Never filled ⇒ no trade id was ever snapshotted.
+            None,
+            &[],
+            &[],
+            None,
+            OrderFate::TerminallyUnfilled,
+        );
+        assert_eq!(
+            s,
+            AttemptState::Cancelled,
+            "a placed-then-cancelled-without-filling order must be a collapsed state the \
+             retry gate can step past, not the Unknown that blocks re-entry"
+        );
+    }
+
+    /// The fail-safe is being NARROWED, not weakened. If we could not
+    /// find out what became of the order, `Unknown` still stands — that
+    /// guard exists for Bug #11 (a still-open position whose order id
+    /// had drifted; a fail-OPEN there stacked a duplicate entry on a
+    /// live position).
+    #[test]
+    fn unresolvable_fate_still_resolves_unknown() {
+        let s = compute_attempt_state("2318", None, &[], &[], None, OrderFate::Unresolved);
+        assert_eq!(
+            s,
+            AttemptState::Unknown,
+            "a failed fate lookup must never become an optimistic Cancelled"
+        );
+    }
+
+    /// A broker record that answers, but not with a terminal state, is
+    /// ambiguous — the snapshots said the order is nowhere while the
+    /// order record says it is live. Ambiguity is exactly what
+    /// `Unknown` is for.
+    #[test]
+    fn live_fate_contradicting_the_snapshots_resolves_unknown() {
+        let s = compute_attempt_state("2318", None, &[], &[], None, OrderFate::Live);
+        assert_eq!(s, AttemptState::Unknown);
+    }
+
+    /// The fate lookup is a fallback for step 4 only. An order still
+    /// resting must read `Pending` regardless of what the fate says,
+    /// or a stale/contradictory record could retire a live order.
+    #[test]
+    fn fate_never_overrides_an_earlier_step() {
+        let pending = vec![make_pending("ord-1")];
+        let s = compute_attempt_state(
+            "ord-1",
+            None,
+            &pending,
+            &[],
+            None,
+            OrderFate::TerminallyUnfilled,
+        );
+        assert_eq!(s, AttemptState::Pending);
+
+        let open = vec![make_trade("ord-2", TradeState::Open, 0.0)];
+        let s = compute_attempt_state(
+            "ord-2",
+            None,
+            &[],
+            &open,
+            None,
+            OrderFate::TerminallyUnfilled,
+        );
+        assert_eq!(
+            s,
+            AttemptState::OpenPosition {
+                broker_trade_id: "ord-2".into()
+            },
+            "an open position must never be retired by an order-record fate"
+        );
     }
 }
 

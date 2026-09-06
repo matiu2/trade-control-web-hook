@@ -78,6 +78,43 @@ fn default_action() -> Action {
 /// `account` scopes the prep — a setup in progress on one account is
 /// not the same as a setup on another account, even on the same pair.
 /// Same scoping rules as [`VetoEntry`] / [`CooldownEntry`].
+/// The two clocks [`StateStore::set_prep`] needs, grouped so they cannot be
+/// transposed at a call site.
+///
+/// They are genuinely different quantities and conflating them cost a live
+/// trade:
+///
+/// - **`set_at`** — the **triggering bar's** time (`Verified::shell.time`).
+///   This is what gets stored on the flag and what the enter gate orders preps
+///   by ([`crate::intent::resolve_slot`], strictly increasing).
+/// - **`now`** — wall-clock at dispatch. The TTL / `expires_at` basis only.
+///
+/// Before this split, `set_prep` took one timestamp for both and `handle_prep`
+/// passed wall-clock. The live cron dispatches **every** fire of a multi-bar
+/// catch-up under a single `Utc::now()`, so two preps landing on different bars
+/// were stamped identically, the strictly-increasing chain failed, and the
+/// entry was rejected `prep-order-violated` on correct geometry — plan
+/// `hs-eur-cad-08ca0693`, 2026-08-07, whose two rows matched to the microsecond.
+///
+/// The reverse conflation is a bug too: the bar is always at or behind
+/// wall-clock, so deriving the TTL from it would silently shorten every prep's
+/// life by the catch-up lag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrepStamp {
+    /// Bar time — stored, and what the ordered prep gate compares.
+    pub set_at: DateTime<Utc>,
+    /// Wall-clock — the TTL basis.
+    pub now: DateTime<Utc>,
+}
+
+impl PrepStamp {
+    /// A stamp whose bar time and wall-clock coincide. For tests and for
+    /// callers with no bar in scope; production `handle_prep` always has one.
+    pub fn at(t: DateTime<Utc>) -> Self {
+        Self { set_at: t, now: t }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrepEntry {
     pub instrument: String,
@@ -709,18 +746,23 @@ pub trait StateStore {
     ) -> impl Future<Output = Result<bool, StateError>>;
 
     /// Record a named prep step for `(account, instrument)` with a TTL.
-    /// `now` is the timestamp stored on the flag; the entry-time gate
-    /// uses it to enforce ordering across multiple preps. `setter_id`
-    /// is the message-id that set this prep, stashed inside the value
-    /// so `clear_prep` can also forget that id's `seen:<id>` record —
-    /// the operator can then re-send the original prep message
-    /// without hitting the replay-protection 409.
+    ///
+    /// [`PrepStamp`] carries the two clocks this needs and keeps them from
+    /// being transposed: `set_at` (the **triggering bar's** time) is stored on
+    /// the flag and is what the entry-time gate orders preps by, while `now`
+    /// (wall-clock) is the basis for the TTL. They are deliberately not one
+    /// value — see [`PrepStamp`] for why conflating them lost a live trade.
+    ///
+    /// `setter_id` is the message-id that set this prep, stashed inside the
+    /// value so `clear_prep` can also forget that id's `seen:<id>` record —
+    /// the operator can then re-send the original prep message without hitting
+    /// the replay-protection 409.
     fn set_prep(
         &self,
         account: Option<&str>,
         instrument: &str,
         step: &str,
-        now: DateTime<Utc>,
+        stamp: PrepStamp,
         ttl_seconds: u64,
         setter_id: &str,
     ) -> impl Future<Output = Result<(), StateError>>;
@@ -1637,16 +1679,18 @@ mod memstore {
             account: Option<&str>,
             instrument: &str,
             step: &str,
-            now: DateTime<Utc>,
+            stamp: PrepStamp,
             ttl_seconds: u64,
             setter_id: &str,
         ) -> Result<(), StateError> {
             let scope = account_scope(account);
+            // Value carries the BAR time (`set_at`); the TTL is measured from
+            // wall-clock (`now`). See `PrepStamp`.
             self.put(
                 format!("prep:{scope}:{instrument}:{step}"),
-                format!("{}|{setter_id}", now.to_rfc3339()),
+                format!("{}|{setter_id}", stamp.set_at.to_rfc3339()),
                 ttl_seconds.max(MIN_TTL_SECONDS),
-                now,
+                stamp.now,
             );
             Ok(())
         }
@@ -2649,8 +2693,15 @@ mod tests {
             None,
         ))
         .unwrap();
-        pollster::block_on(store.set_prep(None, "EUR_USD", "retest", now, 3600, "retest-msg-id"))
-            .unwrap();
+        pollster::block_on(store.set_prep(
+            None,
+            "EUR_USD",
+            "retest",
+            PrepStamp::at(now),
+            3600,
+            "retest-msg-id",
+        ))
+        .unwrap();
 
         // Clearing the prep via clear_named_preps should also drop
         // the seen record.
@@ -2691,8 +2742,15 @@ mod tests {
         // sees the entry as live. The test only cares about round-trip
         // semantics, not TTL expiry.
         let now = Utc::now();
-        pollster::block_on(store.set_prep(None, "EUR_USD", "break", now, 4 * 3600, "setter-1"))
-            .unwrap();
+        pollster::block_on(store.set_prep(
+            None,
+            "EUR_USD",
+            "break",
+            PrepStamp::at(now),
+            4 * 3600,
+            "setter-1",
+        ))
+        .unwrap();
         let got = pollster::block_on(store.get_prep(None, "EUR_USD", "break")).unwrap();
         assert_eq!(got, Some(now));
         let cleared = pollster::block_on(store.clear_prep(None, "EUR_USD", "break")).unwrap();
@@ -2801,7 +2859,7 @@ mod tests {
             Some("acct-a"),
             "EUR_USD",
             "break-and-close",
-            now,
+            PrepStamp::at(now),
             3600,
             "id-a",
         ))
@@ -2830,10 +2888,24 @@ mod tests {
         use super::memstore::MemStateStore;
         let store = MemStateStore::new();
         let now = Utc::now();
-        pollster::block_on(store.set_prep(Some("acct-a"), "EUR_USD", "break", now, 3600, "id-a"))
-            .unwrap();
-        pollster::block_on(store.set_prep(Some("acct-b"), "EUR_USD", "break", now, 3600, "id-b"))
-            .unwrap();
+        pollster::block_on(store.set_prep(
+            Some("acct-a"),
+            "EUR_USD",
+            "break",
+            PrepStamp::at(now),
+            3600,
+            "id-a",
+        ))
+        .unwrap();
+        pollster::block_on(store.set_prep(
+            Some("acct-b"),
+            "EUR_USD",
+            "break",
+            PrepStamp::at(now),
+            3600,
+            "id-b",
+        ))
+        .unwrap();
         // Clearing on acct-a returns Some(setter_id) and removes only
         // that scope. acct-b's prep is untouched.
         let cleared =
@@ -2881,7 +2953,15 @@ mod tests {
         use super::memstore::MemStateStore;
         let store = MemStateStore::new();
         let now = Utc::now();
-        pollster::block_on(store.set_prep(None, "EUR_USD", "break", now, 3600, "id-g")).unwrap();
+        pollster::block_on(store.set_prep(
+            None,
+            "EUR_USD",
+            "break",
+            PrepStamp::at(now),
+            3600,
+            "id-g",
+        ))
+        .unwrap();
         assert_eq!(
             pollster::block_on(store.get_prep(Some("acct-a"), "EUR_USD", "break")).unwrap(),
             Some(now)
@@ -2999,8 +3079,24 @@ mod tests {
         let store = MemStateStore::new();
         let t1 = Utc::now();
         let t2 = t1 + chrono::Duration::minutes(5);
-        pollster::block_on(store.set_prep(None, "EUR_USD", "break", t1, 3600, "id-1")).unwrap();
-        pollster::block_on(store.set_prep(None, "USD_JPY", "break", t2, 3600, "id-2")).unwrap();
+        pollster::block_on(store.set_prep(
+            None,
+            "EUR_USD",
+            "break",
+            PrepStamp::at(t1),
+            3600,
+            "id-1",
+        ))
+        .unwrap();
+        pollster::block_on(store.set_prep(
+            None,
+            "USD_JPY",
+            "break",
+            PrepStamp::at(t2),
+            3600,
+            "id-2",
+        ))
+        .unwrap();
         assert_eq!(
             pollster::block_on(store.get_prep(None, "EUR_USD", "break")).unwrap(),
             Some(t1)
@@ -3020,8 +3116,24 @@ mod tests {
         // Use a TTL that comfortably covers the test's relative clock —
         // memstore's `get_live` consults the real wall clock.
         let ttl = 24 * 3600;
-        pollster::block_on(store.set_prep(None, "EUR_USD", "break", t1, ttl, "id-a")).unwrap();
-        pollster::block_on(store.set_prep(None, "EUR_USD", "break", t2, ttl, "id-b")).unwrap();
+        pollster::block_on(store.set_prep(
+            None,
+            "EUR_USD",
+            "break",
+            PrepStamp::at(t1),
+            ttl,
+            "id-a",
+        ))
+        .unwrap();
+        pollster::block_on(store.set_prep(
+            None,
+            "EUR_USD",
+            "break",
+            PrepStamp::at(t2),
+            ttl,
+            "id-b",
+        ))
+        .unwrap();
         // Refiring a prep refreshes its timestamp — documented behaviour.
         assert_eq!(
             pollster::block_on(store.get_prep(None, "EUR_USD", "break")).unwrap(),
@@ -3039,9 +3151,24 @@ mod tests {
         let store = MemStateStore::new();
         let now = Utc::now();
         let ttl = 24 * 3600;
-        pollster::block_on(store.set_prep(None, "EUR_USD", "retest", now, ttl, "retest-id"))
-            .unwrap();
-        pollster::block_on(store.set_prep(None, "EUR_USD", "other", now, ttl, "other-id")).unwrap();
+        pollster::block_on(store.set_prep(
+            None,
+            "EUR_USD",
+            "retest",
+            PrepStamp::at(now),
+            ttl,
+            "retest-id",
+        ))
+        .unwrap();
+        pollster::block_on(store.set_prep(
+            None,
+            "EUR_USD",
+            "other",
+            PrepStamp::at(now),
+            ttl,
+            "other-id",
+        ))
+        .unwrap();
 
         let cleared = pollster::block_on(clear_named_preps(
             &store,
@@ -3073,8 +3200,15 @@ mod tests {
         use super::memstore::MemStateStore;
         let store = MemStateStore::new();
         let now = Utc::now();
-        pollster::block_on(store.set_prep(None, "EUR_USD", "retest", now, 24 * 3600, "retest-id"))
-            .unwrap();
+        pollster::block_on(store.set_prep(
+            None,
+            "EUR_USD",
+            "retest",
+            PrepStamp::at(now),
+            24 * 3600,
+            "retest-id",
+        ))
+        .unwrap();
         let cleared = pollster::block_on(clear_named_preps(&store, None, "EUR_USD", &[])).unwrap();
         assert!(cleared.is_empty());
         // Existing prep untouched.
@@ -3093,8 +3227,24 @@ mod tests {
         let store = MemStateStore::new();
         let now = Utc::now();
         let ttl = 24 * 3600;
-        pollster::block_on(store.set_prep(None, "EUR_USD", "retest", now, ttl, "eur-id")).unwrap();
-        pollster::block_on(store.set_prep(None, "USD_JPY", "retest", now, ttl, "jpy-id")).unwrap();
+        pollster::block_on(store.set_prep(
+            None,
+            "EUR_USD",
+            "retest",
+            PrepStamp::at(now),
+            ttl,
+            "eur-id",
+        ))
+        .unwrap();
+        pollster::block_on(store.set_prep(
+            None,
+            "USD_JPY",
+            "retest",
+            PrepStamp::at(now),
+            ttl,
+            "jpy-id",
+        ))
+        .unwrap();
 
         let cleared = pollster::block_on(clear_named_preps(
             &store,

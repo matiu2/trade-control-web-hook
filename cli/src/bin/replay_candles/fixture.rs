@@ -354,6 +354,7 @@ fn fixtures_root() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::super::brisbane::bne;
+    use super::super::cadence::CronCadence;
     use super::*;
     use chrono::TimeZone;
     use std::path::PathBuf;
@@ -488,6 +489,7 @@ mod tests {
                 Some(Box::new(super::super::lazy_zoom::WindowSubBars::new(
                     inputs.sub_bars.clone(),
                 ))),
+                CronCadence::PER_BAR,
             )
             .await;
             // Fixtures are saved from `--simulate` runs (the default), so the
@@ -559,6 +561,7 @@ mod tests {
             expires_at,
             mark_cfg,
             None,
+            CronCadence::PER_BAR,
         )
         .await;
         let rendered =
@@ -660,6 +663,7 @@ mod tests {
             expires_at,
             mark_cfg,
             None,
+            CronCadence::PER_BAR,
         )
         .await;
         let rendered =
@@ -734,6 +738,7 @@ mod tests {
             expires_at,
             mark_cfg,
             None,
+            CronCadence::PER_BAR,
         )
         .await;
         let rendered =
@@ -827,6 +832,7 @@ mod tests {
             expires_at,
             mark_cfg,
             None,
+            CronCadence::PER_BAR,
         )
         .await;
         let rendered =
@@ -872,6 +878,7 @@ mod tests {
             expires_at,
             mark_cfg,
             None,
+            CronCadence::PER_BAR,
         )
         .await;
         let rendered =

@@ -1262,7 +1262,7 @@ fn unwrap_dispatch_outcome(outcome: &str) -> &str {
 /// `replay-candles` *computes* the order bracket, fill, break-even and SL-widen
 /// by walking the price path, whereas this shows only what the worker actually
 /// *recorded*: which rule fired on which bar, the engine's phase transition, and
-/// the real dispatch outcome (`entered` / `rejected: trade-already-open` /
+/// the real dispatch outcome (`placed` / `entered` / `rejected: trade-already-open` /
 /// …, `ActionResult::describe()`-wrapper peeled by [`unwrap_dispatch_outcome`]).
 /// There is deliberately **no** `order:` bracket, `fill:`, `be:` or `exit:`
 /// line — those weren't recorded, so inventing them would be fiction.

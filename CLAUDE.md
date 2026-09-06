@@ -455,6 +455,46 @@ it against the candle window. One async gate, swappable broker, no
 decision duplication. (Stale `src/retry_gate.rs` paths in the prose
 above and a comment at `src/lib.rs:1186` predate this move.)
 
+### A prep's `set_at` is the BAR's time, never wall-clock
+
+`handle_prep` stamps `set_at` from `verified.shell.time` — the **triggering
+bar** — and uses `now` (wall-clock) only for the TTL. `StateStore::set_prep`
+takes both as a `core::state::PrepStamp` so they cannot be transposed at a call
+site.
+
+**Why it must be the bar.** The enter's prep gate requires **strictly
+increasing** `set_at` across the ordered `requires_preps` chain
+(`core::intent::resolve_slot`; equal timestamps are `SlotOutcome::OutOfOrder`).
+The live cron hands **every bar closed since the watermark** to one
+`evaluate_plan` call (`trade-control-cron/src/engine.rs`, looped in
+`engine/src/evaluate.rs`) and dispatches every resulting fire under a
+**single** `Utc::now()`. So any multi-bar catch-up — a gap, a restart, a slow
+tick, the first tick after seeding — stamped two preps identically and the
+entry was rejected `prep-order-violated` on perfectly correct geometry. Plan
+`hs-eur-cad-08ca0693`, 2026-08-07, left two rows byte-identical to the
+microsecond, and that spurious rejection is what made the retry gate destroy a
+resting limit order with nothing placed.
+
+**Why the TTL must stay wall-clock.** A closed bar is always at or behind
+`now`, so deriving `expires_at` from it would silently shorten every prep's
+life by the catch-up lag — hours, after a restart.
+
+**Do NOT "fix" this by weakening the gate to `>=`.** That admits a genuine
+same-bar retest and discards real ordering information; it is strictly worse
+than the re-stamp. Tests `same_bar_preps_still_reject` and
+`genuinely_stale_prep_chain_still_rejects_end_to_end` pin the teeth.
+
+⚠️ **Replay cannot reproduce this class of bug.** The offline replay calls
+`evaluate_plan` once per bar, each with its own `now`, so
+`prep-order-violated` occurs zero times across the whole fixture corpus. That
+is accidental immunity, not fidelity — **no fixture is evidence about any
+timing-sensitive gate.**
+
+Only one production reader consumes a prep's `set_at`: the ordered gate in
+`core/src/dispatch/enter.rs`, which compares preps against each other only. The
+`prep_block` table (`prep-expire`) carries its own `set_at` but is a
+presence-only check keyed on `expires_at` — unrelated, untouched.
+
 ### Replay protection scope
 
 The intent-id seen index (`is_seen` / `mark_seen`) covers two

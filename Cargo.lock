@@ -1946,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "instrument-lookup"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2354,7 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "oanda-client"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "candle-model",
  "chrono",
@@ -4415,6 +4415,7 @@ dependencies = [
 name = "trade-control-cli"
 version = "0.2.0"
 dependencies = [
+ "broker-oanda",
  "candle-cache",
  "candle-model",
  "chrono",
