@@ -182,6 +182,9 @@ fn fixture_resolved() -> Resolved {
         dry_run: false,
         recover_entry: None,
         breakeven: None,
+        // A spot FX fixture — futures multipliers are not part of the script
+        // scope this validates.
+        contract_multiplier: None,
     }
 }
 

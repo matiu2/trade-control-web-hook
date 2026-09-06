@@ -2269,8 +2269,8 @@ and the drawn-line classification are deleted.
 ## Brokers
 
 The intent YAML carries an optional `broker:` field, one of `oanda`
-(default) or `tradenation`. Each broker is independent — the operator
-picks per intent at sign time:
+(default), `tradenation`, or `ibkr` (futures — sizing only so far, see below).
+Each broker is independent — the operator picks per intent at sign time:
 
 ```yaml
 v: 1
@@ -2353,6 +2353,54 @@ prices replayed as if they were the contract's.
 The calendar itself is a generated table (`core/src/contract_calendar_baked.rs`,
 GC/MGC/ES/MES, 2026–2028); see [`contract-calendar-gen/README.md`](contract-calendar-gen/README.md)
 for the rules, the margin and how to regenerate.
+
+### Futures sizing — contracts, not units (`broker-ibkr`)
+
+**Sizing works; placing an order does not yet.** The `broker-ibkr` crate sizes
+a futures entry correctly and refuses, loudly, to do anything it cannot yet do.
+
+A CFD/spot position is sized in *units*, effectively continuous. A futures
+position is sized in **whole contracts**, and a contract multiplier converts a
+price move into money:
+
+```
+contracts = budget / (stop_distance × contract_multiplier × fx)
+```
+
+The multiplier is baked onto the signed intent at arm time (`50` for ES, `100`
+for GC, `10` for MGC, `5` for MES — read live off the Gateway) and carried
+through `Resolved` into the broker. Three consequences worth knowing:
+
+- **A missing multiplier is a refusal, never a `1.0` default.** Substituting
+  `1.0` for ES places a **50× oversized** position — an order that is perfectly
+  valid, just enormous, so nothing downstream would flag it. It surfaces as
+  `EntryError::ContractSizeUnavailable`, distinct from `UnitsBelowMinimum`
+  because the two want opposite responses: a below-minimum size is a legitimate
+  small-account outcome that gets parked and re-checked each bar, whereas a
+  missing multiplier is a plumbing defect no amount of waiting fixes.
+- **Sizes floor, never round.** Rounding up would risk more than authorised —
+  for ES, up to half a contract, which on a 20-point stop is $500 of
+  unrequested risk. Flooring can only ever risk less.
+- **A literal size (`size_units`) means contracts**, so its implied risk goes
+  through the multiplier too. Omit it there and a 2-contract ES order reports
+  0.04% risk instead of 2% — slipping past the cap fifty-fold.
+
+The order-size grid comes from IBKR's own `min_size` / `size_increment` per
+contract rather than a bare `units == 0` check, so a root whose exchange
+minimum is above one contract is refused here rather than at the broker.
+
+Everything that would transmit to, or read live state from, the Gateway returns
+a loud failure rather than a plausible empty answer — an empty position list
+reads as "the account is flat", and the breakeven watch, pending sweep and
+blackout apply all act on that. Notably a close returns `Errored`, **not**
+`NothingOpen`: since v135 `NothingOpen` is a *success* that consumes the intent
+id, so it would mark a close fulfilled while a real position kept running.
+
+⚠️ **Market data is not optional.** `get_quote` feeds the SL-spread floor, a
+hard entry gate requiring the stop distance to clear 10× the live spread.
+Delayed COMEX/CME data would make that gate read a stale spread — either
+blocking every entry or waving through a trade whose stop sits inside the real
+spread — so it fails closed until a live entitlement is confirmed.
 
 ### Broker trait surface (contributor note)
 

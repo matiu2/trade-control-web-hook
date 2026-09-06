@@ -1235,6 +1235,7 @@ mod tests {
             dry_run: false,
             recover_entry: None,
             breakeven: None,
+            contract_multiplier: None,
         }
     }
 

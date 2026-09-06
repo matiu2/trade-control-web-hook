@@ -836,6 +836,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
         take_profit: resolved.take_profit,
         risk: resolved.risk,
         dry_run: resolved.dry_run,
+        contract_multiplier: resolved.contract_multiplier,
     };
 
     // Log inputs + R-multiple up front so the operator sees the
@@ -1340,6 +1341,10 @@ async fn place_entry_too_close_fallback<B: Broker>(
                 take_profit: resolved.take_profit,
                 risk: resolved.risk,
                 dry_run: resolved.dry_run,
+                // Same trade, same contract: a recovery re-placement must size
+                // on the SAME multiplier as the original, or the recovered
+                // position is a different size than the one authorised.
+                contract_multiplier: resolved.contract_multiplier,
             };
             match broker
                 .place_entry(max_risk_pct, max_open_positions, &market_request)
@@ -1382,6 +1387,10 @@ async fn place_entry_too_close_fallback<B: Broker>(
                 take_profit: resolved.take_profit,
                 risk: resolved.risk,
                 dry_run: resolved.dry_run,
+                // Same trade, same contract: a recovery re-placement must size
+                // on the SAME multiplier as the original, or the recovered
+                // position is a different size than the one authorised.
+                contract_multiplier: resolved.contract_multiplier,
             };
             match broker
                 .place_entry(max_risk_pct, max_open_positions, &limit_request)
@@ -1421,6 +1430,10 @@ async fn place_entry_too_close_fallback<B: Broker>(
                 take_profit: resolved.take_profit,
                 risk: resolved.risk,
                 dry_run: resolved.dry_run,
+                // Same trade, same contract: a recovery re-placement must size
+                // on the SAME multiplier as the original, or the recovered
+                // position is a different size than the one authorised.
+                contract_multiplier: resolved.contract_multiplier,
             };
             match broker
                 .place_entry(max_risk_pct, max_open_positions, &stop_request)

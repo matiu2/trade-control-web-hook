@@ -693,6 +693,7 @@ mod tests {
             dry_run: false,
             recover_entry: None,
             breakeven: None,
+            contract_multiplier: None,
         }
     }
 
@@ -783,6 +784,7 @@ mod tests {
             dry_run: false,
             recover_entry: None,
             breakeven: None,
+            contract_multiplier: None,
         };
         bind_shell_anchors(&mut scope, &shell_full());
         bind_intent_derived(&mut scope, &r, 0.0001);
