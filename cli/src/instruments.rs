@@ -127,7 +127,11 @@ pub fn validate_instrument(
     name: &str,
 ) -> Result<Option<String>> {
     match broker {
-        BrokerKind::Oanda => Ok(None),
+        // No catalog to validate against. OANDA has always been unvalidated
+        // here; IBKR joins it because the contract calendar — not this cache —
+        // is what says whether a futures symbol is real, and the arm-time
+        // close-out guard already refuses an unknown contract.
+        BrokerKind::Oanda | BrokerKind::Ibkr => Ok(None),
         BrokerKind::TradeNation => {
             let cache = load_cache(false, account, None)?;
             resolve_with_cache(&cache, name)

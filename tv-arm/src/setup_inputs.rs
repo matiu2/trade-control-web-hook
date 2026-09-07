@@ -106,6 +106,8 @@ pub(crate) mod tests {
                 pip_size: 0.0001,
                 tick_size: 0.00001,
                 tick_from_tv: true,
+                // EUR/USD is spot — sized in units, so no multiplier.
+                contract_multiplier: None,
             },
             resolution: "60".into(),
             chart_symbol: "OANDA:EURUSD".into(),

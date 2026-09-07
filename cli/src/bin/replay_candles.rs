@@ -50,6 +50,7 @@ mod replay_candles {
     pub mod economics;
     pub mod fill_sim;
     pub mod fixture;
+    pub mod futures_caveats;
     pub mod golden_eq;
     pub mod granularity;
     pub mod instrument;
@@ -81,6 +82,7 @@ use replay_candles::baseline;
 use replay_candles::batch;
 use replay_candles::cadence::CronCadence;
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
+use replay_candles::futures_caveats;
 use replay_candles::tv::TvDefaults;
 use replay_candles::{
     annotate, brisbane, candles, economics, golden_eq, granularity, instrument, lazy_zoom, outcome,
@@ -381,6 +383,16 @@ async fn run() -> Result<()> {
     // Render once and keep the economics it booked: `--save` records them into
     // the fixture's `expected.json`, so the printed `Net R:` and the saved golden
     // are the same computation.
+    // The close-out check the arm-time guard could only *warn* about: `tv-arm
+    // --plan-out` builds Lenient so a historical setup still replays, so a plan
+    // reaching here has never had this refused. `end` — not now — is the last
+    // moment this replay lets the plan open a position.
+    let futures = futures_caveats::context_for(
+        raw_instrument,
+        plan.direction,
+        end.date_naive(),
+        args.probe_account,
+    );
     let rendered = report::render(
         &plan,
         &replay,
@@ -388,6 +400,7 @@ async fn run() -> Result<()> {
         args.verbose,
         replay_sentiment.as_ref(),
         &mark_cfg,
+        futures,
     );
     print!("{}", rendered.text);
 
@@ -971,6 +984,13 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
     // Market-hours blackout is read from the baked mask keyed on the instrument
     // (`core::intent::market_hours_blocked`) inside `sweep_reason`, so nothing to
     // pass here. Fixtures keep their saved verdict.
+    // Same check for a frozen fixture, against the window the fixture froze.
+    let futures = futures_caveats::context_for(
+        &inputs.meta.instrument,
+        inputs.plan.direction,
+        inputs.meta.end.date_naive(),
+        args.probe_account,
+    );
     let rendered = report::render(
         &inputs.plan,
         &replay,
@@ -978,6 +998,7 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
         args.verbose,
         None,
         &mark_cfg,
+        futures,
     );
     // Under --json the report text would corrupt the JSON on stdout; the rows
     // carry the same numbers, so suppress it.
@@ -1755,6 +1776,7 @@ mod tests {
     /// resolver tests flip individual flags.
     fn base_args() -> Args {
         Args {
+            probe_account: None,
             plan: Some(PathBuf::from("unused.json")),
             instrument: None,
             granularity: None,

@@ -108,6 +108,46 @@ pub struct StoredOrder {
     /// later fire recognise itself as a *fresher* signal for the same setup and
     /// supersede rather than duplicate.
     pub shell_time: DateTime<Utc>,
+    /// Seconds per bar at the enter's granularity, so a per-bar re-check
+    /// ([`StoredReason::rechecked_per_bar`]) can tell "a new bar has started"
+    /// from "the same bar, a few seconds later" — the order-control loop ticks
+    /// faster than a bar.
+    ///
+    /// `None` on a body written before this field existed, and on the webhook
+    /// path which has no plan granularity. Read fail-closed: with no bar clock
+    /// a size park keeps waiting rather than promoting on an unknown cadence,
+    /// and still drops at its own `drop_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bar_seconds: Option<i64>,
+}
+
+impl StoredOrder {
+    /// Has a signal bar strictly later than the one that parked this order
+    /// begun?
+    ///
+    /// The comparison is by **bar bucket**, not raw instant: the order-control
+    /// loop ticks several times within one bar, so `bar > shell_time` alone
+    /// would read a tick 5 seconds into the same bar as "a new bar" whenever the
+    /// caller passes `now` rather than an exact bar open. Both sides are floored
+    /// to a multiple of [`Self::bar_seconds`] and compared as buckets.
+    ///
+    /// Fail-closed on anything unjudgeable — no bar in hand, no bar clock, or a
+    /// non-positive one — because promoting on an unknown cadence is the failure
+    /// this whole per-bar path exists to prevent.
+    pub fn is_a_later_bar(&self, bar_time: Option<DateTime<Utc>>) -> bool {
+        let (Some(bar), Some(secs)) = (bar_time, self.bar_seconds) else {
+            return false;
+        };
+        if secs <= 0 {
+            return false;
+        }
+        bucket(bar, secs) > bucket(self.shell_time, secs)
+    }
+}
+
+/// Floor `t` to a multiple of `secs` since the epoch — which bar it falls in.
+fn bucket(t: DateTime<Utc>, secs: i64) -> i64 {
+    t.timestamp().div_euclid(secs)
 }
 
 /// Why an order is Stored rather than Pending.
@@ -128,6 +168,11 @@ pub enum StoredReason {
     /// replaces the boolean spread-hour gate, parking per-trade instead of
     /// suppressing per-instrument-hour.
     BelowMinRForecast,
+    /// The broker's computed position size floored to zero — `EntryError::
+    /// UnitsBelowMinimum`. A deterministic function of (equity, stop distance,
+    /// contract multiplier), so unlike the two spread reasons above it cannot
+    /// change within a bar; see [`StoredReason::rechecked_per_bar`].
+    BelowMinSize,
 }
 
 impl StoredReason {
@@ -136,6 +181,30 @@ impl StoredReason {
         match self {
             Self::BelowMinR => "below-min-r",
             Self::BelowMinRForecast => "below-min-r-forecast",
+            Self::BelowMinSize => "below-min-size",
+        }
+    }
+
+    /// Is this reason re-checked **once per bar** rather than every tick?
+    ///
+    /// The two spread reasons are re-asked every tick because the spread moves
+    /// continuously and `sl_target` can genuinely answer "it has calmed" from a
+    /// fresh quote. [`Self::BelowMinSize`] cannot: position size is a function
+    /// of equity, stop distance and contract multiplier, none of which move
+    /// within a bar, and the [`Broker`](crate::broker::Broker) trait exposes no
+    /// equity to re-test against — sizing is private inside each broker's
+    /// `place_entry` by design.
+    ///
+    /// So the only honest re-check is to try again on a **new signal bar**.
+    /// Ticking a size-park on the spread gate instead would promote it on the
+    /// next tick straight back into the same rejection — and because the
+    /// order-control loop runs faster than a bar, that converts a once-per-bar
+    /// retry into a once-per-few-seconds one: strictly worse than the bug the
+    /// park exists to fix, while looking like a fix.
+    pub fn rechecked_per_bar(self) -> bool {
+        match self {
+            Self::BelowMinR | Self::BelowMinRForecast => false,
+            Self::BelowMinSize => true,
         }
     }
 }
@@ -163,25 +232,54 @@ pub enum StoredVerdict {
     Drop,
 }
 
+/// What the caller observed this tick, for [`stored_verdict`] to judge.
+///
+/// A named struct rather than two positional `bool`s: `clears_min_r` and
+/// `bar_time` answer different questions for different reasons, and two adjacent
+/// bare booleans transpose silently at a call site. Same discipline as
+/// `InstrumentSizing` on the arm-time path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StoredCheck {
+    /// The caller's verdict from [`sl_target`](super::sl_target) against the
+    /// **current** spread — passed in rather than recomputed so there is exactly
+    /// one place the R decision is made, and so this stays pure. Read only for
+    /// the spread reasons.
+    pub clears_min_r: bool,
+    /// The signal bar this tick is evaluating, when the caller knows it. Read
+    /// only for [`StoredReason::rechecked_per_bar`] reasons, where promotion
+    /// waits for a bar strictly newer than the one that parked the order.
+    ///
+    /// `None` means "no bar identity in hand" and is treated as **not** a new
+    /// bar — a size-park keeps waiting rather than promoting blind, matching the
+    /// fail-closed reading of a legacy park elsewhere in this module.
+    pub bar_time: Option<DateTime<Utc>>,
+}
+
 /// Should this stored order be promoted, kept, or dropped?
 ///
-/// `clears_min_r` is the caller's verdict from
-/// [`sl_target`](super::sl_target) — passed in rather than recomputed so there
-/// is exactly one place the R decision is made, and so this stays pure.
-///
 /// Expiry is checked **first**: an order past its drop deadline is dropped even
-/// if the spread has calmed and it would otherwise promote. Entering three bars
-/// before expiry is the thing the deadline exists to prevent, and a calm spread
-/// doesn't buy back the missing runway.
+/// if it would otherwise promote. Entering three bars before expiry is the thing
+/// the deadline exists to prevent, and neither a calm spread nor a fresh bar
+/// buys back the missing runway.
+///
+/// The promote question itself is **per-reason** — see
+/// [`StoredReason::rechecked_per_bar`]. A spread park is re-asked every tick
+/// (the spread genuinely moves); a size park is re-asked once per new signal
+/// bar, because nothing it depends on can change faster than that.
 pub fn stored_verdict(
     order: &StoredOrder,
     now: DateTime<Utc>,
-    clears_min_r: bool,
+    check: StoredCheck,
 ) -> StoredVerdict {
     if now >= order.drop_at {
         return StoredVerdict::Drop;
     }
-    if clears_min_r {
+    let promote = if order.reason.rechecked_per_bar() {
+        order.is_a_later_bar(check.bar_time)
+    } else {
+        check.clears_min_r
+    };
+    if promote {
         StoredVerdict::Promote
     } else {
         StoredVerdict::KeepWaiting
@@ -191,6 +289,14 @@ pub fn stored_verdict(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spread-reason check: `BelowMinR` reads only `clears_min_r`.
+    fn spread_check(clears_min_r: bool) -> StoredCheck {
+        StoredCheck {
+            clears_min_r,
+            bar_time: None,
+        }
+    }
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s)
@@ -208,6 +314,7 @@ mod tests {
             stored_at: at(stored_at),
             drop_at: at(drop_at),
             shell_time: at(stored_at),
+            bar_seconds: Some(3600),
         }
     }
 
@@ -217,11 +324,11 @@ mod tests {
     fn parks_while_sub_1r_then_promotes_when_the_spread_calms() {
         let o = order("2026-07-22T13:30:00Z", "2026-07-24T00:00:00Z");
         assert_eq!(
-            stored_verdict(&o, at("2026-07-22T13:30:00Z"), false),
+            stored_verdict(&o, at("2026-07-22T13:30:00Z"), spread_check(false)),
             StoredVerdict::KeepWaiting,
         );
         assert_eq!(
-            stored_verdict(&o, at("2026-07-23T06:15:00Z"), true),
+            stored_verdict(&o, at("2026-07-23T06:15:00Z"), spread_check(true)),
             StoredVerdict::Promote,
             "the later fire that today re-derives the same reject and dies",
         );
@@ -236,7 +343,7 @@ mod tests {
     fn expiry_wins_over_a_promotable_spread() {
         let o = order("2026-07-22T13:30:00Z", "2026-07-23T21:00:00Z");
         assert_eq!(
-            stored_verdict(&o, at("2026-07-23T22:00:00Z"), true),
+            stored_verdict(&o, at("2026-07-23T22:00:00Z"), spread_check(true)),
             StoredVerdict::Drop,
             "past the deadline there is no runway left, however calm the spread",
         );
@@ -265,7 +372,10 @@ mod tests {
             drop_at: drop_at(expiry, 3600, stored),
             ..order("2026-07-22T12:00:00Z", "2026-07-22T12:00:00Z")
         };
-        assert_eq!(stored_verdict(&o, stored, true), StoredVerdict::Drop);
+        assert_eq!(
+            stored_verdict(&o, stored, spread_check(true)),
+            StoredVerdict::Drop
+        );
     }
 
     /// Reasons round-trip as stable kebab-case slugs, and an unrecognised one
@@ -337,5 +447,187 @@ mod tests {
             crate::order_control::SlAction::BelowMinR,
             "a park whose geometry we can't read must NOT be placed",
         );
+    }
+
+    // --- BelowMinSize: the per-bar re-check --------------------------------
+    //
+    // `UnitsBelowMinimum` is a deterministic function of (equity, stop distance,
+    // contract multiplier). Re-asking it on the spread gate would promote it
+    // straight back into the same rejection, and the order-control loop ticks
+    // faster than a bar — so these pin the once-per-bar cadence.
+
+    fn size_park(shell: &str, drop_at_s: &str) -> StoredOrder {
+        StoredOrder {
+            reason: StoredReason::BelowMinSize,
+            shell_time: at(shell),
+            drop_at: at(drop_at_s),
+            stored_at: at(shell),
+            bar_seconds: Some(3600),
+            ..order(shell, drop_at_s)
+        }
+    }
+
+    fn bar_check(bar: &str) -> StoredCheck {
+        StoredCheck {
+            // Deliberately TRUE: a size park has healthy geometry, so the spread
+            // gate says "promote". If the verdict consulted it, every test below
+            // would promote immediately — which is exactly the bug.
+            clears_min_r: true,
+            bar_time: Some(at(bar)),
+        }
+    }
+
+    /// The regression that makes this a fix rather than an amplifier: a tick a
+    /// few seconds into the SAME bar must not promote.
+    ///
+    /// Mutation check: make `BelowMinSize` read `clears_min_r` and this goes red.
+    #[test]
+    fn a_size_park_does_not_promote_within_the_same_bar() {
+        let o = size_park("2026-07-22T13:00:00Z", "2026-07-24T00:00:00Z");
+        for tick in [
+            "2026-07-22T13:00:05Z",
+            "2026-07-22T13:00:30Z",
+            "2026-07-22T13:59:59Z",
+        ] {
+            assert_eq!(
+                stored_verdict(&o, at(tick), bar_check(tick)),
+                StoredVerdict::KeepWaiting,
+                "tick {tick} is still inside the 13:00 bar",
+            );
+        }
+    }
+
+    /// ...and it DOES promote once a genuinely new bar opens, so the setup is
+    /// retried rather than abandoned.
+    #[test]
+    fn a_size_park_promotes_on_the_next_bar() {
+        let o = size_park("2026-07-22T13:00:00Z", "2026-07-24T00:00:00Z");
+        assert_eq!(
+            stored_verdict(
+                &o,
+                at("2026-07-22T14:00:00Z"),
+                bar_check("2026-07-22T14:00:00Z"),
+            ),
+            StoredVerdict::Promote,
+        );
+    }
+
+    /// Expiry still wins, so a size park can't retry forever either — the
+    /// property the plain-`Failed` path lacked entirely.
+    ///
+    /// Mutation check: drop the `drop_at` check and this goes red.
+    #[test]
+    fn a_size_park_still_drops_at_its_deadline() {
+        let o = size_park("2026-07-22T13:00:00Z", "2026-07-22T20:00:00Z");
+        assert_eq!(
+            stored_verdict(
+                &o,
+                at("2026-07-22T21:00:00Z"),
+                bar_check("2026-07-22T21:00:00Z"),
+            ),
+            StoredVerdict::Drop,
+            "past the deadline there is no runway left, however fresh the bar",
+        );
+    }
+
+    /// No bar clock (a legacy body, or the webhook path) ⇒ keep waiting rather
+    /// than promoting on an unknown cadence. Fail-closed, matching how a legacy
+    /// park's unreadable geometry is treated above.
+    #[test]
+    fn a_size_park_without_a_bar_clock_keeps_waiting() {
+        let mut o = size_park("2026-07-22T13:00:00Z", "2026-07-24T00:00:00Z");
+        o.bar_seconds = None;
+        assert_eq!(
+            stored_verdict(
+                &o,
+                at("2026-07-23T13:00:00Z"),
+                bar_check("2026-07-23T13:00:00Z"),
+            ),
+            StoredVerdict::KeepWaiting,
+        );
+        // ...and with no bar identity in hand at all.
+        o.bar_seconds = Some(3600);
+        assert_eq!(
+            stored_verdict(
+                &o,
+                at("2026-07-23T13:00:00Z"),
+                StoredCheck {
+                    clears_min_r: true,
+                    bar_time: None,
+                },
+            ),
+            StoredVerdict::KeepWaiting,
+        );
+    }
+
+    /// A spread park must NOT acquire the per-bar gate: its whole point is that
+    /// the spread moves within a bar and is re-asked every tick.
+    ///
+    /// Mutation check: make `rechecked_per_bar` return true for `BelowMinR` and
+    /// this goes red.
+    #[test]
+    fn a_spread_park_still_promotes_within_the_same_bar() {
+        let o = order("2026-07-22T13:00:00Z", "2026-07-24T00:00:00Z");
+        assert_eq!(o.reason, StoredReason::BelowMinR, "precondition");
+        assert_eq!(
+            stored_verdict(
+                &o,
+                at("2026-07-22T13:00:30Z"),
+                StoredCheck {
+                    clears_min_r: true,
+                    bar_time: Some(at("2026-07-22T13:00:30Z")),
+                },
+            ),
+            StoredVerdict::Promote,
+            "the spread calmed mid-bar; that is a real signal and must be acted on",
+        );
+    }
+
+    /// The slug is written into stored bodies and read back, so a disagreement
+    /// between serde and `as_str` silently mis-labels a park.
+    #[test]
+    fn every_reason_round_trips_and_agrees_with_as_str() {
+        for r in [
+            StoredReason::BelowMinR,
+            StoredReason::BelowMinRForecast,
+            StoredReason::BelowMinSize,
+        ] {
+            let json = serde_json::to_string(&r).expect("serialises");
+            assert_eq!(
+                json,
+                format!("\"{}\"", r.as_str()),
+                "serde and as_str must agree for {r:?}",
+            );
+            let back: StoredReason = serde_json::from_str(&json).expect("round-trips");
+            assert_eq!(back, r);
+        }
+    }
+
+    /// Bucketing is by bar boundary, not elapsed time: 13:59 → 14:00 is one
+    /// minute later but a genuinely new bar, while 13:00 → 13:59 is 59 minutes
+    /// later and the same one.
+    #[test]
+    fn a_later_bar_is_measured_in_buckets_not_elapsed_time() {
+        let o = size_park("2026-07-22T13:59:00Z", "2026-07-24T00:00:00Z");
+        assert!(
+            o.is_a_later_bar(Some(at("2026-07-22T14:00:00Z"))),
+            "one minute later, but a new bar",
+        );
+        let o = size_park("2026-07-22T13:00:00Z", "2026-07-24T00:00:00Z");
+        assert!(
+            !o.is_a_later_bar(Some(at("2026-07-22T13:59:00Z"))),
+            "59 minutes later, but the same bar",
+        );
+    }
+
+    /// A non-positive bar clock is unjudgeable, not "every instant is a new
+    /// bar" — which a naive `div_euclid` would panic on anyway.
+    #[test]
+    fn a_degenerate_bar_clock_is_unjudgeable() {
+        let mut o = size_park("2026-07-22T13:00:00Z", "2026-07-24T00:00:00Z");
+        for secs in [0, -3600] {
+            o.bar_seconds = Some(secs);
+            assert!(!o.is_a_later_bar(Some(at("2026-07-23T13:00:00Z"))));
+        }
     }
 }

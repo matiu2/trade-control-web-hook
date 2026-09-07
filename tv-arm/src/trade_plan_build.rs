@@ -688,6 +688,7 @@ mod tests {
             mw: None,
             pip_size,
             tick_size: None,
+            contract_multiplier: None,
             spread_window: None,
             trade_plan: None,
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),

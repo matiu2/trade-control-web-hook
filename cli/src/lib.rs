@@ -4,10 +4,12 @@
 mod admin_client;
 mod admin_secret;
 mod calendar_bars;
+pub mod close_out_check;
 mod control;
 mod expiry;
 pub mod fixtures_dir;
 mod forex_factory_cache;
+pub mod futures_symbol;
 mod history;
 mod instruments;
 mod interactive;

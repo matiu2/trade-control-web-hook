@@ -318,11 +318,7 @@ fn read_setup_from_spec(args: &Args, path: &Path) -> Result<SetupInputs> {
     let instrument = resolved.broker_symbol.clone();
     // No live chart, so no TV Symbol-info to prefer — the catalog precision is
     // the answer, exactly as it is when a live arm can't reach tv-mcp.
-    let effective = crate::precision::EffectivePrecision {
-        pip_size: resolved.precision.pip_size,
-        tick_size: resolved.precision.tick_size,
-        tick_from_tv: false,
-    };
+    let effective = crate::precision::EffectivePrecision::from_catalog(resolved.precision);
 
     // `--start` on the command line overrides the frozen cursor, so a single
     // spec can be re-armed at several cursors (which is what the entry-rule grid
@@ -422,11 +418,7 @@ fn read_setup_from_chart(args: &Args) -> Result<(SetupInputs, Roles)> {
             // Reading symbol-info shouldn't ever block arming — fall back to
             // the per-broker catalog precision and note why.
             warn!(error = %e, "could not read live TV symbol-info; using catalog precision");
-            crate::precision::EffectivePrecision {
-                pip_size: resolved.precision.pip_size,
-                tick_size: resolved.precision.tick_size,
-                tick_from_tv: false,
-            }
+            crate::precision::EffectivePrecision::from_catalog(resolved.precision)
         }
     };
     info!(
@@ -610,7 +602,7 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
     } = setup;
 
     let key = read_key()?;
-    let account = resolve_account(args, broker);
+    let account = resolve_account(args, broker)?;
     let out_dir = arm_out_dir(&raw_symbol)?;
     let now = Utc::now();
     // The time this arm treats as "now" for everything time-derived on the plan:
@@ -668,15 +660,7 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
         // Pip/tick for the baked MwSpec come from `effective` — live
         // TradingView precision when available, else the instrument-lookup
         // catalog. --pip-size / --tick-size override downstream.
-        resolve_mw_trade(
-            args,
-            &geom,
-            &instrument,
-            &account,
-            broker,
-            effective.pip_size,
-            effective.tick_size,
-        )
+        resolve_mw_trade(args, &geom, &instrument, &account, broker, effective)
     } else {
         // Bake the effective pip AND tick onto the H&S enter: pip scales
         // offset_pips (JPY/indices), tick snaps every order price onto the
@@ -689,8 +673,7 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
             &instrument,
             &account,
             broker,
-            effective.pip_size,
-            effective.tick_size,
+            effective,
         )
     };
     let (direction, trade_spec) = match resolved_spec {
@@ -1009,6 +992,14 @@ fn resolve_with_recovery(
     let il_broker = match broker {
         Broker::Oanda => instrument_lookup::Broker::Oanda,
         Broker::TradeNation => instrument_lookup::Broker::TradeNation,
+        // The catalog has no IBKR column, so there is nothing to recover a
+        // futures symbol from. Stage 5 adds `Broker::Ibkr` + rows there.
+        Broker::Ibkr => {
+            return Err(eyre!(
+                "cannot recover chart symbol {tv_symbol:?} for ibkr: the instrument-lookup \
+                 catalog has no IBKR listing yet"
+            ));
+        }
     };
     let broker_symbol = patched
         .asset
@@ -1041,17 +1032,30 @@ fn resolve_with_recovery(
 }
 
 /// `--account-id` > `TRADE_CONTROL_ACCOUNT` env > per-broker default.
-fn resolve_account(args: &Args, broker: Broker) -> String {
+///
+/// Errors when the broker has no default and the operator named no account.
+/// Substituting a placeholder would put a blank account name on the plan and
+/// fail at dispatch instead of here, where the cause is obvious.
+fn resolve_account(args: &Args, broker: Broker) -> Result<String> {
     if let Some(a) = &args.account_id {
-        return a.clone();
+        return Ok(a.clone());
     }
     if let Ok(env_val) = env::var("TRADE_CONTROL_ACCOUNT") {
         let trimmed = env_val.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return Ok(trimmed.to_string());
         }
     }
-    broker.default_account_index().to_string()
+    broker
+        .default_account_index()
+        .map(str::to_string)
+        .ok_or_else(|| {
+            eyre!(
+                "{} has no default account, so one must be named explicitly: \
+             pass --account-id <name> or set TRADE_CONTROL_ACCOUNT",
+                broker.as_str()
+            )
+        })
 }
 
 /// H&S / IH&S path: validate the constellation of drawings, read
@@ -1801,6 +1805,8 @@ mod tests {
             0.01,
             // Distinct tick (finer than pip) to prove it's baked independently.
             0.001,
+            // Spot fixture: no futures multiplier.
+            None,
             Vec::new(),
             // `--sl-anchor` default (signal): no absolute stop baked.
             None,
@@ -1829,6 +1835,8 @@ mod tests {
             false,
             0.0001,
             0.0001,
+            // Spot fixture: no futures multiplier.
+            None,
             Vec::new(),
             // `--sl-anchor` default (signal): no absolute stop baked.
             None,
@@ -1850,6 +1858,8 @@ mod tests {
             false,
             0.0001,
             0.0001,
+            // Spot fixture: no futures multiplier.
+            None,
             Vec::new(),
             // `--sl-anchor` default (signal): no absolute stop baked.
             None,
@@ -1883,6 +1893,8 @@ mod tests {
                 close_on_news,
                 0.0001,
                 0.0001,
+                // Spot fixture: no futures multiplier.
+                None,
                 Vec::new(),
                 // `--sl-anchor` default (signal): no absolute stop baked.
                 None,
@@ -1933,6 +1945,8 @@ mod tests {
             false,
             0.0001,
             0.0001,
+            // Spot fixture: no futures multiplier.
+            None,
             Vec::new(),
             // `--sl-anchor` default (signal): no absolute stop baked.
             None,
@@ -2106,6 +2120,7 @@ mod tests {
             spread_pips: 1.0,
             pip_size: 0.0001,
             tick_size: 0.0001,
+            contract_multiplier: None,
         };
         let default = build_mw_trade_spec(
             &mw_args(&[]),
@@ -2152,6 +2167,8 @@ mod tests {
             false,
             pip_size,
             pip_size,
+            // Spot fixture: no futures multiplier.
+            None,
             Vec::new(),
             // `--sl-anchor` default (signal): no absolute stop baked.
             None,

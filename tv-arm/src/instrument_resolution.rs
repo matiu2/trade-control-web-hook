@@ -65,7 +65,14 @@ pub fn resolve_for_broker(tv_symbol: &str, broker: ConvBroker) -> Result<Resolve
         )
     })?;
 
-    let il_broker = to_il_broker(broker);
+    let il_broker = to_il_broker(broker).ok_or_else(|| {
+        eyre!(
+            "asset {} cannot be resolved for {}: the instrument-lookup catalog has no \
+             listing for that broker",
+            asset.id,
+            broker.as_str(),
+        )
+    })?;
     let broker_symbol = asset.symbol_for(il_broker).ok_or_else(|| {
         let carriers = brokers_carrying(asset);
         let listed = if carriers.is_empty() {
@@ -190,23 +197,35 @@ fn strip_exchange(tv_symbol: &str) -> &str {
     }
 }
 
-fn to_il_broker(broker: ConvBroker) -> IlBroker {
+/// Map our broker vocabulary onto `instrument-lookup`'s.
+///
+/// Every variant now resolves: `instrument-lookup` v4 added `Broker::Ibkr` and
+/// an `ibkr` symbol column carrying the contract **series** root (`"ES"`,
+/// `"GC"`). Before that this returned `None` for IBKR — substituting another
+/// broker's column would have resolved a *different instrument*, which is worse
+/// than not resolving at all. The `Option` is kept because the signature is the
+/// natural place for a future broker that genuinely has no catalog column, and
+/// because every caller already handles the `None`.
+fn to_il_broker(broker: ConvBroker) -> Option<IlBroker> {
     match broker {
-        ConvBroker::Oanda => IlBroker::Oanda,
-        ConvBroker::TradeNation => IlBroker::TradeNation,
+        ConvBroker::Oanda => Some(IlBroker::Oanda),
+        ConvBroker::TradeNation => Some(IlBroker::TradeNation),
+        ConvBroker::Ibkr => Some(IlBroker::Ibkr),
     }
 }
 
+/// Which brokers list this asset — used only to build the "not listed on X,
+/// but is on Y" operator message.
+///
+/// Driven off `IlBroker::ALL` rather than a hand-written array, so a broker
+/// added to the catalog cannot silently go unmentioned in that message.
 fn brokers_carrying(asset: &Asset) -> Vec<&'static str> {
-    [
-        IlBroker::Oanda,
-        IlBroker::TradeNation,
-        IlBroker::TradingView,
-    ]
-    .into_iter()
-    .filter(|b| asset.symbol_for(*b).is_some())
-    .map(broker_label)
-    .collect()
+    IlBroker::ALL
+        .iter()
+        .copied()
+        .filter(|b| asset.symbol_for(*b).is_some())
+        .map(broker_label)
+        .collect()
 }
 
 fn broker_label(b: IlBroker) -> &'static str {
@@ -255,7 +274,8 @@ mod tests {
         let bare = strip_exchange(tv_symbol);
         let asset = instrument_lookup::resolve(bare)?
             .ok_or_else(|| eyre!("{tv_symbol:?} not in catalog"))?;
-        let il_broker = to_il_broker(broker);
+        let il_broker = to_il_broker(broker)
+            .ok_or_else(|| eyre!("{} has no catalog column", broker.as_str()))?;
         let broker_symbol = asset
             .symbol_for(il_broker)
             .ok_or_else(|| eyre!("{} not listed on {}", asset.id, broker.as_str()))?;

@@ -182,6 +182,9 @@ fn fixture_resolved() -> Resolved {
         dry_run: false,
         recover_entry: None,
         breakeven: None,
+        // A spot FX fixture — futures multipliers are not part of the script
+        // scope this validates.
+        contract_multiplier: None,
     }
 }
 
@@ -249,6 +252,7 @@ mod tests {
             mw: None,
             pip_size: None,
             tick_size: None,
+            contract_multiplier: None,
             spread_window: None,
             trade_plan: None,
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),

@@ -46,13 +46,17 @@ fn backend(e: impl std::fmt::Display) -> MetadataError {
     MetadataError::Backend(e.to_string())
 }
 
-/// The lowercase serde string for a [`BrokerKind`] (`oanda` | `tradenation`).
-/// Goes through serde so it can't drift from the wire form.
+/// The lowercase wire string for a [`BrokerKind`] (`oanda` | `tradenation` |
+/// `ibkr`).
+///
+/// Reads [`BrokerKind::as_str`] — an exhaustive match — rather than round-
+/// tripping through `serde_json` and defaulting to `"oanda"` when that failed.
+/// The old shape wrote the wrong broker into the account row on any serde
+/// hiccup, which would later resolve credentials for a venue the operator
+/// never chose; there is now no failure path to default from. The
+/// `broker_wire_form_matches_serde` test keeps the two spellings identical.
 fn broker_to_str(broker: BrokerKind) -> String {
-    serde_json::to_value(broker)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "oanda".to_string())
+    broker.as_str().to_owned()
 }
 
 /// The serde JSON for an [`AccountCaps`] (`{}` when default). Stored in the

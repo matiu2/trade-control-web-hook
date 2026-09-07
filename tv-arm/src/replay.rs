@@ -141,10 +141,17 @@ impl ArmContext<'_> {
 /// Map the resolved broker to the `--source` value `replay-candles` expects.
 /// The live cron engine pulls TradeNation candles, so a TradeNation-armed plan
 /// replays against TradeNation; an OANDA plan against OANDA.
-fn source_for(broker: Broker) -> CandleSource {
+///
+/// `None` for IBKR. `CandleSource` names a **candle-cache feed**, and there is
+/// no IBKR one — futures candles come from a different venue with a different
+/// session model. Defaulting to a CFD source would replay a futures plan
+/// against a *different instrument's* prices and report the R-multiples as if
+/// they were the contract's, which is worse than declining to replay.
+fn source_for(broker: Broker) -> Option<CandleSource> {
     match broker {
-        Broker::TradeNation => CandleSource::TradeNation,
-        Broker::Oanda => CandleSource::Oanda,
+        Broker::TradeNation => Some(CandleSource::TradeNation),
+        Broker::Oanda => Some(CandleSource::Oanda),
+        Broker::Ibkr => None,
     }
 }
 
@@ -231,7 +238,14 @@ pub fn run_replay(
             plan.display()
         ));
     }
-    let source = source_for(broker);
+    let source = source_for(broker).ok_or_else(|| {
+        eyre!(
+            "--replay: no candle source for {} — replay-candles has no IBKR feed, and \
+             replaying against another broker's prices would report a different \
+             instrument's R-multiples",
+            broker.as_str()
+        )
+    })?;
     let argv = build_argv(&bin, &plan, source, passthrough, arm);
 
     // Validate the full invocation against the shared clap definition before
@@ -288,8 +302,22 @@ mod tests {
 
     #[test]
     fn source_maps_broker() {
-        assert_eq!(source_for(Broker::TradeNation).as_str(), "tradenation");
-        assert_eq!(source_for(Broker::Oanda).as_str(), "oanda");
+        assert_eq!(
+            source_for(Broker::TradeNation).map(CandleSource::as_str),
+            Some("tradenation")
+        );
+        assert_eq!(
+            source_for(Broker::Oanda).map(CandleSource::as_str),
+            Some("oanda")
+        );
+    }
+
+    /// IBKR has no candle-cache feed. Returning `None` is what stops a futures
+    /// plan replaying against a CFD broker's prices and reporting the resulting
+    /// R-multiples as if they were the contract's.
+    #[test]
+    fn ibkr_has_no_candle_source() {
+        assert_eq!(source_for(Broker::Ibkr), None);
     }
 
     #[test]

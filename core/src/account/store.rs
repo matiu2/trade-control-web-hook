@@ -100,6 +100,7 @@ where
         let actual = match &creds {
             Credentials::TradeNation(_) => BrokerKind::TradeNation,
             Credentials::Oanda(_) => BrokerKind::Oanda,
+            Credentials::Ibkr(_) => BrokerKind::Ibkr,
         };
         if actual != meta.broker {
             return Err(AccountStoreError::BrokerMismatch {

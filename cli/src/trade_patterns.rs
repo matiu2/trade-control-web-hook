@@ -20,7 +20,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, Utc};
 use color_eyre::eyre::{Context, Result, eyre};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{FuzzySelect, Input};
@@ -34,6 +34,7 @@ use trade_control_core::intent::{
 };
 use trade_control_core::sig::KEY_LEN;
 
+use crate::close_out_check::{self, CloseOutVerdict};
 use crate::control::{
     wrap_signed_direct_enter, wrap_signed_template, wrap_signed_template_drawing,
 };
@@ -78,6 +79,20 @@ impl TradePattern {
             Self::Ihs => "ihs — Inverse Head & Shoulders (long)",
             Self::M => "m — M-top (short)",
             Self::W => "w — W-bottom (long)",
+        }
+    }
+
+    /// Which side of the market this pattern trades.
+    ///
+    /// Total over all four patterns, unlike
+    /// [`PatternGeometry::for_pattern`], which is H&S-only and panics on M/W
+    /// (its callers dispatch those away first). The close-out guard runs
+    /// *before* that dispatch and needs an answer for every pattern, because
+    /// a physical contract's long and short deadlines are ~a month apart.
+    pub fn direction(self) -> Direction {
+        match self {
+            Self::Hs | Self::M => Direction::Short,
+            Self::Ihs | Self::W => Direction::Long,
         }
     }
 
@@ -540,6 +555,15 @@ pub struct TradeSpec {
     /// fractional-pip FX. Absent = the worker falls back to `pip_size`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tick_size: Option<f64>,
+    /// Contract multiplier for an exchange-traded futures instrument (money per
+    /// 1.0 of price: ES `50`, GC `100`), baked onto the enter intent from
+    /// `instrument-lookup` (`Asset::contract_multiplier()`). Absent on every
+    /// spot/CFD spec — those are sized in units, an implicit `1.0`.
+    ///
+    /// Distinct from both [`Self::pip_size`] and [`Self::tick_size`]; see
+    /// `Intent::contract_multiplier` for why conflating them mis-sizes a trade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_multiplier: Option<f64>,
     /// What the market-hours blackout sweep should do with this trade's
     /// still-pending resting order if it's caught inside the instrument's
     /// daily close→open gap. Lands on the `05-enter` intent's
@@ -673,6 +697,10 @@ pub struct MwSpec {
     /// broker's price grid. `None` = fall back to `pip_size` in the worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tick_size: Option<f64>,
+    /// Contract multiplier for a futures instrument, baked onto the enter's
+    /// top-level `contract_multiplier`. `None` for spot/CFD (implicit `1.0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_multiplier: Option<f64>,
 }
 
 impl MwSpec {
@@ -825,6 +853,7 @@ pub fn build_trade_from_spec(
             }
         }
     }
+    check_futures_close_out(&spec, now, strictness)?;
     if !spec.tp_price.is_finite() {
         return Err(eyre!("tp_price must be a finite number"));
     }
@@ -1065,6 +1094,8 @@ fn build_pattern(
         mw: None,
         pip_size: None,
         tick_size: None,
+        // Interactive path is CFD-only; futures arm via tv-arm.
+        contract_multiplier: None,
         // Interactive path keeps the safe default (cancel a resting order,
         // never close a position). The `--blackout-close` flag lives on the
         // `--from-file` / scripted path.
@@ -1215,8 +1246,11 @@ fn assemble_trade(
         spec.needs_confirmed,
         &spec.skip_preps,
         spec.pull_back.is_some(),
-        spec.pip_size,
-        spec.tick_size,
+        InstrumentSizing {
+            pip_size: spec.pip_size,
+            tick_size: spec.tick_size,
+            contract_multiplier: spec.contract_multiplier,
+        },
         spec.blackout_close,
         &spec.broker,
         &spec.account,
@@ -1286,8 +1320,11 @@ fn assemble_trade(
             true,              // QM is always confirmed-candle gated
             &qm_skip_preps,
             false, // QM leg is prep-free (skips both preps) — no pullback either
-            spec.pip_size,
-            spec.tick_size,
+            InstrumentSizing {
+                pip_size: spec.pip_size,
+                tick_size: spec.tick_size,
+                contract_multiplier: spec.contract_multiplier,
+            },
             spec.blackout_close,
             &spec.broker,
             &spec.account,
@@ -1375,6 +1412,112 @@ fn assemble_trade(
 }
 
 // ===== M / W (double-top / double-bottom) assembly =====
+
+/// Refuse to arm a futures plan that could still be opening a position inside
+/// its contract's close-out window.
+///
+/// # The hazard
+///
+/// IBKR force-liquidates an expiring futures position during a close-out
+/// period preceding expiry, **without additional prior notice**, and does not
+/// roll positions. The deadline is not the expiry date on the contract chain:
+/// for a physically delivered contract a *long* must be out two business days
+/// before First Notice Day, which is the last business day of the month
+/// *preceding* delivery — so a December gold long's deadline is in November,
+/// about a month earlier than the chain suggests. Verified live on 2026-09-06:
+/// GCU6 was already past its long deadline while still listed as front month.
+///
+/// # Why this fires at arm time and not at entry
+///
+/// Arming is a licence to open a position later. By the time an entry fires
+/// there is nothing useful to say — the operator has walked away and the plan
+/// is running. So the guard reads the calendar's **arm-by** date, which is the
+/// deadline minus a safety margin sized to cover the trade window, multi-shot
+/// re-entry and a weekend (`ARM_SAFETY_BUSINESS_DAYS` in
+/// `contract-calendar-gen`).
+///
+/// # Scope
+///
+/// Fires for instruments that parse as futures ([`futures_symbol`]); every CFD
+/// and spot instrument the system trades today is untouched.
+///
+/// [`BrokerKind::Ibkr`] is an **additional trigger, not a filter.** The obvious
+/// reading of "scope this to IBKR" is `is_futures && broker == Ibkr`, which is
+/// wrong in the dangerous direction: it lets a futures symbol escape the guard
+/// by carrying a CFD broker field. So an IBKR plan whose instrument does not
+/// parse as a futures contract is *also* refused — on that broker there is
+/// nothing else to trade, so an unparseable symbol means the calendar cannot
+/// vouch for it, and fail-closed applies.
+///
+/// # Fail-closed
+///
+/// An unknown contract is a **refusal**, not an absent constraint — if the
+/// calendar cannot say when IBKR would liquidate, we must not arm. That is the
+/// whole contract of `core::contract_calendar`'s `Option`.
+///
+/// [`BuildStrictness::Lenient`] warns instead, matching how the sibling
+/// `trade_expiry` check treats offline `--plan-out` replay of historical
+/// setups.
+fn check_futures_close_out(
+    spec: &TradeSpec,
+    now: DateTime<Utc>,
+    strictness: BuildStrictness,
+) -> Result<()> {
+    // The whole window has to fit, so the question is asked about the last
+    // moment the plan can still enter, not about now.
+    let expiry_day = spec.trade_expiry.date_naive();
+    let direction = spec.pattern.direction();
+    let verdict = close_out_check::verdict(&spec.instrument, direction, expiry_day, now.year());
+    let side = match direction {
+        Direction::Long => "long",
+        Direction::Short => "short",
+    };
+    let refusal = match &verdict {
+        // Not a futures symbol. On a CFD broker that is the overwhelmingly
+        // common case and there is nothing to check. On IBKR it means we cannot
+        // identify the contract at all, so there is no deadline to honour.
+        CloseOutVerdict::NotFutures if spec.broker == BrokerKind::Ibkr => eyre!(
+            "this is an IBKR plan, but {:?} does not name a futures contract \
+             (expected a form like `GCZ6` or `GC 202612`), so its close-out \
+             deadline cannot be checked — refusing to arm.",
+            spec.instrument,
+        ),
+        CloseOutVerdict::NotFutures | CloseOutVerdict::Armable { .. } => return Ok(()),
+        CloseOutVerdict::PastArmingWindow {
+            contract,
+            arm_by,
+            close_out,
+            acts_until,
+        } => eyre!(
+            "{} {} is past its close-out arming window for a {side}: trade_expiry \
+             {acts_until} runs beyond the last armable day {arm_by}, and IBKR \
+             force-liquidates without notice from {close_out}. Arm the next \
+             contract month instead.",
+            contract.root,
+            contract.contract_month,
+        ),
+        CloseOutVerdict::UnknownContract { contract } => eyre!(
+            "{} {} is not in the contract calendar, so its close-out deadline is \
+             unknown — refusing to arm. IBKR force-liquidates expiring positions \
+             without notice, so an unknown contract is never safe. Regenerate the \
+             calendar with `contract-calendar-gen` if the month should be listed.",
+            contract.root,
+            contract.contract_month,
+        ),
+    };
+    match strictness {
+        BuildStrictness::Strict => Err(refusal),
+        BuildStrictness::Lenient => {
+            tracing::warn!(
+                instrument = %spec.instrument,
+                side,
+                "close-out check failed but allowed because this is an offline \
+                 --plan-out build (would be rejected on the live worker path): {refusal}",
+            );
+            Ok(())
+        }
+    }
+}
 
 /// Assemble an M / W trade bundle. Structurally distinct from H&S: no
 /// prep chain, no drawing-bound invalidation vetos, and the worker — not
@@ -1663,15 +1806,19 @@ fn build_mw_enter_alert(
     intent.spread_window = spread_window;
     // entry / stop_loss / take_profit deliberately left None — the worker
     // computes all three from `mw` + the shell OHLC (mid-correct).
-    // Read the tick before `to_params` consumes `mw`; baked onto the top-level
-    // field so the worker snaps the mid-correct M/W prices onto the grid.
+    // Read the tick and multiplier before `to_params` consumes `mw`; both are
+    // baked onto top-level fields — the tick so the worker snaps the
+    // mid-correct M/W prices onto the grid, the multiplier so a futures M/W
+    // sizes in contracts rather than units.
     let mw_tick = mw.tick_size;
+    let mw_multiplier = mw.contract_multiplier;
     let mw_pip = mw.pip_size;
     intent.mw = Some(mw.to_params());
     // Carry the same pip on the top-level field so the worker's shared
     // sizing tail (`pip_size_for`) sees the baked value, not its default.
     intent.pip_size = Some(mw_pip);
     intent.tick_size = mw_tick;
+    intent.contract_multiplier = mw_multiplier;
     match risk_amount {
         Some(amount) => {
             intent.risk_amount = Some(trade_control_core::tunable::Tunable::Static(amount))
@@ -1733,17 +1880,21 @@ fn prompt_instrument(theme: &ColorfulTheme) -> Result<String> {
 }
 
 fn prompt_broker(theme: &ColorfulTheme) -> Result<BrokerKind> {
-    let options = ["oanda", "tradenation"];
+    // Menu and result both come from `BrokerKind::ALL`, so a new broker shows
+    // up in the picker and maps to itself. The previous shape listed the labels
+    // by hand and mapped `_ => TradeNation`, which would have silently returned
+    // TradeNation for every entry after the first.
+    let options: Vec<&str> = BrokerKind::ALL.iter().map(|b| b.as_str()).collect();
     let idx = FuzzySelect::with_theme(theme)
         .with_prompt("broker")
-        .items(options)
+        .items(&options)
         .default(0)
         .interact()
         .map_err(|e| eyre!("broker pick aborted: {e}"))?;
-    Ok(match idx {
-        0 => BrokerKind::Oanda,
-        _ => BrokerKind::TradeNation,
-    })
+    BrokerKind::ALL
+        .get(idx)
+        .copied()
+        .ok_or_else(|| eyre!("broker pick returned index {idx}, which is not a known broker"))
 }
 
 fn prompt_trade_expiry(
@@ -1856,6 +2007,9 @@ fn skeleton(
         mw: None,
         pip_size: None,
         tick_size: None,
+        // Overwritten by the enter builders from the spec. Vetos and preps
+        // keep `None` — neither is ever sized.
+        contract_multiplier: None,
         spread_window: None,
         trade_plan: None,
         blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
@@ -2088,6 +2242,24 @@ fn build_prep_expire_alert(
     }
 }
 
+/// The three per-instrument sizing numbers baked onto an enter intent.
+///
+/// Grouped rather than passed as three adjacent `Option<f64>` parameters:
+/// `build_enter_alert` already takes 30-odd arguments, and three same-typed
+/// neighbours are a swap waiting to happen that no type would catch — while
+/// mixing them up is precisely the classic futures bug (tick, pip and
+/// multiplier are three different numbers; for ES they are 0.25, 1.0 and 50).
+/// Naming them at the call site makes a transposition visible.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InstrumentSizing {
+    /// Scales `offset_pips` into a price at the worker.
+    pub pip_size: Option<f64>,
+    /// Price grid the worker snaps entry/SL/TP onto before placement.
+    pub tick_size: Option<f64>,
+    /// Futures money-per-1.0-of-price. `None` for spot/CFD (implicit `1.0`).
+    pub contract_multiplier: Option<f64>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_enter_alert(
     instrument: &str,
@@ -2110,8 +2282,7 @@ fn build_enter_alert(
     needs_confirmed: bool,
     skip_preps: &[String],
     pull_back: bool,
-    pip_size: Option<f64>,
-    tick_size: Option<f64>,
+    sizing: InstrumentSizing,
     blackout_close: BlackoutCloseAction,
     broker: &BrokerKind,
     account: &str,
@@ -2150,8 +2321,9 @@ fn build_enter_alert(
     intent.direction = Some(geometry.direction);
     // Baked pip scales the entry/SL offset_pips at the worker; absent =
     // worker falls back to its secret/default.
-    intent.pip_size = pip_size;
-    intent.tick_size = tick_size;
+    intent.pip_size = sizing.pip_size;
+    intent.tick_size = sizing.tick_size;
+    intent.contract_multiplier = sizing.contract_multiplier;
     let (entry_offset_pips, entry_offset_atr_pct) = entry_offset.as_fields();
     intent.entry = Some(match entry_mode {
         EntryMode::Stop => EntrySpec::Stop {
@@ -2360,6 +2532,10 @@ pub struct PositionEnterSpec {
     /// Tick size baked onto the intent (from instrument-lookup) so the worker
     /// snaps entry/SL/TP onto the broker's grid before placement.
     pub tick_size: Option<f64>,
+    /// Contract multiplier for a futures instrument, baked onto the naked
+    /// enter. `None` for spot/CFD (implicit `1.0`). No serde attribute: this
+    /// spec is built in-process by `tv-arm`, never deserialised from a file.
+    pub contract_multiplier: Option<f64>,
     /// When true, the worker logs the order but doesn't push to broker.
     pub dry_run: bool,
 }
@@ -2427,6 +2603,7 @@ pub fn build_position_enter(
     intent.direction = Some(spec.direction);
     intent.pip_size = spec.pip_size;
     intent.tick_size = spec.tick_size;
+    intent.contract_multiplier = spec.contract_multiplier;
     intent.entry = Some(entry);
     intent.stop_loss = Some(PriceRef::Absolute {
         absolute: spec.stop_loss,
@@ -2752,8 +2929,7 @@ mod tests {
                 false,
                 &[],
                 false, // pull_back
-                None,
-                None,
+                InstrumentSizing::default(),
                 BlackoutCloseAction::default(),
                 &BrokerKind::Oanda,
                 "demo",
@@ -2804,6 +2980,7 @@ mod tests {
                 mw: None,
                 pip_size: None,
                 tick_size: None,
+                contract_multiplier: None,
                 blackout_close: BlackoutCloseAction::default(),
                 entry_level_vetos: Vec::new(),
                 recover_entry: RecoverEntryAction::Skip,
@@ -2849,8 +3026,11 @@ mod tests {
             false,
             &[],
             false, // pull_back
-            None,
-            None,
+            InstrumentSizing {
+                pip_size: None,
+                tick_size: None,
+                contract_multiplier: None,
+            },
             BlackoutCloseAction::default(),
             &BrokerKind::Oanda,
             "demo",
@@ -2948,8 +3128,7 @@ mod tests {
                 true, // confirmed-candle gated
                 &["break-and-close".to_string(), "retest".to_string()],
                 false, // pull_back
-                None,
-                None,
+                InstrumentSizing::default(),
                 BlackoutCloseAction::default(),
                 &BrokerKind::Oanda,
                 "demo",
@@ -3043,8 +3222,11 @@ mod tests {
             false,
             &[],
             false, // pull_back
-            None,
-            None,
+            InstrumentSizing {
+                pip_size: None,
+                tick_size: None,
+                contract_multiplier: None,
+            },
             BlackoutCloseAction::default(),
             &BrokerKind::Oanda,
             "demo",
@@ -3086,8 +3268,11 @@ mod tests {
             false,
             &[],
             false, // pull_back
-            None,
-            None,
+            InstrumentSizing {
+                pip_size: None,
+                tick_size: None,
+                contract_multiplier: None,
+            },
             BlackoutCloseAction::default(),
             &BrokerKind::Oanda,
             "demo",
@@ -3168,8 +3353,11 @@ mod tests {
             false,
             &[],
             false, // pull_back
-            None,
-            None,
+            InstrumentSizing {
+                pip_size: None,
+                tick_size: None,
+                contract_multiplier: None,
+            },
             BlackoutCloseAction::default(),
             &BrokerKind::Oanda,
             "demo",
@@ -3224,8 +3412,11 @@ mod tests {
             false,
             &[],
             false,
-            None,
-            None,
+            InstrumentSizing {
+                pip_size: None,
+                tick_size: None,
+                contract_multiplier: None,
+            },
             BlackoutCloseAction::default(),
             &BrokerKind::Oanda,
             "demo",
@@ -3313,6 +3504,7 @@ mod tests {
             risk_amount: None,
             pip_size: Some(0.0001),
             tick_size: Some(0.0001),
+            contract_multiplier: None,
             dry_run: false,
         }
     }
@@ -3410,6 +3602,7 @@ mod tests {
             mw: None,
             pip_size: None,
             tick_size: None,
+            contract_multiplier: None,
             blackout_close: BlackoutCloseAction::default(),
             entry_level_vetos: Vec::new(),
             recover_entry: RecoverEntryAction::Skip,
@@ -3418,6 +3611,180 @@ mod tests {
             breakeven_pct: default_breakeven_pct(),
             spread_window: None,
         }
+    }
+
+    // ---- Stage 3: futures close-out refusal --------------------------------
+    //
+    // GC 202612 in the baked calendar:
+    //   last trade   2026-12-29
+    //   FND          2026-11-30
+    //   long  close-out 2026-11-25, arm-by 2026-11-11
+    //   short close-out 2026-12-24, arm-by 2026-12-10
+    // The month between the two arm-by dates is where direction matters.
+
+    /// A December gold LONG whose window reaches past the November arm-by date
+    /// must be refused — the month-early trap reaching the operator.
+    #[test]
+    fn a_futures_long_past_its_arm_by_date_is_refused() {
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-11-20T00:00:00Z"));
+        spec.instrument = "GCZ6".into();
+        let err = build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Strict)
+            .expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("GC"), "{msg}");
+        assert!(msg.contains("202612"), "{msg}");
+        assert!(msg.contains("long"), "{msg}");
+        // The operator needs both the date they blew and what to do instead.
+        assert!(
+            msg.contains("2026-11-11"),
+            "must name the arm-by date: {msg}"
+        );
+        assert!(msg.contains("next contract month"), "{msg}");
+    }
+
+    /// The same contract, armed well before the window, builds normally.
+    #[test]
+    fn the_same_futures_plan_earlier_in_the_month_builds() {
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-10-20T00:00:00Z"));
+        spec.instrument = "GCZ6".into();
+        build_trade_from_spec(spec, ts("2026-10-18T00:00:00Z"), BuildStrictness::Strict)
+            .expect("a plan whose window ends a month before the arm-by date must build");
+    }
+
+    /// The pair test: on one date, in one contract, a short is still armable
+    /// and a long is not. Collapsing the two deadlines would let a long run a
+    /// month past its own — the single most expensive mistake available here.
+    #[test]
+    fn direction_decides_the_verdict_between_the_two_arm_by_dates() {
+        let now = ts("2026-11-18T00:00:00Z");
+        let expiry = ts("2026-11-20T00:00:00Z");
+
+        let mut long = sample_spec(TradePattern::Ihs, expiry);
+        long.instrument = "GCZ6".into();
+        assert!(
+            build_trade_from_spec(long, now, BuildStrictness::Strict).is_err(),
+            "the long is already past its arm-by date"
+        );
+
+        let mut short = sample_spec(TradePattern::Hs, expiry);
+        short.instrument = "GCZ6".into();
+        build_trade_from_spec(short, now, BuildStrictness::Strict)
+            .expect("the short still has until December");
+    }
+
+    /// An unknown contract is a refusal, never an absent constraint: if the
+    /// calendar cannot say when IBKR would liquidate, arming is not safe.
+    #[test]
+    fn an_unknown_futures_contract_is_refused() {
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.instrument = "ZZZ 202612".into();
+        let err = build_trade_from_spec(spec, ts("2026-05-20T00:00:00Z"), BuildStrictness::Strict)
+            .expect_err("an unknown contract must refuse");
+        assert!(err.to_string().contains("not in the contract calendar"));
+    }
+
+    /// The guard must be invisible to the CFD/spot plans that are all the
+    /// system trades today — the plan's own verification asks for exactly this.
+    #[test]
+    fn a_cfd_plan_with_the_same_geometry_is_unaffected() {
+        // Identical dates to the refused futures long above; only the
+        // instrument differs.
+        let spec = sample_spec(TradePattern::Ihs, ts("2026-11-20T00:00:00Z"));
+        assert_eq!(spec.instrument, "EUR_USD");
+        build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Strict)
+            .expect("a CFD plan must be untouched by the futures close-out guard");
+    }
+
+    /// Offline `--plan-out` replay of a historical setup must still build,
+    /// exactly as it does for an already-expired `trade_expiry`.
+    #[test]
+    fn lenient_plan_out_warns_instead_of_refusing() {
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-11-20T00:00:00Z"));
+        spec.instrument = "GCZ6".into();
+        build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Lenient)
+            .expect("offline builds warn rather than refusing");
+    }
+
+    /// The guard asks about the end of the trade window, not about now — an
+    /// armed plan can still be entering right up to `trade_expiry`.
+    #[test]
+    fn the_window_end_is_what_is_checked_not_the_arming_moment() {
+        // Armed on the arm-by date itself, but with a window running past it.
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-11-13T00:00:00Z"));
+        spec.instrument = "GCZ6".into();
+        assert!(
+            build_trade_from_spec(spec, ts("2026-11-11T00:00:00Z"), BuildStrictness::Strict)
+                .is_err(),
+            "arming on the last armable day with a window that outlives it must refuse"
+        );
+    }
+
+    /// The IBKR broker field is an *additional trigger*, not a filter. The
+    /// tempting `is_futures && broker == Ibkr` scoping would let a futures
+    /// contract escape the guard entirely by carrying a CFD broker field, so a
+    /// futures symbol is refused whatever broker it names.
+    #[test]
+    fn a_futures_symbol_is_guarded_even_on_a_cfd_broker() {
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-11-20T00:00:00Z"));
+        spec.instrument = "GCZ6".into();
+        spec.broker = BrokerKind::Oanda;
+        assert!(
+            build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Strict)
+                .is_err(),
+            "a futures contract must not escape the guard via its broker field"
+        );
+    }
+
+    /// On IBKR there is nothing but futures to trade, so an instrument that
+    /// does not parse as a contract cannot be checked against the calendar —
+    /// and fail-closed means that is a refusal, not a pass.
+    #[test]
+    fn an_ibkr_plan_naming_a_non_futures_instrument_is_refused() {
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-11-20T00:00:00Z"));
+        spec.broker = BrokerKind::Ibkr;
+        assert_eq!(spec.instrument, "EUR_USD");
+        let err = build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Strict)
+            .expect_err("an IBKR plan must name a futures contract");
+        assert!(
+            err.to_string().contains("does not name a futures contract"),
+            "{err}"
+        );
+    }
+
+    /// …and that refusal degrades to a warning offline, like every other arm
+    /// of this guard, so historical `--plan-out` replay still builds.
+    #[test]
+    fn the_ibkr_non_futures_refusal_is_lenient_offline() {
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-11-20T00:00:00Z"));
+        spec.broker = BrokerKind::Ibkr;
+        build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Lenient)
+            .expect("offline builds warn rather than refusing");
+    }
+
+    /// A CFD plan on a CFD broker stays untouched — the narrowing must not have
+    /// widened the guard onto the instruments the system actually trades.
+    ///
+    /// OANDA only: the TradeNation arm of `validate_instrument` reads the local
+    /// encrypted account store, so covering it here would test the developer's
+    /// machine rather than the guard.
+    #[test]
+    fn a_cfd_plan_on_a_cfd_broker_is_still_unaffected() {
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-11-20T00:00:00Z"));
+        spec.broker = BrokerKind::Oanda;
+        build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Strict)
+            .expect("an OANDA CFD plan must build");
+    }
+
+    /// M/W patterns reach the guard too — they dispatch to `build_mw_pattern`
+    /// *after* it, and `PatternGeometry::for_pattern` panics on them, which is
+    /// why the direction mapping is on `TradePattern` rather than the geometry.
+    #[test]
+    fn mw_patterns_are_covered_by_the_guard_without_panicking() {
+        let mut spec = mw_spec(TradePattern::W, ts("2026-11-20T00:00:00Z"));
+        spec.instrument = "GCZ6".into();
+        let err = build_trade_from_spec(spec, ts("2026-11-18T00:00:00Z"), BuildStrictness::Strict)
+            .expect_err("a W-bottom is a long, so it is past its arm-by date");
+        assert!(err.to_string().contains("long"), "{}", err);
     }
 
     #[test]
@@ -4012,6 +4379,7 @@ mod tests {
             spread_pips: 1.0,
             pip_size: 0.0001,
             tick_size: None,
+            contract_multiplier: None,
         }
     }
 
@@ -4157,6 +4525,60 @@ mod tests {
         // The tick is baked onto the enter so the worker snaps prices to grid.
         assert_eq!(enter.tick_size, Some(0.001));
         enter.validate().expect("hs enter with pip valid");
+    }
+
+    #[test]
+    fn build_hs_enter_carries_the_baked_contract_multiplier() {
+        // The three sizing numbers ride the same path but are NOT the same
+        // number — ES ticks 0.25, sizes on a 1.0 point, and is worth $50 per
+        // point. This asserts all three arrive intact and unswapped; reading
+        // 1.0 for the multiplier would place a 50x oversized position.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.pip_size = Some(1.0);
+        spec.tick_size = Some(0.25);
+        spec.contract_multiplier = Some(50.0);
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let enter = &trade.alerts[5].intent;
+        assert_eq!(enter.action, Action::Enter);
+        assert_eq!(enter.contract_multiplier, Some(50.0));
+        assert_eq!(enter.tick_size, Some(0.25));
+        assert_eq!(enter.pip_size, Some(1.0));
+        enter.validate().expect("futures enter valid");
+    }
+
+    #[test]
+    fn only_the_enter_carries_the_contract_multiplier() {
+        // Vetos and preps never place an order, so none of them should carry a
+        // sizing number. A multiplier leaking onto a veto would change its wire
+        // body — and therefore its signature — for no reason.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.contract_multiplier = Some(50.0);
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        for (i, alert) in trade.alerts.iter().enumerate() {
+            let expected = if alert.intent.action == Action::Enter {
+                Some(50.0)
+            } else {
+                None
+            };
+            assert_eq!(
+                alert.intent.contract_multiplier, expected,
+                "alert {i} ({}) carried the wrong multiplier",
+                alert.basename
+            );
+        }
+    }
+
+    #[test]
+    fn build_hs_enter_omits_the_multiplier_for_a_cfd_spec() {
+        // The wire-compat anchor at the build layer: a CFD spec must produce an
+        // enter with no multiplier at all, byte-identical to pre-feature.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        assert_eq!(spec.contract_multiplier, None);
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        assert_eq!(trade.alerts[5].intent.contract_multiplier, None);
     }
 
     #[test]

@@ -495,8 +495,15 @@ mod tests {
             // Fixtures are saved from `--simulate` runs (the default), so the
             // golden outcome carries fills AND economics; recompute both the same
             // way the binary does — render (which books) then snapshot.
-            let rendered =
-                super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
+            let rendered = super::super::report::render(
+                &inputs.plan,
+                &replay,
+                true,
+                false,
+                None,
+                &mark_cfg,
+                None,
+            );
             let computed = ReplayOutcome::compute(&replay, true, Some(&rendered.economics));
 
             // Tolerant compare (`golden_eq`), NOT `assert_eq!`: `ReplayOutcome`'s
@@ -565,7 +572,7 @@ mod tests {
         )
         .await;
         let rendered =
-            super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
+            super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg, None);
         let econ = &rendered.economics;
 
         // The trade-expiry ClosePositions veto must FLATTEN the open position at
@@ -667,7 +674,7 @@ mod tests {
         )
         .await;
         let rendered =
-            super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
+            super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg, None);
         let econ = &rendered.economics;
 
         assert_eq!(
@@ -742,7 +749,7 @@ mod tests {
         )
         .await;
         let rendered =
-            super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
+            super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg, None);
         let econ = &rendered.economics;
         let text = &rendered.text;
 
@@ -836,7 +843,7 @@ mod tests {
         )
         .await;
         let rendered =
-            super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
+            super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg, None);
         let snapshot = ReplayOutcome::compute(&replay, true, Some(&rendered.economics));
 
         let net_r = snapshot
@@ -881,8 +888,15 @@ mod tests {
             CronCadence::PER_BAR,
         )
         .await;
-        let rendered =
-            super::super::report::render(&inputs.plan, &replay, false, false, None, &mark_cfg);
+        let rendered = super::super::report::render(
+            &inputs.plan,
+            &replay,
+            false,
+            false,
+            None,
+            &mark_cfg,
+            None,
+        );
         let snapshot = ReplayOutcome::compute(&replay, false, Some(&rendered.economics));
         assert!(
             snapshot.outcome.is_none(),

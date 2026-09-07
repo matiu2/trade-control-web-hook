@@ -134,8 +134,10 @@ enum Command {
         /// Demo or live.
         #[arg(long)]
         kind: KindArg,
-        /// OANDA sub-account id (required for `--broker oanda`; ignored for
-        /// TradeNation, where the session identifies the account).
+        /// Broker sub-account id. **Required** for `--broker oanda` (the
+        /// sub-account under the shared API key) and for `--broker ibkr` (the
+        /// account under the Gateway login, e.g. `DUR300718` for paper).
+        /// Ignored for TradeNation, where the session identifies the account.
         #[arg(long)]
         oanda_account_id: Option<String>,
         /// Optional per-account max risk % (tighter than the worker-wide cap).
@@ -152,11 +154,13 @@ enum Command {
     },
 }
 
-/// CLI mirror of [`BrokerKind`] so clap can derive `--broker oanda|tradenation`.
+/// CLI mirror of [`BrokerKind`] so clap can derive
+/// `--broker oanda|tradenation|ibkr`.
 #[derive(Clone, Copy, ValueEnum)]
 enum BrokerArg {
     Oanda,
     Tradenation,
+    Ibkr,
 }
 
 impl From<BrokerArg> for BrokerKind {
@@ -164,6 +168,7 @@ impl From<BrokerArg> for BrokerKind {
         match b {
             BrokerArg::Oanda => BrokerKind::Oanda,
             BrokerArg::Tradenation => BrokerKind::TradeNation,
+            BrokerArg::Ibkr => BrokerKind::Ibkr,
         }
     }
 }
@@ -305,10 +310,7 @@ async fn remove(accounts: &PgMetadataStore, name: &str) -> Result<()> {
 
 /// One-line operator-facing rendering of an account's metadata.
 fn render(m: &AccountMetadata) -> String {
-    let broker = match m.broker {
-        BrokerKind::Oanda => "oanda",
-        BrokerKind::TradeNation => "tradenation",
-    };
+    let broker = m.broker.as_str();
     let kind = match m.kind {
         AccountKind::Demo => "demo",
         AccountKind::Live => "live",

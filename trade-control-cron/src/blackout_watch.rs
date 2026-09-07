@@ -201,6 +201,7 @@ async fn restore_remembered_stops<C: CronEnv>(cron: &C, record: &HeldTradeRecord
     let positions = match &broker {
         BrokerHandle::Oanda(b) => b.list_open_positions(account).await,
         BrokerHandle::TradeNation(b) => b.list_open_positions(account).await,
+        BrokerHandle::Ibkr(b) => b.list_open_positions(account).await,
     };
     let positions = match positions {
         Ok(p) => p,
@@ -260,6 +261,7 @@ async fn restore_remembered_stops<C: CronEnv>(cron: &C, record: &HeldTradeRecord
                 let result = match &broker {
                     BrokerHandle::Oanda(b) => b.amend_stop(account, id, level).await,
                     BrokerHandle::TradeNation(b) => b.amend_stop(account, id, level).await,
+                    BrokerHandle::Ibkr(b) => b.amend_stop(account, id, level).await,
                 };
                 match result {
                     Ok(()) => tracing::info!(

@@ -509,6 +509,74 @@ mod tests {
         ));
     }
 
+    /// Build a signed futures `enter` carrying a baked `contract_multiplier`.
+    /// A plain top-level line, like `pip_size` / `tick_size`, so the whole-body
+    /// HMAC covers it with no signing-code change — the tamper test below is
+    /// what proves that rather than assuming it.
+    fn build_signed_futures_enter(multiplier: &str) -> String {
+        let body_without_sig = [
+            "close: 5825.00",
+            "high: 5830.00",
+            "low: 5820.00",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "v: 1",
+            "action: enter",
+            "instrument: ES",
+            "id: hs-es-mult",
+            "trade_id: es-hs-1",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "direction: long",
+            "entry: {\"type\":\"stop\",\"from\":\"high\",\"offset_pips\":1.0}",
+            "stop_loss: {\"from\":\"low\",\"offset_pips\":-1.0}",
+            "take_profit: {\"absolute\":5900.0}",
+            "pip_size: 1.0",
+            "tick_size: 0.25",
+            &format!("contract_multiplier: {multiplier}"),
+            "",
+        ]
+        .join("\n");
+        let pairs = signed_pairs_from_text(&body_without_sig).unwrap();
+        let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+        format!("{body_without_sig}sig: \"{sig}\"\n")
+    }
+
+    #[test]
+    fn signed_path_contract_multiplier_round_trips() {
+        let yaml = build_signed_futures_enter("50.0");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&yaml, &KEY, now).unwrap();
+        assert_eq!(v.intent.contract_multiplier, Some(50.0));
+        // The three sizing numbers are distinct and must not be conflated.
+        assert_eq!(v.intent.tick_size, Some(0.25));
+        assert_eq!(v.intent.pip_size, Some(1.0));
+    }
+
+    #[test]
+    fn signed_path_contract_multiplier_tamper_rejected() {
+        // The multiplier divides the sizing math, so editing it after signing
+        // is the highest-leverage tamper available: 50 -> 1 on ES would place a
+        // 50x oversized position. It is a signed value, and this proves it.
+        let yaml = build_signed_futures_enter("50.0")
+            .replace("contract_multiplier: 50.0", "contract_multiplier: 1.0");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        assert!(matches!(
+            parse_and_verify(&yaml, &KEY, now),
+            Err(IncomingError::Sig(SigError::Mismatch))
+        ));
+    }
+
+    #[test]
+    fn signed_path_rejects_a_zero_contract_multiplier() {
+        // Validation runs on the parsed intent, so a signed-but-nonsensical
+        // multiplier is refused rather than reaching the sizing math.
+        let yaml = build_signed_futures_enter("0.0");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        assert!(
+            parse_and_verify(&yaml, &KEY, now).is_err(),
+            "a zero multiplier must not verify"
+        );
+    }
+
     /// Build a signed `enter` carrying an explicit `blackout_close` policy
     /// (the market-hours entry blackout field). A scalar enum on its own
     /// top-level line, so it's covered by the whole-body HMAC like any other

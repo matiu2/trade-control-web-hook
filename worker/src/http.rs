@@ -64,7 +64,7 @@ use trade_control_core::intent::{Action, BrokerKind, VetoLevel};
 use trade_control_core::state::StateStore;
 
 use crate::dispatch_config_native::build_dispatch_config_native;
-use crate::{PgMetadataStore, PgStateStore, Secrets, acquire_oanda, acquire_tn};
+use crate::{PgMetadataStore, PgStateStore, Secrets, acquire_ibkr, acquire_oanda, acquire_tn};
 
 /// Shared application state owned by the local dispatcher thread. The HMAC
 /// `signing_key` is stored **already hex-decoded** (the wire key is hex; the
@@ -489,6 +489,20 @@ async fn dispatch_broker(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "tradenation login failed (missing account, bad credentials, or expired \
                      session — check logs)",
+                );
+            }
+        },
+        // A failed IBKR acquire is a **local** problem — the IB Gateway on this
+        // host is down, not logged in, or listening elsewhere — so it maps to
+        // 503 like TradeNation's login failure rather than OANDA's 500. It is
+        // retryable and usually fixed by restarting the Gateway.
+        BrokerKind::Ibkr => match acquire_ibkr(&meta).await {
+            Ok(broker) => run_action(&broker, &state.store, verified, &cfg, now, body).await,
+            Err(err) => {
+                tracing::error!("ibkr acquire failed: {err}");
+                return DispatchOutcome::plain(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ibkr gateway unavailable (is IB Gateway running and logged in? — check logs)",
                 );
             }
         },

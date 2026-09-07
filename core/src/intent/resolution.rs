@@ -111,6 +111,18 @@ pub struct Resolved {
     /// entry price — see [`super::Breakeven`]. Carried on the resolved trade so
     /// both consumers share one source of truth and can't drift.
     pub breakeven: Option<super::Breakeven>,
+    /// Contract multiplier for a futures instrument, copied verbatim from
+    /// [`Intent::contract_multiplier`](super::Intent::contract_multiplier).
+    /// `None` for every spot/CFD trade.
+    ///
+    /// Carried here rather than read off the intent at each `EntryRequest`
+    /// construction because there are **four** of them in `run_enter` (the
+    /// initial placement plus three recovery re-placements), and they must all
+    /// agree: a recovery that re-places with a different multiplier than the
+    /// original would silently re-size the trade. That is the same drift hazard
+    /// `pip_size` created by living in two places
+    /// (`Intent::pip_size` and `MwParams::pip_size`) — one field, one source.
+    pub contract_multiplier: Option<f64>,
 }
 
 /// Hard server-side floor on `min_r`. Overrides below this are rejected
@@ -572,6 +584,7 @@ impl Resolved {
             dry_run: intent.dry_run.unwrap_or(false),
             recover_entry,
             breakeven: intent.breakeven,
+            contract_multiplier: intent.contract_multiplier,
         };
 
         // Server-enforced floor: an `min_r` override cannot weaken the
@@ -838,6 +851,7 @@ mod tests {
             mw: None,
             pip_size: None,
             tick_size: None,
+            contract_multiplier: None,
             spread_window: None,
             trade_plan: None,
             blackout_close: crate::intent::BlackoutCloseAction::default(),
@@ -2465,5 +2479,30 @@ min_r: !script "if direction == \"long\" { 1.5 } else { 1.0 }"
         let r = Resolved::from_intent(&intent, &s, 0.0001, 0.0).unwrap();
         // 1.0980 - 2*0.0001 = 1.0978, unchanged.
         assert!((r.stop_loss - 1.0978).abs() < 1e-9, "{}", r.stop_loss);
+    }
+
+    /// The multiplier must survive the intent -> `Resolved` hop.
+    ///
+    /// Stage 5 baked it onto the signed intent and validated it, but nothing
+    /// read it: it reached `run_enter` and stopped. This is the first half of
+    /// closing that gap — a dropped copy here re-opens it silently, because a
+    /// futures trade would then size as though it were spot.
+    #[test]
+    fn a_baked_contract_multiplier_reaches_the_resolved_trade() {
+        let mut intent = long_market_intent();
+        intent.contract_multiplier = Some(50.0);
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
+        assert_eq!(r.contract_multiplier, Some(50.0));
+    }
+
+    /// A spot/CFD trade must stay `None` — not `Some(1.0)`.
+    ///
+    /// The distinction is load-bearing downstream: a futures broker treats
+    /// `None` as a refusal to size, so defaulting it here to `1.0` would hand a
+    /// futures instrument a spot multiplier instead of refusing.
+    #[test]
+    fn a_spot_trade_carries_no_multiplier_rather_than_one() {
+        let r = Resolved::from_intent(&long_market_intent(), &shell(), 0.0001, 0.0).unwrap();
+        assert_eq!(r.contract_multiplier, None);
     }
 }

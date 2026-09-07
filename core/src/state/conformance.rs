@@ -937,6 +937,7 @@ fn sample_record(trade_id: &str, account: Option<&str>, instrument: &str) -> Hel
             stored_at: now,
             drop_at: now + chrono::Duration::hours(3),
             shell_time: now,
+            bar_seconds: Some(3600),
         }],
     }
 }
