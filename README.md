@@ -3137,9 +3137,24 @@ Each script:
    `-dev` set). So you pick an environment by which command you run; no env
    var to set. The worker URL each `tv-arm-<env>` registers its `TradePlan`
    against is baked in the same way.
-4. Rebuilds `trade-control-worker`, installs it to
+4. Rebuilds the **unsuffixed** operator tools that live in the *worker*
+   package — `trade-control-accounts` and `trade-control-broker-check` — and
+   installs them to `~/.cargo/bin`. They bake no webhook and pick their
+   database at runtime (`--database-url` / `DATABASE_URL`, else `--config`,
+   else `~/.config/trade-control/trade-control.toml`), so there is **one
+   current copy** rather than a per-env one.
+5. Rebuilds `trade-control-worker`, installs it to
    `~/.local/bin/trade-control-worker-<suffix>`, and restarts the matching
    systemd `--user` service so the deploy rolls the running process too.
+
+⚠️ Step 4 exists because those two tools belong to neither list the deploy
+previously walked: they are not webhook-baking CLIs, and they are not the
+worker. So **nothing rebuilt them at all**. `trade-control-accounts` sat frozen
+from 2026-06-30 until 2026-09-07 and eventually failed to decode an account row
+a newer binary had written (`decode broker 'ibkr': unknown variant`) — which
+reads like data corruption rather than a stale binary, and both tools are
+exactly what you reach for while debugging an account problem. If you add
+another binary to the worker package, put it in `WORKER_CLI_BINARIES`.
 
 `deploy-lib.sh` holds the shared logic; the per-env wrappers hold only the
 branch + URL (one place each), so standing up a new environment (e.g. the
