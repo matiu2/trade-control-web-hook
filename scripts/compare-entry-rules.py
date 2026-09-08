@@ -45,18 +45,32 @@ COLUMN_ALIASES = {
 
 SL_SUFFIX = {"signal": "", "fib-top": "-sl-fib-top", "invalidation": "-sl-invalidation"}
 
+# Entry order type (`--entry-matrix`). "default" is the unsuffixed pre-axis cell:
+# same plan as an explicit stop, but armed with the flag off. Kept as its own
+# key so an old corpus and a regenerated one can both be read without either
+# silently mapping onto the other.
+ENTRY_SUFFIX = {
+    "default": "",
+    "stop": "-entry-stop",
+    "market": "-entry-market",
+    "limit": "-entry-limit",
+}
+
 
 class Cell:
     """One fixture directory: a (setup, column, news, sl-anchor) coordinate."""
 
-    __slots__ = ("name", "setup", "column", "news", "sl", "net_r", "legs", "phase")
+    __slots__ = (
+        "name", "setup", "column", "news", "sl", "entry", "net_r", "legs", "phase",
+    )
 
-    def __init__(self, name, setup, column, news, sl, net_r, legs, phase):
+    def __init__(self, name, setup, column, news, sl, entry, net_r, legs, phase):
         self.name = name
         self.setup = setup
         self.column = column
         self.news = news
         self.sl = sl
+        self.entry = entry
         self.net_r = net_r
         self.legs = legs
         self.phase = phase
@@ -70,13 +84,23 @@ class Cell:
 
 
 def parse_cell_name(name: str):
-    """Split a fixture dir name into (setup, column, news, sl-anchor).
+    """Split a fixture dir name into (setup, column, news, sl-anchor, entry).
 
     Returns None for cells outside the grid (hand-made regression fixtures like
     `coffee-sad` or `xau-xag-tp-resistance`), which carry no column coordinate
     and must not be scored as if they did.
+
+    Suffix order is fixed by `Variant::fixture_suffix`: `-sl-*` then `-entry-*`,
+    so they must be stripped in reverse (entry first).
     """
     rest = name
+    entry = "default"
+    for kind, suffix in ENTRY_SUFFIX.items():
+        if suffix and rest.endswith(suffix):
+            rest = rest[: -len(suffix)]
+            entry = kind
+            break
+
     sl = "signal"
     for anchor, suffix in SL_SUFFIX.items():
         if suffix and rest.endswith(suffix):
@@ -95,7 +119,7 @@ def parse_cell_name(name: str):
     for column in sorted(COLUMNS, key=len, reverse=True):
         tail = f"-{column}"
         if rest.endswith(tail):
-            return rest[: -len(tail)], column, news, sl
+            return rest[: -len(tail)], column, news, sl, entry
     return None
 
 
@@ -109,7 +133,7 @@ def load_corpus(root: Path):
         if coord is None:
             skipped.append((name, "not a grid cell"))
             continue
-        setup, column, news, sl = coord
+        setup, column, news, sl, entry = coord
         try:
             data = json.loads(meta.read_text())
         except (OSError, json.JSONDecodeError) as exc:
@@ -127,6 +151,7 @@ def load_corpus(root: Path):
                 column=column,
                 news=news,
                 sl=sl,
+                entry=entry,
                 net_r=float(net_r),
                 legs=len(outcome.get("legs") or []),
                 phase=data.get("final_phase"),
@@ -151,11 +176,22 @@ def summarise(rs):
     }
 
 
-def build_grid(cells, news, sl):
-    """setup -> column -> Cell, for one (news, sl-anchor) slice."""
+def build_grid(cells, news, sl, entry):
+    """setup -> column -> Cell, for one (news, sl-anchor, entry-type) slice.
+
+    `entry="any"` accepts whichever entry cell a setup has, preferring an
+    explicit `-entry-stop` over the unsuffixed default. That lets a corpus
+    mid-migration (some setups regenerated with the axis, some not) still be
+    compared, instead of reporting every un-regenerated setup as unpaired.
+    """
     grid = defaultdict(dict)
     for c in cells:
-        if c.news == news and c.sl == sl:
+        if c.news != news or c.sl != sl:
+            continue
+        if entry != "any" and c.entry != entry:
+            continue
+        prev = grid[c.setup].get(c.column)
+        if prev is None or (prev.entry == "default" and c.entry == "stop"):
             grid[c.setup][c.column] = c
     return grid
 
@@ -164,14 +200,14 @@ def fmt_r(x):
     return f"{x:+.2f}"
 
 
-def report(cells, columns, news, sl, verbose, top):
-    grid = build_grid(cells, news, sl)
+def report(cells, columns, news, sl, entry, verbose, top):
+    grid = build_grid(cells, news, sl, entry)
 
     paired = {s: row for s, row in grid.items() if all(c in row for c in columns)}
     unpaired = {s: row for s, row in grid.items() if s not in paired}
 
     print(f"\n{'=' * 78}")
-    print(f"ENTRY-RULE COMPARISON   news={news}   sl-anchor={sl}")
+    print(f"ENTRY-RULE COMPARISON   news={news}   sl-anchor={sl}   entry={entry}")
     print(f"{'=' * 78}")
     print(f"setups with all {len(columns)} columns present : {len(paired)}")
     if unpaired:
@@ -254,6 +290,10 @@ def main():
                          "cells written before 2026-08-15 are duplicates)")
     ap.add_argument("--sl-anchor", choices=sorted(SL_SUFFIX), default="signal",
                     help="hold the SL anchor fixed (default signal, the shipped default)")
+    ap.add_argument("--entry", choices=sorted(ENTRY_SUFFIX) + ["any"], default="any",
+                    help="hold the entry order type fixed (default any: prefers an "
+                         "explicit -entry-stop, falls back to the unsuffixed default cell, "
+                         "so a part-migrated corpus still compares)")
     ap.add_argument("--all-slices", action="store_true",
                     help="run every (news, sl-anchor) slice as a robustness check")
     ap.add_argument("--columns", nargs="+", default=COLUMNS)
@@ -282,7 +322,7 @@ def main():
         tallies = {}
         for news in ("on", "off"):
             for sl in sorted(SL_SUFFIX):
-                got = report(cells, args.columns, news, sl, args.verbose, args.top)
+                got = report(cells, args.columns, news, sl, args.entry, args.verbose, args.top)
                 if got:
                     tallies[(news, sl)] = got
         print(f"\n{'=' * 78}")
@@ -292,7 +332,7 @@ def main():
             win = max(t, key=t.get)
             print(f"  news={news:<4} sl={sl:<13} -> {win:<26} ({fmt_r(t[win])})")
     else:
-        report(cells, args.columns, args.news, args.sl_anchor, args.verbose, args.top)
+        report(cells, args.columns, args.news, args.sl_anchor, args.entry, args.verbose, args.top)
     return 0
 
 
