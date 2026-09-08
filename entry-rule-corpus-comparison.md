@@ -117,3 +117,79 @@ Two caveats worth carrying forward:
    `too-low` line silently zeroed a whole setup and nothing in the corpus
    flagged it. A geometry sanity check — for an iH&S, assert `too-low ≤ head`;
    for an H&S, `too-high ≥ head` — would have caught it at arm time.
+
+## Order type (market / stop / limit) — what the corpus can and cannot answer
+
+**Asked:** do we have pivots for `--market-entry` / `--stop-entry` /
+`--limit-entry`, and is market more profitable?
+
+**No, not as a column.** The grid's four columns vary the *entry rule*, not the
+*order type*, and `meta.arm` does not record the order type at all. What the
+plans actually contain:
+
+| column | main `enter` leg | QM second leg |
+|---|---|---|
+| normal | **stop** | — |
+| skip-bcr | **stop** | — |
+| strategy-v2 | **stop** | **limit** |
+| strategy-v2-qm-market | **stop** | **market** |
+
+So **every main entry in the corpus is a stop** (911 of 911 cells). There is no
+market-vs-stop pivot for the primary entry anywhere in the corpus.
+
+⚠️ Don't confuse the two flag families: `--entry-market` / `--entry-stop` /
+`--entry-limit` are the **pattern path** (H&S / M&W geometry). `--market-entry` /
+`--stop-entry` / `--limit-entry` are the **position-tool path** — they read a
+drawn position, place immediately, and carry no plan, preps, vetos or geometry
+(and no `EntryAttempt` row, so nothing manages them). The position-tool family is
+not comparable to a corpus column at all.
+
+### The one order-type pivot that DOES exist, and it is not conclusive
+
+`strategy-v2` vs `strategy-v2-qm-market` differ *only* in the QM leg's order type
+(limit vs market), so it is a clean paired test — on the second leg only.
+
+Market wins on total R in **all 6 slices** (headline slice +23.07 vs +20.21), and
+on that evidence alone the "market is better" theory looks supported. It does not
+survive a closer look:
+
+| statistic | value |
+|---|---|
+| paired setups (news=on, sl=signal) | 62 |
+| setups where the two differ | 24 |
+| market better / worse | **9 / 15** |
+| sum Δ (market − limit) | +2.86 |
+| **median Δ of differing setups** | **−0.05** |
+| sign test | **p = 0.31** |
+| sum Δ excluding the 2 largest outliers | **−5.87** |
+
+Market **loses on more setups than it wins** and its median is negative; the
+positive total is carried by two outliers (`aud-cad-h1-2026-07-28` +4.50,
+`nzd-jpy-h1-2026-08-05` +4.23). Splitting by direction does not rescue it —
+market's median is negative for longs (−0.03, 4 better / 4 worse) *and* shorts
+(−0.06, 5 better / 11 worse).
+
+Nor is it a participation effect: limit fills 72 legs across those setups, market
+70, so this is fill *price* on much the same trades, not trading more often.
+
+**Verdict: unproven, not disproven.** A one-setup observation (`eur-cad-h4`,
+`--entry-market` +8.51R vs the corpus stop's +6.61R) plus a total-R win in every
+slice is a genuinely reasonable prior — a market order fills at the signal close
+while a stop waits for the break and fills worse, which on a long is strictly
+better *when the trade works*. The corpus just cannot confirm it, because the
+only order-type pivot it holds is on the QM leg and that pivot is
+outlier-driven and insignificant.
+
+### What would actually answer it
+
+A fifth column — `skip-bcr` with `--entry-market` on the **main** leg — armed
+across the corpus from the frozen specs. `skip-bcr` is the shipped rule, so that
+is the comparison that matters, and it needs no new chart reads:
+
+```sh
+tv-arm --spec-in <setup>.spec.json --skip-bcr --entry-market \
+  replay --save <setup>-skip-bcr-market-news-on --instrument <inst>
+```
+
+The paired-comparison machinery already handles a new column; `parse_cell_name`
+and `COLUMNS` in `scripts/compare-entry-rules.py` need the label adding.
