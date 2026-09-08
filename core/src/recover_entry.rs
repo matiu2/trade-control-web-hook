@@ -27,14 +27,73 @@
 use crate::broker::EntryError;
 use crate::intent::{Direction, RecoverEntryAction, ResolvedRecoverEntry};
 
-/// Distinct outcome string for an entry-placement failure. The
-/// too-close case gets its own label so a `#19-10` rejection is a
-/// 30-second log grep instead of an opaque `broker rejected the order`.
-/// Every other error keeps the generic rendering.
-pub fn outcome_for_entry_error(err: &EntryError) -> String {
+/// A short, stable, greppable token for an entry-placement failure —
+/// the *kind* of failure, independent of its prose rendering.
+///
+/// [`EntryError`]'s `Display` is operator prose ("broker rejected the
+/// order") and is free to change wording; these tokens are what the
+/// ledger is queried on, so they must not. Anything reading
+/// `request_records.outcome` — a post-mortem, a dashboard, the sweep
+/// that measured `#19-10` frequency — matches on these.
+///
+/// Kept deliberately in sync with `EntryError`: adding a variant there
+/// is a **compile error** here until it is given a token, so a new
+/// failure mode cannot silently land in the ledger wearing an existing
+/// label.
+fn failure_token(err: &EntryError) -> &'static str {
     match err {
-        EntryError::EntryTooCloseToMarket => "entry-failed: too-close-to-market".to_string(),
-        other => format!("entry-failed: {other}"),
+        EntryError::AccountFetch => "account-fetch",
+        EntryError::EquityParse => "equity-parse",
+        EntryError::RiskCapExceeded { .. } => "risk-cap-exceeded",
+        EntryError::OpenPositionsCapExceeded => "open-positions-cap",
+        EntryError::UnitsBelowMinimum => "units-below-minimum",
+        EntryError::ContractSizeUnavailable => "contract-size-unavailable",
+        EntryError::EntryTooCloseToMarket => "too-close-to-market",
+        EntryError::OrderRejected => "broker-rejected",
+    }
+}
+
+/// Distinct outcome string for an entry-placement failure.
+///
+/// Every failure now carries a stable `failure_token` (see above) rather
+/// than only the too-close case, so a post-mortem can tell an
+/// `account-fetch` from an `equity-parse` from a `broker-rejected`
+/// without reading logs. The operator prose is appended after the token
+/// for the cases where `Display` carries detail the token cannot (the
+/// risk-cap numbers, for one).
+///
+/// Shape: `entry-failed: <token>` or `entry-failed: <token> (<prose>)`.
+pub fn outcome_for_entry_error(err: &EntryError) -> String {
+    outcome_for_entry_failure(err, None)
+}
+
+/// As [`outcome_for_entry_error`], plus **why the `#19-10` recovery
+/// declined** when one was attempted and skipped.
+///
+/// The recovery reason used to reach `tracing` only, so the ledger
+/// recorded *that* an entry was forfeited but never *why* — and the two
+/// are operationally very different: `recover-entry-slippage` means the
+/// guard worked and correctly stayed out of a runaway breakout, whereas
+/// `recover-entry-price-unavailable` means a price read failed and we
+/// bailed blind. Both looked identical downstream.
+///
+/// Shape: `entry-failed: <token> (<reason>)`.
+pub fn outcome_for_entry_failure(err: &EntryError, skip_reason: Option<&str>) -> String {
+    let token = failure_token(err);
+    match skip_reason {
+        Some(reason) => format!("entry-failed: {token} ({reason})"),
+        // `OrderRejected`'s prose adds nothing over its token, and
+        // `too-close-to-market` is the string a year of tooling already
+        // greps for — keep both bare. Everything else appends the prose,
+        // which is where the risk-cap numbers live.
+        None if matches!(
+            err,
+            EntryError::OrderRejected | EntryError::EntryTooCloseToMarket
+        ) =>
+        {
+            format!("entry-failed: {token}")
+        }
+        None => format!("entry-failed: {token} ({err})"),
     }
 }
 
@@ -212,6 +271,98 @@ mod tests {
             action,
             max_slippage_price,
         }
+    }
+
+    /// Every `EntryError` must reach the ledger under its own stable
+    /// token. Before this, eight distinct failure modes rendered as
+    /// three strings — `account-fetch`, `equity-parse`, a degenerate
+    /// stop distance and an FX-resolution failure were all
+    /// `entry-failed: broker rejected the order`, so a post-mortem
+    /// could not tell "our sizing math failed" from "the broker said
+    /// no".
+    ///
+    /// Asserted as a set so a NEW variant cannot be given a duplicate
+    /// token: `failure_token` is a compile error until the variant is
+    /// handled, and this catches the lazier failure of pointing it at
+    /// an existing string.
+    #[test]
+    fn every_entry_error_gets_its_own_distinct_token() {
+        use std::collections::HashSet;
+        let all = [
+            EntryError::AccountFetch,
+            EntryError::EquityParse,
+            EntryError::RiskCapExceeded {
+                requested: 2.0,
+                cap: 1.0,
+            },
+            EntryError::OpenPositionsCapExceeded,
+            EntryError::UnitsBelowMinimum,
+            EntryError::ContractSizeUnavailable,
+            EntryError::EntryTooCloseToMarket,
+            EntryError::OrderRejected,
+        ];
+        let tokens: Vec<&str> = all.iter().map(failure_token).collect();
+        let unique: HashSet<&&str> = tokens.iter().collect();
+        assert_eq!(
+            unique.len(),
+            tokens.len(),
+            "two EntryError variants share a token: {tokens:?}"
+        );
+        // And every one of them actually reaches the outcome string.
+        for (err, token) in all.iter().zip(&tokens) {
+            let outcome = outcome_for_entry_error(err);
+            assert!(
+                outcome.starts_with(&format!("entry-failed: {token}")),
+                "{err:?} rendered {outcome:?}, expected token {token:?}"
+            );
+        }
+    }
+
+    /// The risk-cap numbers live in `Display`, not the token, so that
+    /// arm must keep appending the prose — a bare token would lose
+    /// "requested 2% against a 1% cap", which is the actionable half.
+    #[test]
+    fn prose_is_appended_where_the_token_alone_would_lose_detail() {
+        let outcome = outcome_for_entry_error(&EntryError::RiskCapExceeded {
+            requested: 2.0,
+            cap: 1.0,
+        });
+        assert!(outcome.contains("risk-cap-exceeded"), "{outcome}");
+        assert!(outcome.contains('2'), "lost the requested pct: {outcome}");
+        assert!(outcome.contains('1'), "lost the cap: {outcome}");
+    }
+
+    /// The recovery skip reason must reach the ledger, not just the log.
+    /// `recover-entry-slippage` (the guard correctly refused a runaway
+    /// chase) and `recover-entry-price-unavailable` (we bailed blind)
+    /// are opposite post-mortems that used to render identically.
+    #[test]
+    fn skip_reason_reaches_the_outcome_string() {
+        let slippage = outcome_for_entry_failure(
+            &EntryError::EntryTooCloseToMarket,
+            Some("recover-entry-slippage"),
+        );
+        let blind = outcome_for_entry_failure(
+            &EntryError::EntryTooCloseToMarket,
+            Some("recover-entry-price-unavailable"),
+        );
+        assert!(slippage.contains("recover-entry-slippage"), "{slippage}");
+        assert!(blind.contains("recover-entry-price-unavailable"), "{blind}");
+        assert_ne!(
+            slippage, blind,
+            "two different skip reasons must not render identically"
+        );
+    }
+
+    /// A `#19-10` with no recovery attempted keeps the exact string a
+    /// year of tooling (and the frequency sweep) already greps for.
+    /// Changing it would silently break those queries.
+    #[test]
+    fn too_close_with_no_recovery_keeps_the_legacy_string() {
+        assert_eq!(
+            outcome_for_entry_failure(&EntryError::EntryTooCloseToMarket, None),
+            "entry-failed: too-close-to-market"
+        );
     }
 
     #[test]

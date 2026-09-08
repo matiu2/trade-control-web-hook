@@ -739,13 +739,40 @@ applies. The broker re-place is a **single** synchronous attempt and does
 **not** consume a multi-shot `max_retries` slot — it's the same intended
 entry.
 
-The broker rejection is observable as `entry-failed: too-close-to-market`
-(vs the generic `entry-failed: broker rejected the order`). The recovery
-skip reasons are logged as `recover-entry-<reason>` (e.g.
-`recover-entry-limit-wrong-side`, `recover-entry-slippage`). Only
-TradeNation has a confirmed `#19-10` today; the OANDA path maps its broker
-rejections to the generic case (the resolve-time recovery is
-broker-agnostic).
+**Entry-failure outcomes are tokenised (v141).** Every failed placement records
+`entry-failed: <token>` into `request_records.outcome`, where `<token>` is a
+short stable string — one per `EntryError` variant, never reused:
+
+| token | meaning |
+|---|---|
+| `account-fetch` | couldn't read the account |
+| `equity-parse` | account read, equity unparseable |
+| `risk-cap-exceeded` | over the risk cap (prose appends the numbers) |
+| `open-positions-cap` | at the open-positions cap |
+| `units-below-minimum` | sized fine, answer was zero (parks + re-checks) |
+| `contract-size-unavailable` | futures intent armed with no multiplier |
+| `too-close-to-market` | `#19-10` / `#19-9` — trigger wrong side of market |
+| `broker-rejected` | anything else the broker refused |
+
+Before this, five of those eight rendered as `entry-failed: broker rejected the
+order`, so a post-mortem couldn't tell "our sizing math failed" from "the broker
+said no". The tokens — **not** the prose — are what the ledger is queried on;
+`EntryError`'s `Display` wording is free to change, the tokens are not. Adding an
+`EntryError` variant is a compile error until it is given a token, so a new
+failure mode can't land wearing an existing label.
+
+When a `#19-10` recovery is attempted and **declines**, the outcome names the
+reason too — `entry-failed: too-close-to-market (recover-entry-slippage)` —
+because "the guard correctly refused a runaway chase" and "we couldn't read a
+price and bailed blind" are opposite post-mortems that previously rendered
+identically. Reasons: `recover-entry-none`, `-skip`, `-limit-wrong-side`,
+`-stop-wrong-side`, `-slippage`, `-market-no-slippage-bound`,
+`-price-unavailable`, `-price-read-failed`, `-not-a-stop-entry`. A `#19-10` with
+no recovery attempted keeps the bare `entry-failed: too-close-to-market` string
+that existing tooling greps for.
+
+Only TradeNation has a confirmed `#19-10` today; the OANDA path maps its broker
+rejections to the generic case (the resolve-time recovery is broker-agnostic).
 
 **Arming via `tv-arm` (H&S / iH&S):** pass `--recover-entry
 market|limit|stop|abort` to bake the policy onto the `05-enter` intent

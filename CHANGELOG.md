@@ -1,6 +1,61 @@
 # Changelog
 
-## v141 — 2026-09-09 — a stop entry now recovers to a limit, symmetrically
+## v141 — 2026-09-09 — symmetric entry recovery, and entry failures say WHY
+
+Two changes to the same path: the recovery *default* (below) and the
+observability of a failure when it happens (here).
+
+### Entry-failure outcomes are tokenised
+
+**Why.** `request_records.outcome` recorded five of the eight `EntryError`
+variants as the same string — `entry-failed: broker rejected the order`. A
+post-mortem could not tell "we failed to read the account", "we couldn't parse
+equity", "the stop distance was degenerate", "FX resolution failed" and "the
+broker refused the order" apart. On the OANDA path alone, four distinct causes
+share one `EntryError::OrderRejected` across six construction sites. Upstream,
+TradeNation distinguishes **eleven** error kinds and `map_place_error` collapses
+nine of them.
+
+**What changed.** Every entry failure now records `entry-failed: <token>` with a
+short, stable, per-variant token (`account-fetch`, `equity-parse`,
+`risk-cap-exceeded`, `open-positions-cap`, `units-below-minimum`,
+`contract-size-unavailable`, `too-close-to-market`, `broker-rejected`). The
+token — not the prose — is the queryable contract; `Display` wording stays free
+to change. Prose is appended where the token would lose detail (the risk-cap
+numbers). `failure_token` is exhaustive over `EntryError`, so a new variant is a
+**compile error** until given a token: a new failure mode cannot silently land
+wearing an existing label.
+
+And when a `#19-10` recovery is attempted but declines, the reason now reaches
+the ledger — `entry-failed: too-close-to-market (recover-entry-slippage)` —
+instead of `tracing` only. `recover-entry-slippage` (the guard correctly refused
+a runaway chase) and `recover-entry-price-unavailable` (a price read failed and
+we bailed blind) are opposite post-mortems that previously rendered identically.
+Two new reasons distinguish paths that were silent: `-price-read-failed` and
+`-not-a-stop-entry`.
+
+The reason travels as an out-parameter on `place_entry_too_close_fallback`
+rather than by widening `EntryError` — that type is shared with both broker
+crates (one a separate git repo) and matched exhaustively in 27 places, so
+carrying one dispatcher-local telemetry string through all of it would be the
+wrong trade.
+
+**Breaking.** Outcome strings change shape for the previously-generic failures.
+`entry-failed: too-close-to-market` (no recovery attempted) is **unchanged** —
+existing tooling and the `#19-10` frequency sweep grep exactly that. Anything
+matching on `entry-failed: broker rejected the order` must move to
+`entry-failed: broker-rejected`.
+
+**Tests.** Five mutations, no survivors. Critically, the first pure-layer pass
+**failed** its own mutation check: making the dispatcher discard the reason
+(`outcome_for_entry_failure(&err, None)` — precisely the original bug) left every
+`recover_entry.rs` unit test green. That gap is now closed by an end-to-end test
+through `run_enter` asserting the reason reaches the recorded outcome — the
+entry point, not the layer below
+(`[[mutation_test_the_entry_point_not_just_the_layer_below]]`). Full workspace
+green, 57 test binaries, corpus unchanged.
+
+### A stop entry now recovers to a limit, symmetrically
 
 **Why.** `tv-arm`'s wrong-side recovery default was one-sided. `--entry-limit`
 recovered to a stop unconditionally, but a bare `--entry-stop` recovered *only*

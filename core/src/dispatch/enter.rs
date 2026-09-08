@@ -909,6 +909,9 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // (never a loop — a too-close means price is moving). The re-place
     // is the SAME intended entry, so it shares `retry_attempt_no` and
     // does not consume an extra multi-shot slot.
+    // Set by the fallback when it declines to recover, so the failure
+    // outcome can name *why* (not just that the entry was forfeited).
+    let mut recover_skip_reason: Option<&'static str> = None;
     let placement = match broker
         .place_entry(max_risk_pct, max_open_positions, &entry_request)
         .await
@@ -921,6 +924,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 &verified.intent.id,
                 max_risk_pct,
                 max_open_positions,
+                &mut recover_skip_reason,
             )
             .await
         }
@@ -1060,7 +1064,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
             // a too-close / broker failure must never poison the seen-id
             // so the next signal bar can retry. The too-close case gets
             // a distinct outcome string for log-grep observability.
-            let outcome = recover_entry::outcome_for_entry_error(&err);
+            let outcome = recover_entry::outcome_for_entry_failure(&err, recover_skip_reason);
             tracing::error!("entry failed: {err} ({outcome})");
             ActionResult::Failed(outcome)
         }
@@ -1393,12 +1397,24 @@ async fn maybe_update_mw_state<B: Broker>(
 /// caller surfaces the distinct outcome) when the fallback is absent,
 /// out of threshold, `skip`, a wrong-side `limit`, or the re-place
 /// itself fails / the price read fails. One attempt only.
+/// `skip_reason` is an **out-parameter**: on any path that declines to
+/// recover it is set to the short `recover-entry-*` token naming why, so
+/// the caller can record it in the ledger outcome. It stays `None` when a
+/// recovery is actually attempted (the outcome then describes the
+/// re-placement, not a skip).
+///
+/// It is an out-param rather than a richer return type because the error
+/// channel is [`EntryError`] — shared with both broker crates (one a
+/// separate repo) and matched exhaustively in 27 places. Widening it to
+/// carry a reason would ripple through all of that for one string; the
+/// reason is dispatcher-local telemetry, not a broker concept.
 async fn place_entry_too_close_fallback<B: Broker>(
     broker: &B,
     resolved: &crate::intent::Resolved,
     intent_id: &str,
     max_risk_pct: f64,
     max_open_positions: u32,
+    skip_reason: &mut Option<&'static str>,
 ) -> Result<crate::broker::Placement, EntryError> {
     use crate::intent::ResolvedEntry;
 
@@ -1406,7 +1422,13 @@ async fn place_entry_too_close_fallback<B: Broker>(
     // (shouldn't happen) is terminal.
     let trigger_price = match &resolved.entry {
         ResolvedEntry::Stop { trigger_price } => *trigger_price,
-        _ => return Err(EntryError::EntryTooCloseToMarket),
+        _ => {
+            // Not a shape we can recover. Named distinctly from the
+            // policy skips below: this is "the fallback does not apply
+            // to this entry type", not "the policy declined".
+            *skip_reason = Some("recover-entry-not-a-stop-entry");
+            return Err(EntryError::EntryTooCloseToMarket);
+        }
     };
 
     // The current price drives both the slippage guard and the new
@@ -1418,6 +1440,7 @@ async fn place_entry_too_close_fallback<B: Broker>(
                 "too-close fallback: get_current_price({}) failed: {err} (id={intent_id})",
                 resolved.instrument
             );
+            *skip_reason = Some("recover-entry-price-read-failed");
             return Err(EntryError::EntryTooCloseToMarket);
         }
     };
@@ -1432,6 +1455,12 @@ async fn place_entry_too_close_fallback<B: Broker>(
             tracing::info!(
                 "too-close fallback: not recovering (id={intent_id} reason={reason} trigger={trigger_price} price={current_price})"
             );
+            // Carry the reason to the ledger, not just the log: a
+            // `recover-entry-slippage` (the guard correctly refused a
+            // runaway chase) and a `recover-entry-price-unavailable` (we
+            // bailed blind) are very different post-mortems and used to
+            // be indistinguishable downstream.
+            *skip_reason = Some(reason);
             Err(EntryError::EntryTooCloseToMarket)
         }
         recover_entry::RecoverEntryPlan::Market { reference_price } => {
@@ -2708,6 +2737,53 @@ mod units_below_minimum_tests {
     /// park adds a retry *cadence* and an audit trail, it does not change
     /// replay protection. Pinned so a future "tidy-up" doesn't mark the
     /// rejection seen and strand the setup.
+    /// END-TO-END: the recovery skip reason must survive all the way into
+    /// the recorded outcome, through `run_enter` — not merely be
+    /// renderable by the pure helper.
+    ///
+    /// This exists because a pure-layer test does NOT catch the real
+    /// regression: `outcome_for_entry_failure(&err, None)` at the
+    /// dispatcher (discarding the reason, i.e. the original bug) leaves
+    /// every `recover_entry.rs` unit test green. Mutating the call site
+    /// must turn something red, and this is that something.
+    ///
+    /// Setup: a long stop at 1.5900 against a 1.1000 market. The broker
+    /// rejects with `#19-10`, the `limit` policy is consulted, and the
+    /// wrong-side guard declines (a long limit at 1.5900 sits far above
+    /// market — a `#19-9` waiting to happen). The ledger must say which
+    /// guard refused, not just that the entry failed.
+    #[test]
+    fn recovery_skip_reason_reaches_the_recorded_outcome() {
+        let store = MemStateStore::default();
+        let verified = super::gate_order_tests::enter_verified_with_entry(
+            r#"{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.5900,
+                 "recover_entry": { "action": "limit" } }"#,
+        );
+        let out = pollster::block_on(run_enter(
+            &FailingBroker(|| EntryError::EntryTooCloseToMarket),
+            &store,
+            &verified,
+            &cfg(),
+            at("2026-07-22T13:00:30Z"),
+            None,
+            Some(Granularity::H1),
+            false,
+        ));
+
+        let ActionResult::Failed(outcome) = &out else {
+            panic!("a #19-10 must stay Failed, got {}", out.describe());
+        };
+        assert!(
+            outcome.contains("too-close-to-market"),
+            "must keep the greppable token: {outcome}"
+        );
+        assert!(
+            outcome.contains("recover-entry-limit-wrong-side"),
+            "the ledger must name WHY recovery declined, not just that the \
+             entry failed — this is the whole point of the change: {outcome}"
+        );
+    }
+
     #[test]
     fn parking_does_not_change_seen_id_behaviour() {
         use crate::dispatch::seen::{SeenDecision, seen_decision};
