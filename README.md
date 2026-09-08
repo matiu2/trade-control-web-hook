@@ -623,6 +623,33 @@ for JPY pairs or indices; the correct pip is baked in. The baked `pip_size`
 is also bound as a variable in gate scripts (`allow_entry`, `min_r`,
 `risk_pct`, …) alongside `entry_price`, `r_multiple`, etc.
 
+**Contract multiplier (futures only) — a THIRD number.** An exchange-traded
+futures enter also carries **`contract_multiplier`**: the money one full point
+of price is worth. It travels the same path as `pip_size` and `tick_size` —
+read from `instrument-lookup` (`Asset::contract_multiplier()`) by `tv-arm` at
+arm time, baked onto the signed intent, covered by the whole-body HMAC. It is
+**absent on every spot/CFD intent**, whose wire body is therefore byte-identical
+to a pre-feature one, and absent means an implicit `1.0` (spot is sized in
+units).
+
+⚠️ The three are genuinely different numbers, and conflating any two is the
+classic futures sizing bug. For ES:
+
+| field | meaning | ES |
+|---|---|---|
+| `tick_size` | smallest price increment | `0.25` |
+| `pip_size` | trade-*sizing* unit | `1.0` |
+| `contract_multiplier` | **money per 1.0 of price** | **`50`** |
+
+Sizing reads it as `contracts = budget / (stop_distance × multiplier × fx)`, so
+substituting `1.0` for ES places a **50× oversized** position. That is why there
+is deliberately **no `--contract-multiplier` flag**: unlike pip and tick, which
+an operator may legitimately correct against a stale catalog row, the multiplier
+is an exchange-set contract property and a hand-typed override is a sizing error
+waiting to happen. Unlike `tick_size` it is also **validated** — a zero or
+non-finite multiplier is rejected at parse time rather than dividing the sizing
+math to infinity.
+
 **How a catalog change reaches each binary.** The `instrument-lookup`
 catalog (`instrument-lookup/src/catalog.toml`) is `include_str!`-compiled
 into the `instrument-lookup` library, which the **CLIs** (`tv-arm`,
@@ -632,7 +659,8 @@ into the `instrument-lookup` library, which the **CLIs** (`tv-arm`,
   (its default `import` feature pulls in `reqwest` blocking) and was
   deliberately kept catalog-free. **Recompiling/redeploying the worker
   does *not* teach it a catalog change.** The worker only sees catalog
-  facts (`pip_size`, …) that `tv-arm` baked onto each *signed intent* at
+  facts (`pip_size`, `contract_multiplier`, …) that `tv-arm` baked onto each
+  *signed intent* at
   **arm time**. To make a catalog edit affect a live setup you re-**arm**
   it (re-run `tv-arm` with the new catalog) — you do not redeploy the
   worker.
@@ -1132,6 +1160,31 @@ path. If it doesn't, it is dropped 3 bars before expiry.
 
 You'll see this in a replay as an entry decline that later turns into a placement,
 and in the worker logs as `order-control promote[<trade_id>]`.
+
+### ...and so is a trade too small to place
+
+A position that sizes to **zero units** (`UnitsBelowMinimum`, raised by both OANDA
+and TradeNation) is parked the same way, as `below-min-size`. Previously it was a
+plain failure, which meant the identical computation re-ran on every fire, failed
+identically, and produced no operator signal and no termination — position size is a
+deterministic function of (equity, stop distance, contract multiplier), so nothing
+about that retry could ever succeed. Futures make it acute: one contract is 100%
+granularity.
+
+**The re-check runs once per bar, not once per tick.** The two spread reasons are
+re-asked every tick because the spread genuinely moves within a bar and a fresh quote
+can answer "it has calmed". A size park cannot: nothing it depends on changes faster
+than a bar, and the `Broker` trait exposes no equity to re-test against (sizing is
+private inside each broker's `place_entry`, by design). Since the order-control loop
+deliberately ticks faster than a bar, gating a size park on the spread check would
+promote it straight back into the same rejection every few seconds — strictly worse
+than the plain failure it replaces, while looking like a fix.
+
+So `StoredReason::rechecked_per_bar()` decides which question gets asked, and a size
+park waits for a bar strictly newer than the one that parked it (compared by **bar
+bucket**, not elapsed time). It still drops at its own deadline, so it cannot retry
+forever either. The operator sees `rejected: units-below-minimum stored until <t>`
+rather than silence.
 
 ### The spread floor is a forward-looking max
 
@@ -2216,8 +2269,8 @@ and the drawn-line classification are deleted.
 ## Brokers
 
 The intent YAML carries an optional `broker:` field, one of `oanda`
-(default) or `tradenation`. Each broker is independent — the operator
-picks per intent at sign time:
+(default), `tradenation`, or `ibkr` (futures — sizing only so far, see below).
+Each broker is independent — the operator picks per intent at sign time:
 
 ```yaml
 v: 1
@@ -2226,6 +2279,222 @@ broker: tradenation       # or omit for OANDA
 instrument: EUR/USD
 # ...
 ```
+
+### Futures contracts and the close-out guard
+
+**Not yet tradable — the guard lands ahead of the broker.** IBKR futures are
+being wired in stages; what exists today is the refusal, deliberately built
+before anything that can place a futures order.
+
+IBKR **force-liquidates** an expiring futures position during a close-out
+period preceding expiry, *without additional prior notice*, and does not roll
+positions ("Automatic Futures Rollover" is a charting feature that rolls
+nothing). The deadline is **not** the expiry date on the contract chain:
+
+- **long** — 2 business days before **First Notice Day**
+- **short** — 2 business days before **last trade day**
+
+For a physically delivered contract First Notice Day is the last business day
+of the month *preceding* delivery, so a **December gold long's deadline is in
+November** — about a month before the expiry anyone would read off the chain.
+Observed live on 2026-09-06: GCU6 (last trade 2026-09-28) was already past its
+long deadline while still listed as the healthy front month.
+
+So `build-trade` / `tv-arm` **refuse to arm** a plan on a futures instrument
+whose `trade_expiry` runs past the contract's *arm-by* date — the deadline
+minus a safety margin covering the trade window, multi-shot re-entry and a
+weekend. An **unknown** contract is also a refusal: if the calendar cannot say
+when IBKR would liquidate, arming is never safe.
+
+An instrument is treated as futures when it parses as either IBKR's own
+`local_symbol` (`GCZ6`) or an explicit contract month (`GC 202612`). Every
+CFD/spot instrument the system trades today is untouched — the guard is a
+complete no-op for them.
+
+`broker: ibkr` is an **additional trigger, not a filter**. A futures symbol is
+guarded whatever broker it names, so a contract cannot escape the check by
+carrying a CFD broker field; and an `ibkr` plan whose instrument does *not*
+parse as a contract is refused too, because on that broker there is nothing else
+to trade and an unidentifiable symbol has no deadline to honour.
+
+```
+$ trade-control build-trade --from-file trade.yaml ...
+Error: GC 202612 is past its close-out arming window for a long: trade_expiry
+2026-11-20 runs beyond the last armable day 2026-11-11, and IBKR
+force-liquidates without notice from 2026-11-25. Arm the next contract month
+instead.
+```
+
+Offline `--plan-out` builds warn instead of refusing, matching how an expired
+`trade_expiry` is treated there — historical setups must still replay.
+
+#### `--broker ibkr` today
+
+`oanda`, `tradenation` and `ibkr` are accepted wherever a broker is named —
+`trade-control-accounts add --broker ibkr`, `tv-arm --broker ibkr`,
+`trade-control ... --broker ibkr` — and an IBKR account stores and round-trips
+like any other. The broker is wired end to end and sizes correctly, but
+**cannot place an order**; everything it cannot yet do refuses loudly rather
+than falling back:
+
+| Path | Behaviour |
+|---|---|
+| worker dispatch / cron | acquires a real IBKR broker; a Gateway failure is a `503` |
+| `trade-control-broker-check` | verifies a live Gateway session |
+| order submission | refuses — never exercised, see the sizing section below |
+| account snapshot, quotes, positions | refuse — no Gateway reads implemented |
+| live spread read (`tv-arm`) | refuses rather than guess a spread |
+| `--replay` | refuses — there is no IBKR candle feed |
+| `instruments` subcommands | refuse — no IBKR catalog |
+| account default | none; `--account-id` is required |
+
+Each is a refusal rather than a silent fallback because the fallback would trade
+a *different instrument* — an OANDA symbol resolved for a futures plan, or CFD
+prices replayed as if they were the contract's. An unimplemented broker method
+that answered plausibly would be worse than one that fails: an empty
+`list_open_positions` reads as *"the account is flat"*, and a close that reports
+`NothingOpen` is a **success** that consumes the intent id.
+
+The calendar itself is a generated table (`core/src/contract_calendar_baked.rs`,
+GC/MGC/ES/MES, 2026–2028); see [`contract-calendar-gen/README.md`](contract-calendar-gen/README.md)
+for the rules, the margin and how to regenerate.
+
+### Futures sizing — contracts, not units (`broker-ibkr`)
+
+**Sizing works; placing an order does not yet.** The `broker-ibkr` crate sizes
+a futures entry correctly and refuses, loudly, to do anything it cannot yet do.
+
+A CFD/spot position is sized in *units*, effectively continuous. A futures
+position is sized in **whole contracts**, and a contract multiplier converts a
+price move into money:
+
+```
+contracts = budget / (stop_distance × contract_multiplier × fx)
+```
+
+The multiplier is baked onto the signed intent at arm time (`50` for ES, `100`
+for GC, `10` for MGC, `5` for MES — read live off the Gateway) and carried
+through `Resolved` into the broker. Three consequences worth knowing:
+
+- **A missing multiplier is a refusal, never a `1.0` default.** Substituting
+  `1.0` for ES places a **50× oversized** position — an order that is perfectly
+  valid, just enormous, so nothing downstream would flag it. It surfaces as
+  `EntryError::ContractSizeUnavailable`, distinct from `UnitsBelowMinimum`
+  because the two want opposite responses: a below-minimum size is a legitimate
+  small-account outcome that gets parked and re-checked each bar, whereas a
+  missing multiplier is a plumbing defect no amount of waiting fixes.
+- **Sizes floor, never round.** Rounding up would risk more than authorised —
+  for ES, up to half a contract, which on a 20-point stop is $500 of
+  unrequested risk. Flooring can only ever risk less.
+- **A literal size (`size_units`) means contracts**, so its implied risk goes
+  through the multiplier too. Omit it there and a 2-contract ES order reports
+  0.04% risk instead of 2% — slipping past the cap fifty-fold.
+
+The order-size grid comes from IBKR's own `min_size` / `size_increment` per
+contract rather than a bare `units == 0` check, so a root whose exchange
+minimum is above one contract is refused here rather than at the broker.
+
+Everything that would transmit to, or read live state from, the Gateway returns
+a loud failure rather than a plausible empty answer — an empty position list
+reads as "the account is flat", and the breakeven watch, pending sweep and
+blackout apply all act on that. Notably a close returns `Errored`, **not**
+`NothingOpen`: since v135 `NothingOpen` is a *success* that consumes the intent
+id, so it would mark a close fulfilled while a real position kept running.
+
+⚠️ **Market data is not optional.** `get_quote` feeds the SL-spread floor, a
+hard entry gate requiring the stop distance to clear 10× the live spread.
+Delayed COMEX/CME data would make that gate read a stale spread — either
+blocking every entry or waving through a trade whose stop sits inside the real
+spread — so it fails closed until a live entitlement is confirmed.
+
+### Replaying a futures plan — what the numbers do and don't say
+
+Offline replay **does not size**. `ReplayBroker` reports `size: None` by
+design: sizing needs live account equity and an FX rate, which an offline
+replay has by definition not got, and replay economics are pure R-multiples off
+a synthetic $100k account. Building an equity model into the replayer to
+produce contract counts would make the numbers *less* honest, not more — so the
+gap is accepted, and named rather than left for a reader to discover.
+
+A futures replay therefore prints a caveats block above its summary line:
+
+```
+FUTURES CAVEATS
+  sizing not simulated — live may reject entries that floor to 0 contracts
+  close-out: PAST WINDOW — GC 202606 could only be armed through 2026-06-09, but
+  this replay runs to 2026-07-24 and IBKR may liquidate without notice from
+  2026-06-24. Live, this plan would have been refused.
+```
+
+Three things are going on:
+
+- **The close-out check runs offline too.** It is pure calendar arithmetic, so
+  the replay reaches the same verdict the arm-time guard does — via the same
+  `close_out_check::verdict`, not a second copy. This matters because `tv-arm
+  --plan-out` builds *lenient*: a plan handed to the replay has only ever been
+  **warned** about, so without this a backtest could look profitable on a trade
+  IBKR would have liquidated out from under it.
+- **The sizing bias is named, with its direction.** The replay is *optimistic*:
+  every entry fills here regardless of whether a live account could afford a
+  single contract.
+- **`--probe-account <amount>` measures the gap** instead of simulating it:
+
+  ```sh
+  replay-candles --plan plan.json --probe-account 10000
+  #   granularity probe: 1 of 1 fill(s) would floor to 0 contracts at a stated
+  #   $10000 account (0 placeable)
+  ```
+
+  A **coverage statistic, not a simulation** — it consumes an account size you
+  state rather than inventing equity, which is what keeps it honest. It answers
+  the promotion-ladder question directly: the same GC trade above is unplaceable
+  at $10k and placeable at $100k, and switching to MGC (multiplier 10 instead of
+  100) moves that line by a factor of ten.
+
+  If the catalog has no multiplier for the contract, the probe reports **CANNOT
+  JUDGE** rather than assuming `1.0` — a substituted `1.0` would under-report
+  floor-outs by 100× on gold.
+
+None of this appears for CFD or spot replays, which is every fixture in the
+corpus today: the block renders only when the plan's instrument parses as a
+futures contract.
+
+### Setting up an IBKR account
+
+IBKR needs a **local IB Gateway** running and logged in — it issues no bearer
+token to a retail account, so a Java process holds the session and the worker
+connects to its socket. Consequences worth knowing up front:
+
+- The Gateway forces a **daily restart** and a **weekly re-authentication**, so
+  a long-running worker must tolerate a disconnect window. (A supervisor — IBC
+  — is not installed yet.)
+- The Gateway address is **derived from the account's kind**, not configured:
+  demo ⇒ `127.0.0.1:4002` (paper), live ⇒ `127.0.0.1:4001`. Deriving it removes
+  the failure mode a configurable field would add — a live account pointed at
+  the paper port, or the reverse.
+- An IBKR account's security boundary is the Gateway process and the loopback
+  socket. `Credentials::Ibkr` holds no secret, which is not an omission.
+
+```sh
+# the account id is the one the Gateway login fronts (DU… paper, U… live)
+trade-control-accounts add --broker ibkr --kind demo \
+    --oanda-account-id DUR300718 ibkr-paper
+
+# verify the session — this checks the CONNECTION, which is the thing that
+# actually breaks; it does not fetch a quote (see the market-data note above)
+trade-control-broker-check ibkr-paper
+```
+
+```
+account 'ibkr-paper' → broker=ibkr kind=Demo
+OK — IB Gateway session is live for account 'ibkr-paper'.
+NOTE: no quote was fetched — IBKR market data is not wired up yet
+(entitlement unconfirmed), so this checked the connection only.
+```
+
+⚠️ `--oanda-account-id` is the metadata slot IBKR reuses for its own account id.
+The name is historical; it is the generic "which sub-account under this login"
+field, and IBKR **requires** it just as OANDA does.
 
 ### Broker trait surface (contributor note)
 

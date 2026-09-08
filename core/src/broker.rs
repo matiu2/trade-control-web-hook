@@ -193,6 +193,21 @@ pub struct EntryRequest<'a> {
     /// place the order. Returns a synthetic order id like `"dry-run"`
     /// so callers can treat it as success.
     pub dry_run: bool,
+    /// Contract multiplier for an exchange-traded futures instrument — money
+    /// per 1.0 of price movement, per contract (ES `50`, GC `100`). Carried
+    /// from the signed intent's
+    /// [`contract_multiplier`](crate::intent::Intent::contract_multiplier).
+    ///
+    /// `None` on every spot/CFD instrument, which is sized in units and so has
+    /// an implicit multiplier of `1.0`. The unit-sized brokers (OANDA,
+    /// TradeNation) therefore ignore this field entirely and are unaffected by
+    /// its presence.
+    ///
+    /// ⚠️ **A futures broker must treat `None` as a refusal, never as `1.0`.**
+    /// Substituting `1.0` for ES places a 50x oversized position — the failure
+    /// this field exists to prevent. `broker-ibkr` maps it to
+    /// [`EntryError::ContractSizeUnavailable`].
+    pub contract_multiplier: Option<f64>,
 }
 
 /// Failure modes for [`Broker::place_entry`]. Brokers map their own error
@@ -207,6 +222,18 @@ pub enum EntryError {
     },
     OpenPositionsCapExceeded,
     UnitsBelowMinimum,
+    /// A futures instrument reached the broker with no contract multiplier, so
+    /// its position size cannot be computed at all.
+    ///
+    /// Distinct from [`Self::UnitsBelowMinimum`] (which means "sized fine, the
+    /// answer was zero") because the two demand opposite responses: a
+    /// below-minimum size is a *legitimate* small-account outcome that Stage 7
+    /// parks and re-checks each bar, whereas a missing multiplier is a
+    /// **plumbing defect** — the intent was armed without one — that no amount
+    /// of waiting will fix. It is also a distinct variant so
+    /// [`recover_entry::outcome_for_entry_error`](crate::recover_entry::outcome_for_entry_error)
+    /// renders a string the operator can act on verbatim during an incident.
+    ContractSizeUnavailable,
     /// The entry trigger is on the wrong side of the market (a buy-stop
     /// resting below price / sell-stop above, or the limit analogue).
     /// On TradeNation this is `#19-10` / `#19-9` (`d.Status == -19`).
@@ -228,6 +255,9 @@ impl core::fmt::Display for EntryError {
             }
             Self::OpenPositionsCapExceeded => f.write_str("open positions cap exceeded"),
             Self::UnitsBelowMinimum => f.write_str("computed units below minimum"),
+            Self::ContractSizeUnavailable => {
+                f.write_str("no contract multiplier for this futures instrument")
+            }
             Self::EntryTooCloseToMarket => {
                 f.write_str("entry trigger too close to (or wrong side of) the market price")
             }

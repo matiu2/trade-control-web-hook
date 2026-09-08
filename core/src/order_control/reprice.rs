@@ -262,6 +262,7 @@ async fn park_below_min_r<S: StateStore>(
             stored_at: now,
             drop_at: drop_at(expires_at, bar_seconds, now),
             shell_time,
+            bar_seconds: Some(bar_seconds),
         },
         expires_at,
         now,

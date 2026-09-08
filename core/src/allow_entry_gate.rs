@@ -146,6 +146,7 @@ mod tests {
             dry_run: false,
             recover_entry: None,
             breakeven: None,
+            contract_multiplier: None,
         }
     }
 
@@ -202,6 +203,7 @@ mod tests {
             mw: None,
             pip_size: None,
             tick_size: None,
+            contract_multiplier: None,
             spread_window: None,
             trade_plan: None,
             blackout_close: crate::intent::BlackoutCloseAction::default(),

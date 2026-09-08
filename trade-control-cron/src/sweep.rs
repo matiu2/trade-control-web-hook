@@ -143,6 +143,7 @@ where
             Some(BrokerHandle::TradeNation(b)) => {
                 maybe_breach_cancel(store, attempt, sl, &b, now).await
             }
+            Some(BrokerHandle::Ibkr(b)) => maybe_breach_cancel(store, attempt, sl, &b, now).await,
             None => Err("broker acquisition failed".into()),
         }
     } else {
@@ -190,6 +191,9 @@ async fn cancel_and_delete<S: StateStore, C: CronEnv>(
         Some(BrokerHandle::TradeNation(b)) => {
             cancel_with_broker(&b, attempt, reason, f64::NAN).await;
         }
+        Some(BrokerHandle::Ibkr(b)) => {
+            cancel_with_broker(&b, attempt, reason, f64::NAN).await;
+        }
         None => return Err("broker acquisition failed".into()),
     }
     delete_row(store, attempt).await;
@@ -230,6 +234,7 @@ async fn market_blackout_act<S: StateStore, C: CronEnv>(
     match cron.acquire_broker(attempt.account.as_deref()).await {
         Some(BrokerHandle::Oanda(b)) => blackout_close_position(&b, attempt).await,
         Some(BrokerHandle::TradeNation(b)) => blackout_close_position(&b, attempt).await,
+        Some(BrokerHandle::Ibkr(b)) => blackout_close_position(&b, attempt).await,
         None => return Err("broker acquisition failed".into()),
     }
     Ok(())

@@ -12,6 +12,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["serde", "a
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 trade-control-core = { version = "0.1.0", path = "../core" }
 trade-control-engine = { version = "0.1.0", path = "../engine" }
+broker-ibkr = { version = "0.1.0", path = "../broker-ibkr" }
 
 [dev-dependencies]
 pollster = "1.0.1"

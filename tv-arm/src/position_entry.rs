@@ -102,6 +102,9 @@ pub(crate) fn run_position_entry(
         risk_amount: args.risk_amount,
         pip_size: args.pip_size.or(Some(resolved.precision.pip_size)),
         tick_size: args.tick_size.or(Some(resolved.precision.tick_size)),
+        // Futures only, and catalog-only — there is deliberately no
+        // `--contract-multiplier` flag to override it with.
+        contract_multiplier: resolved.precision.contract_multiplier,
         dry_run: args.broker_dry_run,
     };
 

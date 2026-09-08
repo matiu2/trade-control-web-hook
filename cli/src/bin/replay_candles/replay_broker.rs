@@ -1510,6 +1510,10 @@ mod tests {
             take_profit: 1.0950,
             risk,
             dry_run: false,
+            // Replay does not size (it reports `size: None` by design), so a
+            // multiplier would have nothing to multiply — see the accepted
+            // replay sizing gap in the IBKR plan.
+            contract_multiplier: None,
         }
     }
 

@@ -47,8 +47,10 @@ pub fn resolve_hs_trade(
     instrument: &str,
     account: &str,
     broker: Broker,
-    catalog_pip: f64,
-    catalog_tick: f64,
+    // The whole resolved precision, not two loose scalars: it also carries the
+    // futures contract multiplier, and a third same-typed positional `f64`
+    // beside pip and tick is a transposition waiting to happen.
+    precision: crate::precision::EffectivePrecision,
 ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
     if let Err(msg) = check_required(geom, args) {
         return Err(ResolveError::Reject(msg));
@@ -126,8 +128,13 @@ pub fn resolve_hs_trade(
     let entry_level_vetos = hs_entry_level_vetos(geom, direction);
     let expiry = read_trade_expiry(geom)?;
     // --pip-size / --tick-size override the canonical catalog values when set.
-    let pip_size = args.pip_size.unwrap_or(catalog_pip);
-    let tick_size = args.tick_size.unwrap_or(catalog_tick);
+    let pip_size = args.pip_size.unwrap_or(precision.pip_size);
+    let tick_size = args.tick_size.unwrap_or(precision.tick_size);
+    // No `--contract-multiplier` flag: unlike pip and tick, which an operator
+    // may legitimately correct for a stale catalog row, the multiplier is an
+    // exchange-set contract property. A hand-typed override is a 50x sizing
+    // error waiting to happen, so the catalog is the only source.
+    let contract_multiplier = precision.contract_multiplier;
     let spec = build_trade_spec(
         args,
         instrument,
@@ -140,6 +147,7 @@ pub fn resolve_hs_trade(
         close_on_news,
         pip_size,
         tick_size,
+        contract_multiplier,
         entry_level_vetos,
         anchored_sl,
     );
@@ -266,6 +274,7 @@ pub fn build_trade_spec(
     close_on_news: bool,
     pip_size: f64,
     tick_size: f64,
+    contract_multiplier: Option<f64>,
     entry_level_vetos: Vec<trade_control_core::intent::EntryLevelVeto>,
     // Absolute stop from `--sl-anchor`, already resolved and side-checked by
     // `crate::sl_anchor::resolve_sl_anchor`. `None` for the default `signal`
@@ -397,6 +406,10 @@ pub fn build_trade_spec(
             // Baked from instrument-lookup (or --tick-size) so the worker snaps
             // entry/SL/TP onto the broker's price grid before placement.
             tick_size: Some(tick_size),
+            // Futures only: the money-per-1.0-of-price the worker sizes
+            // contracts with. `None` on every spot/CFD arm, which keeps the
+            // wire body byte-identical to a pre-feature one.
+            contract_multiplier,
             blackout_close: args.blackout_close.into_core(),
             entry_level_vetos,
             // Wrong-side recovery (H&S / iH&S). Explicit `--recover-entry` wins.
@@ -592,6 +605,17 @@ mod tests {
     use clap::Parser;
     use trading_view::drawings::Drawing;
 
+    /// An `EffectivePrecision` for a test arm. These fixtures are all spot
+    /// instruments, so the contract multiplier is `None`.
+    fn test_precision(pip_size: f64, tick_size: f64) -> crate::precision::EffectivePrecision {
+        crate::precision::EffectivePrecision {
+            pip_size,
+            tick_size,
+            tick_from_tv: false,
+            contract_multiplier: None,
+        }
+    }
+
     /// Parse `Args` straight from an argv slice, as the binary would.
     fn mw_args(extra: &[&str]) -> Args {
         let mut argv = vec!["tv-arm"];
@@ -719,8 +743,7 @@ mod tests {
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
-            0.0001,
-            0.0001,
+            test_precision(0.0001, 0.0001),
         )
         .expect("valid HS resolves");
         assert_eq!(dir, Direction::Short);
@@ -742,8 +765,7 @@ mod tests {
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
-            0.0001,
-            0.0001,
+            test_precision(0.0001, 0.0001),
         )
         .expect("valid iH&S resolves");
         assert_eq!(dir, Direction::Long);
@@ -765,8 +787,7 @@ mod tests {
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
-            0.0001,
-            0.0001,
+            test_precision(0.0001, 0.0001),
         ) {
             Err(ResolveError::Reject(msg)) => {
                 assert!(msg.contains("outside the fib range"), "msg = {msg}");
@@ -789,8 +810,7 @@ mod tests {
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
-            0.0001,
-            0.0001,
+            test_precision(0.0001, 0.0001),
         ) {
             Err(ResolveError::Fatal(e)) => {
                 assert!(
@@ -902,8 +922,7 @@ mod tests {
                 "EUR_USD",
                 "ms-oanda-1",
                 Broker::Oanda,
-                0.0001,
-                0.0001,
+                test_precision(0.0001, 0.0001),
             )
             .expect("valid H&S resolves");
             // The TP band is pushed last, after the drawn ones.
@@ -935,8 +954,7 @@ mod tests {
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
-            0.0001,
-            0.0001,
+            test_precision(0.0001, 0.0001),
         )
         .expect("valid H&S resolves");
         assert_eq!(
@@ -961,8 +979,7 @@ mod tests {
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
-            0.0001,
-            0.0001,
+            test_precision(0.0001, 0.0001),
         )
         .expect("valid H&S resolves");
         assert!(
@@ -985,8 +1002,7 @@ mod tests {
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
-            0.0001,
-            0.0001,
+            test_precision(0.0001, 0.0001),
         )
         .expect("valid H&S resolves");
         assert_eq!(
@@ -1019,8 +1035,7 @@ mod tests {
             "EUR_USD",
             "ms-oanda-1",
             Broker::Oanda,
-            0.0001,
-            0.0001,
+            test_precision(0.0001, 0.0001),
         )
         .map(|(_dir, spec)| spec)
     }

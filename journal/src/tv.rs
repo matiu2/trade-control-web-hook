@@ -181,6 +181,13 @@ fn strip_separators(instrument: &str) -> String {
 
 /// The TradingView exchange prefix for a plan broker. `None` for an
 /// unknown/blank broker (caller falls back to a bare symbol).
+/// `ibkr` is deliberately absent. A futures chart's TradingView exchange is a
+/// property of the *contract*, not the broker — gold is `COMEX`, the equity
+/// index futures are `CME` — so there is no single prefix this signature could
+/// return. An IBKR plan therefore falls through to the bare symbol and opens
+/// TradingView's default-exchange chart, which is the same graceful degradation
+/// an unknown broker has always had. Fixing it properly needs the contract root,
+/// which arrives with the catalog work in Stage 5 of the IBKR integration.
 fn tv_exchange(broker: &str) -> Option<&'static str> {
     match broker.to_ascii_lowercase().as_str() {
         "tradenation" => Some("TRADENATION"),

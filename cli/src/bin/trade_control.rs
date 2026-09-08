@@ -485,6 +485,7 @@ impl From<DirectionArg> for Direction {
 enum BrokerKindArg {
     Oanda,
     TradeNation,
+    Ibkr,
 }
 
 impl From<BrokerKindArg> for BrokerKind {
@@ -492,6 +493,7 @@ impl From<BrokerKindArg> for BrokerKind {
         match v {
             BrokerKindArg::Oanda => BrokerKind::Oanda,
             BrokerKindArg::TradeNation => BrokerKind::TradeNation,
+            BrokerKindArg::Ibkr => BrokerKind::Ibkr,
         }
     }
 }
@@ -948,15 +950,11 @@ fn run_instruments(sub: InstrumentsCmd) -> Result<()> {
                 );
                 Ok(())
             }
-            BrokerKind::Oanda => Err(eyre!(
-                "OANDA catalog is not implemented yet; only --broker tradenation is supported",
-            )),
+            other => Err(no_catalog(other)),
         },
         InstrumentsCmd::Resolve { name, broker, json } => match broker.into() {
             BrokerKind::TradeNation => run_resolve_tradenation(&name, json),
-            BrokerKind::Oanda => Err(eyre!(
-                "OANDA catalog is not implemented yet; only --broker tradenation is supported",
-            )),
+            other => Err(no_catalog(other)),
         },
         InstrumentsCmd::List { broker } => match broker.into() {
             BrokerKind::TradeNation => {
@@ -966,11 +964,19 @@ fn run_instruments(sub: InstrumentsCmd) -> Result<()> {
                 }
                 Ok(())
             }
-            BrokerKind::Oanda => Err(eyre!(
-                "OANDA catalog is not implemented yet; only --broker tradenation is supported",
-            )),
+            other => Err(no_catalog(other)),
         },
     }
+}
+
+/// The `instruments` subcommands all read the TradeNation market catalog;
+/// no other broker has one wired up. One message rather than a copy per
+/// subcommand, which is how the OANDA arm came to be repeated three times.
+fn no_catalog(broker: BrokerKind) -> color_eyre::eyre::Report {
+    eyre!(
+        "no instrument catalog for {}; only --broker tradenation is supported",
+        broker.as_str()
+    )
 }
 
 /// Resolve `name` against the TN cache and print the result. `json = true`

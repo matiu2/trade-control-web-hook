@@ -257,6 +257,8 @@ fn build_news_intent(
         mw: None,
         pip_size: None,
         tick_size: None,
+        // A news window never places an order, so it is never sized.
+        contract_multiplier: None,
         spread_window: None,
         trade_plan: None,
         blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),

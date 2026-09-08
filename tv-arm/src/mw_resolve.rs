@@ -52,12 +52,14 @@ pub fn resolve_mw_trade(
     instrument: &str,
     account: &str,
     broker: Broker,
-    catalog_pip: f64,
-    catalog_tick: f64,
+    // The whole resolved precision, not two loose scalars — it also carries the
+    // futures contract multiplier. See `hs_resolve` for the same reasoning.
+    precision: crate::precision::EffectivePrecision,
 ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
     // --pip-size / --tick-size override the canonical catalog values when set.
-    let pip_size = args.pip_size.unwrap_or(catalog_pip);
-    let tick_size = args.tick_size.unwrap_or(catalog_tick);
+    // The multiplier has no flag — it is an exchange-set contract property.
+    let pip_size = args.pip_size.unwrap_or(precision.pip_size);
+    let tick_size = args.tick_size.unwrap_or(precision.tick_size);
     check_mw_required(geom)?;
     // The arm-time broker spread is read live (OANDA /pricing or the
     // TradeNation chart endpoint) and baked into the enter intent so the
@@ -73,6 +75,7 @@ pub fn resolve_mw_trade(
         broker,
         pip_size,
         tick_size,
+        precision.contract_multiplier,
         spread_pips,
     )
 }
@@ -113,6 +116,7 @@ pub fn resolve_mw_trade_with_spread(
     broker: Broker,
     pip_size: f64,
     tick_size: f64,
+    contract_multiplier: Option<f64>,
     spread_pips: f64,
 ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
     check_mw_required(geom)?;
@@ -187,6 +191,7 @@ pub fn resolve_mw_trade_with_spread(
             spread_pips,
             pip_size,
             tick_size,
+            contract_multiplier,
         },
     );
     Ok((direction, spec))
@@ -207,6 +212,9 @@ pub struct MwSpecAnchors {
     /// Canonical instrument tick size (or `--tick-size`), baked onto the enter
     /// so the worker snaps the mid-correct M/W prices onto the broker's grid.
     pub tick_size: f64,
+    /// Futures contract multiplier, baked onto the enter so a futures M/W
+    /// sizes in contracts. `None` for spot/CFD (implicit `1.0`).
+    pub contract_multiplier: Option<f64>,
 }
 
 /// Gate the neckline-retracement percentage. Default ceiling is
@@ -316,12 +324,17 @@ pub fn build_mw_trade_spec(
             spread_pips: anchors.spread_pips,
             pip_size: anchors.pip_size,
             tick_size: Some(anchors.tick_size),
+            contract_multiplier: anchors.contract_multiplier,
         }),
         // Mirror the M/W pip onto the top-level field (the cli M/W builder
         // also does this); keeps the worker's sizing tail on the baked pip.
         pip_size: Some(anchors.pip_size),
         // Baked tick so the worker snaps the mid-correct M/W prices onto grid.
         tick_size: Some(anchors.tick_size),
+        // Mirrored onto the top level alongside pip, same as tick: the M/W
+        // builder reads the `mw` copy, but the sizing tail reads the top-level
+        // one. Both come from `anchors`, so they cannot drift.
+        contract_multiplier: anchors.contract_multiplier,
         blackout_close: args.blackout_close.into_core(),
         // M/W has no fib / invalidation drawing — its abort/cancel/overshoot
         // vetos cover the level guards, so no continuous entry-level vetos.
@@ -425,6 +438,8 @@ mod tests {
             broker,
             pip_size,
             pip_size,
+            // Spot fixtures: no futures multiplier.
+            None,
             SPREAD,
         )
     }

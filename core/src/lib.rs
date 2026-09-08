@@ -12,6 +12,7 @@ pub mod blackout_recreate;
 pub mod blackout_widen;
 pub mod broker;
 pub mod candle_gate;
+pub mod contract_calendar;
 pub mod control_event;
 pub mod dispatch;
 pub mod dispatch_config;

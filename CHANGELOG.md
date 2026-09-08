@@ -86,6 +86,305 @@ corpus is still not evidence about a timing-sensitive gate.
 - The `not-taken` corpus bucket likely contains setups blocked by bug C rather
   than genuinely declined.
 
+## v140 — 2026-09-06 — replay parity for futures: close-out offline, sizing gap named and measured
+
+**Why.** Offline replay does not size. `ReplayBroker` reports `size: None` *by
+design* — sizing needs live account equity and an FX rate, which an offline
+replay has by definition not got, and replay economics are pure R-multiples off
+a synthetic account. So a futures replay is **optimistic**: it books R for
+entries a live account could not have afforded. The scoping doc wanted contract
+sizing built into the replayer; that was decided against, because it means
+inventing an equity model and then reporting contract counts derived from
+invented inputs — a wrong number that looks like a measurement.
+
+This is Stage 8: accept the gap, but make it impossible to be misled by it.
+
+**What changed.**
+
+- **A — the close-out check runs offline.** Pure calendar arithmetic, no equity
+  or broker dependency, so replay reaches the same verdict as the arm-time
+  guard — through the *same* `close_out_check::verdict`, one function with two
+  callers rather than two implementations that must agree by hand. This matters
+  because `tv-arm --plan-out` builds Lenient: a plan handed to the replay has
+  only ever been **warned** about, so without this a backtest could look
+  profitable on a trade IBKR would have force-liquidated.
+- **B — the bias is named, with its direction.** A `FUTURES CAVEATS` block
+  above the summary line, in the spirit of the `IMPLAUSIBLE_R` warning. Kept
+  off the `Done:` / `Net R:` line, which batch drivers scrape.
+- **C — `--probe-account <amount>` measures the gap.** Counts how many fills
+  would floor to 0 contracts at an account size the operator **states** — a
+  coverage statistic, not a simulation. It answers the promotion-ladder
+  question: the same GC trade is unplaceable at $10k and placeable at $100k,
+  and MGC (multiplier 10 vs 100) moves that line tenfold. An unknown multiplier
+  reports **CANNOT JUDGE** rather than assuming `1.0`, which would under-report
+  floor-outs by 100× on gold.
+- The arm-time guard was refactored onto the shared verdict with **no behaviour
+  change** (all 328 cli lib tests unchanged), so the two cannot drift.
+- Corrected README's Stage 4 refusal table, stale since v138 gave IBKR a real
+  broker (worker dispatch and broker-check no longer refuse).
+
+**Breaking:** none. `report::render` takes one more argument (internal to the
+replay binary). No wire, plan or fixture format changed.
+
+**Config:** new `--probe-account <AMOUNT>` on `replay-candles` (and therefore
+on `tv-arm ... replay`). Optional; ignored for CFD/spot replays.
+
+**Tests:** 2961 workspace tests (2940 before), 0 failures. **910/910 golden
+fixtures pass at Net R +294.32, unchanged** — the scope proof that no CFD
+replay is affected. 9 mutations applied, 9 killed.
+
+Two findings worth keeping. **Mutation 4 survived the first pass**: the
+production entry point `context_for` had no test of its own — `Caveats::new`
+caught the mutation downstream, so behaviour was safe by a coincidence of
+layering that nothing asserted, and a refactor trusting `context_for` would
+have printed a futures block on all 910 CFD fixtures. And the multiplier lookup
+was **wrong in a way no unit test could see**: it keyed on the plan's
+instrument string (`GC 202612`) while `instrument-lookup` has no contract-month
+dimension and holds the multiplier on the root row (`GC`), so every probe
+answered CANNOT JUDGE. Found by running the real binary; now pinned by a test.
+
+**Follow-up:** the accepted divergence is recorded in `PARITY.md` for a future
+refactorer — if you are tempted to implement sizing in `ReplayBroker`, answer
+first where the equity and FX rate come from. Stage 9 (paper demo month) still
+needs the market-data entitlement decision and IBC, neither of which is a code
+change.
+
+## v139 — 2026-09-06 — IBKR broker: futures sized in contracts, wired end to end
+
+**Why.** v137 baked `contract_multiplier` onto the signed intent and validated
+it, but **nothing read it** — the field reached `run_enter` and stopped, because
+`EntryRequest` had no multiplier at all. This is Stage 6: the broker that
+consumes it, and the wiring that lets an IBKR account resolve to a real broker
+instead of a loud refusal.
+
+**An IBKR account can now hold a live Gateway session and size a futures entry
+correctly. It still cannot place an order** — transmission is deliberately not
+implemented, and every Gateway-touching path refuses loudly rather than
+answering plausibly.
+
+**What changed.**
+
+- **`broker-ibkr`** — a new workspace member mirroring `broker-oanda`'s layout,
+  with sizing private (`mod risk`, not `pub mod`) so it stays implementation
+  detail rather than trait surface. Path-depends on `ibkr-client` (Stage 1,
+  merged; its directory renamed from `ibkr-spike` to match the crate).
+
+- **Futures sizing** — `contracts = budget / (stop_distance × multiplier × fx)`,
+  floored. Three rules that are not obvious:
+
+  - **A missing multiplier is refused, never defaulted to `1.0`.** Substituting
+    `1.0` for ES places a **50× oversized** position — a perfectly valid order,
+    just enormous, so nothing downstream would flag it. New
+    `EntryError::ContractSizeUnavailable`, distinct from `UnitsBelowMinimum`
+    because the two want opposite responses: a below-minimum size is a
+    legitimate small-account outcome that v137 parks and re-checks each bar,
+    whereas a missing multiplier is a plumbing defect no waiting can fix.
+  - **Sizes floor, never round.** Rounding up risks more than authorised — for
+    ES, up to half a contract, which on a 20-point stop is $500 unrequested.
+  - **A literal `size_units` means CONTRACTS**, so its implied risk goes through
+    the multiplier too. Omit it there and a 2-contract ES order reports 0.04%
+    risk instead of 2%, slipping the cap fifty-fold.
+
+  The order-size grid reads IBKR's own `min_size` / `size_increment` per
+  contract rather than a bare `units == 0` check — the distinction OANDA's
+  `units == 0` misses.
+
+- **The multiplier landed on `Resolved`, not read off the intent per call site.**
+  `run_enter` builds **four** `EntryRequest`s (the initial placement plus three
+  recovery re-placements) and they must all agree: a recovery that re-places on
+  a different multiplier silently re-sizes the trade. One field, one source —
+  the drift `pip_size` created by living in both `Intent` and `MwParams`.
+
+- **`BrokerHandle::Ibkr` + `Credentials::Ibkr` + `acquire_ibkr`**, plus 16
+  compile-enforced cron match arms. `Credentials::Ibkr` was deferred from Stage
+  4 on the grounds that IBKR authenticates via the Gateway socket rather than a
+  token; that held up — `IbkrCreds` carries **no secret at all**, so an IBKR
+  account's security boundary is the Gateway process and the loopback socket.
+
+- **The Gateway address is derived from the account's `kind`**, not configured:
+  demo ⇒ paper port, live ⇒ live port. A configurable field would introduce the
+  failure mode of a live account pointed at paper — or, far worse, the reverse.
+
+- **`trade-control-broker-check` gained a real IBKR arm.** Stage 4 made it
+  refuse outright; it now verifies the **connection**, which is the thing that
+  actually breaks (the Gateway force-restarts daily and re-authenticates
+  weekly), and says plainly that it did not fetch a quote.
+
+**What deliberately refuses.** Sizing is complete; transmission is not. Order
+submission, the account snapshot, quotes, positions, pending orders and candles
+all fail loudly. This is not a stub-vs-implementation nicety — a broker adapter's
+caller cannot tell a polite lie from the truth. An empty `list_open_positions`
+reads as "the account is flat", and the breakeven watch, pending sweep and
+blackout apply all act on that. A close returns `Errored`, **not** `NothingOpen`,
+because v135 made the latter a *success* that consumes the intent id — it would
+mark a close fulfilled while a real position kept running.
+
+⚠️ **Market data is not optional.** `get_quote` feeds the SL-spread floor, a hard
+entry gate requiring the stop distance to clear 10× the live spread. Delayed
+COMEX/CME data would make that gate read a stale spread — either blocking every
+entry or waving through a trade whose stop sits inside the real spread — so it
+fails closed until a live entitlement is confirmed.
+
+**Breaking.** None on the wire. `EntryRequest` and `Resolved` each gain a
+`contract_multiplier: Option<f64>`; downstream literals must add it (a compile
+error, not a silent change). Replay passes `None` — it does not size, by design.
+
+**Config.** No new env vars or secrets. An IBKR account needs a local IB Gateway
+running and logged in, and `--oanda-account-id` (the generic "which sub-account
+under this login" slot, which IBKR reuses) is now **required** for `--broker
+ibkr`; its `--help` said "ignored for TradeNation" and did not mention IBKR.
+
+**Tests.** 2940 pass (2902 before).
+
+**Verified against the live paper Gateway**, not only unit tests: an account
+created, read back, and `broker-check` reporting a live session through the
+whole path — account row → `BrokerKind::Ibkr` → `acquire_ibkr` → derived paper
+port → hashed client id → real Gateway. A `--kind live` account correctly routed
+to the live port and failed with `Connection refused`, which is what proves the
+derivation. Contract chains re-confirmed live: GC 100, MGC 10, ES 50, MES 5,
+`min_size` and `size_increment` both 1.
+
+Three operator-facing error defects were found by **running the binary**, none by
+a test: a "connecting…" announcement printed before a check that fails without
+connecting (so a config error read as a connection problem), a doubled "connect
+failed" prefix, and a Gateway hint appended to config errors it did not apply to.
+
+**Mutations: 15 applied, 15 killed.** Two are worth recording:
+
+- Reordering the multiplier check to *after* the account fetch initially
+  **survived** — the ordering had no coverage. It is not cosmetic: a Gateway
+  that is merely down would mask a missing multiplier, sending the operator
+  after a connection problem during an incident. Closing it made the Gateway
+  read a named `AccountSource` seam so `place_entry` is callable offline,
+  separating the money math (complete) from the I/O (not).
+- Removing the client-id floor also survived, so the test was widened to sweep
+  2,000 names — **and that sweep went red on a real bug**: hashing client ids
+  into a 60,000-wide range collides across a few hundred accounts (birthday
+  paradox), and IBKR rejects a duplicate client id outright, so the second
+  account cannot connect while the first is up. An outage visible only once both
+  are live. Widened to the full positive `i32`. The sweep still could not kill
+  the floor mutation — over a range that wide, names never land near the floor,
+  so it asserted a guarantee it had no power to check; the mapping is now a pure
+  `client_id_from_hash` tested at `0`, `1` and `u64::MAX`.
+
+**Follow-up.** ⚠️ **`ibkr-client` has no git remote and is not a submodule** —
+`broker-ibkr` path-depends on it, so a fresh `trading-libraries` checkout cannot
+build the workspace. It needs a GitHub repo and a submodule registration before
+anyone else clones this.
+
+Remaining for IBKR: the **order path** (never exercised — `ibapi`'s
+`BracketOrderBuilder` offers market and limit entries but **no `entry_stop()`**,
+while this system's primary entry mode is a stop entry, so it needs a parent stop
+order with children attached by `parent_id` — pinned as `bracket_can_carry`);
+the **account snapshot** (equity + FX); **market-data entitlement**; and **IBC**,
+which is not installed, so the daily-restart cycle is unproven over 48h+. Stage 8
+is replay parity, Stage 9 the paper demo month. The 10-business-day arm-time
+safety margin remains the plan's proposed default and is **not
+operator-signed-off**.
+
+## v138 — 2026-09-06 — IBKR futures: close-out gate, broker enum, contract multiplier, size park
+
+**Why.** Interactive Brokers is being added as a third broker for exchange-traded
+futures, where measured cost is ~43–52% below CFD venues on gold and ~38–44% on
+the S&P (the saving is overnight financing, which futures do not charge). Three
+things the codebase had no concept of had to land first — a contract *calendar*,
+a *broker* identity, and a contract *multiplier* — and in that order, because
+nothing that can place a futures order may land before the close-out guard.
+
+Covers Stages 2–5 and 7 of the plan. **No order can be placed on IBKR at the end of
+this**: there is no broker implementation, and every path that would reach the
+venue refuses loudly rather than falling back (a fallback would trade a
+*different instrument*).
+
+**What changed.**
+
+- **Futures close-out calendar** (`contract-calendar-gen` → baked
+  `core/src/contract_calendar_baked.rs`). IBKR force-liquidates an expiring
+  position without notice, and **the deadline is not the expiry date**: for a
+  physically delivered contract the *long* deadline is 2 business days before
+  First Notice Day, which is the last business day of the month *preceding*
+  delivery — so a December gold contract's long deadline falls in **November**.
+  Lookup is fail-closed: unknown contract or ambiguous key ⇒ `None` ⇒ refuse.
+- **Arm-time refusal** (`build_trade_from_spec`) when a plan's `trade_expiry`
+  runs past that deadline. Scoped by **instrument**, with IBKR as an *additional*
+  trigger — not `is_futures && broker == Ibkr`, which would let a futures
+  contract escape the guard by carrying a CFD broker field.
+- **`BrokerKind::Ibkr`** plus every parallel enum, deliberately before the broker
+  exists so the compiler enumerated the work. All four operator binaries accept
+  `ibkr`. Broker lists are now driven from `BrokerKind::ALL` / `Broker::ALL`,
+  which killed a live `_ => TradeNation` catch-all on a menu index.
+- **`Intent.contract_multiplier`** — the money one full point of price is worth
+  (ES 50, GC 100), read from `instrument-lookup` at arm time and baked onto the
+  signed intent, never looked up worker-side (the worker links no catalog). New
+  `InstrumentSizing { pip_size, tick_size, contract_multiplier }` groups the
+  three at the builder seam.
+
+- **A trade too small to place is parked, not retried forever.**
+  `EntryError::UnitsBelowMinimum` (raised by **both** existing brokers) fell
+  through to `ActionResult::Failed` — a `SeenDecision::Skip` — so the identical
+  computation re-ran every bar, failed identically, and gave the operator no
+  signal and no termination. Position size is a deterministic function of
+  (equity, stop distance, contract multiplier), so that retry could never
+  succeed. It now parks as `StoredReason::BelowMinSize`, beside the existing
+  sub-min-R park. Benefits OANDA and TradeNation today, ahead of futures where
+  one contract is 100% granularity.
+
+  The promote gate became **per-reason**, which the plan did not anticipate: the
+  two spread reasons are re-asked every tick (the spread genuinely moves and a
+  fresh quote can answer), but a size park cannot be — nothing it depends on
+  changes faster than a bar, and the `Broker` trait exposes no equity to re-test
+  against. Since the order-control loop deliberately ticks *faster* than a bar,
+  parking a size rejection under the spread gate would have promoted it back into
+  the same rejection every few seconds: **strictly worse than the bug**, while
+  looking like a fix. So `rechecked_per_bar()` selects the question, and a size
+  park waits for a bar strictly newer than the one that parked it — compared by
+  bar bucket, not elapsed time.
+
+**Breaking.** None on the wire. `Intent` gains one `skip_serializing_if`-elided
+field, so a CFD alert body is byte-identical to pre-feature — load-bearing,
+because `sig::canonical_form` writes a `keys:` fingerprint over every top-level
+key, so an emitted `contract_multiplier: null` would change the signature of
+every existing CFD alert. Downstream `Intent` struct literals must add
+`contract_multiplier: None` (a compile error, not a silent change).
+
+**Config.** `instrument-lookup` bumped 0.4 → 0.5 across the six crates pinning
+it. No new env vars or secrets. There is deliberately **no
+`--contract-multiplier` flag**: unlike pip and tick, which an operator may
+legitimately correct against a stale catalog, the multiplier is an exchange-set
+contract property and a hand-typed override is a 50× sizing error waiting to
+happen.
+
+**Tests.** 2902 pass (2874 before). Highlights: a GC plan inside its close-out
+window is refused while the same plan 30 days earlier builds; a **long and a
+short on the same physical contract get different verdicts** in the month
+between the two deadlines; the multiplier round-trips through sign→parse and a
+post-signing edit (50 → 1) fails verification; a zero/negative/NaN multiplier is
+rejected at parse time — unlike `tick_size`, which has no validation and whose
+omission was deliberately not inherited.
+
+For the size park: a size-parked order does **not** promote on a same-bar tick
+but does on the next bar, still drops at its deadline, and keeps waiting when it
+has no bar clock (a legacy body); `EntryTooCloseToMarket` still plain-fails and
+parks nothing; and neither arm changes seen-id behaviour, since both are already
+a `Skip`.
+
+Mutations were applied at every stage and all killed — eight for the size park
+alone, including `tick_size`/`contract_multiplier` **transposed at the call
+site** (the reason those three are a named struct rather than three positional
+`Option<f64>`s) and a raw-instant bar comparison in place of bucketing, which
+reads as correct and is caught by three tests.
+
+**Follow-up.** The size park does not change replay: `ReplayBroker` reports
+`size: None` by design and raises only `RiskCapExceeded` /
+`OpenPositionsCapExceeded`, never `UnitsBelowMinimum`, so no fixture shifts. That
+sizing gap is Stage 8's accepted, documented divergence.
+
+Sizing does not yet *consume* the multiplier — that is Stage 6b
+(`broker-ibkr`'s private `risk.rs`), where `contracts = budget / (stop_distance ×
+multiplier × fx)` lands with the broker that reports `min_size`/`size_increment`.
+The 10-business-day arm-time safety margin is the plan's proposed default and is
+**not operator-signed-off**; changing it is one constant plus a regenerate.
+
 ## v136 — 2026-09-02 — `--save-fixture` wrote to the tree the binary was BUILT in
 
 **Why.** A capture died after the chart had already been read:

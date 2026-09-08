@@ -18,6 +18,7 @@ pub fn broker_to_kind(b: Broker) -> cli::BrokerKind {
     match b {
         Broker::Oanda => cli::BrokerKind::Oanda,
         Broker::TradeNation => cli::BrokerKind::TradeNation,
+        Broker::Ibkr => cli::BrokerKind::Ibkr,
     }
 }
 
@@ -26,6 +27,7 @@ pub fn kind_to_broker(k: cli::BrokerKind) -> Broker {
     match k {
         cli::BrokerKind::Oanda => Broker::Oanda,
         cli::BrokerKind::TradeNation => Broker::TradeNation,
+        cli::BrokerKind::Ibkr => Broker::Ibkr,
     }
 }
 
@@ -39,12 +41,15 @@ mod tests {
     /// noticed.
     #[test]
     fn every_broker_round_trips() {
-        for b in [Broker::Oanda, Broker::TradeNation] {
-            assert_eq!(kind_to_broker(broker_to_kind(b)), b);
+        for &b in Broker::ALL {
+            assert_eq!(kind_to_broker(broker_to_kind(b)), b, "{b:?}");
         }
-        for k in [cli::BrokerKind::Oanda, cli::BrokerKind::TradeNation] {
-            assert_eq!(broker_to_kind(kind_to_broker(k)), k);
+        for &k in cli::BrokerKind::ALL {
+            assert_eq!(broker_to_kind(kind_to_broker(k)), k, "{k:?}");
         }
+        // Both sides must list the same number of brokers, or the loops above
+        // silently stop covering the variant that was left out of one list.
+        assert_eq!(Broker::ALL.len(), cli::BrokerKind::ALL.len());
     }
 
     /// …and that the mapping is the identity on names, not just a bijection. A
@@ -56,5 +61,6 @@ mod tests {
             broker_to_kind(Broker::TradeNation),
             cli::BrokerKind::TradeNation
         );
+        assert_eq!(broker_to_kind(Broker::Ibkr), cli::BrokerKind::Ibkr);
     }
 }

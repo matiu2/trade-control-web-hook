@@ -645,6 +645,7 @@ mod dispatcher_outcome_tests {
                 mw: None,
                 pip_size: None,
                 tick_size: None,
+                contract_multiplier: None,
                 spread_window: None,
                 trade_plan: None,
                 blackout_close: crate::intent::BlackoutCloseAction::default(),

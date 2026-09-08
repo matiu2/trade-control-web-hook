@@ -28,7 +28,8 @@ use trade_control_core::account::{MetadataError, MetadataStore};
 use trade_control_core::broker::Broker;
 use trade_control_core::intent::BrokerKind;
 use trade_control_worker::{
-    Config, PgMetadataStore, PgStateStore, Secrets, acquire_oanda, acquire_tn,
+    BrokerError, Config, PgMetadataStore, PgStateStore, Secrets, acquire_ibkr, acquire_oanda,
+    acquire_tn,
 };
 
 #[derive(Parser)]
@@ -78,7 +79,7 @@ async fn main() -> Result<()> {
     println!(
         "account '{}' → broker={} kind={:?}",
         meta.name,
-        broker_str(meta.broker),
+        meta.broker.as_str(),
         meta.kind
     );
 
@@ -97,6 +98,36 @@ async fn main() -> Result<()> {
             let broker =
                 acquire_oanda(&meta, &secrets).map_err(|e| eyre!("acquire_oanda failed: {e}"))?;
             broker.get_quote(&cli.instrument).await
+        }
+        // IBKR's liveness check is the **connection**, not a quote: the
+        // Gateway session is exactly what can be down (a local Java process
+        // that force-restarts daily and re-authenticates weekly), while
+        // `get_quote` is unimplemented pending a market-data entitlement. So
+        // this reports what it actually verified and says plainly what it did
+        // not — rather than refusing outright, which would leave the operator
+        // with no way to check the one thing that most often breaks.
+        BrokerKind::Ibkr => {
+            // Deliberately not announcing "connecting…" before the call: a
+            // missing account id is refused without any socket work, and
+            // printing the announcement first makes that failure read as a
+            // connection problem — the exact misdirection this check exists to
+            // avoid during an incident.
+            acquire_ibkr(&meta).await.map_err(|e| match e {
+                // Only a genuine connect failure earns the "is the Gateway up?"
+                // hint. Appending it to a config error (a missing account id)
+                // would point the operator at the wrong thing.
+                BrokerError::IbkrConnect(_) => {
+                    eyre!("{e}\nis IB Gateway running on this host and logged in?")
+                }
+                other => eyre!("{other}"),
+            })?;
+            println!(
+                "OK — IB Gateway session is live for account '{}'.\n\
+                 NOTE: no quote was fetched — IBKR market data is not wired up yet \
+                 (entitlement unconfirmed), so this checked the connection only.",
+                meta.name
+            );
+            return Ok(());
         }
     };
 
@@ -118,13 +149,6 @@ async fn main() -> Result<()> {
              try --instrument with a symbol the broker trades",
             cli.instrument
         )),
-    }
-}
-
-fn broker_str(b: BrokerKind) -> &'static str {
-    match b {
-        BrokerKind::Oanda => "oanda",
-        BrokerKind::TradeNation => "tradenation",
     }
 }
 

@@ -26,20 +26,26 @@ pub fn split_symbol(symbol: &str) -> (Option<&str>, &str) {
 /// - 6-letter all-alpha symbol (`EURUSD`, `eurusd`) is uppercased
 ///   and split into a 3+3 currency pair: `EUR_USD` / `EUR/USD`.
 /// - Any other shape passes through with `/` ↔ `_` swap.
+///
+/// **IBKR is exempt from both rules.** A futures contract symbol carries its
+/// contract month (`GCZ6`, or `GC 202612`), not a currency pair, so the 3+3
+/// split would corrupt a 6-character root and the `/` ↔ `_` swap has no
+/// meaning. IBKR symbols pass through verbatim.
 pub fn instrument_for(broker: Broker, raw_sym: &str) -> String {
+    // Matching once, at the top, keeps the exemption and the reshaping rules
+    // from drifting apart — a new broker has to say which side it is on.
+    let separator = match broker {
+        Broker::TradeNation => '/',
+        Broker::Oanda => '_',
+        Broker::Ibkr => return raw_sym.to_string(),
+    };
     if raw_sym.len() == 6 && raw_sym.chars().all(|c| c.is_ascii_alphabetic()) {
         let a = raw_sym[..3].to_ascii_uppercase();
         let b = raw_sym[3..].to_ascii_uppercase();
-        return match broker {
-            Broker::TradeNation => alloc::format!("{a}/{b}"),
-            Broker::Oanda => alloc::format!("{a}_{b}"),
-        };
+        return alloc::format!("{a}{separator}{b}");
     }
-    match broker {
-        Broker::TradeNation => raw_sym.replace('_', "/"),
-        Broker::Oanda => raw_sym.replace('/', "_"),
-    }
-    .to_string()
+    let foreign = if separator == '/' { '_' } else { '/' };
+    raw_sym.replace(foreign, &alloc::string::String::from(separator))
 }
 
 #[cfg(test)]
@@ -61,6 +67,21 @@ mod tests {
         // `tv_arm_hs.py` falls back to (sym, "") shape — we model that
         // with `(None, "EUR_USD")`.
         assert_eq!(split_symbol("EUR_USD:"), (None, "EUR_USD:"));
+    }
+
+    /// A futures symbol must survive untouched. `GCZ6` is 4 chars so it dodges
+    /// the 3+3 split by luck, but a 6-character root would be silently
+    /// corrupted into a currency pair — hence the explicit exemption rather
+    /// than relying on symbol length.
+    #[test]
+    fn ibkr_symbols_pass_through_verbatim() {
+        assert_eq!(instrument_for(Broker::Ibkr, "GCZ6"), "GCZ6");
+        assert_eq!(instrument_for(Broker::Ibkr, "MESZ6"), "MESZ6");
+        assert_eq!(instrument_for(Broker::Ibkr, "GC 202612"), "GC 202612");
+        // The shape that would otherwise be split 3+3 into "ABC_DEF".
+        assert_eq!(instrument_for(Broker::Ibkr, "ABCDEF"), "ABCDEF");
+        // …and the swap that would otherwise rewrite the separator.
+        assert_eq!(instrument_for(Broker::Ibkr, "GC_202612"), "GC_202612");
     }
 
     #[test]

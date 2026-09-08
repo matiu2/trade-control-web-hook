@@ -23,6 +23,8 @@ pub enum BrokerArg {
     Oanda,
     /// TradeNation.
     TradeNation,
+    /// Interactive Brokers (futures).
+    Ibkr,
 }
 
 impl BrokerArg {
@@ -31,6 +33,7 @@ impl BrokerArg {
         match self {
             Self::Oanda => trade_control_conventions::Broker::Oanda,
             Self::TradeNation => trade_control_conventions::Broker::TradeNation,
+            Self::Ibkr => trade_control_conventions::Broker::Ibkr,
         }
     }
 }
@@ -122,7 +125,8 @@ pub struct Args {
     pub broker: Option<BrokerArg>,
 
     /// Worker account index. Defaults per broker (`tradenation` → `reversals`,
-    /// `oanda` → `m-and-w`); also `TRADE_CONTROL_ACCOUNT` env.
+    /// `oanda` → `m-and-w`); also `TRADE_CONTROL_ACCOUNT` env. `ibkr` has no
+    /// default — name one explicitly.
     #[arg(long, env = "TRADE_CONTROL_ACCOUNT")]
     pub account_id: Option<String>,
 
@@ -1281,6 +1285,22 @@ mod tests {
         assert_eq!(args.broker, Some(BrokerArg::Oanda));
         let args = Args::try_parse_from(["tv-arm", "--broker", "tradenation"]).expect("parse tn");
         assert_eq!(args.broker, Some(BrokerArg::TradeNation));
+        let args = Args::try_parse_from(["tv-arm", "--broker", "ibkr"]).expect("parse ibkr");
+        assert_eq!(args.broker, Some(BrokerArg::Ibkr));
+    }
+
+    /// The clap mirror must map onto the shared vocabulary enum, not merely
+    /// parse. A mirror that parsed `ibkr` and mapped it to OANDA would arm a
+    /// futures plan against the wrong venue and never fail a parse test.
+    #[test]
+    fn every_broker_arg_maps_to_its_own_conventions_variant() {
+        use trade_control_conventions::Broker;
+        assert_eq!(BrokerArg::Oanda.into_conventions(), Broker::Oanda);
+        assert_eq!(
+            BrokerArg::TradeNation.into_conventions(),
+            Broker::TradeNation
+        );
+        assert_eq!(BrokerArg::Ibkr.into_conventions(), Broker::Ibkr);
     }
 
     #[test]
