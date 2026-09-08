@@ -297,157 +297,172 @@ pub fn build_trade_spec(
     }
     // Borrow `skip_preps` before it's moved into the struct literal below.
     let prep_expiries = prep_expiry_steps(geom, &skip_preps);
-    let mut spec =
-        cli::TradeSpec {
-            pattern,
-            instrument: instrument.to_string(),
-            account: account.to_string(),
-            broker: broker_to_kind(broker),
-            trade_expiry: expiry,
-            risk_pct: args.risk_pct.unwrap_or(1.0),
-            risk_amount: args.risk_amount,
-            dry_run: args.broker_dry_run,
-            // strategy-v2 needs a non-zero max_retries on both enters: it's the
-            // multi_shot flag that keeps the engine plan alive after the first
-            // enter fires, so the worker retry gate can cancel the sibling's
-            // resting order. Floor to 1 (a `--max-retries 0` with `--strategy-v2`
-            // is rejected by validate_args, so this floor is just belt-and-braces).
-            max_retries: if args.strategy_v2 {
-                args.max_retries.unwrap_or(5).max(1)
-            } else {
-                args.max_retries.unwrap_or(5)
-            },
-            expiry_bars: args.expiry_bars,
-            skip_preps,
-            pull_back: args.pull_back,
-            entry_offset_pips: None,
-            sl_offset_pips: None,
-            // Both offset forms None → the shared builder applies the ATR-pct
-            // default (DEFAULT_BUFFER_ATR_PCT). Unused on the M/W path (worker
-            // computes geometry); the H&S enter inherits the volatility-scaled buffer.
-            entry_offset_atr_pct: None,
-            sl_offset_atr_pct: None,
-            sl_anchor: None,
-            tp_price: round5(tp),
-            // SL is normally anchored to the pattern extreme. An `sl` chart Note
-            // overrides that with the level the operator drew (shoulder or head)
-            // — see `crate::sl_note`. The buffer keeps the stop *clear* of that
-            // level; its direction is derived from `direction` when the spec is
-            // lowered (`build_enter_alert`), not stored here.
-            // A drawn `sl` Note, else a `--sl-anchor` structural level. Both
-            // lower to `PriceRef::AbsoluteBuffered`; the buffer keeps the stop
-            // clear of the level either way, and the SL-vs-spread floor
-            // (`widen_sl_to_spread_floor`) still applies downstream in both the
-            // worker and the replay, so no anchor bypasses it.
-            //
-            // `or` and not `or_else`: the caller already guarantees `anchored_sl`
-            // is `None` whenever a Note exists, so this is precedence made
-            // explicit rather than a fallback that could mask a double-set.
-            sl_price: geom.stop_loss.or(anchored_sl).map(round5),
-            sl_price_buffer_atr_pct: geom.stop_loss.or(anchored_sl).map(|_| {
-                args.sl_note_buffer_atr_pct
-                    .unwrap_or(DEFAULT_SL_NOTE_BUFFER_ATR_PCT)
-            }),
-            entry_deadline_pct: 80,
-            allow_entry: args.entry_filter_script.clone(),
-            // Pattern-path entry order type: explicit `--entry-{market,stop,limit}`
-            // wins; default is stop.
-            entry_mode: match args.pattern_entry_mode() {
-                Some(crate::args::PatternEntry::Market) => cli::EntryMode::Market,
-                Some(crate::args::PatternEntry::Limit) => cli::EntryMode::Limit,
-                Some(crate::args::PatternEntry::Stop) | None => cli::EntryMode::Stop,
-            },
-            needs_golden: !args.skip_golden,
-            needs_confirmed: args.require_confirmation,
-            close_on_news,
-            // Chart-drawn S/R bands, plus (default-on) the take-profit
-            // resistance band so a reversal near TP flattens for a partial win
-            // rather than round-tripping to the stop. `07-close-on-sr-reversal`
-            // OR-fires across every band. H&S only — the M/W path recomputes TP
-            // live and gets no auto band.
-            //
-            // The two are sized by **different** rules and must stay that way:
-            // drawn lines widen by `--reversal-band-pct` (a percent of price),
-            // the TP band spans TP → a fib level (`--tp-resistance-fib-level`).
-            // They shared one percent until 2026-08, so two widenings meant for
-            // drawn lines silently inflated the TP band — see `tp_resistance_band`.
-            sr_reversal_ranges: {
-                let mut bands = build_sr_ranges(geom, args.reversal_band_pct);
-                // Needs the fib itself, not just the TP derived from it: the band's
-                // far edge is a level *on* that fib. `check_required` has already
-                // rejected a missing/degenerate fib by here, so this is present for
-                // any H&S that resolves — but stay `if let` rather than unwrapping,
-                // so a future caller that skips that check loses the band instead
-                // of panicking mid-arm.
-                if !args.skip_tp_resistance
-                    && let Some((head, neckline)) = geom.fib_head_neckline
-                {
-                    bands.push(tp_resistance_band(
-                        head,
-                        neckline,
-                        args.tp_resistance_fib_level,
-                    ));
+    let mut spec = cli::TradeSpec {
+        pattern,
+        instrument: instrument.to_string(),
+        account: account.to_string(),
+        broker: broker_to_kind(broker),
+        trade_expiry: expiry,
+        risk_pct: args.risk_pct.unwrap_or(1.0),
+        risk_amount: args.risk_amount,
+        dry_run: args.broker_dry_run,
+        // strategy-v2 needs a non-zero max_retries on both enters: it's the
+        // multi_shot flag that keeps the engine plan alive after the first
+        // enter fires, so the worker retry gate can cancel the sibling's
+        // resting order. Floor to 1 (a `--max-retries 0` with `--strategy-v2`
+        // is rejected by validate_args, so this floor is just belt-and-braces).
+        max_retries: if args.strategy_v2 {
+            args.max_retries.unwrap_or(5).max(1)
+        } else {
+            args.max_retries.unwrap_or(5)
+        },
+        expiry_bars: args.expiry_bars,
+        skip_preps,
+        pull_back: args.pull_back,
+        entry_offset_pips: None,
+        sl_offset_pips: None,
+        // Both offset forms None → the shared builder applies the ATR-pct
+        // default (DEFAULT_BUFFER_ATR_PCT). Unused on the M/W path (worker
+        // computes geometry); the H&S enter inherits the volatility-scaled buffer.
+        entry_offset_atr_pct: None,
+        sl_offset_atr_pct: None,
+        sl_anchor: None,
+        tp_price: round5(tp),
+        // SL is normally anchored to the pattern extreme. An `sl` chart Note
+        // overrides that with the level the operator drew (shoulder or head)
+        // — see `crate::sl_note`. The buffer keeps the stop *clear* of that
+        // level; its direction is derived from `direction` when the spec is
+        // lowered (`build_enter_alert`), not stored here.
+        // A drawn `sl` Note, else a `--sl-anchor` structural level. Both
+        // lower to `PriceRef::AbsoluteBuffered`; the buffer keeps the stop
+        // clear of the level either way, and the SL-vs-spread floor
+        // (`widen_sl_to_spread_floor`) still applies downstream in both the
+        // worker and the replay, so no anchor bypasses it.
+        //
+        // `or` and not `or_else`: the caller already guarantees `anchored_sl`
+        // is `None` whenever a Note exists, so this is precedence made
+        // explicit rather than a fallback that could mask a double-set.
+        sl_price: geom.stop_loss.or(anchored_sl).map(round5),
+        sl_price_buffer_atr_pct: geom.stop_loss.or(anchored_sl).map(|_| {
+            args.sl_note_buffer_atr_pct
+                .unwrap_or(DEFAULT_SL_NOTE_BUFFER_ATR_PCT)
+        }),
+        entry_deadline_pct: 80,
+        allow_entry: args.entry_filter_script.clone(),
+        // Pattern-path entry order type: explicit `--entry-{market,stop,limit}`
+        // wins; default is stop.
+        entry_mode: match args.pattern_entry_mode() {
+            Some(crate::args::PatternEntry::Market) => cli::EntryMode::Market,
+            Some(crate::args::PatternEntry::Limit) => cli::EntryMode::Limit,
+            Some(crate::args::PatternEntry::Stop) | None => cli::EntryMode::Stop,
+        },
+        needs_golden: !args.skip_golden,
+        needs_confirmed: args.require_confirmation,
+        close_on_news,
+        // Chart-drawn S/R bands, plus (default-on) the take-profit
+        // resistance band so a reversal near TP flattens for a partial win
+        // rather than round-tripping to the stop. `07-close-on-sr-reversal`
+        // OR-fires across every band. H&S only — the M/W path recomputes TP
+        // live and gets no auto band.
+        //
+        // The two are sized by **different** rules and must stay that way:
+        // drawn lines widen by `--reversal-band-pct` (a percent of price),
+        // the TP band spans TP → a fib level (`--tp-resistance-fib-level`).
+        // They shared one percent until 2026-08, so two widenings meant for
+        // drawn lines silently inflated the TP band — see `tp_resistance_band`.
+        sr_reversal_ranges: {
+            let mut bands = build_sr_ranges(geom, args.reversal_band_pct);
+            // Needs the fib itself, not just the TP derived from it: the band's
+            // far edge is a level *on* that fib. `check_required` has already
+            // rejected a missing/degenerate fib by here, so this is present for
+            // any H&S that resolves — but stay `if let` rather than unwrapping,
+            // so a future caller that skips that check loses the band instead
+            // of panicking mid-arm.
+            if !args.skip_tp_resistance
+                && let Some((head, neckline)) = geom.fib_head_neckline
+            {
+                bands.push(tp_resistance_band(
+                    head,
+                    neckline,
+                    args.tp_resistance_fib_level,
+                ));
+            }
+            bands
+        },
+        veto_on_reversal: args.veto_on_reversal,
+        needs_confirmed_close: false,
+        // Populated from the chart's `<prep>-expiry` vertical lines —
+        // see `prep_expiry_steps`. Skipped preps (e.g. `--quasimodo`
+        // drops break-and-close) are filtered out so a stale expiry line
+        // doesn't collide with `skip_preps`.
+        prep_expiries,
+        // H&S path: no M/W static geometry. The M/W branch (commit 9)
+        // builds its spec separately, keyed on `roles.mw_path`.
+        mw: None,
+        // Baked from instrument-lookup (or --pip-size) so the worker scales
+        // the entry/SL offset_pips with the right pip, not its forex default.
+        pip_size: Some(pip_size),
+        // Baked from instrument-lookup (or --tick-size) so the worker snaps
+        // entry/SL/TP onto the broker's price grid before placement.
+        tick_size: Some(tick_size),
+        // Futures only: the money-per-1.0-of-price the worker sizes
+        // contracts with. `None` on every spot/CFD arm, which keeps the
+        // wire body byte-identical to a pre-feature one.
+        contract_multiplier,
+        blackout_close: args.blackout_close.into_core(),
+        entry_level_vetos,
+        // Wrong-side recovery (H&S / iH&S), keyed to the entry order type.
+        // Explicit `--recover-entry` always wins; otherwise the default is
+        // the **symmetric** rule the QM leg already applies
+        // (`cli/src/trade_patterns.rs`, `match spec.qm_entry_mode`):
+        //
+        //  - a **stop** recovers to a **limit** — price ran through the
+        //    trigger, so rest at the same level and wait for the pullback;
+        //  - a **limit** recovers to a **stop** — price already crossed the
+        //    level, so catch the continuation through it;
+        //  - **market** has no resting order to recover.
+        //
+        // Both directions preserve the planned R exactly (neither can fill
+        // worse than the original level), which is why neither needs a
+        // slippage bound. `--recover-entry abort` still gets the old drop.
+        //
+        // The stop arm used to default to `Skip` unless
+        // `--require-confirmation` was passed — an asymmetry with no
+        // rationale, since `--entry-limit` recovered unconditionally. See
+        // `BUG-entry-recovery-asymmetric-and-replay-blind.md`.
+        recover_entry: args.recover_entry.map(|r| r.into_core()).unwrap_or(
+            match args.pattern_entry_mode() {
+                Some(crate::args::PatternEntry::Market) => {
+                    trade_control_core::intent::RecoverEntryAction::Skip
                 }
-                bands
+                Some(crate::args::PatternEntry::Limit) => {
+                    trade_control_core::intent::RecoverEntryAction::Stop
+                }
+                // `--entry-stop`, and the unflagged default (also a stop).
+                Some(crate::args::PatternEntry::Stop) | None => {
+                    trade_control_core::intent::RecoverEntryAction::Limit
+                }
             },
-            veto_on_reversal: args.veto_on_reversal,
-            needs_confirmed_close: false,
-            // Populated from the chart's `<prep>-expiry` vertical lines —
-            // see `prep_expiry_steps`. Skipped preps (e.g. `--quasimodo`
-            // drops break-and-close) are filtered out so a stale expiry line
-            // doesn't collide with `skip_preps`.
-            prep_expiries,
-            // H&S path: no M/W static geometry. The M/W branch (commit 9)
-            // builds its spec separately, keyed on `roles.mw_path`.
-            mw: None,
-            // Baked from instrument-lookup (or --pip-size) so the worker scales
-            // the entry/SL offset_pips with the right pip, not its forex default.
-            pip_size: Some(pip_size),
-            // Baked from instrument-lookup (or --tick-size) so the worker snaps
-            // entry/SL/TP onto the broker's price grid before placement.
-            tick_size: Some(tick_size),
-            // Futures only: the money-per-1.0-of-price the worker sizes
-            // contracts with. `None` on every spot/CFD arm, which keeps the
-            // wire body byte-identical to a pre-feature one.
-            contract_multiplier,
-            blackout_close: args.blackout_close.into_core(),
-            entry_level_vetos,
-            // Wrong-side recovery (H&S / iH&S). Explicit `--recover-entry` wins.
-            // Otherwise the default depends on the entry mode:
-            //  - `--entry-limit`: a wrong-side limit recovers to a **stop** at the
-            //    same level (the operator's rule; `limit_recover_action`).
-            //  - stop entry + `--require-confirmation`: defaults to `limit` (the
-            //    confirmation lag is what strands the stop).
-            //  - everything else: today's drop (`skip`).
-            recover_entry: match args.pattern_entry_mode() {
-                Some(crate::args::PatternEntry::Limit) => args.limit_recover_action(),
-                _ => args.recover_entry.map(|r| r.into_core()).unwrap_or(
-                    if args.require_confirmation {
-                        trade_control_core::intent::RecoverEntryAction::Limit
-                    } else {
-                        trade_control_core::intent::RecoverEntryAction::Skip
-                    },
-                ),
-            },
-            strategy_v2: args.strategy_v2,
-            // QM leg (`09-enter-qm`) entry order type — `--qm-entry`, default
-            // Limit (rest at the signal level, recover to a stop when price has
-            // already crossed it). Independent of the BCR leg's `entry_mode`.
-            qm_entry_mode: match args.qm_entry {
-                Some(crate::args::QmEntry::Market) => cli::EntryMode::Market,
-                Some(crate::args::QmEntry::Stop) => cli::EntryMode::Stop,
-                Some(crate::args::QmEntry::Limit) | None => cli::EntryMode::Limit,
-            },
-            // Break-even on at 50% by default; `--no-breakeven` opts out,
-            // `--breakeven-pct` overrides the threshold.
-            breakeven_pct: if args.no_breakeven {
-                None
-            } else {
-                Some(args.breakeven_pct.unwrap_or(0.5))
-            },
-            // Entry SL-spread floor window baked onto the enter; `None` → worker default (5).
-            spread_window: args.spread_window,
-        };
+        ),
+        strategy_v2: args.strategy_v2,
+        // QM leg (`09-enter-qm`) entry order type — `--qm-entry`, default
+        // Limit (rest at the signal level, recover to a stop when price has
+        // already crossed it). Independent of the BCR leg's `entry_mode`.
+        qm_entry_mode: match args.qm_entry {
+            Some(crate::args::QmEntry::Market) => cli::EntryMode::Market,
+            Some(crate::args::QmEntry::Stop) => cli::EntryMode::Stop,
+            Some(crate::args::QmEntry::Limit) | None => cli::EntryMode::Limit,
+        },
+        // Break-even on at 50% by default; `--no-breakeven` opts out,
+        // `--breakeven-pct` overrides the threshold.
+        breakeven_pct: if args.no_breakeven {
+            None
+        } else {
+            Some(args.breakeven_pct.unwrap_or(0.5))
+        },
+        // Entry SL-spread floor window baked onto the enter; `None` → worker default (5).
+        spread_window: args.spread_window,
+    };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {
             Direction::Short => cli::PriceAnchor::RecentHigh,
@@ -1038,6 +1053,75 @@ mod tests {
             test_precision(0.0001, 0.0001),
         )
         .map(|(_dir, spec)| spec)
+    }
+
+    // ===== wrong-side entry recovery (BUG-entry-recovery-asymmetric-…) =====
+    //
+    // These assert the value baked onto the **TradeSpec** — the thing that
+    // reaches the signed plan — not a helper one layer below it. An earlier
+    // version of this rule was tested on an `Args` method, which is why the
+    // asymmetry below survived: the helper was only ever consulted on the
+    // limit arm, so nothing exercised what a bare `--entry-stop` produced.
+
+    /// The rule, stated once: each resting order type recovers to the other,
+    /// and a market entry has no resting order to recover. Mirrors the QM
+    /// leg's `match spec.qm_entry_mode` in `cli/src/trade_patterns.rs`.
+    #[test]
+    fn wrong_side_recovery_is_symmetric_across_entry_types() {
+        use trade_control_core::intent::RecoverEntryAction;
+        for (flags, want) in [
+            (&["--entry-stop"][..], RecoverEntryAction::Limit),
+            (&["--entry-limit"][..], RecoverEntryAction::Stop),
+            (&["--entry-market"][..], RecoverEntryAction::Skip),
+            // Unflagged is a stop, so it recovers like one.
+            (&[][..], RecoverEntryAction::Limit),
+        ] {
+            let spec = resolve_with_sl(None, flags).expect("valid H&S resolves");
+            assert_eq!(
+                spec.recover_entry, want,
+                "entry flags {flags:?} should recover to {want:?}"
+            );
+        }
+    }
+
+    /// The specific regression: a bare `--entry-stop` used to bake `Skip`
+    /// (dropping the entry) unless `--require-confirmation` happened to be
+    /// passed, while `--entry-limit` recovered unconditionally. Confirmation is
+    /// now irrelevant to the recovery default — it changes when the entry is
+    /// allowed to fire, not what happens when it lands wrong-side.
+    #[test]
+    fn stop_entry_recovers_to_limit_without_require_confirmation() {
+        use trade_control_core::intent::RecoverEntryAction;
+        let bare = resolve_with_sl(None, &["--entry-stop"]).expect("valid H&S resolves");
+        let confirmed = resolve_with_sl(None, &["--entry-stop", "--require-confirmation"])
+            .expect("valid H&S resolves");
+        assert_eq!(bare.recover_entry, RecoverEntryAction::Limit);
+        assert_eq!(
+            bare.recover_entry, confirmed.recover_entry,
+            "--require-confirmation must not change the recovery default"
+        );
+    }
+
+    /// `Skip` stays reachable — the operator can still opt back into the drop.
+    /// Asserted on every entry type so an explicit flag can never be silently
+    /// overridden by the type-keyed default.
+    #[test]
+    fn explicit_recover_entry_overrides_the_default_on_every_entry_type() {
+        use trade_control_core::intent::RecoverEntryAction;
+        for entry in ["--entry-stop", "--entry-limit", "--entry-market"] {
+            let spec = resolve_with_sl(None, &[entry, "--recover-entry", "abort"])
+                .expect("valid H&S resolves");
+            assert_eq!(
+                spec.recover_entry,
+                RecoverEntryAction::Skip,
+                "--recover-entry abort should win over {entry}'s default"
+            );
+        }
+        // And a non-Skip override lands too, so the test above isn't just
+        // reading a value that happens to equal the old default.
+        let spec = resolve_with_sl(None, &["--entry-stop", "--recover-entry", "market"])
+            .expect("valid H&S resolves");
+        assert_eq!(spec.recover_entry, RecoverEntryAction::Market);
     }
 
     #[test]

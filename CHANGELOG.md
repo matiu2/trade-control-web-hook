@@ -1,5 +1,65 @@
 # Changelog
 
+## v141 — 2026-09-09 — a stop entry now recovers to a limit, symmetrically
+
+**Why.** `tv-arm`'s wrong-side recovery default was one-sided. `--entry-limit`
+recovered to a stop unconditionally, but a bare `--entry-stop` recovered *only*
+if `--require-confirmation` happened to be passed — otherwise it baked `skip`
+and the entry was **dropped** when price ran through the trigger during the
+confirmation wait. Nothing justified the difference: confirmation governs *when*
+an entry may fire, not what happens when it lands wrong-side.
+
+The engine was never the problem — `core/src/intent/resolution.rs` has been
+symmetric all along (its Stop arm supports Limit recovery, mirroring the Limit
+arm's Stop recovery), and the **strategy-v2 QM leg already applied exactly the
+right rule** (`match spec.qm_entry_mode` in `cli/src/trade_patterns.rs`). The
+BCR leg was the odd one out.
+
+**What changed.** One expression in `tv-arm/src/hs_resolve.rs`, keyed off the
+entry order type alone, with an explicit `--recover-entry` still winning:
+
+- `--entry-stop` (and the unflagged default, also a stop) → recover to **limit**
+- `--entry-limit` → recover to **stop**
+- `--entry-market` → **skip** (no resting order to recover)
+
+Either resting direction preserves the planned R — neither can fill worse than
+the original level — which is why neither needs a slippage bound.
+
+**Breaking.** A `tv-arm`-armed stop entry no longer defaults to dropping on a
+wrong-side resolve; it rests a limit at the original trigger instead. Pass
+`--recover-entry abort` for the old behaviour. Hand-written specs that omit
+`recover_entry` are unaffected (still `skip`).
+
+`Args::limit_recover_action` was **deleted** rather than left in place — it was
+a second, limit-only derivation of the same rule, and two places that must agree
+by hand is the shape that produced this bug.
+
+**Config.** `--recover-entry` gains no new values; its help text and the README
+section now document the symmetric default. `--require-confirmation` no longer
+affects recovery.
+
+**Tests.** Three new tests in `hs_resolve`, asserting the value baked onto the
+real `TradeSpec` rather than an `Args` helper — the layer the old test sat at,
+and the reason the asymmetry survived. Mutation-tested at that entry point, no
+survivors: reverting the stop arm to `Skip`, breaking the limit mirror,
+recovering a market entry, and ignoring an explicit `--recover-entry` each turn
+a test red. Full workspace green, including the 304-test CLI suite that scores
+all 2695 corpus cells — **the corpus is byte-unchanged**, as predicted: a long
+stop triggers above the signal bar's own high, so it is correct-side by
+construction and the branch is unreachable for today's geometry. That makes
+this a latent trap closed, not a live loss recovered. Do not delete the branch
+as dead — a multi-bar confirmation wait, a zero/negative offset, an absolute
+`at`, or a differently-anchored future entry all make it live.
+
+**Follow-up.** The sibling defect is unfixed and now tracked separately in
+`BUG-replay-blind-to-broker-entry-recovery.md`: the replay broker never raises
+`EntryTooCloseToMarket`, so the broker-side (`#19-10`) recovery path is dead
+offline — 1339 of 2695 corpus cells configure a recovery replay cannot execute,
+and `Leg` has no field that could record one if it did. That report also flags a
+probable third defect: `place_entry_too_close_fallback` admits only
+`ResolvedEntry::Stop`, making `RecoverEntryPlan::Stop` unreachable from its only
+caller — exactly what the 888 `entry-limit` cells configure.
+
 ## v137 — 2026-09-07 — a whole setup was forfeited by three bugs in sequence
 
 **Why.** EUR/CAD H1 H&S short, 2026-08-07 (plan `hs-eur-cad-08ca0693`, OANDA

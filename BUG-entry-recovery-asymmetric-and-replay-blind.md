@@ -1,17 +1,21 @@
-# BUG — `--entry-stop` doesn't recover to a limit, and replay can't see broker-side recovery
+# BUG — `--entry-stop` didn't recover to a limit, and replay can't see broker-side recovery
 
-**Status:** OPEN, 2026-09-09. Two related defects found while measuring the
-`--entry-matrix` axis. Operator's call on both: the rules **should be
-symmetrical**, and a live↔replay divergence **is a bug**.
+**Status:** Bug 1 **FIXED** 2026-09-09. Bug 2 **OPEN** and split out into its
+own report — `BUG-replay-blind-to-broker-entry-recovery.md` — so it can be
+worked independently; the summary below is retained for context.
+
+Two related defects found while measuring the `--entry-matrix` axis.
+Operator's call on both: the rules **should be symmetrical**, and a live↔replay
+divergence **is a bug**.
 
 **Severity:** MEDIUM-HIGH. Neither moves a number in the current corpus (proven
 below), which is exactly why they survived: the corpus cannot see either one.
 
 ---
 
-## Bug 1 — the wrong-side recovery default is asymmetric
+## Bug 1 — the wrong-side recovery default is asymmetric — FIXED
 
-`tv-arm/src/hs_resolve.rs` (~line 422) picks the wrong-side recovery default:
+`tv-arm/src/hs_resolve.rs` (~line 422) picked the wrong-side recovery default:
 
 | armed as | wrong-side default | should be |
 |---|---|---|
@@ -23,10 +27,50 @@ The engine is NOT the problem: `core/src/intent/resolution.rs` is already
 symmetric — the Stop arm supports `Market` and `Limit` recovery, mirroring the
 Limit arm's `Stop` recovery. Only the *default* is one-sided.
 
-**Fix:** make `--entry-stop`'s wrong-side default `Limit`, unconditionally —
-i.e. drop the `require_confirmation` condition so a stop recovers to a limit the
-same way a limit recovers to a stop. `Skip` stays reachable via
-`--recover-entry abort`.
+**Fix — SHIPPED.** The default is now keyed off the entry order type alone, in
+one expression, with `--recover-entry` overriding it:
+
+```rust
+recover_entry: args.recover_entry.map(|r| r.into_core()).unwrap_or(
+    match args.pattern_entry_mode() {
+        Some(PatternEntry::Market)      => RecoverEntryAction::Skip,
+        Some(PatternEntry::Limit)       => RecoverEntryAction::Stop,
+        Some(PatternEntry::Stop) | None => RecoverEntryAction::Limit,
+    },
+),
+```
+
+This is deliberately the **same rule the QM leg already applied** —
+`match spec.qm_entry_mode` in `cli/src/trade_patterns.rs` — which was itself
+written from the operator's reasoning ("a Stop recovers to a Limit … a Limit
+recovers to a Stop … Market has no resting order to recover"). The BCR leg was
+the odd one out, not the QM leg. `require_confirmation` no longer participates:
+it governs *when* an entry may fire, not what happens when it lands wrong-side.
+`Skip` stays reachable via `--recover-entry abort`.
+
+`Args::limit_recover_action` was **deleted**, not left in place. It was a
+second, limit-only derivation of the same rule, and keeping it would have left
+two places that must agree by hand — the shape that produced this bug. Its unit
+test went with it, replaced by tests at the layer that matters (below).
+
+### Verification
+
+`cargo test --workspace` green, including the 304-test CLI suite that scores
+the full 2695-cell corpus — so the corpus is byte-unchanged, as predicted.
+
+Because green tests prove nothing here, the three new tests were
+**mutation-tested at the entry point** (`hs_resolve`, which returns the real
+`TradeSpec` that gets signed) rather than on an `Args` helper — the layer the
+old test sat at, and the reason the asymmetry survived:
+
+| mutation | caught by |
+|---|---|
+| stop arm `Limit` → `Skip` (restore the original bug) | both symmetry tests |
+| limit arm `Stop` → `Limit` (break the mirror) | `wrong_side_recovery_is_symmetric_across_entry_types` |
+| market arm `Skip` → `Limit` (recover a non-resting order) | same |
+| ignore an explicit `--recover-entry` | `explicit_recover_entry_overrides_the_default_on_every_entry_type` |
+
+No survivors.
 
 ### Why it changes nothing in today's corpus (and why that is NOT a reason to skip it)
 
@@ -49,7 +93,15 @@ construction is what makes a **limit** wrong-side ~always, which is why
 `-entry-limit` converges onto stops (601/102/86 identical order counts; 81.5%
 of paired cells byte-identical).
 
-## Bug 2 — replay cannot see broker-side recovery (`#19-10`)
+## Bug 2 — replay cannot see broker-side recovery (`#19-10`) — OPEN
+
+> **Now tracked in `BUG-replay-blind-to-broker-entry-recovery.md`**, which adds
+> the evidence gathered since: 1339 of 2695 corpus cells configure a
+> `recover_entry` replay can never execute, and a probable third defect —
+> `place_entry_too_close_fallback` admits only `ResolvedEntry::Stop`, making
+> `RecoverEntryPlan::Stop` unreachable from its only caller, which is exactly
+> what the 888 `entry-limit` cells configure. The summary below is retained for
+> context; work from the split-out report.
 
 There are **two** recovery routes. Replay implements one:
 

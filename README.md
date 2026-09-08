@@ -705,14 +705,15 @@ entry:
   type: stop
   from: signal_low
   offset_pips: -1.0
-  recover_entry:              # optional; default = skip (today's drop)
-    action: limit             # market | limit | skip
+  recover_entry:              # optional; omit in a hand-written spec = skip
+    action: limit             # market | limit | stop | skip
     max_slippage_pips: 8.0    # optional for market; derived if omitted
 ```
 
-- `action: skip` (default, also when `recover_entry` is omitted) — drop
-  the entry (resolve-time) / fail the placement without poisoning the id
-  (broker-time), letting the next bar try.
+- `action: skip` (also when `recover_entry` is omitted from a hand-written
+  spec) — drop the entry (resolve-time) / fail the placement without poisoning
+  the id (broker-time), letting the next bar try. Note `tv-arm` does **not**
+  default to this: it bakes a recovery keyed to the entry order type (below).
 - `action: market` — enter the confirmed breakout at **market**. At
   resolve time the reference becomes the current candle close; at the
   broker the live market price. The chase is bounded by
@@ -751,15 +752,25 @@ market|limit|stop|abort` to bake the policy onto the `05-enter` intent
 (`abort` → `skip`). When the flag is **omitted**, the default is keyed off
 the **entry order type**:
 
-- `--entry-limit`: a wrong-side limit (price already crossed the level)
-  defaults to **`stop`** — rest a stop at the same level to catch the
-  continuation through it. This is the operator's rule: "pass `--entry-limit`
-  and if price is above the level, turn it into a stop." `EntrySpec::Limit`
-  carries its own `recover_entry` for this (the mirror of the stop→limit
-  recovery below).
-- stop entry + `--require-confirmation`: defaults to **`limit`** (the
-  confirmation lag is exactly what strands the stop).
-- otherwise: **drop** (`skip`).
+- `--entry-stop` (and the unflagged default, which is also a stop): defaults to
+  **`limit`** — price ran through the trigger, so rest at the same level and
+  wait for the pullback.
+- `--entry-limit`: defaults to **`stop`** — price already crossed the level, so
+  rest a stop there to catch the continuation through it. This is the
+  operator's rule: "pass `--entry-limit` and if price is above the level, turn
+  it into a stop." `EntrySpec::Limit` carries its own `recover_entry` for this.
+- `--entry-market`: **`skip`** — there is no resting order to recover.
+
+The rule is **symmetric**: each resting order type recovers to the other, and
+either direction preserves the planned R (neither can fill worse than the
+original level). `--require-confirmation` does **not** participate — it governs
+*when* an entry may fire, not what happens when it lands wrong-side. Pass
+`--recover-entry abort` to opt back into dropping the entry.
+
+The strategy-v2 QM leg keys its own recovery off `--qm-entry` by the same rule.
+(Until 2026-09-09 a bare `--entry-stop` defaulted to `skip` unless
+`--require-confirmation` happened to be passed, while `--entry-limit` recovered
+unconditionally — see `BUG-entry-recovery-asymmetric-and-replay-blind.md`.)
 
 **Pattern entry order type (`--entry-market` / `--entry-stop` /
 `--entry-limit`):** the H&S / iH&S / M/W pattern path defaults to a pending
@@ -2702,8 +2713,10 @@ stores the order's whole **signed alert body** so the recovery watcher can
     SL band) → re-drive as a stop.
   - **Stop overrun** (the move is gone) → route to the order's `recover_entry`
     fallback (market / limit / skip) via the broker's own `#19-10` rejection.
-    If `recover_entry` is `skip` (the default), it's dropped without a
-    pointless broker round-trip and the next signal bar can retry.
+    If `recover_entry` is `skip` (only when the operator passed
+    `--recover-entry abort` — a `tv-arm`-armed stop defaults to `limit`), it's
+    dropped without a pointless broker round-trip and the next signal bar can
+    retry.
   - **Limit still on the pullback side** (fill-side strictly between entry
     and TP) → re-drive as a limit.
   - **Limit stale** (wrong side / past TP) → **dropped**, leaving the trade
