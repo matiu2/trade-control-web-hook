@@ -108,11 +108,11 @@ carried by many setups, not one or two.
 
 Two caveats worth carrying forward:
 
-1. **`--entry-market` is untested as a column.** The one setup measured suggests
-   a market fill beats the stop entry on a long (+8.51 vs +6.61R) simply by
-   filling earlier. That is one setup, one direction — it may well reverse on a
-   short, where filling earlier means filling worse. It deserves a real column
-   before anyone reads anything into it.
+1. **`--entry-market` on the main leg has now been measured** (59 setups, both
+   news modes) and is **worse** by ~10-12R — see "MEASURED" above. Its fill-price
+   advantage is real (+3.25R across the 50 setups that take identical trades) but
+   is outweighed by the stop's break-confirmation filter, which market discards:
+   83 filled legs vs 72, SL hits 25 -> 38.
 2. **Drawings are an input, and a bad one is invisible here.** The `eur-cad`
    `too-low` line silently zeroed a whole setup and nothing in the corpus
    flagged it. A geometry sanity check — for an iH&S, assert `too-low ≤ head`;
@@ -172,13 +172,76 @@ market's median is negative for longs (−0.03, 4 better / 4 worse) *and* shorts
 Nor is it a participation effect: limit fills 72 legs across those setups, market
 70, so this is fill *price* on much the same trades, not trading more often.
 
-**Verdict: unproven, not disproven.** A one-setup observation (`eur-cad-h4`,
-`--entry-market` +8.51R vs the corpus stop's +6.61R) plus a total-R win in every
-slice is a genuinely reasonable prior — a market order fills at the signal close
-while a stop waits for the break and fills worse, which on a long is strictly
-better *when the trade works*. The corpus just cannot confirm it, because the
-only order-type pivot it holds is on the QM leg and that pivot is
-outlier-driven and insignificant.
+**Verdict on the QM leg: unproven.** Outlier-driven and insignificant. (The
+*main*-leg question this raised has since been measured directly — see the next
+section, which answers it.)
+
+### MEASURED — `--skip-bcr --entry-market` vs `--skip-bcr` (stop), 59 setups
+
+Run 2026-09-08. Every setup re-armed from its frozen `.spec.json` with
+`--skip-bcr --entry-market`, both news modes, and paired against the corpus's
+own `skip-bcr` cell. The only difference between the two sides is the main
+entry's order type (asserted per cell: `stop` vs `market`, not inferred from the
+directory name). Script: `scripts/compare-market-vs-stop-entry.py`.
+
+3 of 62 setups (`us-2000`, `australia-200`, `germany-40-uk-100-…`) could not be
+re-armed — *not* a market-entry problem: they are missing from the baked spread
+table and the plain `--skip-bcr` re-arm refuses identically. They drop out of
+both sides symmetrically.
+
+| | news=on STOP | news=on MARKET | news=off STOP | news=off MARKET |
+|---|---:|---:|---:|---:|
+| total R | **+39.88** | +29.81 | **+42.60** | +30.93 |
+| mean R | +0.68 | +0.51 | +0.72 | +0.52 |
+| median R | +0.27 | +0.00 | +0.56 | +0.03 |
+| filled legs | 72 | **83** | 72 | **85** |
+| TP / SL | 19/25 | 18/**38** | 20/25 | 19/**39** |
+
+**Headline: market is WORSE, by ~10-12R on 59 setups, in both news slices.**
+
+This is the opposite of what the per-setup win rate suggests — market is better
+on **31 setups and worse on 11** (sign test **p = 0.003**). It wins most setups
+and still loses overall, so the win rate is the misleading statistic here.
+
+### Why: two effects pulling opposite ways
+
+Splitting the setups by whether the two sides took the *same number of trades*
+separates the fill-price effect from the trade-selection effect:
+
+| | setups | market better/worse | sum Δ | median Δ |
+|---|---:|---:|---:|---:|
+| **same** leg count (isolates fill PRICE) | 50 | **30 / 3** | **+3.25** | +0.060 |
+| **different** leg count (trade COUNT) | 9 | 1 / 8 | **−13.32** | −1.174 |
+
+1. **The fill-price edge is real and consistent.** When both sides take the same
+   trades, a market order fills at the signal close instead of waiting for the
+   break, and it wins 30 of 33 differing setups. This is exactly the mechanism
+   the `eur-cad-h4` observation showed (+6.61 → +8.51R), and it is the largest
+   single *gain* in the table.
+
+2. **But the stop is also a FILTER, and that dominates.** A resting stop only
+   fills if price actually breaks through the level; a market order always
+   fills. Market therefore takes trades the stop never triggers — 83 legs vs 72
+   — and those extra trades are bad: SL hits jump 25 → 38 while TP hits stay
+   flat at ~19. Per *leg*, market's mean R is +0.36 vs stop's +0.54 and its
+   median is **−0.01 vs +0.25**.
+
+The clearest single case is `gbp-nzd-h4-2026-08-05` (−4.24R): the stop takes
+**one** trade and banks +2.24R at TP; market takes **four**, stopping out three
+times before reaching the same TP, netting −2.00R.
+
+So: the market fill is better per trade, but the stop's *break confirmation* is
+worth more than the fill improvement costs. `--entry-market` buys a slightly
+better price and pays for it with materially worse trade selection.
+
+**Verdict: keep the default stop entry for `skip-bcr`.** The theory was
+mechanically sound and its predicted effect is measurably present — it is simply
+outweighed by the filtering the stop provides.
+
+⚠️ Caveat: these 59 market cells are **not** part of the committed corpus. They
+live outside `replay-fixtures/` deliberately (adding a fifth column would change
+every paired comparison in this document). Re-create them with the loop in
+`scripts/compare-market-vs-stop-entry.py`'s docstring if the question comes back.
 
 ### What would actually answer it
 
