@@ -18,6 +18,10 @@
 #      suffixed names (trade-control-staging, tv-arm-staging, …). The
 #      binary is identical bar the baked URL; the suffix is how you pick
 #      an environment from the shell.
+#   3b. Rebuild + install the UNSUFFIXED operator tools that live in the worker
+#      package (trade-control-accounts, trade-control-broker-check). They bake
+#      no webhook and choose their database at runtime, so there is one current
+#      copy rather than a per-env one.
 #   4. Rebuild + install the native worker binary and restart its systemd
 #      user service so the deploy rolls the running process, not just the CLIs.
 #
@@ -56,6 +60,25 @@ WORKER_BIN_DIR="$HOME/.local/bin"
 # so it bakes only `BAKED_ENV_SUFFIX` (build.rs), no webhook.
 CLI_PACKAGES=(trade-control-cli tv-arm tv-news journal)
 CLI_BINARIES=(trade-control tv-arm tv-news replay-candles journal)
+
+# Operator tools that live in the WORKER package, not the CLI packages.
+#
+# These are installed UNSUFFIXED and rebuilt on every deploy. They are not part
+# of CLI_BINARIES because they bake no webhook, and not part of the worker roll
+# because they are not the worker — so before this list existed nothing rebuilt
+# them at all. `trade-control-accounts` sat frozen from 2026-06-30 until
+# 2026-09-07 and eventually failed to decode an account row a newer binary had
+# written (`unknown variant 'ibkr'`), which reads like data corruption rather
+# than a stale binary — and both tools are exactly what an operator reaches for
+# while debugging an account problem.
+#
+# Deliberately NOT suffixed: they take no baked webhook and pick their database
+# at runtime (`--database-url` / `DATABASE_URL`, else `--config`, else
+# `~/.config/trade-control/trade-control.toml`). A `-dev` / `-staging` copy
+# would imply an environment binding these binaries do not have. One current
+# copy, pointed at whichever config you name.
+WORKER_CLI_PACKAGE=trade-control-worker
+WORKER_CLI_BINARIES=(trade-control-accounts trade-control-broker-check)
 
 # roll_native_worker <env-name> <suffix>
 #
@@ -150,6 +173,20 @@ deploy_env() {
     dest="$CARGO_BIN/${bin}-${suffix}"
     cp -f "$REPO_ROOT/target/release/$bin" "$dest"
     echo "==> [$env_name] installed $dest"
+  done
+
+  # 3b. Rebuild + install the unsuffixed worker-package operator tools, so a
+  #     schema change can never leave them behind (see WORKER_CLI_BINARIES).
+  echo "==> [$env_name] building worker CLIs (${WORKER_CLI_BINARIES[*]})"
+  local wbin_args=()
+  local wbin
+  for wbin in "${WORKER_CLI_BINARIES[@]}"; do
+    wbin_args+=(--bin "$wbin")
+  done
+  cargo build --release -p "$WORKER_CLI_PACKAGE" "${wbin_args[@]}"
+  for wbin in "${WORKER_CLI_BINARIES[@]}"; do
+    cp -f "$REPO_ROOT/target/release/$wbin" "$CARGO_BIN/$wbin"
+    echo "==> [$env_name] installed $CARGO_BIN/$wbin"
   done
 
   # 4. Rebuild + install the worker binary and restart its systemd user service,
