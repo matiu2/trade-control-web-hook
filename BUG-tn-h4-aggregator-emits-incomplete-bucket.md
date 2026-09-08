@@ -136,8 +136,11 @@ Both halves of the fix are visible in the diff: bars **added** inside the window
 week-open buckets, bars **removed** are all past `meta.end` — this bug's still-forming
 buckets. Gate: 918/918 real cells pass, `cargo test -p trade-control-cli` 304/304.
 
-**Still to do:** `entry-rule-corpus-comparison.md` (the basis of the current `skip-bcr`
-entry rule) must be re-run — the corpus is now correct, so this is unblocked.
+**Re-run done 2026-09-08:** `entry-rule-corpus-comparison.md` — `skip-bcr` still wins
+in all 6 slices (total R +32.33 -> +34.30, median +0.04 -> +0.26), so the entry-rule
+decision stands. The write-up isolates the H4 candle fix from the tv-arm version bump
+that rode along with the re-arm: the **candle fix is worth +18.86R**; the -30.85R on
+`eur-cad-h4-2026-07-23` is the plan rebuild, not this fix.
 
 ## Impact on the journal
 

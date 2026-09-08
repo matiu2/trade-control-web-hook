@@ -196,9 +196,17 @@ inflate volume/OHLC, was kept as its own test).
 1. ~~**Regenerate the TradeNation H4 fixtures.**~~ **DONE 2026-09-08** (`b7e277b`) — all
    **48** TN H4 cells re-fetched from their frozen `.spec.json`. See "Fixture
    regeneration" below for the scope proof and what moved.
-2. **Re-run `entry-rule-corpus-comparison.md`** — **STILL OUTSTANDING.** The current
-   `skip-bcr` entry rule was chosen on the affected data, so that conclusion is
-   unverified until it is re-run. The corpus is now correct, so this is unblocked.
+2. ~~**Re-run `entry-rule-corpus-comparison.md`**~~ **DONE 2026-09-08** — the
+   conclusion is **unchanged**: `skip-bcr` still wins, in all 6 (news x sl-anchor)
+   slices, with total R +32.33 -> +34.30 and its median +0.04 -> +0.26. Written up
+   in `entry-rule-corpus-comparison.md` (which did not previously exist as a file --
+   only `scripts/compare-entry-rules.py` did).
+
+   That write-up also isolates a confound worth knowing: re-arming rebuilt the plans
+   under a newer tv-arm (v132/v134 -> v140), so the corpus-wide -11.99R is **two**
+   effects. Replaying the old plans against the new candles separates them --
+   the **candle fix is +18.86R**; the plan rebuild is -30.85R, all of it on
+   `eur-cad-h4-2026-07-23`.
 3. The doc's original suggestion to split `WEEKEND_ENTRY_RESUME_MIN` (22:00) from
    `WEEKEND_DATA_RESUME_MIN` (21:00) still stands **on its own merits** — the entry-safety
    margin and the first-valid-bar are different questions — but it is **not** a fix for
