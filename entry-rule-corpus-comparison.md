@@ -258,10 +258,48 @@ So `--entry-limit` is best read as *"a stop, unless price happens not to have
 overrun yet"*, and the corpus says that exception is rare. It is **not**
 independent evidence that limits are as good as stops.
 
-⚠️ The mirror does NOT hold, and the naming invites the mistake: a **stop does
-not recover to a limit**. `recover_entry` is baked only onto the limit cells
-(`{"action":"stop"}`); every stop and market cell has none. The conversion is
-one-directional.
+### Is the conversion one-directional? No — but the corpus makes it look that way
+
+An earlier revision of this document said "a stop does not recover to a limit".
+**That was wrong as stated.** `core/src/intent/resolution.rs` is symmetric: the
+Stop arm supports recovering to `Market` *or* `Limit`, exactly mirroring the
+Limit arm's recovery to `Stop`. The capability is there in both directions.
+
+What is asymmetric is the **default**, chosen in `tv-arm/src/hs_resolve.rs`:
+
+| armed as | wrong-side default | why |
+|---|---|---|
+| `--entry-limit` | recover to **stop** | the operator's rule; a limit that price ran past becomes a stop at the same level |
+| `--entry-stop` **+** `--require-confirmation` | recover to **limit** | the confirmation lag is what strands the stop |
+| `--entry-stop` alone | **`Skip`** (drop the entry) | pre-existing behaviour, zero blast radius for un-opted stops |
+
+No corpus cell sets `--require-confirmation` (0 of 2694), so every stop cell
+takes the third row and gets `Skip`. That is why the plans show `recover_entry`
+only on the limit cells — a property of how the corpus is armed, not of the
+engine.
+
+**Is the asymmetric default a bug? Measured: no.** Re-arming setups with
+`--entry-stop --recover-entry limit` (the flag exists, and it bakes correctly —
+verified `{"action":"limit"}` on the plan) produces **byte-identical results on
+13 of 13 setups tested**. The wrong-side-stop branch is essentially never
+reached, and the geometry says why: a long stop triggers at
+`signal_high + 0.5%·ATR`, i.e. *above* the signal bar's own high, and the
+resolve happens on that same bar whose close cannot exceed its high. So a stop
+is correct-side **by construction**, while a limit at the same level is
+wrong-side by the same construction — which is exactly why the limit column
+converges onto stops and the stop column has nothing to recover.
+
+The default is therefore doing nothing in the corpus rather than costing R. It
+would start to matter for a setup where the confirmation wait spans bars (which
+is what `--require-confirmation` turns on, and what its default already
+handles).
+
+⚠️ Still worth knowing: **live has a second conversion route replay cannot
+see.** `core/src/recover_entry.rs` handles a TradeNation `#19-10` broker
+rejection ("entry too close to market") and can re-place as market or limit. The
+replay broker never raises that error, so there are **zero** such recoveries
+across all 2695 cells. Any live-vs-replay comparison on a stop entry inherits
+that gap.
 
 ### MEASURED (superseded) — `--skip-bcr --entry-market` vs stop, 59 setups
 
