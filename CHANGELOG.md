@@ -1,5 +1,71 @@
 # Changelog
 
+## v142 — 2026-09-09 — replay can now see broker-side entry recovery (`#19-10`)
+
+**Why.** The offline replay never returned `EntryTooCloseToMarket`, so the whole
+broker-side recovery branch in `dispatch::enter` was **dead offline** while 1339
+of 2695 corpus cells configured one. Live could reject a wrong-side pending entry
+and recover into a different order type at a different price; replay scored the
+original — or nothing — and the two disagreed with no warning on either side.
+Nothing in the corpus could detect it, which is why it survived. Operator's
+standing rule: any live↔replay divergence is a bug.
+
+Sibling of v141 (which fixed what gets *baked* onto a plan); this fixes what
+replay *does* with it. Report: `BUG-replay-blind-to-broker-entry-recovery.md`.
+
+**What changed.**
+
+- **`ReplayBroker::place_entry` raises `#19-10`** — a third rejection alongside
+  the two account caps, held to the same standard (reject only where replay can
+  *know*). A pure `wrong_side_of_market` helper compares the requested level
+  against the as-of bar's mid. The two pending types **invert** (a stop rests
+  above the market for a long, a limit below), so each gets its own arm and its
+  own test. A `Market` entry is never wrong-side; no knowable price ⇒ no
+  rejection. The rejection deliberately does not consume the armed placement, so
+  the dispatcher's recovery re-place lands on the same slot and order id.
+- **`Leg` records the outcome** — new `placed_as` (market/stop/limit) and
+  `recovered_entry`, both elided when absent/false so the 2695 existing goldens
+  round-trip unchanged. Plumbed `PlacedLevels → HeldOrder → HeldPosition →
+  ClosedTrade → RealizedOutcome → FireResult → Leg`.
+- **`golden_eq` compares them** — otherwise the corpus would deserialize the
+  fields and ignore them, and a recovered entry would still compare equal to an
+  ordinary one at the same price. `placed_as` is compared only where the
+  *expected* side recorded one (absent = not recorded); `recovered_entry` always.
+- **A wrong-side LIMIT can finally recover** — `place_entry_too_close_fallback`
+  admitted only `ResolvedEntry::Stop`, making `RecoverEntryPlan::Stop`
+  unreachable despite its ~45-line handler being fully written. It now admits
+  `Limit` too (`Market` stays terminal), matching what
+  `EntrySpec::Limit::recover_entry`'s docs and the README already promised.
+- **`recover_entry.rs`'s `Stop` arm gained its first tests** (it had none — 17
+  tests covered Skip/Limit/Market only), and a geometry comment that had the two
+  directions backwards was corrected.
+
+**Breaking.** None on the wire. `Leg` gains two optional fields; old goldens load
+unchanged.
+
+**Config.** None.
+
+**Tests.** +23 tests. **8 mutations, all killed** — one initially *survived*
+(`golden_eq` ignoring the new fields), so a test was added. The decisive check:
+deleting the replay rejection now turns **23 corpus cells red**, where the corpus
+was previously blind to the entire path. Goldens recording a recovery: **0 → 23**.
+Full workspace 3029 passed / 0 failed.
+
+**Corpus.** First run diverged 1582 cells — all on the new key alone, every
+economic number byte-identical; fixed at the comparator, **not** by re-blessing.
+The remaining 23 each carry exactly one real recovery (3 setups × axis variants +
+1 spread-floor cell, overwhelmingly `entry-limit`) and were re-blessed
+deliberately: cad-sgd −1.66R → −1.00R (recovery avoided loss), de30 +2.83R →
++2.12R (recovery cost profit), nzd-jpy net-R unchanged but a different entry leg.
+Hand-verified de30: an `entry: limit` + `recover_entry: stop` plan whose limit
+used to fill @25732.5 now correctly rejects and recovers as a stop @25705.5 — the
+old number was a fill live never got.
+
+**Follow-up.** Live has still never hit `#19-10` (0 across 19,872 staging + 210
+dev `request_records`, Jul 6 → Sep 8); `broker-oanda` cannot even construct the
+variant. This closes a **latent** divergence ahead of TradeNation carrying live
+stop/limit entries under the 2026-09-06 both-brokers decision.
+
 ## v141 — 2026-09-09 — a stop entry now recovers to a limit, symmetrically
 
 **Why.** `tv-arm`'s wrong-side recovery default was one-sided. `--entry-limit`

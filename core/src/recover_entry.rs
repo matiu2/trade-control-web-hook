@@ -148,9 +148,12 @@ pub fn recover_entry_plan(
             }
             // A long stop must rest at/above the market, a short stop at/below —
             // the mirror of the limit check. For a genuine wrong-side *limit* the
-            // price has crossed the level (long: current >= trigger; short:
-            // current <= trigger), so the original trigger is the correct *stop*
-            // side and fills on the continuation through it.
+            // price has crossed the level: a long limit rests BELOW the market, so
+            // it goes wrong-side when price falls THROUGH it (long: current <=
+            // trigger; short: current >= trigger). The original trigger is then
+            // the correct *stop* side and fills on the continuation back through
+            // it. (The comparisons below are the authority; an earlier version of
+            // this comment had the two directions the wrong way round.)
             let correct_side = match direction {
                 Direction::Long => current_price <= trigger_price,
                 Direction::Short => current_price >= trigger_price,
@@ -383,6 +386,89 @@ mod tests {
     #[test]
     fn market_non_finite_price_skips() {
         let cfg = rec_cfg(RecoverEntryAction::Market, Some(0.0008));
+        let plan = recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, f64::NAN);
+        assert!(
+            matches!(plan, RecoverEntryPlan::Skip { reason } if reason == "recover-entry-price-unavailable")
+        );
+    }
+    // ---- `RecoverEntryAction::Stop`. This arm had NO tests until 2026-09-09:
+    // it was also unreachable from its only caller (the fallback admitted only a
+    // `Stop` entry, so a wrong-side *limit* — the case this arm exists for —
+    // returned terminal two lines earlier). Untested AND unreachable is how a
+    // fully-written ~45-line handler stayed green forever. See
+    // `BUG-replay-blind-to-broker-entry-recovery.md`.
+
+    /// A long limit rests BELOW the market, so it is wrong-side once price has
+    /// fallen through it. A long stop at that same level then rests correctly
+    /// ABOVE the market and catches the continuation back up through it.
+    #[test]
+    fn stop_long_correct_side_rests_at_trigger() {
+        let cfg = rec_cfg(RecoverEntryAction::Stop, None);
+        let plan = recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, 1.0995);
+        assert_eq!(
+            plan,
+            RecoverEntryPlan::Stop {
+                trigger_price: 1.1000
+            }
+        );
+    }
+
+    /// The mirror: a short limit rests above the market, wrong-side once price
+    /// rises through it; a short stop at that level rests correctly below.
+    #[test]
+    fn stop_short_correct_side_rests_at_trigger() {
+        let cfg = rec_cfg(RecoverEntryAction::Stop, None);
+        let plan = recover_entry_plan(Some(&cfg), Direction::Short, 1.1000, 1.1005);
+        assert_eq!(
+            plan,
+            RecoverEntryPlan::Stop {
+                trigger_price: 1.1000
+            }
+        );
+    }
+
+    /// The geometry guard: a long stop BELOW the market would be a `#19-10` all
+    /// over again, so a degenerate non-overrun case must skip, not re-place.
+    #[test]
+    fn stop_long_wrong_side_skips() {
+        let cfg = rec_cfg(RecoverEntryAction::Stop, None);
+        let plan = recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, 1.1005);
+        assert!(
+            matches!(plan, RecoverEntryPlan::Skip { reason } if reason == "recover-entry-stop-wrong-side")
+        );
+    }
+
+    #[test]
+    fn stop_short_wrong_side_skips() {
+        let cfg = rec_cfg(RecoverEntryAction::Stop, None);
+        let plan = recover_entry_plan(Some(&cfg), Direction::Short, 1.1000, 1.0995);
+        assert!(
+            matches!(plan, RecoverEntryPlan::Skip { reason } if reason == "recover-entry-stop-wrong-side")
+        );
+    }
+
+    /// Price exactly at the trigger is restable (inclusive), matching the limit
+    /// arm's treatment of the same boundary.
+    #[test]
+    fn stop_at_exact_trigger_rests() {
+        let cfg = rec_cfg(RecoverEntryAction::Stop, None);
+        assert_eq!(
+            recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, 1.1000),
+            RecoverEntryPlan::Stop {
+                trigger_price: 1.1000
+            }
+        );
+        assert_eq!(
+            recover_entry_plan(Some(&cfg), Direction::Short, 1.1000, 1.1000),
+            RecoverEntryPlan::Stop {
+                trigger_price: 1.1000
+            }
+        );
+    }
+
+    #[test]
+    fn stop_non_finite_price_skips() {
+        let cfg = rec_cfg(RecoverEntryAction::Stop, None);
         let plan = recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, f64::NAN);
         assert!(
             matches!(plan, RecoverEntryPlan::Skip { reason } if reason == "recover-entry-price-unavailable")

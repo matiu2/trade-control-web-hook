@@ -14,6 +14,7 @@
 
 use std::cell::RefCell;
 
+use super::economics::PlacedOrderKind;
 use super::fill_sim::{SimOutcome, simulate_fill_resolved_zoom};
 use super::report::FillKind;
 use chrono::{DateTime, Utc};
@@ -94,6 +95,10 @@ struct HeldOrder {
     /// cancel-and-replace). A cancelled resting order fills nothing and appears in
     /// neither the open nor the pending list; a restore re-activates it.
     cancelled: bool,
+    /// Set when this order reached the broker through the `#19-10` recovery
+    /// re-place rather than as a first placement. Travels to the position and
+    /// then the closed trade so the fixture leg can record it.
+    recovered: bool,
 }
 
 /// A filled position the broker holds: promoted from a [`HeldOrder`] when a bar
@@ -102,6 +107,9 @@ struct HeldOrder {
 #[derive(Clone)]
 struct HeldPosition {
     order_id: String,
+    /// Whether this position's order reached the broker via the `#19-10`
+    /// recovery path. Travels with the position so a close can record it.
+    recovered: bool,
     intent: Intent,
     shell: Shell,
     /// The bracket the position rests on — the floored stop, take-profit, and the
@@ -138,6 +146,11 @@ pub enum ExitReason {
 #[derive(Clone)]
 struct ClosedTrade {
     order_id: String,
+    /// The order type the position was placed as, and whether it got there via
+    /// the `#19-10` recovery path — carried through the close so the fixture can
+    /// record it (`PlacedLevels` is dropped once a trade closes).
+    placed_as: Option<PlacedOrderKind>,
+    recovered: bool,
     direction: Direction,
     entry_price: f64,
     /// The floored stop the position rested on — R is `realized_r(entry, stop, exit)`.
@@ -197,6 +210,13 @@ pub struct RealizedOutcome {
     /// journal's Net R comes from the broker ledger, not a re-simulation.
     pub exit_price: Option<f64>,
     pub kind: FillKind,
+    /// The order type actually placed. A broker-side `#19-10` recovery can
+    /// re-place a rejected entry as a different type, so this is not always the
+    /// type the plan asked for. `None` when the ledger has no captured levels.
+    pub placed_as: Option<PlacedOrderKind>,
+    /// True when this entry reached the broker through the `#19-10` recovery
+    /// path rather than as a first placement.
+    pub recovered_entry: bool,
 }
 
 /// The geometry the replay loop arms before each `run_enter` so this broker's
@@ -226,6 +246,11 @@ pub struct ReplayBroker {
     /// The placement the loop armed for the next `run_enter` (its intent, shell,
     /// and the order id `place_entry` should return). Consumed by `place_entry`.
     armed: RefCell<Option<ArmedPlacement>>,
+    /// Set when this broker answered a placement with `EntryTooCloseToMarket`
+    /// and is now expecting the dispatcher's recovery re-place onto the SAME
+    /// armed slot. Cleared as soon as a placement is recorded, so it can only
+    /// ever mark the one placement that directly followed the rejection.
+    recovering: RefCell<bool>,
     /// The sub-bar zoom provider (PR-2), or `None` ⇒ [`NoZoom`]. Every fill/exit
     /// path passes this to `simulate_fill_resolved_zoom`, so an ambiguous SL/TP
     /// bar is disambiguated by finer candles when available and
@@ -265,6 +290,7 @@ impl ReplayBroker {
             as_of: RefCell::new(last),
             placed: RefCell::new(Vec::new()),
             armed: RefCell::new(None),
+            recovering: RefCell::new(false),
             finer: None,
             resting: RefCell::new(Vec::new()),
             open: RefCell::new(Vec::new()),
@@ -350,12 +376,30 @@ impl ReplayBroker {
     /// levels `place_entry` captured from the `EntryRequest` — the floored stop
     /// the broker rests on (`None` only on the direct-record test path, which
     /// falls back to resolving from the intent).
+    /// Record a placement directly, without going through `place_entry` — the
+    /// "direct-record test path" the module docs refer to. Test-only: the live
+    /// replay loop always arrives via `place_entry`, which is what carries the
+    /// `#19-10` recovery marker.
+    #[cfg(test)]
     pub(crate) fn record_attempt(
         &self,
         order_id: String,
         intent: Intent,
         shell: Shell,
         placed: Option<PlacedLevels>,
+    ) {
+        self.record_attempt_inner(order_id, intent, shell, placed, false)
+    }
+
+    /// [`record_attempt`](Self::record_attempt) plus the `#19-10` recovery
+    /// marker. Split so the direct-record test path keeps its 4-arg shape.
+    fn record_attempt_inner(
+        &self,
+        order_id: String,
+        intent: Intent,
+        shell: Shell,
+        placed: Option<PlacedLevels>,
+        recovered: bool,
     ) {
         // Register a placement: a held resting order the per-bar `advance()` steps
         // to open/closed, plus the retry-gate `PlacedAttempt` record. `placed` are
@@ -367,6 +411,7 @@ impl ReplayBroker {
             shell: shell.clone(),
             placed: placed.clone(),
             cancelled: false,
+            recovered,
         });
         self.placed.borrow_mut().push(PlacedAttempt {
             order_id,
@@ -524,6 +569,8 @@ impl ReplayBroker {
                 take_profit: t.take_profit,
                 exit_price: Some(t.exit_price),
                 kind,
+                placed_as: t.placed_as,
+                recovered_entry: t.recovered,
             });
         }
         if let Some(p) = self.open.borrow().iter().find(|p| p.order_id == order_id) {
@@ -545,6 +592,8 @@ impl ReplayBroker {
                     .unwrap_or(p.entry_price),
                 exit_price: None,
                 kind: FillKind::Open,
+                placed_as: p.placed.as_ref().map(|pl| PlacedOrderKind::of(&pl.entry)),
+                recovered_entry: p.recovered,
             });
         }
         // Still resting at window end. An UNCANCELLED resting order is a genuine
@@ -574,6 +623,8 @@ impl ReplayBroker {
                     take_profit: resolved.take_profit,
                     exit_price: None,
                     kind: FillKind::NeverFilled,
+                    placed_as: Some(PlacedOrderKind::of(&resolved.entry)),
+                    recovered_entry: o.recovered,
                 });
             }
         }
@@ -623,6 +674,17 @@ impl ReplayBroker {
     fn candle_at_as_of(&self) -> Option<&BidAskCandle> {
         let as_of = *self.as_of.borrow();
         self.candles.iter().rfind(|c| c.time <= as_of)
+    }
+
+    /// The market mid at the current `as_of` bar, or `None` when no bar sits
+    /// at/before it (nothing knowable — do not guess).
+    ///
+    /// This is the **same quantity** the recovery path reads back through the
+    /// defaulted `Broker::get_current_price` (→ `get_quote(..).mid()`), so the
+    /// rejection and the recovery decision that follows it reason about one
+    /// price rather than two that could disagree.
+    fn market_price_as_of(&self) -> Option<f64> {
+        self.candle_at_as_of().map(|c| (c.bid_c + c.ask_c) / 2.0)
     }
 
     /// The `Resolved` bracket the sim walks for an attempt — its stored PLACED
@@ -762,6 +824,7 @@ impl ReplayBroker {
                     self.remove_resting(&order.order_id);
                     self.open.borrow_mut().push(HeldPosition {
                         order_id: order.order_id.clone(),
+                        recovered: order.recovered,
                         intent: order.intent.clone(),
                         shell: order.shell.clone(),
                         placed: order.placed.clone(),
@@ -792,6 +855,11 @@ impl ReplayBroker {
                     self.remove_resting(&order.order_id);
                     self.closed.borrow_mut().push(ClosedTrade {
                         order_id: order.order_id.clone(),
+                        placed_as: order
+                            .placed
+                            .as_ref()
+                            .map(|pl| PlacedOrderKind::of(&pl.entry)),
+                        recovered: order.recovered,
                         direction: resolved.direction,
                         entry_price,
                         stop_loss: resolved.stop_loss,
@@ -836,6 +904,8 @@ impl ReplayBroker {
                 self.remove_open(&pos.order_id);
                 self.closed.borrow_mut().push(ClosedTrade {
                     order_id: pos.order_id.clone(),
+                    placed_as: pos.placed.as_ref().map(|pl| PlacedOrderKind::of(&pl.entry)),
+                    recovered: pos.recovered,
                     direction: pos.direction,
                     entry_price: pos.entry_price,
                     stop_loss: resolved.stop_loss,
@@ -946,6 +1016,50 @@ impl ReplayBroker {
 ///
 /// `price` IS known — it is the requested entry the replay is placing at, the
 /// same quantity the live brokers report. Not a fill.
+/// Is this pending entry on the **wrong side** of the market — i.e. already
+/// overtaken, so a real broker cannot rest it (TradeNation `#19-10`,
+/// [`EntryError::EntryTooCloseToMarket`])?
+///
+/// The two pending types sit on opposite sides of the market and so invert:
+///
+/// | entry | rests | wrong-side when |
+/// |---|---|---|
+/// | long stop | above market | market ≥ trigger |
+/// | short stop | below market | market ≤ trigger |
+/// | long limit | below market | market ≤ trigger |
+/// | short limit | above market | market ≥ trigger |
+///
+/// This is the same correct-side test [`trade_control_core::recover_entry`]
+/// applies when deciding a recovery, read in the opposite direction — the
+/// broker rejects exactly what the recovery would then consider re-placing.
+///
+/// A **market** order has no resting level, so it is never wrong-side. A
+/// non-finite price is not a rejection: replay rejects only where it can *know*
+/// (the same conservatism as the risk / open-position caps).
+///
+/// The comparisons are inclusive (`>=` / `<=`), matching `recover_entry`'s
+/// treatment of a level exactly at the market as marketable rather than restable.
+fn wrong_side_of_market(entry: &ResolvedEntry, direction: Direction, market: f64) -> bool {
+    let Some(trigger) = (match entry {
+        ResolvedEntry::Stop { trigger_price } | ResolvedEntry::Limit { trigger_price } => {
+            Some(*trigger_price)
+        }
+        ResolvedEntry::Market { .. } => None,
+    }) else {
+        return false;
+    };
+    if !market.is_finite() || !trigger.is_finite() {
+        return false;
+    }
+    match (entry, direction) {
+        (ResolvedEntry::Stop { .. }, Direction::Long) => market >= trigger,
+        (ResolvedEntry::Stop { .. }, Direction::Short) => market <= trigger,
+        (ResolvedEntry::Limit { .. }, Direction::Long) => market <= trigger,
+        (ResolvedEntry::Limit { .. }, Direction::Short) => market >= trigger,
+        (ResolvedEntry::Market { .. }, _) => false,
+    }
+}
+
 fn replay_placement(
     order_id: String,
     req: &EntryRequest<'_>,
@@ -995,6 +1109,30 @@ impl Broker for ReplayBroker {
         if open_now as u32 >= max_open_positions {
             return Err(EntryError::OpenPositionsCapExceeded);
         }
+        // 3. Wrong-side pending entry (TradeNation `#19-10`,
+        //    `EntryTooCloseToMarket`): the resting level has already been
+        //    overtaken by price, so the broker cannot rest the order. Like the
+        //    two caps above, this is a rejection the replay can faithfully
+        //    reproduce — a pure comparison of the requested trigger against the
+        //    market, both of which it knows — so a live reject-and-recover is
+        //    not silently scored offline as an ordinary fill.
+        //
+        //    Without it the entire broker-side recovery branch in
+        //    `dispatch::enter` (`place_entry_too_close_fallback`) was dead
+        //    offline while 1339 corpus cells configured one. See
+        //    `BUG-replay-blind-to-broker-entry-recovery.md`.
+        //    The rejection deliberately does NOT consume the armed placement:
+        //    `dispatch::enter` may recover by re-placing immediately, and that
+        //    re-place is the SAME intended entry (it shares `retry_attempt_no`
+        //    and burns no multi-shot slot), so it must land on the same armed
+        //    slot and order id. `recovering` remembers that the next placement
+        //    got there through the recovery path, so the leg can record it.
+        if let Some(market) = self.market_price_as_of()
+            && wrong_side_of_market(&req.entry, req.direction, market)
+        {
+            *self.recovering.borrow_mut() = true;
+            return Err(EntryError::EntryTooCloseToMarket);
+        }
 
         // The real dispatch (`run_enter`) calls this to "place" the order. The
         // replay loop armed the geometry out-of-band (intent + shell + the order
@@ -1015,7 +1153,17 @@ impl Broker for ReplayBroker {
                     stop_loss: req.stop_loss,
                     take_profit: req.take_profit,
                 };
-                self.record_attempt(a.order_id.clone(), a.intent, a.shell, Some(placed));
+                // A placement immediately following this broker's own `#19-10`
+                // answer IS the dispatcher's recovery re-place. Take (not peek)
+                // the flag so it marks exactly one placement.
+                let recovered = self.recovering.replace(false);
+                self.record_attempt_inner(
+                    a.order_id.clone(),
+                    a.intent,
+                    a.shell,
+                    Some(placed),
+                    recovered,
+                );
                 Ok(replay_placement(a.order_id, req))
             }
             // No armed placement: this is the shared `pending_order_lifecycle`
@@ -1082,6 +1230,8 @@ impl Broker for ReplayBroker {
         for p in to_close {
             closed.push(ClosedTrade {
                 order_id: p.order_id,
+                placed_as: p.placed.as_ref().map(|pl| PlacedOrderKind::of(&pl.entry)),
+                recovered: p.recovered,
                 direction: p.direction,
                 entry_price: p.entry_price,
                 // Resolve the stored floored stop for R scoring; fall back to the
@@ -1593,8 +1743,17 @@ mod tests {
     #[tokio::test]
     async fn place_entry_under_the_open_positions_cap_is_accepted() {
         // One open, cap = 3 → the next place is allowed.
+        //
+        // Bar 1 closes at 1.1005, ABOVE the 1.1000 short-stop trigger, so the
+        // second placement rests correctly. (It used to close exactly AT the
+        // trigger; once `place_entry` learned to reject a wrong-side pending
+        // entry that became an inclusive-boundary `#19-10` — a real rejection,
+        // but nothing to do with the open-positions cap this test pins. The bar
+        // is moved off the boundary rather than the rejection weakened: the
+        // live resolve-time geometry check is inclusive too
+        // (`core/src/intent/resolution.rs`, long `trigger <= close`).)
         let fire = candle(0, 1.1010);
-        let fill = candle(3600, 1.1000);
+        let fill = candle(3600, 1.1005);
         let b = ReplayBroker::new(vec![fire, fill], 0.0001);
         b.record_attempt(
             "o1".into(),
@@ -1717,6 +1876,191 @@ mod tests {
         assert!(
             b.closed.borrow().is_empty(),
             "no trade may be closed before the loop reaches bar 1"
+        );
+    }
+
+    // ---- `#19-10` (EntryTooCloseToMarket) — Gap A of
+    // `BUG-replay-blind-to-broker-entry-recovery.md`. Before this, the replay
+    // broker never returned this variant, so the ENTIRE broker-side recovery
+    // branch in `dispatch::enter` was dead offline: live could reject a
+    // wrong-side pending entry and recover into a different order type, and
+    // replay scored the original (or nothing) with no warning on either side.
+
+    /// A **long** stop entry whose trigger the market has already overtaken.
+    fn long_stop_req(trigger: f64) -> EntryRequest<'static> {
+        EntryRequest {
+            instrument: "EUR/USD",
+            direction: Direction::Long,
+            entry: ResolvedEntry::Stop {
+                trigger_price: trigger,
+            },
+            stop_loss: trigger - 0.0020,
+            take_profit: trigger + 0.0050,
+            risk: RiskBudget::Percent(1.0),
+            dry_run: false,
+            contract_multiplier: None,
+        }
+    }
+
+    /// A **long** limit entry at `trigger`.
+    fn long_limit_req(trigger: f64) -> EntryRequest<'static> {
+        EntryRequest {
+            instrument: "EUR/USD",
+            direction: Direction::Long,
+            entry: ResolvedEntry::Limit {
+                trigger_price: trigger,
+            },
+            stop_loss: trigger - 0.0020,
+            take_profit: trigger + 0.0050,
+            risk: RiskBudget::Percent(1.0),
+            dry_run: false,
+            contract_multiplier: None,
+        }
+    }
+
+    /// A long STOP rests above the market. Market at 1.1050 has already run
+    /// past a 1.1000 trigger, so the broker cannot rest it — live TradeNation
+    /// answers `#19-10`. Replay must too, or it silently takes a fill live
+    /// never got.
+    ///
+    /// Mutation check: delete the too-close arm (or flip its comparison) and
+    /// this goes RED.
+    #[tokio::test]
+    async fn place_entry_rejects_a_long_stop_the_market_has_overtaken() {
+        let b = ReplayBroker::new(vec![candle(0, 1.1050)], 0.0001);
+        b.arm_placement(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&candle(0, 1.1050).mid()),
+        );
+        let err = b
+            .place_entry(100.0, 100, &long_stop_req(1.1000))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EntryError::EntryTooCloseToMarket),
+            "market 1.1050 past a 1.1000 long-stop trigger must reject, got {err:?}"
+        );
+    }
+
+    /// The mirror: a short STOP rests below the market, so it is overtaken when
+    /// the market falls through it.
+    #[tokio::test]
+    async fn place_entry_rejects_a_short_stop_the_market_has_overtaken() {
+        let b = ReplayBroker::new(vec![candle(0, 1.0950)], 0.0001);
+        b.arm_placement(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&candle(0, 1.0950).mid()),
+        );
+        let req = EntryRequest {
+            direction: Direction::Short,
+            ..long_stop_req(1.1000)
+        };
+        let err = b.place_entry(100.0, 100, &req).await.unwrap_err();
+        assert!(
+            matches!(err, EntryError::EntryTooCloseToMarket),
+            "market 1.0950 below a 1.1000 short-stop trigger must reject, got {err:?}"
+        );
+    }
+
+    /// A long LIMIT rests *below* the market, so it is wrong-side when the
+    /// market has fallen *through* it — the opposite comparison to a stop.
+    /// Getting this backwards would reject every healthy limit in the corpus,
+    /// which is why both types get their own test.
+    #[tokio::test]
+    async fn place_entry_rejects_a_long_limit_the_market_has_fallen_through() {
+        let b = ReplayBroker::new(vec![candle(0, 1.0950)], 0.0001);
+        b.arm_placement(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&candle(0, 1.0950).mid()),
+        );
+        let err = b
+            .place_entry(100.0, 100, &long_limit_req(1.1000))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EntryError::EntryTooCloseToMarket),
+            "market 1.0950 below a 1.1000 long-limit must reject, got {err:?}"
+        );
+    }
+
+    /// The common case must be untouched: a correctly-placed pending order
+    /// still rests. A rejection here would starve the whole corpus.
+    #[tokio::test]
+    async fn place_entry_accepts_pending_orders_that_rest_correctly() {
+        // Long stop at 1.1000 with the market BELOW it — rests correctly above.
+        let b = ReplayBroker::new(vec![candle(0, 1.0950)], 0.0001);
+        b.arm_placement(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&candle(0, 1.0950).mid()),
+        );
+        assert_eq!(
+            b.place_entry(100.0, 100, &long_stop_req(1.1000))
+                .await
+                .expect("a correctly-resting long stop must be accepted")
+                .order_id,
+            "o1",
+        );
+
+        // Long limit at 1.1000 with the market ABOVE it — rests correctly below.
+        let b2 = ReplayBroker::new(vec![candle(0, 1.1050)], 0.0001);
+        b2.arm_placement(
+            "o2".into(),
+            short_enter_intent(),
+            Shell::from_candle(&candle(0, 1.1050).mid()),
+        );
+        assert_eq!(
+            b2.place_entry(100.0, 100, &long_limit_req(1.1000))
+                .await
+                .expect("a correctly-resting long limit must be accepted")
+                .order_id,
+            "o2",
+        );
+    }
+
+    /// A MARKET entry has no resting level to be wrong-side of, so it can never
+    /// draw a `#19-10`. Pinned so the new check never grows to cover it.
+    #[tokio::test]
+    async fn place_entry_never_rejects_a_market_order_as_too_close() {
+        let b = ReplayBroker::new(vec![candle(0, 1.1050)], 0.0001);
+        b.arm_placement(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&candle(0, 1.1050).mid()),
+        );
+        let req = EntryRequest {
+            entry: ResolvedEntry::Market {
+                reference_price: 1.1050,
+            },
+            ..long_stop_req(1.1000)
+        };
+        assert!(
+            b.place_entry(100.0, 100, &req).await.is_ok(),
+            "a market order is never wrong-side",
+        );
+    }
+
+    /// Conservatism rail, matching the two existing cap checks: replay rejects
+    /// only where it can KNOW. With no bar at/before `as_of` there is no market
+    /// price, so the placement is accepted rather than guessed at.
+    #[tokio::test]
+    async fn place_entry_with_no_market_price_does_not_guess_a_rejection() {
+        let b = ReplayBroker::new(vec![candle(3600, 1.1050)], 0.0001);
+        // `as_of` sits BEFORE every candle → `candle_at_as_of()` is None.
+        b.set_as_of(Utc.timestamp_opt(0, 0).unwrap());
+        b.arm_placement(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&candle(3600, 1.1050).mid()),
+        );
+        assert!(
+            b.place_entry(100.0, 100, &long_stop_req(1.1000))
+                .await
+                .is_ok(),
+            "no knowable market price must not fabricate a rejection",
         );
     }
 }

@@ -225,6 +225,10 @@ pub struct FireResult {
     /// line come from the ledger, not a re-simulation.
     pub exit_price: Option<f64>,
     pub kind: FillKind,
+    /// The order type actually placed — see [`super::economics::Leg::placed_as`].
+    pub placed_as: Option<super::economics::PlacedOrderKind>,
+    /// Whether the entry reached the broker via the `#19-10` recovery path.
+    pub recovered_entry: bool,
 }
 
 /// The taken/filled outcome for one fire, returning a [`FireResult`]
@@ -295,6 +299,10 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
             take_profit: resolved.take_profit,
             exit_price: None,
             kind: FillKind::GateBlocked,
+            // Nothing was placed (the gate refused before the broker), so this is
+            // the INTENDED type and cannot be a recovery.
+            placed_as: Some(super::economics::PlacedOrderKind::of(&resolved.entry)),
+            recovered_entry: false,
         });
     }
 
@@ -315,6 +323,8 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
         take_profit: r.take_profit,
         exit_price: r.exit_price,
         kind: r.kind,
+        placed_as: r.placed_as,
+        recovered_entry: r.recovered_entry,
     })
 }
 
@@ -1272,6 +1282,8 @@ mod tests {
                 take_profit: 1.11,
                 exit_price: None,
                 kind: FillKind::NeverFilled,
+                placed_as: None,
+                recovered_entry: false,
             },
         );
         assert!(frag.is_empty());
@@ -1294,6 +1306,8 @@ mod tests {
                 take_profit: 1.11,
                 exit_price: Some(1.11),
                 kind: FillKind::TookProfit,
+                placed_as: None,
+                recovered_entry: false,
             },
         );
         assert!((e.net_r - 1.0).abs() < 1e-9);

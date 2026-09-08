@@ -543,6 +543,8 @@ mod tests {
             exit_price: Some(1.1),
             exit_reason: ExitReason::TookProfit,
             r,
+            placed_as: None,
+            recovered_entry: false,
         }
     }
 

@@ -961,6 +961,8 @@ mod tests {
                     exit_price: Some(1.2400),
                     exit_reason: super::super::economics::ExitReason::TookProfit,
                     r: 1.0,
+                    placed_as: None,
+                    recovered_entry: false,
                 }],
                 ..ReplayEconomics::new()
             }),

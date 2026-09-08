@@ -31,6 +31,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::report::{FillKind, FireResult};
+use trade_control_core::intent::ResolvedEntry;
 
 /// The account size a `--simulate` P&L projection compounds from: 1% risk per
 /// taken trade against a fresh $100k. Every fill's R multiple grows or shrinks
@@ -99,6 +100,34 @@ impl ExitReason {
     }
 }
 
+/// The order type a position was actually placed as.
+///
+/// Recorded on the leg because a broker-side recovery can change it: a
+/// wrong-side pending entry is rejected (`#19-10`) and re-placed as a different
+/// type, so the order that filled is not always the order the plan asked for.
+/// Without this on the fixture a recovered entry is indistinguishable from an
+/// ordinary one that happened to fill at the same price, and the corpus cannot
+/// fail on a recovery regression — see
+/// `BUG-replay-blind-to-broker-entry-recovery.md` (Gap B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlacedOrderKind {
+    Market,
+    Stop,
+    Limit,
+}
+
+impl PlacedOrderKind {
+    /// The kind of a resolved entry.
+    pub fn of(entry: &ResolvedEntry) -> Self {
+        match entry {
+            ResolvedEntry::Market { .. } => Self::Market,
+            ResolvedEntry::Stop { .. } => Self::Stop,
+            ResolvedEntry::Limit { .. } => Self::Limit,
+        }
+    }
+}
+
 /// One taken position's economics: where it got in, where it got out, and what
 /// that was worth in R.
 ///
@@ -129,6 +158,20 @@ pub struct Leg {
     /// Realized R: `(exit − entry) / (entry − stop)`. `0.0` for a still-open
     /// position and for a degenerate zero-risk bracket.
     pub r: f64,
+    /// The order type this position was actually placed as. `None` on fixtures
+    /// blessed before the field existed, and whenever the ledger did not capture
+    /// the placed levels — absent means "not recorded", never "market".
+    ///
+    /// `skip_serializing_if` keeps it out of the 2695 pre-existing goldens so
+    /// they round-trip byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placed_as: Option<PlacedOrderKind>,
+    /// Set when this entry was placed by a broker-side recovery — the original
+    /// order was rejected as wrong-side (`#19-10`) and re-placed, possibly as a
+    /// different type (`placed_as`). Elided when false, so an ordinary entry
+    /// writes nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recovered_entry: bool,
 }
 
 /// The economic result of one replay: every taken position, the net R, and the
@@ -290,6 +333,8 @@ impl ReplayEconomics {
             exit_price: exit,
             exit_reason: reason,
             r,
+            placed_as: result.placed_as,
+            recovered_entry: result.recovered_entry,
         });
         self.legs.last()
     }
@@ -390,6 +435,8 @@ mod tests {
             take_profit: 1.12,
             exit_price: exit,
             kind,
+            placed_as: None,
+            recovered_entry: false,
         }
     }
 
@@ -770,5 +817,111 @@ mod tests {
         let json = serde_json::to_string_pretty(&e).unwrap();
         let back: ReplayEconomics = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
+    }
+
+    // ---- Gap B of `BUG-replay-blind-to-broker-entry-recovery.md`: the leg must
+    // RECORD a recovered entry. Adding the replay-side rejection without these
+    // fields would leave a recovered entry indistinguishable from an ordinary
+    // one that filled at the same price — the fixture would go green either way
+    // and the corpus still could not fail on this.
+
+    fn leg_json(leg: &Leg) -> serde_json::Value {
+        serde_json::to_value(leg).expect("a leg serializes")
+    }
+
+    /// The 2695 pre-existing goldens must round-trip byte-identically: an
+    /// ordinary entry writes NEITHER new key.
+    ///
+    /// Mutation check: drop either `skip_serializing_if` and this goes RED.
+    #[test]
+    fn an_ordinary_leg_writes_neither_new_field() {
+        let leg = Leg {
+            entry_time: at(0),
+            entry_price: 1.10,
+            stop_loss: 1.09,
+            take_profit: 1.12,
+            exit_time: Some(at(3)),
+            exit_price: Some(1.12),
+            exit_reason: ExitReason::TookProfit,
+            r: 2.0,
+            placed_as: None,
+            recovered_entry: false,
+        };
+        let obj = leg_json(&leg);
+        let obj = obj.as_object().expect("a leg is a JSON object");
+        assert!(
+            !obj.contains_key("placed_as"),
+            "an unrecorded order type must be ELIDED, not written as null: {obj:?}",
+        );
+        assert!(
+            !obj.contains_key("recovered_entry"),
+            "a non-recovered entry must be ELIDED, not written as false: {obj:?}",
+        );
+    }
+
+    /// A leg blessed before these fields existed still loads, and loads as
+    /// "not recorded" / "not recovered" — never as a guess.
+    #[test]
+    fn a_pre_existing_golden_leg_still_deserializes() {
+        let old = serde_json::json!({
+            "entry_time": "2026-06-18T13:00:00Z",
+            "entry_price": 1.23,
+            "stop_loss": 1.22,
+            "take_profit": 1.24,
+            "exit_time": "2026-06-18T18:00:00Z",
+            "exit_price": 1.24,
+            "exit_reason": "took_profit",
+            "r": 1.0
+        });
+        let leg: Leg = serde_json::from_value(old).expect("a v1 golden leg still loads");
+        assert_eq!(leg.placed_as, None, "absent means NOT RECORDED, not market");
+        assert!(!leg.recovered_entry);
+    }
+
+    /// A recovered entry writes both, so the fixture can fail on a regression.
+    #[test]
+    fn a_recovered_leg_records_the_type_it_was_actually_placed_as() {
+        let leg = Leg {
+            placed_as: Some(PlacedOrderKind::Stop),
+            recovered_entry: true,
+            ..Leg {
+                entry_time: at(0),
+                entry_price: 1.10,
+                stop_loss: 1.09,
+                take_profit: 1.12,
+                exit_time: None,
+                exit_price: None,
+                exit_reason: ExitReason::OpenAtWindowEnd,
+                r: 0.0,
+                placed_as: None,
+                recovered_entry: false,
+            }
+        };
+        let obj = leg_json(&leg);
+        assert_eq!(obj["placed_as"], "stop");
+        assert_eq!(obj["recovered_entry"], true);
+        // And it survives a round-trip.
+        let back: Leg = serde_json::from_value(obj).expect("round-trips");
+        assert_eq!(back.placed_as, Some(PlacedOrderKind::Stop));
+        assert!(back.recovered_entry);
+    }
+
+    /// The kind is read off the resolved entry, not guessed from a price.
+    #[test]
+    fn placed_order_kind_reads_the_resolved_entry_variant() {
+        assert_eq!(
+            PlacedOrderKind::of(&ResolvedEntry::Market {
+                reference_price: 1.0
+            }),
+            PlacedOrderKind::Market
+        );
+        assert_eq!(
+            PlacedOrderKind::of(&ResolvedEntry::Stop { trigger_price: 1.0 }),
+            PlacedOrderKind::Stop
+        );
+        assert_eq!(
+            PlacedOrderKind::of(&ResolvedEntry::Limit { trigger_price: 1.0 }),
+            PlacedOrderKind::Limit
+        );
     }
 }

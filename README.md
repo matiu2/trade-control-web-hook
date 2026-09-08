@@ -683,9 +683,9 @@ rejects the trade if the geometry is wrong (e.g. a long limit priced above
 the current candle close), so a typo can't turn a limit into an instant
 market fill at a worse price.
 
-**Wrong-side stop-entry recovery (`recover_entry`):** a stop entry can be
-unplaceable because its trigger has already been overtaken by price. This
-happens at **two** points:
+**Wrong-side pending-entry recovery (`recover_entry`):** a resting entry —
+stop **or** limit — can be unplaceable because its level has already been
+overtaken by price. This happens at **two** points:
 
 1. **At resolve time** — the breakout ran *during* the
    signal-confirmation wait, so by the bar the signal confirms the stop
@@ -698,7 +698,9 @@ happens at **two** points:
    By default the placement fails (HTTP 502) without poisoning the intent
    id, so the next signal bar can retry.
 
-A `stop` entry can opt into a recovery for **both** cases:
+Either resting entry type (`stop` or `limit`) can opt into a recovery for
+**both** cases; each recovers into the other (see "the rule is symmetric",
+below). A `market` entry has no resting level and so has nothing to recover.
 
 ```yaml
 entry:
@@ -729,6 +731,12 @@ entry:
   at/above) — a degenerate case that would create a `#19-9` is dropped.
   The resting limit is a normal pending order, so the alert-window /
   `expiry_bars` cron sweep cancels it if it never fills.
+- `action: stop` — the mirror of `limit`, and what an `--entry-limit` setup
+  bakes: price has already crossed the level, so rest a **stop** there to catch
+  the continuation *through* it. Same R-preservation and the mirrored geometry
+  guard (long: trigger at/above the market; short: at/below). Note a long limit
+  rests *below* the market, so it goes wrong-side when price falls **through**
+  it — the opposite comparison to a stop.
 
 **Both recoveries are still gated.** The recovered entry runs through the
 same resolver tail as any entry, so the **≥1R floor** (`min_r`) and the
@@ -746,6 +754,15 @@ skip reasons are logged as `recover-entry-<reason>` (e.g.
 TradeNation has a confirmed `#19-10` today; the OANDA path maps its broker
 rejections to the generic case (the resolve-time recovery is
 broker-agnostic).
+
+⚠️ **Until 2026-09-09 the broker-time half of this only worked for a `stop`
+entry.** The dispatcher's fallback admitted only `ResolvedEntry::Stop` and
+returned terminal for anything else, so an `--entry-limit` setup's
+`recover_entry: stop` — the arm the symmetric rule below describes, fully
+implemented — was unreachable, and the offline replay never raised `#19-10` at
+all so nothing could detect it. Both are fixed; see
+`BUG-replay-blind-to-broker-entry-recovery.md`. The **resolve-time** half was
+always symmetric.
 
 **Arming via `tv-arm` (H&S / iH&S):** pass `--recover-entry
 market|limit|stop|abort` to bake the policy onto the `05-enter` intent

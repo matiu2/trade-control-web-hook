@@ -316,6 +316,8 @@ mod tests {
             exit_price: None,
             exit_reason: ExitReason::OpenAtWindowEnd,
             r: 0.0,
+            placed_as: None,
+            recovered_entry: false,
         }
     }
 

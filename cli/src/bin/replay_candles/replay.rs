@@ -1931,7 +1931,7 @@ mod tests {
                             "action": "enter",
                             "instrument": "EUR_USD",
                             "direction": "long",
-                            "entry": { "type": "limit", "from": "close", "offset_pips": 0.0, "at": 1.1100 },
+                            "entry": { "type": "limit", "from": "close", "offset_pips": 0.0, "at": 1.1050 },
                             "stop_loss": { "absolute": 1.1000 },
                             "take_profit": { "absolute": 1.1300 },
                             "broker": "tradenation",
@@ -1950,14 +1950,27 @@ mod tests {
     /// the gate must cancel-and-replace it (the first fire is `superseded`), and
     /// the still-resting order must not go on to fill as a second position.
     ///
-    /// Geometry (all LONG stop/limit @ 1.1100, SL 1.1000, TP 1.1300):
+    /// Geometry (LONG; stop @1.1100, limit @1.1050, SL 1.1000, TP 1.1300):
     /// - bar 0..9: warm-up/seed below every level.
     /// - bar 10: crosses 1.1050 up → `05-enter` (stop) fires, order rests @1.1100.
     /// - bar 11: crosses 1.1060 up → `09-enter-qm` (limit) fires while the stop
-    ///   still rests (neither has reached 1.1100 yet) → gate cancels the stop →
+    ///   still rests (price has not reached 1.1100) → gate cancels the stop →
     ///   the stop fire is `superseded`.
-    /// - bars 12+: price rises through 1.1100 (fills the limit) then to TP.
+    /// - bar 12: dips to 1.1050 → the limit fills on the pullback.
+    /// - bars 13+: price rises to TP 1.1300.
     /// Exactly one taken position (the limit), no overlap.
+    ///
+    /// The limit rests at **1.1050, below** bar 11's close of 1.1065 — a long
+    /// limit sits on the near side of the market. It used to sit at 1.1100,
+    /// *above* the close, which no real broker would rest: it would fill
+    /// instantly at a worse price (TradeNation `#19-9`, the sibling of the
+    /// `#19-10` this test's broker now models). The live resolver deliberately
+    /// skips its own wrong-side check for an absolute `at` and leaves the call
+    /// to the broker (`core/src/intent/resolution.rs`) — so once the replay
+    /// broker became that arbiter, the old level was rejected and the limit
+    /// never rested to supersede anything. The level is corrected rather than
+    /// the rejection weakened; what this test pins (cancel-and-replace, no
+    /// overlap) is unchanged.
     #[tokio::test]
     async fn a_new_enter_cancels_a_resting_sibling_order_no_overlap() {
         // 10 seed bars at 1.1040 (below 1.1050), then the two crosses, then a run
@@ -1972,9 +1985,13 @@ mod tests {
         // 1.1065) → `09-enter-qm` (limit) fires once, while the stop's order
         // @1.1100 is still resting (high < 1.1100 throughout).
         candles.push(ohlc(11 * 3600, 1.1056, 1.1068, 1.1050, 1.1065));
-        // bars 12..15: rise through 1.1100 (fills) up to TP 1.1300.
-        candles.push(ohlc(12 * 3600, 1.1060, 1.1120, 1.1055, 1.1110)); // fills @1.1100
-        candles.push(ohlc(13 * 3600, 1.1110, 1.1200, 1.1100, 1.1190));
+        // bar 12: pulls back to 1.1050 → fills the resting LONG limit on the dip
+        // (a long limit fills on the way DOWN to it, which is the whole point of
+        // a limit entry; the old fixture had it "fill" on a rise, which only
+        // worked because the level sat wrong-side of the market).
+        candles.push(ohlc(12 * 3600, 1.1062, 1.1070, 1.1045, 1.1060)); // fills @1.1050
+        // bars 13..15: rise to TP 1.1300.
+        candles.push(ohlc(13 * 3600, 1.1060, 1.1200, 1.1055, 1.1190));
         candles.push(ohlc(14 * 3600, 1.1190, 1.1310, 1.1185, 1.1300)); // hits TP 1.1300
         candles.push(ohlc(15 * 3600, 1.1300, 1.1320, 1.1290, 1.1305));
 

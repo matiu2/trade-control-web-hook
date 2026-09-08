@@ -1402,11 +1402,26 @@ async fn place_entry_too_close_fallback<B: Broker>(
 ) -> Result<crate::broker::Placement, EntryError> {
     use crate::intent::ResolvedEntry;
 
-    // Only stop entries carry the fallback; a too-close on anything else
-    // (shouldn't happen) is terminal.
+    // Both *pending* entry types carry a recovery, and each recovers into the
+    // other: a wrong-side STOP re-places as a market/limit, a wrong-side LIMIT
+    // re-places as a stop through the level (`RecoverEntryPlan::Stop`, the
+    // mirror documented on `EntrySpec::Limit::recover_entry`). The concrete
+    // recovery is `recover_entry_plan`'s call, not ours — this only supplies
+    // the resting level it reasons about, which for either type is the trigger.
+    //
+    // Admitting only `Stop` here made `RecoverEntryPlan::Stop` unreachable
+    // (its ~45-line arm below never ran), so the 888 `entry-limit` corpus cells
+    // configuring `recover_entry` had no recovery at all — the limit returned
+    // terminal two lines earlier. See
+    // `BUG-replay-blind-to-broker-entry-recovery.md`.
+    //
+    // A `Market` entry genuinely has no resting level to recover to, so it
+    // stays terminal.
     let trigger_price = match &resolved.entry {
-        ResolvedEntry::Stop { trigger_price } => *trigger_price,
-        _ => return Err(EntryError::EntryTooCloseToMarket),
+        ResolvedEntry::Stop { trigger_price } | ResolvedEntry::Limit { trigger_price } => {
+            *trigger_price
+        }
+        ResolvedEntry::Market { .. } => return Err(EntryError::EntryTooCloseToMarket),
     };
 
     // The current price drives both the slippage guard and the new
@@ -2717,5 +2732,262 @@ mod units_below_minimum_tests {
         let store2 = MemStateStore::default();
         let failed = dispatch(|| EntryError::EntryTooCloseToMarket, &store2);
         assert!(matches!(seen_decision(&failed), SeenDecision::Skip { .. }));
+    }
+}
+
+#[cfg(test)]
+mod too_close_fallback_tests {
+    //! Pins [`place_entry_too_close_fallback`] — the **caller** of the pure
+    //! [`crate::recover_entry::recover_entry_plan`].
+    //!
+    //! `recover_entry.rs` is thoroughly unit-tested, and those tests stay green
+    //! no matter what this caller does — which is exactly how
+    //! `RecoverEntryPlan::Stop` came to be fully written yet unreachable: the
+    //! entry guard admitted only `ResolvedEntry::Stop`, so a wrong-side *limit*
+    //! (the case that arm exists for) returned terminal two lines earlier.
+    //! See `BUG-replay-blind-to-broker-entry-recovery.md`.
+    //!
+    //! So these tests drive `run_enter` with a broker that rejects the FIRST
+    //! placement with `#19-10` and records what the recovery re-places — the
+    //! entry point, not the layer below.
+
+    use super::*;
+    use crate::broker::{
+        AttemptState, CancelError, Candle, CloseOutcome, EntryRequest, Granularity, LookupError,
+        OpenPosition, PendingOrder, Placement, Quote,
+    };
+    use crate::dispatch_config::DispatchConfig;
+    use crate::intent::ResolvedEntry;
+    use crate::state::MemStateStore;
+    use chrono::{DateTime, Utc};
+    use std::cell::RefCell;
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s)
+            .expect("valid test timestamp")
+            .with_timezone(&Utc)
+    }
+
+    /// Rejects the first `place_entry` with `#19-10`, accepts every later one,
+    /// and records each requested entry so a test can assert what the recovery
+    /// actually asked the broker for.
+    struct TooCloseThenAccept {
+        seen: RefCell<Vec<ResolvedEntry>>,
+        /// Mid price the fallback reads via the defaulted `get_current_price`.
+        mid: f64,
+    }
+
+    impl TooCloseThenAccept {
+        fn new(mid: f64) -> Self {
+            Self {
+                seen: RefCell::new(Vec::new()),
+                mid,
+            }
+        }
+    }
+
+    impl Broker for TooCloseThenAccept {
+        async fn place_entry(
+            &self,
+            _max_risk_pct: f64,
+            _max_open_positions: u32,
+            req: &EntryRequest<'_>,
+        ) -> Result<Placement, EntryError> {
+            let first = self.seen.borrow().is_empty();
+            self.seen.borrow_mut().push(req.entry.clone());
+            if first {
+                return Err(EntryError::EntryTooCloseToMarket);
+            }
+            Ok(Placement {
+                order_id: "recovered-1".to_string(),
+                size: None,
+                price: Some(req.entry.reference_price()),
+            })
+        }
+        async fn close_positions(&self, _instrument: &str) -> CloseOutcome {
+            CloseOutcome::NothingOpen
+        }
+        async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
+            0
+        }
+        async fn lookup_attempt_state(
+            &self,
+            _instrument: &str,
+            _broker_order_id: &str,
+            _broker_trade_id: Option<&str>,
+        ) -> Result<AttemptState, LookupError> {
+            Ok(AttemptState::Unknown)
+        }
+        async fn cancel_order(
+            &self,
+            _account_id: &str,
+            _broker_order_id: &str,
+        ) -> Result<(), CancelError> {
+            Ok(())
+        }
+        async fn amend_stop(
+            &self,
+            _account_id: &str,
+            _position_or_order_id: &str,
+            _new_stop: f64,
+        ) -> Result<(), crate::broker::AmendError> {
+            Ok(())
+        }
+        async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
+            // Tight, and centred on `mid`, so the SL-spread floor never fires
+            // and `get_current_price` (mid) is what the fallback reads.
+            Ok(Quote {
+                bid: self.mid - 0.00005,
+                ask: self.mid + 0.00005,
+            })
+        }
+        async fn list_open_positions(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<OpenPosition>, LookupError> {
+            Ok(vec![])
+        }
+        async fn list_pending_orders(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<PendingOrder>, LookupError> {
+            Ok(vec![])
+        }
+        async fn get_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<Candle>, crate::broker::CandleError> {
+            Ok(vec![])
+        }
+    }
+
+    fn cfg() -> DispatchConfig {
+        DispatchConfig {
+            worker_max_risk_pct: 100.0,
+            worker_max_open_positions: 100,
+            pip_size: 0.0001,
+            tick_size: None,
+            caps: Default::default(),
+        }
+    }
+
+    /// A **limit** enter carrying `recover_entry: { action: stop }` — the exact
+    /// shape those 888 `entry-limit` corpus cells configure.
+    fn limit_enter_recovering_to_stop(trigger: f64) -> incoming::Verified {
+        use crate::intent::Shell;
+        let intent: crate::intent::Intent = serde_json::from_str(&format!(
+            r#"{{
+                "v": 1,
+                "id": "t-1-enter",
+                "not_after": "2026-07-24T00:00:00Z",
+                "action": "enter",
+                "instrument": "EUR_USD",
+                "direction": "long",
+                "entry": {{
+                    "type": "limit",
+                    "from": "close",
+                    "at": {trigger},
+                    "recover_entry": {{ "action": "stop" }}
+                }},
+                "stop_loss": {{ "absolute": 1.0980 }},
+                "take_profit": {{ "absolute": 1.1200 }},
+                "broker": "oanda",
+                "trade_id": "t-1",
+                "pip_size": 0.0001
+            }}"#
+        ))
+        .expect("valid limit enter intent");
+        let shell = Shell::from_candle(&Candle {
+            time: at("2026-07-22T13:00:00Z"),
+            o: 1.0990,
+            h: 1.1005,
+            l: 1.0985,
+            c: 1.1000,
+        });
+        incoming::Verified { shell, intent }
+    }
+
+    fn run(broker: &TooCloseThenAccept, verified: &incoming::Verified) -> ActionResult {
+        let store = MemStateStore::default();
+        pollster::block_on(run_enter(
+            broker,
+            &store,
+            verified,
+            &cfg(),
+            at("2026-07-22T13:00:30Z"),
+            None,
+            Some(Granularity::H1),
+            false,
+        ))
+    }
+
+    /// THE BUG: a wrong-side **limit** rejected with `#19-10` must recover as a
+    /// STOP at the original trigger — the `RecoverEntryPlan::Stop` arm.
+    ///
+    /// A long limit rests *below* the market. It goes wrong-side when price
+    /// drops *through* it (mid 1.0990 < trigger 1.1000): the limit would now
+    /// fill instantly at a worse price. A long **stop** at that same 1.1000
+    /// rests correctly *above* the new market and catches the continuation back
+    /// up through the level — preserving the planned R exactly.
+    ///
+    /// Mutation check: restore the `_ => return Err(..)` guard so only
+    /// `ResolvedEntry::Stop` recovers, and this goes RED (one placement, and a
+    /// `Failed` result). That is the state this test was written against.
+    #[test]
+    fn wrong_side_limit_recovers_as_a_stop_at_the_original_trigger() {
+        let broker = TooCloseThenAccept::new(1.0990);
+        let out = run(&broker, &limit_enter_recovering_to_stop(1.1000));
+
+        let seen = broker.seen.borrow();
+        assert_eq!(
+            seen.len(),
+            2,
+            "expected the rejected limit AND a recovery re-place, got {seen:?}",
+        );
+        assert!(
+            matches!(seen[0], ResolvedEntry::Limit { .. }),
+            "first placement is the original limit: {:?}",
+            seen[0],
+        );
+        match seen[1] {
+            ResolvedEntry::Stop { trigger_price } => assert!(
+                (trigger_price - 1.1000).abs() < 1e-9,
+                "the stop must rest at the ORIGINAL trigger (R is preserved), got {trigger_price}",
+            ),
+            ref other => panic!("recovery must re-place as a STOP, got {other:?}"),
+        }
+        assert!(
+            matches!(out, ActionResult::Ok(_)),
+            "a successful recovery is an Ok entry, got {}",
+            out.describe(),
+        );
+    }
+
+    /// The geometry guard still bites: admitting `Limit` above must not become a
+    /// blanket "always flip to a stop". A long limit at 1.1000 with the market
+    /// at 1.1010 rests correctly *below* the market, so a `#19-10` here is
+    /// degenerate — and a long stop at 1.1000 would sit *below* the market,
+    /// which is `#19-9`, the sibling rejection. It must skip, not recover.
+    ///
+    /// Mutation check: drop the `correct_side` test in `recover_entry_plan`'s
+    /// `Stop` arm and this goes RED.
+    #[test]
+    fn correct_side_limit_is_not_flipped_to_a_stop() {
+        let broker = TooCloseThenAccept::new(1.1010);
+        let out = run(&broker, &limit_enter_recovering_to_stop(1.1000));
+
+        assert_eq!(
+            broker.seen.borrow().len(),
+            1,
+            "a wrong-side recovery must not be attempted",
+        );
+        assert!(
+            matches!(out, ActionResult::Failed(ref o) if o.contains("too-close-to-market")),
+            "expected the terminal too-close outcome, got {}",
+            out.describe(),
+        );
     }
 }

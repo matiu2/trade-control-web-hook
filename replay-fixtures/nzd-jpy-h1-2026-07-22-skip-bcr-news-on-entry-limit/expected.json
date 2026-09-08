@@ -81,17 +81,20 @@
         "exit_time": "2026-07-24T00:00:00Z",
         "exit_price": 94.74400000000004,
         "exit_reason": "stopped_out",
-        "r": -1.0
+        "r": -1.0,
+        "placed_as": "stop"
       },
       {
-        "entry_time": "2026-07-24T03:00:00Z",
-        "entry_price": 94.616,
-        "stop_loss": 94.89599999999997,
+        "entry_time": "2026-07-24T13:00:00Z",
+        "entry_price": 94.673,
+        "stop_loss": 94.93100000000004,
         "take_profit": 94.202,
         "exit_time": "2026-07-24T15:00:00Z",
-        "exit_price": 94.89599999999997,
+        "exit_price": 94.93100000000004,
         "exit_reason": "stopped_out",
-        "r": -1.0
+        "r": -1.0,
+        "placed_as": "stop",
+        "recovered_entry": true
       },
       {
         "entry_time": "2026-07-24T18:00:00Z",
@@ -101,7 +104,8 @@
         "exit_time": "2026-07-27T23:00:00Z",
         "exit_price": 94.491,
         "exit_reason": "expiry",
-        "r": 1.3246268656716533
+        "r": 1.3246268656716533,
+        "placed_as": "stop"
       }
     ]
   }

@@ -94,6 +94,26 @@ fn legs_match(a: &Leg, b: &Leg) -> bool {
     a.entry_time == b.entry_time
         && a.exit_time == b.exit_time
         && a.exit_reason == b.exit_reason
+        // The placed order type and the recovery marker are EXACT where BOTH
+        // sides recorded one (they are enums/bools, not measurements — a
+        // difference is a behaviour change, never float noise). Without them
+        // here the corpus would deserialize both fields and then ignore them,
+        // so a fixture recording a `#19-10` recovery would compare equal to one
+        // that entered normally at the same price — precisely the blindness
+        // Gap B exists to remove.
+        //
+        // `placed_as` is compared only when the EXPECTED side has one. The 2695
+        // goldens blessed before the field existed carry `None`, and a fresh run
+        // now always computes `Some(..)`; comparing those as unequal would fail
+        // 1582 cells whose every economic number is byte-identical — a mass
+        // re-bless that would silently retire coverage
+        // (`[[rebless_can_silently_retire_coverage]]`) while proving nothing.
+        // "Absent" means NOT RECORDED, so there is nothing to disagree with; a
+        // golden that DOES record one is held to it exactly, which is what makes
+        // a recovery regression fail. `recovered_entry` is a plain bool with a
+        // meaningful `false`, so it is always compared.
+        && a.placed_as.is_none_or(|want| Some(want) == b.placed_as)
+        && a.recovered_entry == b.recovered_entry
         && close(a.entry_price, b.entry_price)
         && close(a.stop_loss, b.stop_loss)
         && close(a.take_profit, b.take_profit)
@@ -179,6 +199,8 @@ mod tests {
             exit_price: Some(1.14342),
             exit_reason: ExitReason::TookProfit,
             r: 1.0641025641028596,
+            placed_as: None,
+            recovered_entry: false,
         }
     }
 
@@ -314,5 +336,80 @@ mod tests {
             ..Default::default()
         };
         assert!(economics_match(&a, &c));
+    }
+
+    /// Gap B's teeth: the tolerant comparator must NOT tolerate a changed entry
+    /// type or a changed recovery marker. These are enums/bools, not
+    /// measurements — a difference is a behaviour change, never float noise.
+    ///
+    /// Without this the corpus would deserialize both fields and then ignore
+    /// them, so a fixture recording a `#19-10` recovery would compare equal to
+    /// one that entered normally at the same price — exactly the blindness the
+    /// bug is about.
+    ///
+    /// Mutation check: delete either `&&` clause from `legs_match` and the
+    /// matching case here goes RED.
+    #[test]
+    fn a_changed_placed_type_or_recovery_marker_is_never_tolerated() {
+        let base = Leg {
+            placed_as: Some(super::super::economics::PlacedOrderKind::Limit),
+            recovered_entry: false,
+            ..leg()
+        };
+
+        let flipped_type = Leg {
+            placed_as: Some(super::super::economics::PlacedOrderKind::Stop),
+            ..base.clone()
+        };
+        assert!(
+            !legs_match(&base, &flipped_type),
+            "a limit that became a stop is a behaviour change, not noise",
+        );
+
+        let recovered = Leg {
+            recovered_entry: true,
+            ..base.clone()
+        };
+        assert!(
+            !legs_match(&base, &recovered),
+            "an entry that only reached the broker via `#19-10` recovery must \
+             not compare equal to one placed first time",
+        );
+
+        // ...while the tolerance on the MEASURED fields is untouched.
+        assert!(legs_match(&base, &base.clone()));
+    }
+
+    /// The asymmetry that keeps the 2695 pre-existing goldens loadable: an
+    /// EXPECTED leg with no recorded `placed_as` accepts whatever the run
+    /// computed ("not recorded" has nothing to disagree with), but the reverse
+    /// is a real regression — a golden that DID record one must keep it.
+    ///
+    /// Without the first half, 1582 cells whose every economic number is
+    /// byte-identical would fail on the new key alone, forcing a mass re-bless
+    /// that proves nothing and can silently retire coverage.
+    ///
+    /// Mutation check: make the comparison symmetric (`a.placed_as ==
+    /// b.placed_as`) and the first case goes RED; drop the gate entirely and
+    /// the second goes RED.
+    #[test]
+    fn an_unrecorded_expected_placed_type_accepts_any_run_but_not_the_reverse() {
+        let unrecorded = Leg {
+            placed_as: None,
+            ..leg()
+        };
+        let recorded = Leg {
+            placed_as: Some(super::super::economics::PlacedOrderKind::Stop),
+            ..leg()
+        };
+
+        assert!(
+            legs_match(&unrecorded, &recorded),
+            "a pre-field golden must still match a run that now records the type",
+        );
+        assert!(
+            !legs_match(&recorded, &unrecorded),
+            "a golden that recorded a type must NOT accept a run that lost it",
+        );
     }
 }

@@ -1,6 +1,7 @@
 # BUG — replay cannot see broker-side entry recovery (`#19-10`), so 1339 corpus cells score a path they never run
 
-**Status:** OPEN, 2026-09-09. Split out of
+**Status:** **FIXED 2026-09-09** (branch `fix/replay-blind-to-entry-recovery`).
+All three defects closed; see "Resolution" at the foot. Originally split out of
 `BUG-entry-recovery-asymmetric-and-replay-blind.md` (Bug 2 of 2) so it can be
 worked independently. Bug 1 of that doc (the asymmetric `--entry-stop`
 recovery default in `tv-arm`) is being fixed separately — **the two touch
@@ -226,3 +227,119 @@ Found 2026-09-09 while measuring the new `--entry-matrix` axis
 because limits convert to stops — is what led to inspecting recovery at all.
 Sibling: `BUG-entry-recovery-asymmetric-and-replay-blind.md`,
 `BUG-stop-entry-recover-defaults-to-skip.md`.
+
+
+---
+
+## Resolution (2026-09-09)
+
+All three defects fixed on `fix/replay-blind-to-entry-recovery`.
+
+### Gap A — replay now raises `#19-10`
+
+`ReplayBroker::place_entry` gained a third rejection alongside the two existing
+account caps, with the same conservatism (reject only where replay can *know*):
+
+```rust
+if let Some(market) = self.market_price_as_of()
+    && wrong_side_of_market(&req.entry, req.direction, market)
+{ *self.recovering.borrow_mut() = true; return Err(EntryError::EntryTooCloseToMarket); }
+```
+
+`wrong_side_of_market` is a pure helper. **The two pending types invert** — a
+stop rests above the market (long), a limit below — so they get separate arms and
+separate tests; conflating them would reject every healthy limit in the corpus.
+A `Market` entry has no resting level and is never wrong-side. No market price
+(no bar at/before `as_of`) ⇒ **no rejection**, never a guess.
+
+The rejection deliberately does **not** consume the armed placement: the
+dispatcher's recovery re-place is the same intended entry and must land on the
+same armed slot and order id.
+
+### Gap B — the leg records it
+
+`Leg` gained `placed_as: Option<PlacedOrderKind>` and `recovered_entry: bool`,
+both elided when absent/false so the 2695 pre-existing goldens round-trip
+unchanged. Plumbed `PlacedLevels → HeldOrder → HeldPosition → ClosedTrade →
+RealizedOutcome → FireResult → Leg` (every hop compile-enforced).
+
+⚠️ **The `golden_eq` comparator had to change too, and this is the subtle part.**
+Adding the fields is useless if the tolerant comparator ignores them — a
+recovered entry would still compare equal to an ordinary one at the same price.
+But comparing them symmetrically failed **1582 cells whose every economic number
+was byte-identical**, purely on the new key. Resolution: `placed_as` is compared
+only when the **expected** side recorded one (`a.placed_as.is_none_or(..)`) —
+absent means *not recorded*, which has nothing to disagree with, while a golden
+that *does* record one is held to it exactly. `recovered_entry` is a plain bool
+with a meaningful `false`, so it is always compared.
+
+### Third defect — `RecoverEntryPlan::Stop` was unreachable
+
+Confirmed dead, and worse than the doc supposed: `recover_entry.rs` has **no
+tests for the `Stop` arm at all** (17 tests cover Skip/Limit/Market). So it was
+unreachable *and* untested, while its ~45-line handling arm sat fully written.
+
+`place_entry_too_close_fallback`'s guard now admits `ResolvedEntry::Limit`
+alongside `Stop` (both carry a resting level; `Market` stays terminal), matching
+what `EntrySpec::Limit::recover_entry`'s own docs already promised.
+
+**Note the doc's geometry prose here is backwards** (`recover_entry.rs:150-152`,
+carried into this bug report): a long limit goes wrong-side when the market falls
+*through* it (`current <= trigger`), not when price runs up. The code was right;
+only the comment misleads. Two tests were written against the wrong reading and
+corrected — worth knowing before trusting that comment.
+
+## Measured corpus impact
+
+First full run: **1582** cells diverged — all on the new key alone. Fixed at the
+comparator, **not** by re-blessing → **23**.
+
+Those 23 each carry **exactly one** `recovered_entry: true` — a real `#19-10`
+recovery running offline for the first time. 3 setups × axis variants + 1
+spread-floor cell, overwhelmingly `entry-limit`:
+
+| setup | was | with recovery | reading |
+|---|---|---|---|
+| cad-sgd (×8) | −1.66 / −1.00 | −1.00 | recovery **avoided** 0.66R of loss |
+| de30 (×6) | 2.83 / 1.53 / 2.41 | 2.12 / 1.20 / 1.76 | recovery **cost** ~0.7R of profit |
+| nzd-jpy (×8) | −0.68 / −0.30 / −0.40 | unchanged | same net R, different entry leg |
+| sgdjpy-spread-floor | −0.0806 | −0.0798 | marginal |
+
+Hand-verified de30: the plan is `entry: limit` + `recover_entry: {action: stop}`
+— one of the 888 cells this bug names. Old replay filled the limit @25732.5
+(+2.83R); it now rejects the wrong-side limit and recovers as a **stop** @25705.5
+an hour later (+2.12R), which is what the live worker would have done. **The old
+number was a fill live never got** — the divergence, made visible.
+
+Re-blessed **only** those 23 (verified: exactly 23 dirs changed, only
+`expected.json` touched, no `meta.json` rewritten, the hand-written
+`sgdjpy-spread-floor-min-r-block` `message` intact).
+
+⚠️ That cell's `message` ("all three entries blocked… nothing fills") was
+**already stale before this change** — the committed golden had 2 legs. Left
+alone: not this bug's drift, and rewriting it would destroy hand-written text.
+
+## Verification — the corpus can now fail on this
+
+The bug's own standard was that a green corpus proves nothing. So:
+
+- **8 mutations, all killed.** Guard reverted / long-stop comparison flipped /
+  limit given the stop comparison / no-price conservatism dropped / each
+  `skip_serializing_if` dropped / comparator gate removed — each turns a test red.
+- **One mutation initially SURVIVED** (`golden_eq` ignoring the new fields). That
+  is the "a survivor means the real caller is untested" case
+  (`[[mutation_test_the_entry_point_not_just_the_layer_below]]`) — a test was
+  added and the mutation now dies.
+- **The decisive one: delete the replay rejection and 23 corpus cells go RED.**
+  Before this change the corpus was blind to the entire path; it now pins it.
+- Corpus-wide, goldens recording a recovery went **0 → 23**.
+- Full workspace: **3023 passed, 0 failed**. Clippy clean (16 pre-existing
+  `engine/` warnings, unchanged). `cargo fmt` applied.
+
+## Still true after the fix
+
+The **live** measurement is unchanged: `#19-10` has never fired in production
+(0 occurrences across 19,872 staging + 210 dev `request_records`, Jul 6 → Sep 8).
+`broker-oanda` cannot even construct the variant. This fix closes a **latent**
+divergence before TradeNation carries live stop/limit entries — which the
+2026-09-06 both-brokers decision puts ahead of us, not behind.
