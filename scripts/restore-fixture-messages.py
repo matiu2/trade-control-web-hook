@@ -34,11 +34,25 @@ for cell, m in msgs.items():
     if s:
         by_setup[s].add(m)
 
-exact = inherited = ambiguous = blank = 0
+exact = inherited = renamed = ambiguous = blank = 0
 for f in sorted(glob.glob(f'{root}/*/meta.json')):
     cell = os.path.basename(os.path.dirname(f))
     want = msgs.get(cell)
     why = 'exact'
+    if want is None:
+        # A renamed cell: the axis appended a suffix, so the prose written for
+        # the pre-axis cell still applies to the cell that kept its behaviour.
+        # Try the name with each known axis suffix stripped, longest first, so
+        # `-sl-fib-top-entry-stop` falls back to `-sl-fib-top` before the bare
+        # name. Only `-entry-stop` and the unsuffixed default share behaviour
+        # with the old cell; `-entry-market`/`-entry-limit` are genuinely new
+        # cells and must NOT inherit a note describing a stop entry's fills.
+        for suffix in ('-entry-stop',):
+            if cell.endswith(suffix):
+                want = msgs.get(cell[: -len(suffix)])
+                if want is not None:
+                    why = 'renamed'
+                break
     if want is None:
         s = setup_of(cell)
         cands = by_setup.get(s, set())
@@ -49,16 +63,17 @@ for f in sorted(glob.glob(f'{root}/*/meta.json')):
         else:
             blank += 1; continue
     d = json.load(open(f))
-    if (d.get('message') or '') == want:
-        if why == 'exact': exact += 1
-        else: inherited += 1
-        continue
-    d['message'] = want
-    if apply_:
-        json.dump(d, open(f, 'w'), indent=2)
-        open(f, 'a').write('\n')
-    if why == 'exact': exact += 1
-    else: inherited += 1
+    if (d.get('message') or '') != want:
+        d['message'] = want
+        if apply_:
+            json.dump(d, open(f, 'w'), indent=2)
+            open(f, 'a').write('\n')
+    if why == 'exact':
+        exact += 1
+    elif why == 'renamed':
+        renamed += 1
+    else:
+        inherited += 1
 
 print(f"{'APPLIED' if apply_ else 'DRY-RUN'}: exact={exact} inherited={inherited} "
       f"ambiguous-left-blank={ambiguous} no-prior-message={blank}")

@@ -1,0 +1,35 @@
+{
+  "fires": [
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-07-29T01:00:00Z",
+      "candle_close": 0.97932
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-07-30T13:00:00Z",
+      "candle_close": 0.98317
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "action": "veto",
+      "candle_time": "2026-08-04T11:00:00Z",
+      "candle_close": 0.98854
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 0.0,
+    "tp_hits": 0,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": []
+  }
+}

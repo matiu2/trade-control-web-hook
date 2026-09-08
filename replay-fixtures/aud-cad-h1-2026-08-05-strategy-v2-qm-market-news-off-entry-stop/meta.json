@@ -1,0 +1,17 @@
+{
+  "instrument": "AUD/CAD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-05T18:00:00Z",
+  "end": "2026-08-07T17:00:00Z",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:AUDCAD",
+    "tv_arm_version": "v140-25-g8cd1aad-dirty",
+    "engine_version": "v140-25-g8cd1aad-dirty"
+  },
+  "message": "cup and handle"
+}

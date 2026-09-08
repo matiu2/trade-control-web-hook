@@ -381,7 +381,12 @@ mod tests {
     /// The iH&S long whose `too-low` **invalidation** veto flattened it four days
     /// before the trade-expiry. Paired with [`UK_100`] (a genuine trade-expiry
     /// flatten) these two pin both sides of the `ClosePositions` classification.
-    const GBP_NZD_INVALIDATION: &str = "gbp-nzd-h1-2026-07-22-normal-news-off";
+    ///
+    /// Renamed 2026-09-08 when `--entry-matrix` gave every grid cell an explicit
+    /// entry-order-type suffix; `-entry-stop` is the behaviour-preserving
+    /// counterpart of the old unsuffixed cell (same plan, same −0.2483R, same
+    /// single `invalidation_closes`), so this still pins what it always did.
+    const GBP_NZD_INVALIDATION: &str = "gbp-nzd-h1-2026-07-22-normal-news-off-entry-stop";
 
     /// Resolve a fixture directory by name, **panicking** if it isn't there.
     ///

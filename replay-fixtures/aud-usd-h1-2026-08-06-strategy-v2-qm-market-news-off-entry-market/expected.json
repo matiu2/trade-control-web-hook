@@ -1,0 +1,41 @@
+{
+  "fires": [
+    {
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-08-06T15:00:00Z",
+      "candle_close": 0.70276
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-08-06T16:00:00Z",
+      "candle_close": 0.70315
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-08-06T16:00:00Z",
+      "candle_close": 0.70315
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "action": "veto",
+      "candle_time": "2026-08-07T12:00:00Z",
+      "candle_close": 0.70681
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 0.0,
+    "tp_hits": 0,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": []
+  }
+}

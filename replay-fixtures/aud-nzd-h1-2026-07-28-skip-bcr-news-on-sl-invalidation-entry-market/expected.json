@@ -1,0 +1,68 @@
+{
+  "fires": [
+    {
+      "rule_id": "01-pause-1785259800-1785288600",
+      "action": "pause",
+      "candle_time": "2026-07-28T21:00:00Z",
+      "candle_close": 1.20619
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-29T00:00:00Z",
+      "candle_close": 1.20547,
+      "suppressed_by": [
+        "1785259800-1785288600(news:AUD/NZD-2026-07-28T17:30:00+00:00)"
+      ]
+    },
+    {
+      "rule_id": "02-resume-1785259800-1785288600",
+      "action": "resume",
+      "candle_time": "2026-07-29T00:00:00Z",
+      "candle_close": 1.20547
+    },
+    {
+      "rule_id": "01-news-start-1785288600-1785292200",
+      "action": "news-start",
+      "candle_time": "2026-07-29T00:00:00Z",
+      "candle_close": 1.20547
+    },
+    {
+      "rule_id": "02-news-end-1785288600-1785292200",
+      "action": "news-end",
+      "candle_time": "2026-07-29T01:00:00Z",
+      "candle_close": 1.20245
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-07-29T14:00:00Z",
+      "candle_close": 1.19964
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-07-29T18:00:00Z",
+      "candle_close": 1.2002
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "action": "veto",
+      "candle_time": "2026-08-04T10:00:00Z",
+      "candle_close": 1.19594
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 0.0,
+    "tp_hits": 0,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": []
+  }
+}

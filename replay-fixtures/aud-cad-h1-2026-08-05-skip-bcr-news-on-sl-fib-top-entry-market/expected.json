@@ -1,0 +1,59 @@
+{
+  "fires": [
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-08-06T11:00:00Z",
+      "candle_close": 0.98536
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-08-06T13:00:00Z",
+      "candle_close": 0.98665
+    },
+    {
+      "rule_id": "01-pause-1786077000-1786105800",
+      "action": "pause",
+      "candle_time": "2026-08-07T03:00:00Z",
+      "candle_close": 0.98479
+    },
+    {
+      "rule_id": "02-resume-1786077000-1786105800",
+      "action": "resume",
+      "candle_time": "2026-08-07T11:00:00Z",
+      "candle_close": 0.98646
+    },
+    {
+      "rule_id": "01-news-start-1786105800-1786109400",
+      "action": "news-start",
+      "candle_time": "2026-08-07T11:00:00Z",
+      "candle_close": 0.98646
+    },
+    {
+      "rule_id": "02-news-end-1786105800-1786109400",
+      "action": "news-end",
+      "candle_time": "2026-08-07T12:00:00Z",
+      "candle_close": 0.98582
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "action": "veto",
+      "candle_time": "2026-08-07T17:00:00Z",
+      "candle_close": 0.98491
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 0.0,
+    "tp_hits": 0,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": []
+  }
+}

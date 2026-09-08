@@ -1,0 +1,119 @@
+{
+  "fires": [
+    {
+      "rule_id": "01-pause-1787891400-1787920200",
+      "action": "pause",
+      "candle_time": "2026-08-28T03:00:00Z",
+      "candle_close": 0.82582
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-08-28T11:00:00Z",
+      "candle_close": 0.82339
+    },
+    {
+      "rule_id": "02-resume-1787891400-1787920200",
+      "action": "resume",
+      "candle_time": "2026-08-28T11:00:00Z",
+      "candle_close": 0.82339
+    },
+    {
+      "rule_id": "01-news-start-1787920200-1787923800",
+      "action": "news-start",
+      "candle_time": "2026-08-28T11:00:00Z",
+      "candle_close": 0.82339
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "action": "prep",
+      "candle_time": "2026-08-28T12:00:00Z",
+      "candle_close": 0.82418
+    },
+    {
+      "rule_id": "02-news-end-1787920200-1787923800",
+      "action": "news-end",
+      "candle_time": "2026-08-28T12:00:00Z",
+      "candle_close": 0.82418
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-08-28T15:00:00Z",
+      "candle_close": 0.82177
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-08-31T16:00:00Z",
+      "candle_close": 0.82031
+    },
+    {
+      "rule_id": "01-pause-1788285600-1788318000",
+      "action": "pause",
+      "candle_time": "2026-09-01T17:00:00Z",
+      "candle_close": 0.81912
+    },
+    {
+      "rule_id": "02-resume-1788285600-1788318000",
+      "action": "resume",
+      "candle_time": "2026-09-02T02:00:00Z",
+      "candle_close": 0.81484
+    },
+    {
+      "rule_id": "01-news-start-1788318000-1788321600",
+      "action": "news-start",
+      "candle_time": "2026-09-02T02:00:00Z",
+      "candle_close": 0.81484
+    },
+    {
+      "rule_id": "02-news-end-1788318000-1788321600",
+      "action": "news-end",
+      "candle_time": "2026-09-02T03:00:00Z",
+      "candle_close": 0.81286
+    },
+    {
+      "rule_id": "01-pause-1788327900-1788359400",
+      "action": "pause",
+      "candle_time": "2026-09-02T04:00:00Z",
+      "candle_close": 0.81155
+    },
+    {
+      "rule_id": "02-resume-1788327900-1788359400",
+      "action": "resume",
+      "candle_time": "2026-09-02T13:00:00Z",
+      "candle_close": 0.81058
+    },
+    {
+      "rule_id": "01-news-start-1788359400-1788363000",
+      "action": "news-start",
+      "candle_time": "2026-09-02T13:00:00Z",
+      "candle_close": 0.81058
+    },
+    {
+      "rule_id": "02-news-end-1788359400-1788363000",
+      "action": "news-end",
+      "candle_time": "2026-09-02T14:00:00Z",
+      "candle_close": 0.80954
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "action": "veto",
+      "candle_time": "2026-09-03T06:00:00Z",
+      "candle_close": 0.80989
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 0.0,
+    "tp_hits": 0,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": []
+  }
+}

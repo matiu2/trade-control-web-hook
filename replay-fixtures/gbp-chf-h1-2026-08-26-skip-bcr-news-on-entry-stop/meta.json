@@ -1,0 +1,17 @@
+{
+  "instrument": "GBP/CHF",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-26T00:00:00Z",
+  "end": "2026-08-31T08:00:00Z",
+  "arm": {
+    "entry_rule": "skip-bcr",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:GBPCHF",
+    "tv_arm_version": "v140-25-g8cd1aad-dirty",
+    "engine_version": "v140-25-g8cd1aad-dirty"
+  },
+  "message": "normal entry was -0.62"
+}

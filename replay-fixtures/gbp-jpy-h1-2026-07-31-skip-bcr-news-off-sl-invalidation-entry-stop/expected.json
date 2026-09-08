@@ -1,0 +1,23 @@
+{
+  "fires": [
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-07-31T20:00:00Z",
+      "candle_close": 212.239
+    }
+  ],
+  "done": false,
+  "final_phase": "await_entry",
+  "warnings": [],
+  "outcome": {
+    "net_r": 0.0,
+    "tp_hits": 0,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": []
+  }
+}
