@@ -108,6 +108,34 @@ pub struct Variant {
     /// 8-cell matrix stays byte-identical to before this axis existed. Only
     /// [`sl_grid`] varies it.
     pub sl_anchor: SlAnchor,
+    /// Pattern-path entry order type (`--entry-{stop,market,limit}`).
+    ///
+    /// `None` on every cell of the base [`GRID`] — the pipeline's default is a
+    /// stop, and leaving the flag *off* is what keeps the default cells
+    /// byte-identical to every fixture captured before this axis existed.
+    /// `Some(Stop)` is deliberately NOT the same thing: it would set an
+    /// explicit flag the old fixtures never carried. Only [`grid_for`] with
+    /// `entry_matrix` varies it.
+    pub entry_mode: Option<crate::args::PatternEntry>,
+}
+
+/// Fixture-name suffix for the entry-order-type axis.
+///
+/// Empty for `None` — the default (stop) cells must keep the directory names
+/// the corpus already has, exactly as [`SlAnchor::Signal`] adds no `-sl-signal`.
+/// Renaming them would orphan every existing fixture for no gain.
+///
+/// The labels are `-entry-stop` / `-entry-market` / `-entry-limit`, matching the
+/// flag that produces them so a directory name reads back as the command that
+/// made it. Note `Some(Stop)` is a *different cell* from `None`: same resulting
+/// plan, but armed with the flag explicitly set, which is why it gets a suffix.
+fn entry_suffix(mode: Option<crate::args::PatternEntry>) -> &'static str {
+    match mode {
+        None => "",
+        Some(crate::args::PatternEntry::Stop) => "-entry-stop",
+        Some(crate::args::PatternEntry::Market) => "-entry-market",
+        Some(crate::args::PatternEntry::Limit) => "-entry-limit",
+    }
 }
 
 impl Variant {
@@ -133,7 +161,11 @@ impl Variant {
         } else {
             String::new()
         };
-        format!("{}-{news}{sl}", self.entry_rule)
+        format!(
+            "{}-{news}{sl}{}",
+            self.entry_rule,
+            entry_suffix(self.entry_mode)
+        )
     }
 
     /// Apply this variant's flags to a copy of the operator's args.
@@ -162,6 +194,15 @@ impl Variant {
         args.qm_entry = self.qm_entry;
         args.skip_calendar_bars = self.skip_calendar_bars;
         args.sl_anchor = self.sl_anchor;
+        // Pattern-path entry order type. Set all three bools explicitly rather
+        // than only the chosen one: the operator may have passed
+        // `--entry-market` on the command line, and a cell that left it standing
+        // would arm as market while its directory name claimed otherwise.
+        // `None` clears all three, which is the pipeline default (stop) and what
+        // every pre-axis fixture froze.
+        args.entry_market = self.entry_mode == Some(crate::args::PatternEntry::Market);
+        args.entry_stop = self.entry_mode == Some(crate::args::PatternEntry::Stop);
+        args.entry_limit = self.entry_mode == Some(crate::args::PatternEntry::Limit);
         // The one expansion `apply_aliases` performs for these flags.
         if self.skip_bcr {
             args.skip_break_and_close = true;
@@ -252,6 +293,7 @@ pub const GRID: [Variant; 8] = [
         qm_entry: None,
         skip_calendar_bars: false,
         sl_anchor: SlAnchor::Signal,
+        entry_mode: None,
     },
     Variant {
         entry_rule: "normal",
@@ -260,6 +302,7 @@ pub const GRID: [Variant; 8] = [
         qm_entry: None,
         skip_calendar_bars: true,
         sl_anchor: SlAnchor::Signal,
+        entry_mode: None,
     },
     Variant {
         entry_rule: "skip-bcr",
@@ -268,6 +311,7 @@ pub const GRID: [Variant; 8] = [
         qm_entry: None,
         skip_calendar_bars: false,
         sl_anchor: SlAnchor::Signal,
+        entry_mode: None,
     },
     Variant {
         entry_rule: "skip-bcr",
@@ -276,6 +320,7 @@ pub const GRID: [Variant; 8] = [
         qm_entry: None,
         skip_calendar_bars: true,
         sl_anchor: SlAnchor::Signal,
+        entry_mode: None,
     },
     Variant {
         entry_rule: "strategy-v2",
@@ -287,6 +332,7 @@ pub const GRID: [Variant; 8] = [
         qm_entry: None,
         skip_calendar_bars: false,
         sl_anchor: SlAnchor::Signal,
+        entry_mode: None,
     },
     Variant {
         entry_rule: "strategy-v2",
@@ -295,6 +341,7 @@ pub const GRID: [Variant; 8] = [
         qm_entry: None,
         skip_calendar_bars: true,
         sl_anchor: SlAnchor::Signal,
+        entry_mode: None,
     },
     Variant {
         entry_rule: "strategy-v2-qm-market",
@@ -303,6 +350,7 @@ pub const GRID: [Variant; 8] = [
         qm_entry: Some(crate::args::QmEntry::Market),
         skip_calendar_bars: false,
         sl_anchor: SlAnchor::Signal,
+        entry_mode: None,
     },
     Variant {
         entry_rule: "strategy-v2-qm-market",
@@ -311,6 +359,7 @@ pub const GRID: [Variant; 8] = [
         qm_entry: Some(crate::args::QmEntry::Market),
         skip_calendar_bars: true,
         sl_anchor: SlAnchor::Signal,
+        entry_mode: None,
     },
 ];
 
@@ -340,13 +389,65 @@ pub const SL_AXIS: [SlAnchor; 3] = [SlAnchor::Signal, SlAnchor::Invalidation, Sl
 /// rule is what makes that interaction visible; a v2-only slice would answer the
 /// narrower question and leave the interesting one unanswered. An operator who
 /// wants the narrow slice can still pass `--sl-anchor` with a plain arm.
-pub fn grid_for(sl_matrix: bool) -> Vec<Variant> {
-    if !sl_matrix {
-        return GRID.to_vec();
+/// The pattern-path entry-order-type axis.
+///
+/// Ordered stop → market → limit: stop is the shipped default and the baseline
+/// the other two are read against.
+pub const ENTRY_AXIS: [crate::args::PatternEntry; 3] = [
+    crate::args::PatternEntry::Stop,
+    crate::args::PatternEntry::Market,
+    crate::args::PatternEntry::Limit,
+];
+
+/// The grid to run: the base 8 cells, times each opted-in axis.
+///
+/// ## Why both axes are opt-in
+///
+/// Each multiplies the cell count by 3, and the matrix loop is **sequential** —
+/// every cell shells out to `replay-candles` (`crate::replay::run_replay`). The
+/// base grid is 8 cells; `--sl-matrix` makes it 24, `--entry-matrix` 24, and
+/// both together **72**. Making either the default would slow every corpus run
+/// to answer a question most of them aren't asking.
+///
+/// Leaving them off also keeps the default 8 cells producing byte-identical
+/// fixture names, so the existing corpus stays valid rather than being orphaned
+/// by a rename.
+///
+/// ## Why the entry axis is a product, not a slice
+///
+/// Same reasoning as the SL axis. Entry order type interacts with the gate
+/// chain: a stop entry only fills if price *breaks* the level, so it doubles as
+/// a confirmation filter, while a market order always fills. How much that
+/// filter is worth plausibly depends on how much confirmation the entry rule
+/// already demands — which is exactly what the entry-rule axis varies. Crossing
+/// them is what makes the interaction visible.
+///
+/// Measured once before this axis existed (2026-09-08, `skip-bcr` only, 59
+/// setups): market's fill-price edge was real (+3.25R across the 50 setups that
+/// took identical trades) but was outweighed by the trades it took that the stop
+/// filtered out (83 filled legs vs 72; SL hits 25 → 38), for a net −10 to −12R.
+/// That is one entry rule; the axis exists so the same question can be asked of
+/// all four without hand-rolling a loop.
+pub fn grid_for(sl_matrix: bool, entry_matrix: bool) -> Vec<Variant> {
+    let with_sl: Vec<Variant> = if sl_matrix {
+        SL_AXIS
+            .iter()
+            .flat_map(|&sl_anchor| GRID.iter().map(move |base| Variant { sl_anchor, ..*base }))
+            .collect()
+    } else {
+        GRID.to_vec()
+    };
+    if !entry_matrix {
+        return with_sl;
     }
-    SL_AXIS
+    ENTRY_AXIS
         .iter()
-        .flat_map(|&sl_anchor| GRID.iter().map(move |base| Variant { sl_anchor, ..*base }))
+        .flat_map(|&mode| {
+            with_sl.iter().map(move |base| Variant {
+                entry_mode: Some(mode),
+                ..*base
+            })
+        })
         .collect()
 }
 
@@ -501,7 +602,7 @@ mod tests {
     /// only be caught by someone re-reading this file.
     #[test]
     fn every_grid_cell_matches_its_news_label() {
-        for v in grid_for(true) {
+        for v in grid_for(true, false) {
             let out = v.apply_to_setup(setup_with_news());
             let suffix = v.fixture_suffix();
             if suffix.contains("news-off") {
@@ -859,7 +960,7 @@ mod tests {
     /// the default anchor. The SL axis must cost nothing when unused.
     #[test]
     fn the_sl_axis_is_off_by_default() {
-        let grid = grid_for(false);
+        let grid = grid_for(false, false);
         assert_eq!(grid.len(), 8);
         assert!(grid.iter().all(|v| v.sl_anchor == SlAnchor::Signal));
     }
@@ -869,7 +970,10 @@ mod tests {
     /// existing fixture directories are orphaned by a rename.
     #[test]
     fn default_cells_keep_their_original_fixture_names() {
-        let names: Vec<String> = grid_for(false).iter().map(|v| v.fixture_suffix()).collect();
+        let names: Vec<String> = grid_for(false, false)
+            .iter()
+            .map(|v| v.fixture_suffix())
+            .collect();
         assert_eq!(
             names,
             vec![
@@ -890,7 +994,7 @@ mod tests {
     /// distinct directory name.
     #[test]
     fn the_sl_matrix_is_the_full_product_with_distinct_names() {
-        let grid = grid_for(true);
+        let grid = grid_for(true, false);
         assert_eq!(grid.len(), 24, "3 anchors × 8 base cells");
         let names: std::collections::HashSet<String> =
             grid.iter().map(|v| v.fixture_suffix()).collect();
@@ -904,11 +1008,141 @@ mod tests {
         assert!(names.contains("normal-news-on-sl-fib-top"), "{names:?}");
     }
 
+    /// `--entry-matrix` is the full 3× product, and every cell still has a
+    /// distinct directory name.
+    #[test]
+    fn the_entry_matrix_is_the_full_product_with_distinct_names() {
+        let grid = grid_for(false, true);
+        assert_eq!(grid.len(), 24, "3 entry types × 8 base cells");
+        let names: std::collections::HashSet<String> =
+            grid.iter().map(|v| v.fixture_suffix()).collect();
+        assert_eq!(names.len(), 24, "colliding fixture names");
+        assert!(names.contains("normal-news-on-entry-stop"), "{names:?}");
+        assert!(names.contains("normal-news-on-entry-market"), "{names:?}");
+        assert!(names.contains("normal-news-on-entry-limit"), "{names:?}");
+    }
+
+    /// Both axes together are the full 72-cell product with no name collisions.
+    /// The two suffixes must compose in a fixed order, or the same cell gets two
+    /// names across runs and the corpus grows duplicates.
+    #[test]
+    fn both_axes_compose_into_72_distinct_cells() {
+        let grid = grid_for(true, true);
+        assert_eq!(grid.len(), 72, "3 anchors × 3 entry types × 8 base cells");
+        let names: std::collections::HashSet<String> =
+            grid.iter().map(|v| v.fixture_suffix()).collect();
+        assert_eq!(names.len(), 72, "colliding fixture names");
+        assert!(
+            names.contains("skip-bcr-news-off-sl-fib-top-entry-market"),
+            "sl suffix must precede the entry suffix: {names:?}"
+        );
+    }
+
+    /// The default grid names NOTHING with an entry suffix. This is the
+    /// corpus-compatibility guarantee: 900+ existing fixture directories are
+    /// named without one, and adding a `-entry-stop` to the default cells would
+    /// orphan every one of them.
+    #[test]
+    fn the_default_grid_keeps_bare_names() {
+        for v in grid_for(false, false) {
+            assert_eq!(v.entry_mode, None, "base grid must not set an entry mode");
+            assert!(
+                !v.fixture_suffix().contains("-entry-"),
+                "default cell {} must keep its bare name",
+                v.fixture_suffix()
+            );
+        }
+    }
+
+    /// `Some(Stop)` and `None` produce the SAME plan but are DIFFERENT cells.
+    /// The distinction is deliberate: `None` leaves the flag off (what every
+    /// pre-axis fixture froze), `Some(Stop)` sets it explicitly. Collapsing them
+    /// would either rename the corpus or silently drop a third of the axis.
+    #[test]
+    fn explicit_stop_is_a_distinct_cell_from_the_default() {
+        let cell = GRID[0];
+        let dflt = Variant {
+            entry_mode: None,
+            ..cell
+        };
+        let explicit = Variant {
+            entry_mode: Some(crate::args::PatternEntry::Stop),
+            ..cell
+        };
+        assert_ne!(dflt.fixture_suffix(), explicit.fixture_suffix());
+        let args = base();
+        // Same resulting flags on the args...
+        assert!(!dflt.apply(&args).entry_stop);
+        assert!(explicit.apply(&args).entry_stop);
+        // ...but both resolve to the same pipeline behaviour (stop).
+        assert_eq!(dflt.apply(&args).pattern_entry_mode(), None);
+        assert_eq!(
+            explicit.apply(&args).pattern_entry_mode(),
+            Some(crate::args::PatternEntry::Stop)
+        );
+    }
+
+    /// `apply` puts the entry type onto the args, so the cell actually arms with
+    /// the order type it names. Without this the axis is cosmetic — 24
+    /// directories holding 8 distinct results, which is exactly the failure the
+    /// news axis shipped with for as long as the matrix existed.
+    #[test]
+    fn apply_sets_the_entry_type_on_the_args() {
+        let args = base();
+        for mode in ENTRY_AXIS {
+            let v = Variant {
+                entry_mode: Some(mode),
+                ..GRID[0]
+            };
+            assert_eq!(
+                v.apply(&args).pattern_entry_mode(),
+                Some(mode),
+                "{mode:?} must reach the args"
+            );
+        }
+    }
+
+    /// An operator flag must not leak into a cell that names a different type.
+    /// `apply` sets all three bools, so `--entry-market` on the command line is
+    /// overridden by each cell rather than surviving into all of them.
+    #[test]
+    fn an_operator_entry_flag_does_not_leak_into_every_cell() {
+        let mut args = base();
+        args.entry_market = true;
+        let limit = Variant {
+            entry_mode: Some(crate::args::PatternEntry::Limit),
+            ..GRID[0]
+        };
+        let applied = limit.apply(&args);
+        assert!(!applied.entry_market, "operator's --entry-market leaked");
+        assert_eq!(
+            applied.pattern_entry_mode(),
+            Some(crate::args::PatternEntry::Limit)
+        );
+        // And the default cell clears it back to the pipeline default.
+        assert_eq!(GRID[0].apply(&args).pattern_entry_mode(), None);
+    }
+
+    /// The entry axis varies ONLY the order type: entry rule, news and SL of
+    /// each base cell survive untouched.
+    #[test]
+    fn the_entry_axis_varies_only_the_order_type() {
+        for (i, v) in grid_for(false, true).iter().enumerate() {
+            let base = &GRID[i % 8];
+            assert_eq!(v.entry_rule, base.entry_rule);
+            assert_eq!(v.skip_bcr, base.skip_bcr);
+            assert_eq!(v.strategy_v2, base.strategy_v2);
+            assert_eq!(v.qm_entry, base.qm_entry);
+            assert_eq!(v.skip_calendar_bars, base.skip_calendar_bars);
+            assert_eq!(v.sl_anchor, base.sl_anchor);
+        }
+    }
+
     /// Each anchor appears on every base cell — the axis is a true product, not
     /// a few cells sprinkled in.
     #[test]
     fn every_anchor_covers_every_base_cell() {
-        let grid = grid_for(true);
+        let grid = grid_for(true, false);
         for anchor in SL_AXIS {
             assert_eq!(
                 grid.iter().filter(|v| v.sl_anchor == anchor).count(),
@@ -923,7 +1157,7 @@ mod tests {
     /// would be attributing an entry difference to the stop.
     #[test]
     fn the_sl_axis_varies_only_the_stop() {
-        for (i, v) in grid_for(true).iter().enumerate() {
+        for (i, v) in grid_for(true, false).iter().enumerate() {
             let base = &GRID[i % 8];
             assert_eq!(v.entry_rule, base.entry_rule);
             assert_eq!(v.skip_bcr, base.skip_bcr);

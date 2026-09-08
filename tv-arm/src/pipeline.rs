@@ -239,10 +239,11 @@ fn arm_context<'a>(args: &'a Args, chart_symbol: &'a str) -> crate::replay::ArmC
 }
 
 fn arm_the_matrix(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Result<i32> {
-    let grid = save_matrix::grid_for(args.sl_matrix);
+    let grid = save_matrix::grid_for(args.sl_matrix, args.entry_matrix);
     info!(
         cells = grid.len(),
         sl_matrix = args.sl_matrix,
+        entry_matrix = args.entry_matrix,
         "matrix grid"
     );
     let outcomes: Vec<save_matrix::CellOutcome> = grid

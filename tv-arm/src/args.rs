@@ -375,6 +375,20 @@ pub struct Args {
     #[arg(long)]
     pub sl_matrix: bool,
 
+    /// Sweep the three pattern-path entry order types (`--entry-stop` /
+    /// `--entry-market` / `--entry-limit`) as an extra `--save-matrix` axis,
+    /// tripling the cell count (8 → 24, or 24 → 72 with `--sl-matrix`).
+    ///
+    /// A stop entry only fills if price *breaks* the level, so it doubles as a
+    /// confirmation filter; a market order always fills; a limit waits for the
+    /// pullback. This axis measures what that filtering is worth against each
+    /// entry rule.
+    ///
+    /// Off by default so the standard matrix stays 8 cells and the existing
+    /// fixture corpus stays valid. Only meaningful with `--save-matrix`.
+    #[arg(long)]
+    pub entry_matrix: bool,
+
     /// Require the break-and-close (`03`) and retest (`04`) candles to be
     /// **golden** — the crossing bar's full range (`high − low`) must be at
     /// least the Wilder ATR at that bar. A weak, indecisive bar that merely

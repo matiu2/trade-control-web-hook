@@ -3910,6 +3910,44 @@ Off by default: the loop is sequential, so 24 cells is 3× the wall-clock, and
 the default cells keep their **original** fixture names so the existing corpus
 isn't orphaned by a rename.
 
+#### The entry-order-type axis: `--entry-matrix`
+
+The three pattern-path entry types answer *"is the break worth waiting for?"*:
+
+| value | entry | what it buys |
+|---|---|---|
+| `--entry-stop` (default) | pending stop at the geometry anchor | only fills if price **breaks** the level, so it doubles as a confirmation filter |
+| `--entry-market` | market order on the signal bar | best fill price; always fills |
+| `--entry-limit` | pending limit at the anchor | fills on the pullback; recovers to a stop when wrong-side |
+
+`--entry-matrix` adds the axis to the grid — 8 cells become 24, or **72** when
+combined with `--sl-matrix`:
+
+```sh
+tv-arm --spec-in setups/trade-124.json --save-matrix --entry-matrix \
+  replay --instrument AUD_CAD --fixtures-dir replay-fixtures --save trade-124
+# → trade-124-normal-news-on                    (default: name unchanged)
+#   trade-124-normal-news-on-entry-stop         (explicit stop)
+#   trade-124-normal-news-on-entry-market
+#   trade-124-normal-news-on-entry-limit         … ×8 base cells
+```
+
+Note `-entry-stop` is a **distinct cell** from the unsuffixed default even
+though both arm a stop: the default leaves the flag off (what every pre-axis
+fixture froze), while `-entry-stop` sets it explicitly. Collapsing them would
+either rename the whole corpus or silently drop a third of the axis.
+
+Off by default, for the same two reasons as `--sl-matrix`: the loop is
+sequential, and the default cells keep their **original** fixture names.
+
+The axis is a product rather than a slice because the filtering a stop provides
+plausibly depends on how much confirmation the entry rule already demands —
+which is exactly what the entry-rule axis varies. Measured once on `skip-bcr`
+alone (2026-09-08, 59 setups): a market entry's fill-price edge was real
+(+3.25R across the 50 setups that took identical trades) but was outweighed by
+the trades it took that a stop filters out (83 filled legs vs 72, SL hits
+25 → 38), for a net −10 to −12R. See `entry-rule-corpus-comparison.md`.
+
 To sweep every frozen setup in the corpus, `scripts/sl-anchor-sweep.sh` drives
 this over each `*.spec.json`. Note the coverage limit it prints: only setups
 armed with `--spec-out` can be re-armed chartlessly (currently ~26 of ~206
