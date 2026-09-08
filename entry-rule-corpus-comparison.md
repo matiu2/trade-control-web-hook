@@ -114,7 +114,9 @@ Two caveats worth carrying forward:
    on `skip-bcr`; ~−5.5R on both v2 columns). Its fill-price advantage is real
    but is outweighed by the stop's break-confirmation filter: 283 filled legs vs
    253 for the same 57-58 TPs, and 135 stop-outs vs 101. Limit is level with
-   stop (+81.16 vs +80.78) — "no worse", not an edge.
+   stop (+81.16 vs +80.78) — and that near-tie is because a wrong-side limit
+   recovers to a stop, so the two columns place the SAME orders (601/102/86
+   identical; 81.5% of cells byte-identical). Not an independent result.
 2. **Drawings are an input, and a bad one is invisible here.** The `eur-cad`
    `too-low` line silently zeroed a whole setup and nothing in the corpus
    flagged it. A geometry sanity check — for an iH&S, assert `too-low ≤ head`;
@@ -214,10 +216,52 @@ the wrong statistic here.
 **Limit ≈ stop, marginally ahead** (+81.16 vs +80.78, +0.38 over 236 rows). It
 differs on only 56 rows and is better on **all 56** — but the median gain is
 +0.004R, i.e. a rounding-level better fill on the same trades, with identical
-leg/TP/SL counts. Treat it as "no worse", not as an edge.
+leg/TP/SL counts. Treat it as "no worse", not as an edge — and see "Why limit ≈
+stop" below: they largely **place the same orders**, so this is not an
+independent comparison.
 
-**Verdict: keep the default stop entry.** Limit is a defensible alternative;
-market is not.
+**Verdict: keep the default stop entry.** Market is not a defensible
+alternative. Limit is not really an *alternative* at all — see below.
+
+### Why limit ≈ stop: they converge on the SAME ORDERS
+
+Limit's +0.38R over stop is not a small edge, it is the residue of two columns
+that mostly **place the same orders**. Counted across all 888 stop cells and all
+888 limit cells, the orders actually placed are **identical**:
+
+| | stop orders | limit orders | market orders |
+|---|---:|---:|---:|
+| `-entry-stop` cells | 601 | 102 | 86 |
+| `-entry-limit` cells | **601** | **102** | **86** |
+
+and **81.5% of paired cells (724 of 888) have byte-identical Net R**; the
+differing 164 differ by ~0.005–0.014R.
+
+The plans are genuinely different, so the axis is not broken:
+
+```
+-entry-stop  → {"type": "stop",  "from": "signal_high", "offset_atr_pct": 0.5}
+-entry-limit → {"type": "limit", "from": "signal_high",
+                "recover_entry": {"action": "stop"}}
+```
+
+What collapses them is **wrong-side recovery** at resolve time
+(`core/src/intent/resolution.rs`, shared by worker and replay). By the time a
+`skip-bcr` signal candle latches, price has usually already run past the entry
+level, so the limit is wrong-side and recovers to a **stop at the same level** —
+the operator's own rule. A verbose replay of a `-entry-limit` cell prints
+`order: LONG stop @ …` for every entry. The 102 `limit` placements in both
+columns come from the strategy-v2 **QM leg**, which both columns share and
+neither varies.
+
+So `--entry-limit` is best read as *"a stop, unless price happens not to have
+overrun yet"*, and the corpus says that exception is rare. It is **not**
+independent evidence that limits are as good as stops.
+
+⚠️ The mirror does NOT hold, and the naming invites the mistake: a **stop does
+not recover to a limit**. `recover_entry` is baked only onto the limit cells
+(`{"action":"stop"}`); every stop and market cell has none. The conversion is
+one-directional.
 
 ### MEASURED (superseded) — `--skip-bcr --entry-market` vs stop, 59 setups
 
