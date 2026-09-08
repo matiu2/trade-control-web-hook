@@ -108,11 +108,13 @@ carried by many setups, not one or two.
 
 Two caveats worth carrying forward:
 
-1. **`--entry-market` on the main leg has now been measured** (59 setups, both
-   news modes) and is **worse** by ~10-12R — see "MEASURED" above. Its fill-price
-   advantage is real (+3.25R across the 50 setups that take identical trades) but
-   is outweighed by the stop's break-confirmation filter, which market discards:
-   83 filled legs vs 72, SL hits 25 -> 38.
+1. **`--entry-market` is measured and worse against ALL FOUR entry rules** —
+   the corpus now carries the axis (`--entry-matrix`, 2026-09-08). Market loses
+   to stop on every column (−9.7R on `normal`, enough to make it negative; ~−10R
+   on `skip-bcr`; ~−5.5R on both v2 columns). Its fill-price advantage is real
+   but is outweighed by the stop's break-confirmation filter: 283 filled legs vs
+   253 for the same 57-58 TPs, and 135 stop-outs vs 101. Limit is level with
+   stop (+81.16 vs +80.78) — "no worse", not an edge.
 2. **Drawings are an input, and a bad one is invisible here.** The `eur-cad`
    `too-low` line silently zeroed a whole setup and nothing in the corpus
    flagged it. A geometry sanity check — for an iH&S, assert `too-low ≤ head`;
@@ -176,9 +178,52 @@ Nor is it a participation effect: limit fills 72 legs across those setups, marke
 *main*-leg question this raised has since been measured directly — see the next
 section, which answers it.)
 
-### MEASURED — `--skip-bcr --entry-market` vs `--skip-bcr` (stop), 59 setups
+### MEASURED (all four entry rules) — the `--entry-matrix` corpus
 
-Run 2026-09-08. Every setup re-armed from its frozen `.spec.json` with
+Superseding the `skip-bcr`-only measurement below: the corpus was regenerated
+2026-09-08 with `--entry-matrix`, so every setup now carries all three entry
+order types. 236 paired (setup × entry-rule) rows, news=on, sl=signal.
+
+| | total R | mean | median | filled legs | TP | SL |
+|---|---:|---:|---:|---:|---:|---:|
+| **stop** (default) | **+80.78** | +0.34 | +0.00 | 253 | 58 | 101 |
+| market | +49.71 | +0.21 | +0.00 | **283** | 57 | **135** |
+| **limit** | **+81.16** | +0.34 | +0.00 | 253 | 58 | 101 |
+
+**Market is worse against every entry rule, without exception:**
+
+| entry rule | stop | market | limit |
+|---|---:|---:|---:|
+| normal | +3.67 | **−6.06** | +3.74 |
+| skip-bcr | +39.88 | +29.81 | **+40.08** |
+| strategy-v2 | +17.18 | +11.75 | **+17.22** |
+| strategy-v2-qm-market | +20.05 | +14.21 | **+20.11** |
+
+That answers the question the axis was built for. The earlier `skip-bcr`-only
+result was not a quirk of one entry rule: market costs ~10R on `skip-bcr`, ~9.7R
+on `normal` (enough to turn it *negative*), and ~5.5R on both v2 columns.
+
+The mechanism is the same one measured before, now visible corpus-wide: market
+fills **283 legs vs 253** and takes **135 stop-outs vs 101**, for the *same* 57-58
+take-profits. It buys a better price on the trades a stop would also take, then
+pays it back many times over on the trades a stop never triggers. Note the
+paired sign test says market is better on **76 of 111** differing rows
+(p < 0.001) — it wins most rows and still loses by 31R, so per-row win rate is
+the wrong statistic here.
+
+**Limit ≈ stop, marginally ahead** (+81.16 vs +80.78, +0.38 over 236 rows). It
+differs on only 56 rows and is better on **all 56** — but the median gain is
++0.004R, i.e. a rounding-level better fill on the same trades, with identical
+leg/TP/SL counts. Treat it as "no worse", not as an edge.
+
+**Verdict: keep the default stop entry.** Limit is a defensible alternative;
+market is not.
+
+### MEASURED (superseded) — `--skip-bcr --entry-market` vs stop, 59 setups
+
+The first measurement, run before the corpus carried the axis. Kept because it
+is the paired one-rule study the corpus-wide result above confirms. Run
+2026-09-08. Every setup re-armed from its frozen `.spec.json` with
 `--skip-bcr --entry-market`, both news modes, and paired against the corpus's
 own `skip-bcr` cell. The only difference between the two sides is the main
 entry's order type (asserted per cell: `stop` vs `market`, not inferred from the
