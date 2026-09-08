@@ -10,6 +10,8 @@ divergence **is a bug**.
 
 **Severity:** MEDIUM-HIGH. Neither moves a number in the current corpus (proven
 below), which is exactly why they survived: the corpus cannot see either one.
+That is a statement about the corpus, **not** about the cost — and the cost
+itself is contested (see the two conflicting sources below).
 
 ---
 
@@ -48,6 +50,16 @@ the odd one out, not the QM leg. `require_confirmation` no longer participates:
 it governs *when* an entry may fire, not what happens when it lands wrong-side.
 `Skip` stays reachable via `--recover-entry abort`.
 
+**Not fixed: the M/W path.** `tv-arm/src/mw_resolve.rs` still hard-codes
+`RecoverEntryAction::Skip`. `BUG-stop-entry-recover-defaults-to-skip.md` calls
+this "worse — no operator override path at all", but the code's own reason
+checks out: the M/W enter builder takes an `MwSpec` and **never constructs an
+`EntrySpec::Stop`** (the worker resolves M/W geometry from `intent.mw` at fill),
+so there is no field for a recovery to ride on. Honouring `args.recover_entry`
+there would bake a value nothing reads. Giving M/W recovery means teaching the
+worker's `intent.mw` resolution about it first — a real gap, but a larger one
+than a defaulting change.
+
 `Args::limit_recover_action` was **deleted**, not left in place. It was a
 second, limit-only derivation of the same rule, and keeping it would have left
 two places that must agree by hand — the shape that produced this bug. Its unit
@@ -72,7 +84,58 @@ old test sat at, and the reason the asymmetry survived:
 
 No survivors.
 
-### Why it changes nothing in today's corpus (and why that is NOT a reason to skip it)
+### Did it cost live trades? Two sources disagree — `BUG-stop-entry-recover-defaults-to-skip.md`
+
+That report (from demo-journal trade 154, USD/ZAR H1, plan `hs-usd-zar-1ac62120`)
+independently found this same default and reached the same fix (`Limit`, for the
+same reason). Its evidence:
+
+| trade | instrument | live | as-designed replay |
+|---|---|---|---|
+| 049 | GBP/NZD | no entry (`too-close`) | trade ran |
+| 050 | — | no entry (`too-close`) | trade ran |
+| 154 | USD/ZAR H1 | no entry (`too-close`) | −1.00R |
+
+In each, `05-enter` fired once, the broker rejected it `#19-10`, and the plan sat
+inert until expiry — no veto, no decline, nothing in the outcome ledger. Trade
+154's replay happened to lose, so the drop *saved* 1R by luck, not by design.
+
+⚠️ **A concurrent database sweep contradicts this and is not dismissible either.**
+Zero `entry-failed: too-close-to-market` outcomes across staging (19,872 rows,
+2026-07-06 → 09-08) and dev — and plan `hs-usd-zar-1ac62120` is **absent from
+both databases** despite the window covering it (present USD/ZAR ids are
+`2802f414`, `ac81ae99`, `25b08c7f`, `b042053f`). Verified independently here.
+
+Points in each direction, so that whoever resolves this starts from facts:
+
+- **For the incident being real:** the USD/ZAR plan was armed on **TradeNation**
+  (checked: `plan.json` carries `broker: tradenation`), the only broker that
+  emits `#19-10` — `broker-oanda` never constructs the variant. A stale or
+  re-armed plan id is a known trap in this repo (cf. trade-142, whose bug doc
+  named a re-armed copy).
+- **For the zero being real:** the sweep anchored on the exact outcome string
+  rather than a `LIKE '%too-close%'`, which returns 15 false rows because the
+  worker records each request *body* into the next row's outcome.
+- **Weakening both:** the journal keeps only ~7 days of detail, so absence is
+  weak evidence, and the incident doc's own frequency table is unsourced.
+
+**Treat the cost as unresolved.** Don't quote either number as settled.
+
+Two consequences worth carrying forward:
+
+- **A `Skip` biases the ledger.** A forfeited trade leaves no row whether it
+  would have won or lost, so the outcome distribution of dropped entries is
+  currently unmeasurable.
+- **The claimed forfeits all came through the BROKER route** (`#19-10`), not the
+  resolve-time one. That is exactly the route replay cannot see — Bug 2 — which
+  is why the byte-identical corpus result below must be read narrowly, whichever
+  way the frequency question lands.
+
+### Why it changes nothing in today's corpus — and why that proves LESS than it looks
+
+⚠️ The measurement below covers the **resolve-time** branch only. The three
+forfeits above went through the **broker** branch, which replay never exercises
+at all. A green corpus was never evidence that this default was harmless.
 
 Measured 2026-09-09: re-arming with `--entry-stop --recover-entry limit`
 (verified it bakes `{"action":"limit"}` onto the plan) is **byte-identical on
@@ -86,7 +149,7 @@ That is a property of `from: signal_high` + a positive offset resolved on the
 signal bar. Anything that breaks it makes the branch live: a multi-bar
 confirmation wait, a zero/negative offset, an absolute `at`, an M/W leg with
 different anchoring, or a future entry anchored off something other than the
-signal bar. The asymmetry is a latent trap, not a live loss.
+signal bar.
 
 ⚠️ Do not "fix" this by asserting the branch is dead and deleting it. The same
 construction is what makes a **limit** wrong-side ~always, which is why

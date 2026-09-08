@@ -38,18 +38,48 @@ by hand is the shape that produced this bug.
 section now document the symmetric default. `--require-confirmation` no longer
 affects recovery.
 
+**Cost — two sources disagree; both are recorded.**
+`BUG-stop-entry-recover-defaults-to-skip.md` (written from demo-journal trade 154,
+USD/ZAR H1, plan `hs-usd-zar-1ac62120`, armed 2026-08-27) reports **three silent
+forfeits** — trades 049 (GBP/NZD), 050 and 154 — each a `05-enter` rejected
+`#19-10` after which the plan sat inert to expiry with no veto, no decline and no
+ledger row. A concurrent database sweep found **zero** `entry-failed:
+too-close-to-market` outcomes across staging (19,872 rows, 2026-07-06 → 09-08)
+and dev, and plan `hs-usd-zar-1ac62120` is absent from **both** databases even
+though the window covers it (the only USD/ZAR ids present are `2802f414`,
+`ac81ae99`, `25b08c7f`, `b042053f`).
+
+Neither result is dismissible. The plan *was* on TradeNation — the only broker
+that emits `#19-10` (`broker-oanda` never constructs the variant) — so the
+mechanism was live for it, and a stale/re-armed plan id is a known trap in this
+repo. Equally, the journal only keeps ~7 days of detail, so absence there is weak
+evidence. **Treat the cost as unresolved**, and do not quote either number as
+settled without re-deriving it.
+
+What is not in dispute is the shape: a stop is rejected `#19-10` *precisely when*
+price has run through the trigger — i.e. when the breakout the setup was built to
+catch is happening — and a `Skip` leaves no ledger row whether the dropped trade
+would have won or lost, so it **biases the journal** and makes its own frequency
+hard to measure. That is reason enough to change the default.
+
 **Tests.** Three new tests in `hs_resolve`, asserting the value baked onto the
 real `TradeSpec` rather than an `Args` helper — the layer the old test sat at,
 and the reason the asymmetry survived. Mutation-tested at that entry point, no
 survivors: reverting the stop arm to `Skip`, breaking the limit mirror,
 recovering a market entry, and ignoring an explicit `--recover-entry` each turn
-a test red. Full workspace green, including the 304-test CLI suite that scores
-all 2695 corpus cells — **the corpus is byte-unchanged**, as predicted: a long
-stop triggers above the signal bar's own high, so it is correct-side by
-construction and the branch is unreachable for today's geometry. That makes
-this a latent trap closed, not a live loss recovered. Do not delete the branch
-as dead — a multi-bar confirmation wait, a zero/negative offset, an absolute
-`at`, or a differently-anchored future entry all make it live.
+a test red. Full workspace green, including the 304-test CLI suite over all 2695
+corpus cells — **the corpus is byte-unchanged**.
+
+⚠️ **Read that byte-unchanged result narrowly.** It proves only that the
+*resolve-time* wrong-side branch is unreachable for today's geometry (a long stop
+triggers above the signal bar's own high, so it is correct-side by construction).
+It says **nothing** about the *broker-side* `#19-10` route — which is where all
+three forfeits happened, and which replay cannot see at all (Bug 2). A green
+corpus was never evidence that this default was harmless.
+
+Do not delete the resolve-time branch as dead either: a multi-bar confirmation
+wait, a zero/negative offset, an absolute `at`, or a differently-anchored future
+entry all make it live.
 
 **Follow-up.** The sibling defect is unfixed and now tracked separately in
 `BUG-replay-blind-to-broker-entry-recovery.md`: the replay broker never raises
