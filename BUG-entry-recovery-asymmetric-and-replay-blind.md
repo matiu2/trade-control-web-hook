@@ -50,15 +50,28 @@ the odd one out, not the QM leg. `require_confirmation` no longer participates:
 it governs *when* an entry may fire, not what happens when it lands wrong-side.
 `Skip` stays reachable via `--recover-entry abort`.
 
-**Not fixed: the M/W path.** `tv-arm/src/mw_resolve.rs` still hard-codes
-`RecoverEntryAction::Skip`. `BUG-stop-entry-recover-defaults-to-skip.md` calls
-this "worse — no operator override path at all", but the code's own reason
-checks out: the M/W enter builder takes an `MwSpec` and **never constructs an
+**M/W keeps `Skip` — WON'T FIX, deliberately.** `tv-arm/src/mw_resolve.rs`
+still hard-codes `RecoverEntryAction::Skip`, and that is now a recorded decision
+rather than an untouched corner (operator, 2026-09-09):
+
+> An M/W trade moves much faster than an H&S, and its edge is taking the
+> reversal **at the top, on the way down** (mirror for a W). If the entry is
+> missed and price later comes back to tag a resting limit, that fill is no
+> longer the setup — it's a late entry into a move that already ran. Get in at
+> the top or not at all.
+
+So the stop→limit recovery that is right for an H&S is *wrong* for M/W — this is
+a behavioural difference between the patterns, not an inconsistency to be tidied
+away. M/W is also not currently traded (it has not been profitable in practice),
+so there is no live exposure either way.
+
+`BUG-stop-entry-recover-defaults-to-skip.md` item 2 asks for M/W to at least
+honour `args.recover_entry`; that is declined, and would not work as described
+anyway — the M/W enter builder takes an `MwSpec` and **never constructs an
 `EntrySpec::Stop`** (the worker resolves M/W geometry from `intent.mw` at fill),
-so there is no field for a recovery to ride on. Honouring `args.recover_entry`
-there would bake a value nothing reads. Giving M/W recovery means teaching the
-worker's `intent.mw` resolution about it first — a real gap, but a larger one
-than a defaulting change.
+so there is no field for a recovery to ride on and the flag would bake a value
+nothing reads. The rationale lives at the `recover_entry` line in
+`mw_resolve.rs` so it isn't "helpfully" wired up later.
 
 `Args::limit_recover_action` was **deleted**, not left in place. It was a
 second, limit-only derivation of the same rule, and keeping it would have left

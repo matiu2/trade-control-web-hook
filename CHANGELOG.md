@@ -81,6 +81,15 @@ Do not delete the resolve-time branch as dead either: a multi-bar confirmation
 wait, a zero/negative offset, an absolute `at`, or a differently-anchored future
 entry all make it live.
 
+**Not changed: M/W.** `tv-arm/src/mw_resolve.rs` keeps `RecoverEntryAction::Skip`,
+deliberately. An M/W trade moves much faster than an H&S and its edge is taking
+the reversal at the top on the way down (mirror for a W); a resting limit that
+fills when price comes *back* is a late entry into a move that already ran, not
+the setup. Get in at the top or not at all. M/W is also not currently traded (not
+profitable in practice). `BUG-stop-entry-recover-defaults-to-skip.md` item 2 asks
+for M/W to honour `--recover-entry`; declined, and it would bake a value nothing
+reads regardless — the M/W enter builder never constructs an `EntrySpec::Stop`.
+
 **Follow-up.** The sibling defect is unfixed and now tracked separately in
 `BUG-replay-blind-to-broker-entry-recovery.md`: the replay broker never raises
 `EntryTooCloseToMarket`, so the broker-side (`#19-10`) recovery path is dead

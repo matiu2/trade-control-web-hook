@@ -339,8 +339,28 @@ pub fn build_mw_trade_spec(
         // M/W has no fib / invalidation drawing — its abort/cancel/overshoot
         // vetos cover the level guards, so no continuous entry-level vetos.
         entry_level_vetos: Vec::new(),
-        // M/W is out of scope for wrong-side stop recovery (it has no
-        // EntrySpec — resolves via intent.mw). Keep today's behaviour.
+        // M/W deliberately does NOT recover a wrong-side entry — `Skip` is a
+        // decision here, not an oversight, and it is the one arm that stays
+        // `Skip` now that the H&S default is symmetric (stop->limit,
+        // limit->stop; see `hs_resolve`).
+        //
+        // Operator's rule (2026-09-09): an M/W trade moves much faster than an
+        // H&S, and its edge is taking the reversal **at the top, on the way
+        // down** (mirror for a W). If the entry is missed and price later comes
+        // back to tag a resting limit, that fill is no longer the setup —
+        // it's a late entry into a move that already ran. Better not to be in
+        // it at all. So the recovery that is right for an H&S is wrong here,
+        // and neither `Limit` nor `Market` should be wired up.
+        //
+        // Mechanically it could not ride today anyway: the M/W enter builder
+        // takes an `MwSpec` and never constructs an `EntrySpec::Stop` (the
+        // worker resolves M/W geometry from `intent.mw` at fill), so there is
+        // no field for a recovery to attach to. Honouring `--recover-entry`
+        // here would bake a value nothing reads — worse than `Skip`, because
+        // it would look configured.
+        //
+        // `BUG-stop-entry-recover-defaults-to-skip.md` item 2 asks for this to
+        // be wired up. WON'T FIX — see that doc's status header.
         recover_entry: trade_control_core::intent::RecoverEntryAction::Skip,
         // strategy-v2 (dual stop + QM enter) is H&S-only.
         strategy_v2: false,

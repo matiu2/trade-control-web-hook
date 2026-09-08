@@ -10,6 +10,69 @@ This is a **defaulting bug, not a missing feature.**
 
 ---
 
+## Status (2026-09-09) — item 1 FIXED, item 2 WON'T FIX, item 3 open
+
+| # | suggested fix | status |
+|---|---|---|
+| 1 | stop-entry default `Skip` → a real recovery | **FIXED** — `f5480f38`, v141 |
+| 2 | give `mw_resolve.rs` the same treatment | **WON'T FIX** — deliberate, see below |
+| 3 | make the drop observable | **open**, but narrower than described |
+
+**Item 1 — fixed.** The default is now keyed off the entry order type alone and is
+symmetric, which is also how the strategy-v2 QM leg had always worked: `--entry-stop`
+(and the unflagged default) → `limit`, `--entry-limit` → `stop`, `--entry-market` →
+`skip`. `--require-confirmation` no longer participates — it governs *when* an entry may
+fire, not what happens when it lands wrong-side. `--recover-entry abort` restores the
+drop. This doc's reasoning for preferring `Limit` over `Market` was adopted as written.
+Tracked in `BUG-entry-recovery-asymmetric-and-replay-blind.md`, which found the same
+defect independently via the `--entry-matrix` axis.
+
+**Item 2 — WON'T FIX (operator decision, 2026-09-09).** Two reasons, in order:
+
+1. **A recovery is the wrong behaviour for M/W, not merely unwired.** An M/W trade moves
+   much faster than an H&S, and its edge is taking the reversal **at the top, on the way
+   down** (mirror for a W). If the entry is missed and price later comes back to tag a
+   resting limit, that fill is no longer the setup — it's a late entry into a move that
+   has already run. The operator's rule: get in at the top or not at all. So the
+   stop→limit recovery that is correct for an H&S is actively undesirable here, and
+   neither `Limit` nor `Market` should be wired up.
+2. **M/W is not being traded.** M/W setups have not been profitable in practice and are
+   not currently armed, so there is no live exposure behind this item either way.
+
+Note also that "at minimum it should honour `args.recover_entry`" would not work as
+described even if wanted: the M/W enter builder takes an `MwSpec` and never constructs an
+`EntrySpec::Stop` (the worker resolves M/W geometry from `intent.mw` at fill), so there is
+no field for a recovery to ride on. Threading the flag through would bake a value nothing
+reads — worse than the honest `Skip`, because it would look configured. The rationale is
+recorded at the `recover_entry` line in `tv-arm/src/mw_resolve.rs` so it isn't
+"helpfully" wired up later.
+
+**Item 3 — open, but its premise is too strong.** The claim that "a forfeited trade and a
+trade that never triggered are indistinguishable downstream" does not hold: a non-recovered
+`#19-10` records `ActionResult::Failed("entry-failed: too-close-to-market")` into the
+ledger (`core/src/dispatch/enter.rs`, via `recover_entry::outcome_for_entry_error`) — that
+is the exact string the database sweep below queried on. What is genuinely log-only is the
+*reason recovery declined* (`recover-entry-limit-wrong-side`, `recover-entry-slippage`),
+which reaches `tracing` but not the outcome. So the real gap is "you can see a forfeit
+happened but not why", which is narrower than stated — and less urgent now that item 1
+means a stop entry no longer forfeits by default.
+
+⚠️ **This doc's frequency table is contested.** A sweep on 2026-09-09 found **zero**
+`entry-failed: too-close-to-market` outcomes across staging (19,872 rows, 2026-07-06 →
+09-08) and dev, and plan `hs-usd-zar-1ac62120` is absent from **both** databases despite
+the window covering it. The plan *was* armed on TradeNation (verified), the only broker
+that emits `#19-10`, so the mechanism was live for it; but the journal keeps only ~7 days
+of detail and re-armed plan ids are a known trap in this repo. Treat the three-occurrence
+count as unresolved. It does not change item 1's fix, which is right at zero occurrences
+or three.
+
+Item 3's rationale ("what let this run three times without being caught") inherits that
+uncertainty.
+
+---
+
+---
+
 ## Symptom
 
 Live plan `hs-usd-zar-1ac62120` (USD/ZAR H1, short):
