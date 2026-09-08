@@ -202,11 +202,13 @@ inflate volume/OHLC, was kept as its own test).
    in `entry-rule-corpus-comparison.md` (which did not previously exist as a file --
    only `scripts/compare-entry-rules.py` did).
 
-   That write-up also isolates a confound worth knowing: re-arming rebuilt the plans
-   under a newer tv-arm (v132/v134 -> v140), so the corpus-wide -11.99R is **two**
-   effects. Replaying the old plans against the new candles separates them --
-   the **candle fix is +18.86R**; the plan rebuild is -30.85R, all of it on
-   `eur-cad-h4-2026-07-23`.
+   **Revised later the same day:** an interim reading of that write-up blamed a
+   tv-arm version bump for a corpus-wide -11.99R. That was wrong. The real cause
+   was a **mis-drawn `too-low` line** on `eur-cad-h4-2026-07-23`: at 1.60867 it
+   sat *above* the iH&S head (1.601), i.e. inside the trade, so it vetoed the
+   setup's own entries and zeroed all 24 of its cells. Operator redrew it
+   (1.6012386, just below the head) and the setup went +0.00 -> +54.35R.
+   **The corpus is MORE profitable after the fixes: +309.62 -> +351.99.**
 3. The doc's original suggestion to split `WEEKEND_ENTRY_RESUME_MIN` (22:00) from
    `WEEKEND_DATA_RESUME_MIN` (21:00) still stands **on its own merits** — the entry-safety
    margin and the first-valid-bar are different questions — but it is **not** a fix for

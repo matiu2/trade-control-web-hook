@@ -137,10 +137,10 @@ week-open buckets, bars **removed** are all past `meta.end` — this bug's still
 buckets. Gate: 918/918 real cells pass, `cargo test -p trade-control-cli` 304/304.
 
 **Re-run done 2026-09-08:** `entry-rule-corpus-comparison.md` — `skip-bcr` still wins
-in all 6 slices (total R +32.33 -> +34.30, median +0.04 -> +0.26), so the entry-rule
-decision stands. The write-up isolates the H4 candle fix from the tv-arm version bump
-that rode along with the re-arm: the **candle fix is worth +18.86R**; the -30.85R on
-`eur-cad-h4-2026-07-23` is the plan rebuild, not this fix.
+in all 6 slices (total R +32.33 -> +40.91, median +0.04 -> +0.27), so the entry-rule
+decision stands. The candle fix is worth **+18.86R** on its own (`gbp-nzd-h4`). A
+separate mis-drawn `too-low` line on `eur-cad-h4-2026-07-23`, corrected by the operator
+the same day, was worth a further **+23.50R**. Corpus-wide: **+309.62 -> +351.99**.
 
 ## Impact on the journal
 
