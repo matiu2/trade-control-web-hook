@@ -191,13 +191,14 @@ inflate volume/OHLC, was kept as its own test).
 
 `WEEKEND_TO_MIN` was **not** changed — see the correction at the top.
 
-## Follow-up — NOT yet done
+## Follow-up
 
-1. **Regenerate the TradeNation H4 fixtures.** Every one gains a bar per week and shifts
-   live fire times. A blanket `--rebless` is the wrong move (it can silently retire
-   coverage, and most cells are untracked); pass `--fixtures-dir` explicitly.
-2. **Re-run `entry-rule-corpus-comparison.md`** — the current `skip-bcr` entry rule was
-   chosen on the affected data, so that conclusion is unverified until it is re-run.
+1. ~~**Regenerate the TradeNation H4 fixtures.**~~ **DONE 2026-09-08** (`b7e277b`) — all
+   **48** TN H4 cells re-fetched from their frozen `.spec.json`. See "Fixture
+   regeneration" below for the scope proof and what moved.
+2. **Re-run `entry-rule-corpus-comparison.md`** — **STILL OUTSTANDING.** The current
+   `skip-bcr` entry rule was chosen on the affected data, so that conclusion is
+   unverified until it is re-run. The corpus is now correct, so this is unblocked.
 3. The doc's original suggestion to split `WEEKEND_ENTRY_RESUME_MIN` (22:00) from
    `WEEKEND_DATA_RESUME_MIN` (21:00) still stands **on its own merits** — the entry-safety
    margin and the first-valid-bar are different questions — but it is **not** a fix for
@@ -220,3 +221,39 @@ This was misdiagnosed twice (as an hour-blacklist, then as a weekend market clos
 fixture was used as evidence about itself. **When the data is the suspect, check an independent
 source first.** The operator said three times that the chart showed the bar; pulling the chart
 would have settled it immediately.
+
+## Fixture regeneration (2026-09-08, `b7e277b`)
+
+**`--rebless` alone would have been a silent no-op.** `--test-mode` replays the
+fixture's **own frozen candles**, so re-blessing re-scores the stale bars and
+writes back the same numbers. The candles had to be **re-pulled from the broker**
+via `tv-arm --spec-in … --save-matrix replay --save`.
+
+**Scope: exactly 48 cells**, and this is proven, not assumed.
+`aggregation::resolve_native` returns `None` for H1/M15/D1, so those bypass
+`aggregate_candles` entirely — only H4 (and M5, which has no fixtures) can move.
+Confirmed empirically by diffing every fixture dir against a pre-run backup: 48
+changed, 0 others.
+
+**⚠️ Pass `--instrument` when regenerating.** `replay-candles` resolves the
+instrument from the **TradingView chart** before falling back to the plan, so
+re-arming several setups in one session silently pulled the chart's last-loaded
+symbol for all of them. Caught because EUR/CAD cells showed entries at 2.29
+(GBP/NZD prices) against a 1.60 SL..TP band. Every setup must pass its own
+`--instrument`; see `[[replay_candles_reads_chart_symbol]]`.
+
+**Per-cell diff had zero unexplained bars across all 48:** every ADDED bar falls
+inside `[meta.start, meta.end]` and is a 21:00 UTC week-open bucket (this bug);
+every REMOVED bar is strictly after `meta.end` (the sibling bug — buckets emitted
+past the requested window, now cut by the `end_time` reference).
+
+28 of 48 cells moved; TN-H4 Net R **+30.48 → +18.49**. Both directions are real:
+
+- **gbp-nzd 2026-08-05** gains the disputed `2026-08-09T21:00Z` bar and now takes
+  a trade worth up to **+4.43R** where it scored +0.00R.
+- **eur-cad 2026-07-23** *loses* its entries: the restored week-open bars pierce
+  the `too-low` level, so the entry-level veto now correctly blocks them. A
+  fixture getting *worse* here is the fix working.
+
+Gate: **918/918** real cells pass; `cargo test -p trade-control-cli` **304/304**
+green with the corpus complete.

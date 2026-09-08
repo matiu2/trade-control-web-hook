@@ -126,12 +126,18 @@ not deleted**.
 `candle-cache/src/aggregation.rs` carried the same latent defect on the mid path and was
 fixed identically.
 
-**Still to do:** as this doc warned, the fix shifts every TN H4/M5 live fire one bar later
-and changes any corpus fixture built from TN data. Fixtures are **not** yet regenerated,
-and `entry-rule-corpus-comparison.md` (the basis of the current `skip-bcr` entry rule)
-must be re-run afterwards. Both bugs are now fixed in one change, so a **single**
-regeneration covers them — do not regenerate twice. A blanket `--rebless` is the wrong
-move: it can silently retire coverage, and most cells are untracked.
+**Fixtures regenerated 2026-09-08** (`b7e277b`): all **48** TN H4 cells re-fetched from
+their frozen `.spec.json` — a single regeneration covering both bugs, as planned. Note
+`--rebless` alone would have been a **no-op**: `--test-mode` replays the fixture's own
+frozen candles, so it re-scores stale bars rather than re-pulling from the broker.
+Scope was provably 48 cells (`resolve_native` returns `None` for H1/M15/D1, so they never
+reach `aggregate_candles`; verified by diffing every dir against a pre-run backup).
+Both halves of the fix are visible in the diff: bars **added** inside the window are the
+week-open buckets, bars **removed** are all past `meta.end` — this bug's still-forming
+buckets. Gate: 918/918 real cells pass, `cargo test -p trade-control-cli` 304/304.
+
+**Still to do:** `entry-rule-corpus-comparison.md` (the basis of the current `skip-bcr`
+entry rule) must be re-run — the corpus is now correct, so this is unblocked.
 
 ## Impact on the journal
 
