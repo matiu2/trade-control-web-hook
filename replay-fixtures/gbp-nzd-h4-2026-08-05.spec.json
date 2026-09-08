@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785747600,
+        "price": 2.29359
+      },
+      "b": {
+        "at_epoch": 1785906000,
+        "price": 2.2962
+      }
+    },
+    "invalidation": 2.285674661976239,
+    "fib_head_neckline": [
+      2.28141,
+      2.295360863739127
+    ],
+    "trade_expiry_epoch": 1787533200,
+    "sr_levels": [
+      1.98104,
+      2.8933,
+      2.2601
+    ]
+  },
+  "resolution": "240",
+  "chart_symbol": "TRADENATION:GBPNZD",
+  "start": 1785963600,
+  "tv_arm_version": "v140-13-g3d33b9a-dirty"
+}

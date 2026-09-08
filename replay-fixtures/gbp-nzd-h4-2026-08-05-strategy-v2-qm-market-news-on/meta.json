@@ -1,0 +1,17 @@
+{
+  "instrument": "GBP/NZD",
+  "granularity": "h4",
+  "source": "tradenation",
+  "start": "2026-08-05T21:00:00Z",
+  "end": "2026-08-24T01:00:00Z",
+  "message": "4h ihs",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:GBPNZD",
+    "tv_arm_version": "v140-17-gdf55a7c-dirty",
+    "engine_version": "v140-17-gdf55a7c-dirty"
+  }
+}

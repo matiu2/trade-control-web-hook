@@ -19,10 +19,10 @@
       "candle_close": 1.61661
     },
     {
-      "rule_id": "02-veto-trade-expiry",
+      "rule_id": "01-veto-too-low",
       "action": "veto",
-      "candle_time": "2026-08-13T21:00:00Z",
-      "candle_close": 1.60626
+      "candle_time": "2026-08-10T21:00:00Z",
+      "candle_close": 1.60864
     }
   ],
   "done": true,

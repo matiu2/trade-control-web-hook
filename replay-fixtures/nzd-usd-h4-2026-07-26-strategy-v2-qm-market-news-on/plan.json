@@ -1,5 +1,5 @@
 {
-  "trade_id": "hs-nzd-usd-e6eff6b5",
+  "trade_id": "hs-nzd-usd-e93f5f9d",
   "instrument": "NZD/USD",
   "direction": "short",
   "granularity": "h4",
@@ -16,7 +16,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-too-high",
+        "id": "hs-nzd-usd-e93f5f9d-too-high",
         "not_after": "2026-08-10T05:30:00Z",
         "action": "veto",
         "instrument": "NZD/USD",
@@ -25,7 +25,7 @@
         "name": "too-high",
         "ttl_hours": 345,
         "level": "close-positions",
-        "trade_id": "hs-nzd-usd-e6eff6b5"
+        "trade_id": "hs-nzd-usd-e93f5f9d"
       },
       "kind": "setup_invalidation"
     },
@@ -40,7 +40,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-too-low",
+        "id": "hs-nzd-usd-e93f5f9d-too-low",
         "not_after": "2026-08-10T05:30:00Z",
         "action": "veto",
         "instrument": "NZD/USD",
@@ -49,7 +49,7 @@
         "name": "too-low",
         "ttl_hours": 345,
         "level": "stop-next-entry",
-        "trade_id": "hs-nzd-usd-e6eff6b5"
+        "trade_id": "hs-nzd-usd-e93f5f9d"
       },
       "kind": "setup_invalidation"
     },
@@ -62,7 +62,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-trade-expiry",
+        "id": "hs-nzd-usd-e93f5f9d-trade-expiry",
         "not_before": "2026-08-10T05:00:00Z",
         "not_after": "2026-08-10T05:30:00Z",
         "action": "veto",
@@ -72,7 +72,7 @@
         "name": "trade-expiry",
         "ttl_hours": 345,
         "level": "close-positions",
-        "trade_id": "hs-nzd-usd-e6eff6b5"
+        "trade_id": "hs-nzd-usd-e93f5f9d"
       },
       "kind": "setup_invalidation"
     },
@@ -96,7 +96,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-break-and-close",
+        "id": "hs-nzd-usd-e93f5f9d-break-and-close",
         "not_after": "2026-08-10T05:00:00Z",
         "action": "prep",
         "instrument": "NZD/USD",
@@ -107,7 +107,7 @@
         "clears": [
           "retest"
         ],
-        "trade_id": "hs-nzd-usd-e6eff6b5"
+        "trade_id": "hs-nzd-usd-e93f5f9d"
       },
       "kind": "prep_break_and_close"
     },
@@ -131,7 +131,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-retest",
+        "id": "hs-nzd-usd-e93f5f9d-retest",
         "not_after": "2026-08-10T05:00:00Z",
         "action": "prep",
         "instrument": "NZD/USD",
@@ -139,7 +139,7 @@
         "account": "reversals",
         "step": "retest",
         "ttl_hours": 876000,
-        "trade_id": "hs-nzd-usd-e6eff6b5"
+        "trade_id": "hs-nzd-usd-e93f5f9d"
       },
       "kind": "prep_retest"
     },
@@ -152,7 +152,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-enter",
+        "id": "hs-nzd-usd-e93f5f9d-enter",
         "not_after": "2026-08-07T08:12:00Z",
         "action": "enter",
         "instrument": "NZD/USD",
@@ -197,11 +197,12 @@
         "breakeven": {
           "threshold": 0.5
         },
-        "trade_id": "hs-nzd-usd-e6eff6b5",
+        "trade_id": "hs-nzd-usd-e93f5f9d",
         "max_retries": 5,
         "needs_golden": true,
         "pip_size": 0.0001,
-        "tick_size": 0.00001
+        "tick_size": 0.00001,
+        "contract_multiplier": 1.0
       },
       "kind": "enter"
     },
@@ -214,7 +215,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-enter-qm",
+        "id": "hs-nzd-usd-e93f5f9d-enter-qm",
         "not_after": "2026-08-07T08:12:00Z",
         "action": "enter",
         "instrument": "NZD/USD",
@@ -252,12 +253,13 @@
         "breakeven": {
           "threshold": 0.5
         },
-        "trade_id": "hs-nzd-usd-e6eff6b5",
+        "trade_id": "hs-nzd-usd-e93f5f9d",
         "max_retries": 5,
         "needs_golden": true,
         "needs_confirmed": true,
         "pip_size": 0.0001,
-        "tick_size": 0.00001
+        "tick_size": 0.00001,
+        "contract_multiplier": 1.0
       },
       "kind": "enter"
     },
@@ -270,13 +272,13 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-close-on-sr-reversal",
+        "id": "hs-nzd-usd-e93f5f9d-close-on-sr-reversal",
         "not_after": "2026-08-10T05:00:00Z",
         "action": "close",
         "instrument": "NZD/USD",
         "broker": "tradenation",
         "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
+        "trade_id": "hs-nzd-usd-e93f5f9d",
         "needs_golden": true,
         "inside_window": [
           "price"
@@ -306,450 +308,6 @@
         "reason": "support/resistance reversal"
       },
       "kind": "per_position_close"
-    },
-    {
-      "rule_id": "06-close-on-reversal",
-      "trigger": {
-        "type": "pine_pattern",
-        "dir": "long"
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-close-on-reversal",
-        "not_after": "2026-08-10T05:00:00Z",
-        "action": "close",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "needs_golden": true,
-        "inside_window": [
-          "news"
-        ],
-        "reason": "news-window reversal"
-      },
-      "kind": "per_position_close"
-    },
-    {
-      "rule_id": "01-pause-1785319200-1785349800",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785319200
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-pause-1785319200-1785349800",
-        "not_after": "2026-07-29T18:30:00Z",
-        "action": "pause",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "blackout_id": "1785319200-1785349800",
-        "reason": "news:NZD/USD-2026-07-29T10:00:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "02-resume-1785319200-1785349800",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785349800
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-resume-1785319200-1785349800",
-        "not_after": "2026-07-29T19:00:00Z",
-        "action": "resume",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "blackout_id": "1785319200-1785349800",
-        "reason": "news:NZD/USD-2026-07-29T10:00:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "01-pause-1785385800-1785414600",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785385800
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-pause-1785385800-1785414600",
-        "not_after": "2026-07-30T12:30:00Z",
-        "action": "pause",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "blackout_id": "1785385800-1785414600",
-        "reason": "news:NZD/USD-2026-07-30T04:30:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "02-resume-1785385800-1785414600",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785414600
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-resume-1785385800-1785414600",
-        "not_after": "2026-07-30T13:00:00Z",
-        "action": "resume",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "blackout_id": "1785385800-1785414600",
-        "reason": "news:NZD/USD-2026-07-30T04:30:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "01-pause-1785736800-1785765600",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785736800
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-pause-1785736800-1785765600",
-        "not_after": "2026-08-03T14:00:00Z",
-        "action": "pause",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "blackout_id": "1785736800-1785765600",
-        "reason": "news:NZD/USD-2026-08-03T06:00:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "02-resume-1785736800-1785765600",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785765600
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-resume-1785736800-1785765600",
-        "not_after": "2026-08-03T14:30:00Z",
-        "action": "resume",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "blackout_id": "1785736800-1785765600",
-        "reason": "news:NZD/USD-2026-08-03T06:00:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "01-pause-1785854700-1785883500",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785854700
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-pause-1785854700-1785883500",
-        "not_after": "2026-08-04T22:45:00Z",
-        "action": "pause",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "blackout_id": "1785854700-1785883500",
-        "reason": "news:NZD/USD-2026-08-04T14:45:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "02-resume-1785854700-1785883500",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785883500
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-resume-1785854700-1785883500",
-        "not_after": "2026-08-04T23:15:00Z",
-        "action": "resume",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "blackout_id": "1785854700-1785883500",
-        "reason": "news:NZD/USD-2026-08-04T14:45:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "01-pause-1786077000-1786105800",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1786077000
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-pause-1786077000-1786105800",
-        "not_after": "2026-08-07T12:30:00Z",
-        "action": "pause",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "blackout_id": "1786077000-1786105800",
-        "reason": "news:NZD/USD-2026-08-07T04:30:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "02-resume-1786077000-1786105800",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1786105800
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-resume-1786077000-1786105800",
-        "not_after": "2026-08-07T13:00:00Z",
-        "action": "resume",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "blackout_id": "1786077000-1786105800",
-        "reason": "news:NZD/USD-2026-08-07T04:30:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "01-news-start-1785349800-1785353400",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785349800
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-news-start-1785349800-1785353400",
-        "not_after": "2026-07-29T19:30:00Z",
-        "action": "news-start",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "news_id": "1785349800-1785353400",
-        "reason": "news:NZD/USD-2026-07-29T18:30:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "02-news-end-1785349800-1785353400",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785353400
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-news-end-1785349800-1785353400",
-        "not_after": "2026-07-29T20:00:00Z",
-        "action": "news-end",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "news_id": "1785349800-1785353400",
-        "reason": "news:NZD/USD-2026-07-29T18:30:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "01-news-start-1785414600-1785418200",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785414600
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-news-start-1785414600-1785418200",
-        "not_after": "2026-07-30T13:30:00Z",
-        "action": "news-start",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "news_id": "1785414600-1785418200",
-        "reason": "news:NZD/USD-2026-07-30T12:30:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "02-news-end-1785414600-1785418200",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785418200
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-news-end-1785414600-1785418200",
-        "not_after": "2026-07-30T14:00:00Z",
-        "action": "news-end",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "news_id": "1785414600-1785418200",
-        "reason": "news:NZD/USD-2026-07-30T12:30:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "01-news-start-1785765600-1785769200",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785765600
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-news-start-1785765600-1785769200",
-        "not_after": "2026-08-03T15:00:00Z",
-        "action": "news-start",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "news_id": "1785765600-1785769200",
-        "reason": "news:NZD/USD-2026-08-03T14:00:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "02-news-end-1785765600-1785769200",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785769200
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-news-end-1785765600-1785769200",
-        "not_after": "2026-08-03T15:30:00Z",
-        "action": "news-end",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "news_id": "1785765600-1785769200",
-        "reason": "news:NZD/USD-2026-08-03T14:00:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "01-news-start-1785883500-1785887100",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785883500
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-news-start-1785883500-1785887100",
-        "not_after": "2026-08-04T23:45:00Z",
-        "action": "news-start",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "news_id": "1785883500-1785887100",
-        "reason": "news:NZD/USD-2026-08-04T22:45:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "02-news-end-1785883500-1785887100",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1785887100
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-news-end-1785883500-1785887100",
-        "not_after": "2026-08-05T00:15:00Z",
-        "action": "news-end",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "news_id": "1785883500-1785887100",
-        "reason": "news:NZD/USD-2026-08-04T22:45:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "01-news-start-1786105800-1786109400",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1786105800
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-news-start-1786105800-1786109400",
-        "not_after": "2026-08-07T13:30:00Z",
-        "action": "news-start",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "news_id": "1786105800-1786109400",
-        "reason": "news:NZD/USD-2026-08-07T12:30:00+00:00"
-      },
-      "kind": "control"
-    },
-    {
-      "rule_id": "02-news-end-1786105800-1786109400",
-      "trigger": {
-        "type": "time_reached",
-        "at_epoch": 1786109400
-      },
-      "fire_mode": "once",
-      "intent": {
-        "v": 1,
-        "id": "hs-nzd-usd-e6eff6b5-news-end-1786105800-1786109400",
-        "not_after": "2026-08-07T14:00:00Z",
-        "action": "news-end",
-        "instrument": "NZD/USD",
-        "broker": "tradenation",
-        "account": "reversals",
-        "trade_id": "hs-nzd-usd-e6eff6b5",
-        "news_id": "1786105800-1786109400",
-        "reason": "news:NZD/USD-2026-08-07T12:30:00+00:00"
-      },
-      "kind": "control"
     }
   ],
   "shadow": false,

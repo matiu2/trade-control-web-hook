@@ -11,7 +11,7 @@
     "skip_golden": false,
     "candle_source": "tradenation",
     "chart_symbol": "TRADENATION:NZDUSD",
-    "tv_arm_version": "v132-12-g948e5f3",
-    "engine_version": "v132-12-g948e5f3"
+    "tv_arm_version": "v140-17-gdf55a7c-dirty",
+    "engine_version": "v140-17-gdf55a7c-dirty"
   }
 }

@@ -1,5 +1,5 @@
 {
-  "trade_id": "hs-gbp-cad-17845a47",
+  "trade_id": "hs-gbp-cad-208320eb",
   "instrument": "GBP/CAD",
   "direction": "short",
   "granularity": "h4",
@@ -16,7 +16,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-gbp-cad-17845a47-too-high",
+        "id": "hs-gbp-cad-208320eb-too-high",
         "not_after": "2026-08-17T05:30:00Z",
         "action": "veto",
         "instrument": "GBP/CAD",
@@ -25,7 +25,7 @@
         "name": "too-high",
         "ttl_hours": 241,
         "level": "close-positions",
-        "trade_id": "hs-gbp-cad-17845a47"
+        "trade_id": "hs-gbp-cad-208320eb"
       },
       "kind": "setup_invalidation"
     },
@@ -40,7 +40,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-gbp-cad-17845a47-too-low",
+        "id": "hs-gbp-cad-208320eb-too-low",
         "not_after": "2026-08-17T05:30:00Z",
         "action": "veto",
         "instrument": "GBP/CAD",
@@ -49,7 +49,7 @@
         "name": "too-low",
         "ttl_hours": 241,
         "level": "stop-next-entry",
-        "trade_id": "hs-gbp-cad-17845a47"
+        "trade_id": "hs-gbp-cad-208320eb"
       },
       "kind": "setup_invalidation"
     },
@@ -62,7 +62,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-gbp-cad-17845a47-trade-expiry",
+        "id": "hs-gbp-cad-208320eb-trade-expiry",
         "not_before": "2026-08-17T05:00:00Z",
         "not_after": "2026-08-17T05:30:00Z",
         "action": "veto",
@@ -72,7 +72,7 @@
         "name": "trade-expiry",
         "ttl_hours": 241,
         "level": "close-positions",
-        "trade_id": "hs-gbp-cad-17845a47"
+        "trade_id": "hs-gbp-cad-208320eb"
       },
       "kind": "setup_invalidation"
     },
@@ -85,7 +85,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-gbp-cad-17845a47-enter",
+        "id": "hs-gbp-cad-208320eb-enter",
         "not_after": "2026-08-15T05:00:00Z",
         "action": "enter",
         "instrument": "GBP/CAD",
@@ -126,11 +126,12 @@
         "breakeven": {
           "threshold": 0.5
         },
-        "trade_id": "hs-gbp-cad-17845a47",
+        "trade_id": "hs-gbp-cad-208320eb",
         "max_retries": 5,
         "needs_golden": true,
         "pip_size": 0.0001,
-        "tick_size": 0.00001
+        "tick_size": 0.00001,
+        "contract_multiplier": 1.0
       },
       "kind": "enter"
     },
@@ -143,13 +144,13 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "hs-gbp-cad-17845a47-close-on-sr-reversal",
+        "id": "hs-gbp-cad-208320eb-close-on-sr-reversal",
         "not_after": "2026-08-17T05:00:00Z",
         "action": "close",
         "instrument": "GBP/CAD",
         "broker": "tradenation",
         "account": "reversals",
-        "trade_id": "hs-gbp-cad-17845a47",
+        "trade_id": "hs-gbp-cad-208320eb",
         "needs_golden": true,
         "inside_window": [
           "price"
@@ -199,6 +200,5 @@
         ]
       }
     ]
-  },
-  "screenshot_url": "https://www.tradingview.com/x/TBPUHm7I/"
+  }
 }

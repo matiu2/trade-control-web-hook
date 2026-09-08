@@ -25,64 +25,10 @@
       "candle_close": 1.61075
     },
     {
-      "rule_id": "01-pause-1785472200-1785501000",
-      "action": "pause",
-      "candle_time": "2026-07-30T21:00:00Z",
-      "candle_close": 1.61424
-    },
-    {
-      "rule_id": "02-resume-1785472200-1785501000",
-      "action": "resume",
-      "candle_time": "2026-07-31T05:00:00Z",
-      "candle_close": 1.61416
-    },
-    {
-      "rule_id": "01-news-start-1785501000-1785504600",
-      "action": "news-start",
-      "candle_time": "2026-07-31T05:00:00Z",
-      "candle_close": 1.61416
-    },
-    {
-      "rule_id": "02-news-end-1785501000-1785504600",
-      "action": "news-end",
-      "candle_time": "2026-07-31T09:00:00Z",
-      "candle_close": 1.61257
-    },
-    {
       "rule_id": "01-veto-too-high",
       "action": "veto",
       "candle_time": "2026-07-31T17:00:00Z",
       "candle_close": 1.61661
-    },
-    {
-      "rule_id": "01-pause-1786077000-1786105800",
-      "action": "pause",
-      "candle_time": "2026-08-06T21:00:00Z",
-      "candle_close": 1.6148
-    },
-    {
-      "rule_id": "02-resume-1786077000-1786105800",
-      "action": "resume",
-      "candle_time": "2026-08-07T05:00:00Z",
-      "candle_close": 1.6159
-    },
-    {
-      "rule_id": "01-news-start-1786105800-1786109400",
-      "action": "news-start",
-      "candle_time": "2026-08-07T05:00:00Z",
-      "candle_close": 1.6159
-    },
-    {
-      "rule_id": "06-close-on-reversal",
-      "action": "close",
-      "candle_time": "2026-08-07T09:00:00Z",
-      "candle_close": 1.61413
-    },
-    {
-      "rule_id": "02-news-end-1786105800-1786109400",
-      "action": "news-end",
-      "candle_time": "2026-08-07T09:00:00Z",
-      "candle_close": 1.61413
     },
     {
       "rule_id": "01-veto-too-low",
