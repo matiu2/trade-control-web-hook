@@ -16,7 +16,7 @@ This is a **defaulting bug, not a missing feature.**
 |---|---|---|
 | 1 | stop-entry default `Skip` → a real recovery | **FIXED** — `f5480f38`, v141 |
 | 2 | give `mw_resolve.rs` the same treatment | **WON'T FIX** — deliberate, see below |
-| 3 | make the drop observable | **open**, but narrower than described |
+| 3 | make the drop observable | **FIXED** — `7d24fb6d`, v141 (broadened) |
 
 **Item 1 — fixed.** The default is now keyed off the entry order type alone and is
 symmetric, which is also how the strategy-v2 QM leg had always worked: `--entry-stop`
@@ -47,7 +47,26 @@ reads — worse than the honest `Skip`, because it would look configured. The ra
 recorded at the `recover_entry` line in `tv-arm/src/mw_resolve.rs` so it isn't
 "helpfully" wired up later.
 
-**Item 3 — open, but its premise is too strong.** The claim that "a forfeited trade and a
+**Item 3 — FIXED (`7d24fb6d`), and broadened past what was asked.**
+
+The skip reason now reaches the ledger:
+`entry-failed: too-close-to-market (recover-entry-slippage)`. Beyond that, *every*
+entry failure now carries a stable per-variant token — five of the eight
+`EntryError` variants previously rendered as the single string
+`entry-failed: broker rejected the order`, which is the same blind spot one layer
+up (OANDA alone has four distinct causes sharing `OrderRejected` across six
+construction sites; TradeNation distinguishes eleven kinds and `map_place_error`
+collapses nine). `failure_token` is exhaustive, so a new variant is a compile
+error until given a token.
+
+Worth recording for the next person: the first pass at this **failed its own
+mutation check**. Making the dispatcher discard the reason —
+`outcome_for_entry_failure(&err, None)`, precisely the bug being fixed — left
+every `recover_entry.rs` unit test green, because the tests sat on the pure layer
+below the real caller. Closed with an end-to-end test through `run_enter`. Same
+lesson as item 1's fix.
+
+**The original framing was too strong.** The claim that "a forfeited trade and a
 trade that never triggered are indistinguishable downstream" does not hold: a non-recovered
 `#19-10` records `ActionResult::Failed("entry-failed: too-close-to-market")` into the
 ledger (`core/src/dispatch/enter.rs`, via `recover_entry::outcome_for_entry_error`) — that
