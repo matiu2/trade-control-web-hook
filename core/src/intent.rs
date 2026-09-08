@@ -1979,13 +1979,15 @@ pub enum EntrySpec {
     },
 }
 
-/// What to do when a stop entry can't be placed as a resting stop
-/// because the trigger has already been overtaken by price — at resolve
-/// time (wrong-side for its direction after the signal-confirmation
-/// wait) or at the broker (TradeNation `#19-10`). Opt-in on
-/// [`EntrySpec::Stop`]; absent means "drop" (today's behaviour). The
-/// strategy author encodes the intent in the alert; it is not a
-/// universal default.
+/// What to do when a **resting** entry can't be placed because its level has
+/// already been overtaken by price — at resolve time (wrong-side for its
+/// direction after the signal-confirmation wait) or at the broker (TradeNation
+/// `#19-10`). Opt-in on [`EntrySpec::Stop`] **and** [`EntrySpec::Limit`], which
+/// recover into each other; absent means "drop". The strategy author encodes
+/// the intent in the alert; it is not a universal default.
+///
+/// A [`EntrySpec::Market`] entry has no resting level, so there is nothing to
+/// recover and it carries no `recover_entry`.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 pub struct RecoverEntry {
     /// Which recovery to attempt.
