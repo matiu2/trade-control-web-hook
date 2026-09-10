@@ -533,6 +533,10 @@ mod tests {
             position_id: position_id.into(),
             order_id: "ord-1".into(),
             stake: 1.0,
+            // Join-correlation fixtures: this test is about the keys, not the
+            // fill, so the fill facts are honestly unknown.
+            entry_price: None,
+            opened_at: None,
         }
     }
 

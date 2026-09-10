@@ -606,6 +606,12 @@ fn find_amend_target(
 /// Map a TradeNation [`Position`] to a broker-agnostic [`OpenPosition`].
 /// Pure — unit-tested for the Buy/Sell → direction and SL/TP optionality
 /// branches. `direction` is `"Buy"` / `"Sell"` in upstream fixtures.
+/// `entry_price` / `opened_at` come from `Position.opening_price` and
+/// `Position.creation_time` — the price the position actually opened at and
+/// when, not the originating order's trigger. `creation_time` is `Option` on
+/// the wire (an unparseable broker timestamp), and it stays `None` here rather
+/// than being fabricated; callers needing a post-fill lower bound must treat
+/// `None` as "unknown", never as "beginning of time".
 fn tn_position_to_open(p: &Position) -> OpenPosition {
     OpenPosition {
         instrument: p.market_name.clone(),
@@ -619,6 +625,8 @@ fn tn_position_to_open(p: &Position) -> OpenPosition {
         position_id: p.position_id.to_string(),
         order_id: p.order_id.to_string(),
         stake: p.stake,
+        entry_price: Some(p.opening_price),
+        opened_at: p.creation_time.map(|t| t.with_timezone(&Utc)),
     }
 }
 
@@ -1250,7 +1258,11 @@ mod mapping_tests {
             limit_order_price: tp,
             imr: 0.0,
             currency_symbol: String::new(),
-            creation_time: None,
+            creation_time: Some(
+                "2026-08-10T23:46:00+10:00"
+                    .parse()
+                    .expect("fixture timestamp"),
+            ),
             creation_time_original: String::new(),
             quote_id: 0,
             tradable: true,
@@ -1295,8 +1307,37 @@ mod mapping_tests {
                 position_id: "9999".into(),
                 order_id: "101".into(),
                 stake: 2.5,
+                entry_price: Some(1.1),
+                opened_at: Some("2026-08-10T13:46:00Z".parse().expect("fixture ts")),
             }
         );
+    }
+
+    /// The fill facts come off the POSITION's own record — `opening_price` and
+    /// `creation_time`, normalised to UTC — and never from the originating
+    /// order's trigger (`BUG-breakeven-arms-off-pre-fill-history.md`, Defect 2).
+    #[test]
+    fn open_position_carries_the_opening_price_and_time_in_utc() {
+        let mut p = position_with(1, 2, "NZD/CAD", "Sell", None, None);
+        p.opening_price = 0.82043;
+        let o = tn_position_to_open(&p);
+        assert_eq!(o.entry_price, Some(0.82043), "the FILL, not the trigger");
+        assert_eq!(
+            o.opened_at,
+            Some("2026-08-10T13:46:00Z".parse().expect("fixture ts")),
+            "Brisbane +10:00 normalised to UTC",
+        );
+    }
+
+    /// A missing broker timestamp stays `None`, never a fabricated epoch — a
+    /// bogus "long ago" would let pre-fill bars into a post-fill window.
+    #[test]
+    fn missing_creation_time_is_none_not_a_fabricated_timestamp() {
+        let mut p = position_with(1, 2, "EUR/USD", "Buy", None, None);
+        p.creation_time = None;
+        let o = tn_position_to_open(&p);
+        assert_eq!(o.opened_at, None);
+        assert_eq!(o.entry_price, Some(1.1), "the price is still known");
     }
 
     #[test]

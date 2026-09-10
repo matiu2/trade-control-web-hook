@@ -1,5 +1,6 @@
 //! Layer to interact with oanda.
 
+use chrono::{DateTime, Utc};
 use oanda_client::OandaClient;
 use oanda_client::orders::{
     LimitOrder, OrderPositionFill, OrderType, PendingOrder, StopLossDetails, StopOrder,
@@ -590,6 +591,12 @@ pub async fn amend_stop(
 
 /// Map an OANDA open [`Trade`] to a broker-agnostic [`OpenPosition`].
 /// Direction from the sign of `current_units`; SL/TP from dependent orders.
+///
+/// `entry_price` / `opened_at` come from `Trade.price` and `Trade.openTime` —
+/// the **execution** price and time OANDA recorded for the fill, not the
+/// originating order's trigger. An unparseable `openTime` yields `None` rather
+/// than a fabricated timestamp; callers that need a post-fill lower bound must
+/// treat `None` as "unknown", never as "beginning of time".
 fn oanda_trade_to_open(t: &Trade) -> OpenPosition {
     let units: f64 = t.current_units.parse().unwrap_or(0.0);
     OpenPosition {
@@ -604,6 +611,19 @@ fn oanda_trade_to_open(t: &Trade) -> OpenPosition {
         position_id: t.id.clone(),
         order_id: t.id.clone(),
         stake: units.abs(),
+        entry_price: Some(t.price),
+        opened_at: t
+            .open_time
+            .parse::<DateTime<Utc>>()
+            .map_err(|err| {
+                tracing::warn!(
+                    "oanda open trade {}: unparseable openTime {:?} ({err}) — post-fill \
+                     bounding will be unavailable for this position",
+                    t.id,
+                    t.open_time,
+                );
+            })
+            .ok(),
     }
 }
 
@@ -1034,7 +1054,7 @@ mod mapping_tests {
             instrument: instrument.into(),
             current_units: units.into(),
             price: 1.1,
-            open_time: String::new(),
+            open_time: "2026-08-10T23:46:00Z".into(),
             state: TradeState::Open,
             initial_units: units.into(),
             initial_margin_required: 0.0,
@@ -1080,8 +1100,41 @@ mod mapping_tests {
                 position_id: "t-1".into(),
                 order_id: "t-1".into(),
                 stake: 100.0,
+                entry_price: Some(1.1),
+                opened_at: Some("2026-08-10T23:46:00Z".parse().expect("fixture ts")),
             }
         );
+    }
+
+    /// The fill facts must come off the TRADE's own execution record — OANDA's
+    /// `Trade.price` / `Trade.openTime` — and not from the originating order's
+    /// trigger. `BUG-breakeven-arms-off-pre-fill-history.md` Defect 2 is exactly
+    /// the confusion between the two: the incident's stop-order trigger was
+    /// 0.82046 while the trade filled at 0.82043.
+    #[test]
+    fn open_position_carries_the_execution_price_and_time_not_the_trigger() {
+        let mut t = trade("t-3", "NZD_CAD", "-876934", Some(0.82527), Some(0.81531));
+        t.price = 0.82043;
+        t.open_time = "2026-08-10T23:46:00Z".into();
+        let o = oanda_trade_to_open(&t);
+        assert_eq!(o.entry_price, Some(0.82043), "the FILL, not the trigger");
+        assert_eq!(
+            o.opened_at,
+            Some("2026-08-10T23:46:00Z".parse().expect("fixture ts")),
+            "the FILL time, not the placement time",
+        );
+    }
+
+    /// An unparseable `openTime` must degrade to `None`, never to a fabricated
+    /// timestamp — a bogus epoch would read as "the fill was long ago" and let
+    /// pre-fill bars back into a post-fill window.
+    #[test]
+    fn unparseable_open_time_is_none_not_a_fabricated_timestamp() {
+        let mut t = trade("t-4", "EUR_USD", "100", None, None);
+        t.open_time = "not-a-timestamp".into();
+        let o = oanda_trade_to_open(&t);
+        assert_eq!(o.opened_at, None);
+        assert_eq!(o.entry_price, Some(1.1), "the price is still known");
     }
 
     #[test]

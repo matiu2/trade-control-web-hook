@@ -21,9 +21,17 @@
 //!    the accounts with joinable open positions (self-scoping).
 //! 2. For each open position, join back to its attempt and read the baked
 //!    [`BreakevenSnapshot`] (entry / TP / threshold / granularity).
-//! 3. Fetch the closed candles since the fill, find the one that ran furthest
-//!    toward TP, and ask the pure helper for the new stop.
-//! 4. If armed and not already at break-even, `amend_stop(entry)`.
+//! 3. Fetch a bounded candle window, keep only the bars that closed **at or
+//!    after the fill** (the broker's own `opened_at` on the open position),
+//!    find the one that ran furthest toward TP, and ask the pure decision for
+//!    the new stop.
+//! 4. If armed and not already at break-even, `amend_stop(fill_price)`.
+//!
+//! The decision itself — window bound, target price, noise floor — is pure and
+//! lives in [`crate::breakeven_decision`]; this module is the broker wiring
+//! around it. Both defects in `BUG-breakeven-arms-off-pre-fill-history.md` were
+//! in the wiring's own inline logic, unreachable by any test, which is why the
+//! decision was lifted out.
 //!
 //! Idempotency / one-way: the decision returns `None` when the stop is already
 //! at (or past, in the trade's favour) break-even, so re-running every tick is
@@ -46,15 +54,22 @@
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::{AmendError, Broker, Candle, Granularity, OpenPosition};
 use trade_control_core::order_control::join_position_to_attempt;
-use trade_control_core::state::{BreakevenSnapshot, EntryAttempt, StateStore};
+use trade_control_core::state::{EntryAttempt, StateStore};
 
+use crate::breakeven_decision::{
+    BREAKEVEN_MIN_ATR_FRACTION, BreakevenBlock, BreakevenDecision, BreakevenInputs, decide,
+};
 use crate::broker_handle::BrokerHandle;
 use crate::seam::CronEnv;
 
-/// How far back to look for closed candles when deciding a break-even arm. The
-/// arm is latched and idempotent, so we only need to catch a candle that closed
-/// past 50% at any point since the fill — but the broker candle pull is bounded,
-/// so we look back a generous window of the trade's own bars.
+/// How far back the broker candle **pull** reaches. This bounds the FETCH only
+/// — it is not, and must never again become, the window a break-even arms off.
+/// [`crate::breakeven_decision`] narrows these bars to the ones that closed at
+/// or after the fill; without that narrowing this constant is ~83 days of
+/// pre-fill history on H4, which is exactly how
+/// `BUG-breakeven-arms-off-pre-fill-history.md` happened. The pull stays
+/// generous so a long-running position still has ATR warmup and its full
+/// post-fill path in one request.
 const BREAKEVEN_LOOKBACK_BARS: i64 = 500;
 
 /// Walk every open position and move its stop to break-even when a candle has
@@ -125,9 +140,53 @@ async fn watch_account<C: CronEnv>(
     }
 }
 
+/// The two broker operations one position's break-even needs: read its candles
+/// and move its stop.
+///
+/// A seam, not an abstraction for its own sake. [`watch_one`] is where both
+/// live-money defects in `BUG-breakeven-arms-off-pre-fill-history.md` sat, and
+/// with a concrete [`BrokerHandle`] in its signature it could not be driven by
+/// a test at all — the pure decision could be proven correct while the wiring
+/// around it quietly amended anyway. This trait is what lets a test assert the
+/// thing that actually matters: *did the broker's stop move, and to what*.
+#[allow(async_fn_in_trait)]
+trait PositionBroker {
+    async fn candles(
+        &self,
+        instrument: &str,
+        granularity: Granularity,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<Vec<Candle>>;
+
+    async fn amend_stop(&self, account_id: &str, id: &str, new_stop: f64)
+    -> Result<(), AmendError>;
+}
+
+impl PositionBroker for BrokerHandle {
+    async fn candles(
+        &self,
+        instrument: &str,
+        granularity: Granularity,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<Vec<Candle>> {
+        fetch_candles(self, instrument, granularity, since, now).await
+    }
+
+    async fn amend_stop(
+        &self,
+        account_id: &str,
+        id: &str,
+        new_stop: f64,
+    ) -> Result<(), AmendError> {
+        amend(self, account_id, id, new_stop).await
+    }
+}
+
 /// Decide + (maybe) move one open position's stop to break-even.
-async fn watch_one(
-    broker: &BrokerHandle,
+async fn watch_one<B: PositionBroker>(
+    broker: &B,
     account: Option<&str>,
     attempts: &[EntryAttempt],
     position: &OpenPosition,
@@ -147,86 +206,103 @@ async fn watch_one(
         return;
     };
     let trade_id = attempt.trade_id.as_str();
+    let who = account.unwrap_or("<global>");
 
-    // Fetch the closed candles since (around) the fill at the trade's
-    // granularity, and find the close that ran furthest toward TP.
-    let Some(best_close) =
-        best_close_toward_tp(broker, &position.instrument, &snap, position, now).await
+    // Bounded FETCH — the lookback bounds the broker pull, nothing else. Which
+    // of these bars may *arm* is decided by `breakeven_decision`, against the
+    // fill time.
+    let since = now - Duration::seconds(snap.granularity.seconds() * BREAKEVEN_LOOKBACK_BARS);
+    let Some(candles) = broker
+        .candles(&position.instrument, snap.granularity, since, now)
+        .await
     else {
-        // No usable closed candle yet (just filled, or the pull failed) — try
-        // again next tick. Not an error worth shouting about every position.
+        // The pull failed — logged inside `fetch_candles`; retry next tick.
         return;
     };
 
-    let Some(new_stop) = snap.rule.decide_move(
-        position.direction,
-        snap.entry_price,
-        snap.take_profit,
+    let inputs = BreakevenInputs {
+        snapshot: &snap,
+        position,
         current_stop,
-        best_close,
-    ) else {
-        // Not armed yet, or already at break-even → nothing to do.
-        return;
+    };
+    let (new_stop, armed_by, armed_at) = match decide(&inputs, candles, now) {
+        BreakevenDecision::Hold => return,
+        BreakevenDecision::Blocked(BreakevenBlock::NoFillTime) => {
+            tracing::error!(
+                "breakeven watch[{who}]: trade={trade_id} id={} instrument={} — broker reported \
+                 no fill time for this position; REFUSING to arm break-even rather than arming \
+                 off pre-fill history (see BUG-breakeven-arms-off-pre-fill-history.md). The \
+                 original stop still protects the trade.",
+                position.order_id,
+                position.instrument,
+            );
+            return;
+        }
+        BreakevenDecision::Blocked(BreakevenBlock::InsideNoise {
+            new_stop,
+            reference_price,
+            distance,
+            floor,
+        }) => {
+            tracing::error!(
+                "breakeven watch[{who}]: trade={trade_id} id={} instrument={} — REFUSING \
+                 amend_stop to {new_stop}: it sits {distance} from the last close \
+                 {reference_price}, inside the {floor} noise floor ({}× ATR). A break-even this \
+                 close to market is not a scratch — something upstream produced a wrong target.",
+                position.order_id,
+                position.instrument,
+                BREAKEVEN_MIN_ATR_FRACTION,
+            );
+            return;
+        }
+        BreakevenDecision::Amend {
+            new_stop,
+            armed_by,
+            at,
+        } => (new_stop, armed_by, at),
     };
 
     // PRECONDITION-guarded amend: log the intent prominently so a demo run can
     // confirm `AmendCloseOrder`-on-open-position moved the SL (and left TP)
-    // before this is trusted live.
+    // before this is trusted live. `entry=` is the price the position actually
+    // FILLED at where the broker reports one — never the order trigger.
     tracing::info!(
-        "breakeven watch[{}]: INTENT amend_stop trade={trade_id} id={} instrument={} dir={:?} \
-         current_sl={current_stop} -> BE={new_stop} (entry={}, tp={}, best_close={best_close}) \
+        "breakeven watch[{who}]: INTENT amend_stop trade={trade_id} id={} instrument={} \
+         dir={:?} current_sl={current_stop} -> BE={new_stop} (entry={}, entry_source={}, \
+         tp={}, armed_by={armed_by} at {armed_at}, filled_at={:?}) \
          (DEMO-CONFIRM AmendCloseOrder-on-open-position before trusting live)",
-        account.unwrap_or("<global>"),
         position.order_id,
         position.instrument,
         position.direction,
-        snap.entry_price,
+        new_stop,
+        if position.entry_price.is_some() {
+            "broker-fill"
+        } else {
+            "placement-snapshot"
+        },
         snap.take_profit,
+        position.opened_at,
     );
-    match amend(broker, account.unwrap_or(""), &position.order_id, new_stop).await {
+    match broker
+        .amend_stop(account.unwrap_or(""), &position.order_id, new_stop)
+        .await
+    {
         Ok(()) => tracing::info!(
-            "breakeven watch[{}]: amend_stop ok trade={trade_id} id={} -> {new_stop} (break-even)",
-            account.unwrap_or("<global>"),
+            "breakeven watch[{who}]: amend_stop ok trade={trade_id} id={} -> {new_stop} \
+             (break-even)",
             position.order_id,
         ),
         Err(AmendError::NotFound) => tracing::info!(
-            "breakeven watch[{}]: amend_stop id={} not found (position closed?) trade={trade_id} — \
-             benign",
-            account.unwrap_or("<global>"),
+            "breakeven watch[{who}]: amend_stop id={} not found (position closed?) \
+             trade={trade_id} — benign",
             position.order_id,
         ),
         Err(err) => tracing::error!(
-            "breakeven watch[{}]: amend_stop trade={trade_id} id={} -> {new_stop} FAILED ({err}); \
-             will retry next tick",
-            account.unwrap_or("<global>"),
+            "breakeven watch[{who}]: amend_stop trade={trade_id} id={} -> {new_stop} FAILED \
+             ({err}); will retry next tick",
             position.order_id,
         ),
     }
-}
-
-/// Fetch the closed candles since the fill at the snapshot's granularity, and
-/// fold them into the close that ran *furthest toward TP* — the input the pure
-/// helper needs (a BE arm on a bar that has since retraced must not be missed,
-/// since BE is latched). Returns `None` when no closed candle is available.
-async fn best_close_toward_tp(
-    broker: &BrokerHandle,
-    instrument: &str,
-    snap: &BreakevenSnapshot,
-    position: &OpenPosition,
-    now: DateTime<Utc>,
-) -> Option<f64> {
-    let since = now - Duration::seconds(snap.granularity.seconds() * BREAKEVEN_LOOKBACK_BARS);
-    let candles = fetch_candles(broker, instrument, snap.granularity, since, now).await?;
-    // Only *closed* candles count ("a candle CLOSES past 50%"): a bar whose
-    // open time + one granularity is still in the future hasn't closed yet.
-    let bar = Duration::seconds(snap.granularity.seconds());
-    candles
-        .into_iter()
-        .filter(|c| c.time + bar <= now)
-        .map(|c| c.c)
-        .reduce(|a, b| {
-            trade_control_core::intent::Breakeven::more_progressed(position.direction, a, b)
-        })
 }
 
 async fn fetch_candles(
@@ -283,7 +359,9 @@ async fn amend(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use trade_control_core::intent::{Breakeven, Direction};
+    use trade_control_core::state::BreakevenSnapshot;
 
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().expect("valid rfc3339 fixture")
@@ -325,7 +403,228 @@ mod tests {
             position_id: position_id.into(),
             order_id: "ord-1".into(),
             stake: 1.0,
+            entry_price: Some(1.1000),
+            opened_at: Some(ts("2026-06-24T01:00:00Z")),
         }
+    }
+
+    /// A [`PositionBroker`] that records every amend instead of making one, so
+    /// a test can assert on what the LIVE PATH would have sent the broker —
+    /// not merely on what the pure decision returned.
+    ///
+    /// This exists because a mutation that made `watch_one` amend on a
+    /// `Blocked` decision **survived** every test of the pure `decide`: the
+    /// decision was right and the wiring ignored it. See
+    /// `BUG-breakeven-arms-off-pre-fill-history.md`.
+    struct SpyBroker {
+        candles: Vec<Candle>,
+        amends: RefCell<Vec<f64>>,
+    }
+
+    impl SpyBroker {
+        fn with(candles: Vec<Candle>) -> Self {
+            Self {
+                candles,
+                amends: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PositionBroker for SpyBroker {
+        async fn candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Option<Vec<Candle>> {
+            Some(self.candles.clone())
+        }
+
+        async fn amend_stop(
+            &self,
+            _account_id: &str,
+            _id: &str,
+            new_stop: f64,
+        ) -> Result<(), AmendError> {
+            self.amends.borrow_mut().push(new_stop);
+            Ok(())
+        }
+    }
+
+    fn bar(time: &str, close: f64) -> Candle {
+        Candle {
+            time: ts(time),
+            o: close,
+            h: close + 0.0010,
+            l: close - 0.0010,
+            c: close,
+        }
+    }
+
+    /// The NZD_CAD incident geometry as the live cron would see it: an attempt
+    /// carrying the trigger-priced snapshot, and an open position carrying the
+    /// broker's real fill.
+    fn incident_attempt() -> EntryAttempt {
+        let mut a = attempt_with_be(
+            "NZD_CAD",
+            Direction::Short,
+            None,
+            Some("2321"),
+            Some(BreakevenSnapshot {
+                rule: Breakeven::at_half(),
+                entry_price: 0.82046, // the TRIGGER, as placement snapshots it
+                take_profit: 0.81531,
+                granularity: Granularity::H4,
+            }),
+        );
+        a.instrument = "NZD_CAD".into();
+        a
+    }
+
+    fn incident_position() -> OpenPosition {
+        OpenPosition {
+            instrument: "NZD_CAD".into(),
+            direction: Direction::Short,
+            stop_loss: Some(0.82527),
+            take_profit: Some(0.81531),
+            position_id: "2321".into(),
+            order_id: "2321".into(),
+            stake: 876_934.0,
+            entry_price: Some(0.82043), // the FILL
+            opened_at: Some(ts("2026-08-10T23:46:00Z")),
+        }
+    }
+
+    /// **The incident, driven through the live entry point.** July bars that
+    /// close far past the arming level, a position that filled on 10 August,
+    /// six minutes of life. The broker must receive NO amend at all.
+    #[test]
+    fn the_live_path_sends_no_amend_for_a_pre_fill_arm() {
+        let attempts = vec![incident_attempt()];
+        let pos = incident_position();
+        // Every bar closes below the 0.81787 arming level, and every one of
+        // them predates the fill.
+        let candles: Vec<Candle> = (0..40)
+            .map(|i| Candle {
+                time: ts("2026-07-01T00:00:00Z") + Duration::hours(4 * i),
+                o: 0.80500,
+                h: 0.80600,
+                l: 0.80400,
+                c: 0.80500,
+            })
+            .collect();
+        let broker = SpyBroker::with(candles);
+        pollster::block_on(watch_one(
+            &broker,
+            None,
+            &attempts,
+            &pos,
+            ts("2026-08-10T23:52:00Z"),
+        ));
+        assert!(
+            broker.amends.borrow().is_empty(),
+            "the live path amended off pre-fill history: {:?}",
+            broker.amends.borrow(),
+        );
+    }
+
+    /// The mirror, so the test above cannot pass merely because `watch_one`
+    /// never amends anything: a genuine post-fill run must reach the broker —
+    /// **at the fill price, not the trigger**.
+    #[test]
+    fn the_live_path_amends_to_the_fill_on_a_genuine_arm() {
+        let attempts = vec![incident_attempt()];
+        let pos = incident_position();
+        let broker = SpyBroker::with(vec![
+            bar("2026-08-11T00:00:00Z", 0.81900),
+            bar("2026-08-11T04:00:00Z", 0.81700), // arms (< 0.81787)
+        ]);
+        pollster::block_on(watch_one(
+            &broker,
+            None,
+            &attempts,
+            &pos,
+            ts("2026-08-11T08:00:00Z"),
+        ));
+        let amends = broker.amends.borrow().clone();
+        assert_eq!(
+            amends.len(),
+            1,
+            "expected exactly one amend, got {amends:?}"
+        );
+        assert!(
+            (amends[0] - 0.82043).abs() < 1e-9,
+            "the live path amended to {} — 0.82046 is the trigger, 0.82043 is the fill",
+            amends[0],
+        );
+    }
+
+    /// A `Blocked` decision must reach the broker as *nothing*. This is the
+    /// wiring mutation that survived the pure-decision tests: the decision said
+    /// "refuse" and the caller amended anyway.
+    #[test]
+    fn the_live_path_sends_no_amend_when_the_decision_is_blocked() {
+        let attempts = vec![incident_attempt()];
+        let mut pos = incident_position();
+        // Broker reported no fill time → `BreakevenBlock::NoFillTime`.
+        pos.opened_at = None;
+        let broker = SpyBroker::with(vec![bar("2026-08-11T04:00:00Z", 0.81700)]);
+        pollster::block_on(watch_one(
+            &broker,
+            None,
+            &attempts,
+            &pos,
+            ts("2026-08-11T08:00:00Z"),
+        ));
+        assert!(
+            broker.amends.borrow().is_empty(),
+            "a Blocked decision must never reach the broker: {:?}",
+            broker.amends.borrow(),
+        );
+    }
+
+    /// The other `Blocked` variant, through the same entry point: a break-even
+    /// that would land on top of market is refused at the broker boundary.
+    #[test]
+    fn the_live_path_sends_no_amend_for_a_target_inside_noise() {
+        let mut attempt = incident_attempt();
+        attempt.breakeven = Some(BreakevenSnapshot {
+            rule: Breakeven::at_half(),
+            entry_price: 0.81700,
+            take_profit: 0.81000,
+            granularity: Granularity::H4,
+        });
+        let mut pos = incident_position();
+        pos.entry_price = Some(0.81700);
+        pos.opened_at = Some(ts("2026-06-30T00:00:00Z"));
+        pos.stop_loss = Some(0.82500);
+        // 40 warm bars for a judgeable ATR, an arming bar, then price returns
+        // right on top of the 0.81700 break-even target.
+        let mut candles: Vec<Candle> = (0..40)
+            .map(|i| Candle {
+                time: ts("2026-07-01T00:00:00Z") + Duration::hours(4 * i),
+                o: 0.81800,
+                h: 0.81900,
+                l: 0.81700,
+                c: 0.81800,
+            })
+            .collect();
+        candles.push(bar("2026-08-11T00:00:00Z", 0.81300));
+        candles.push(bar("2026-08-11T04:00:00Z", 0.81700));
+        let broker = SpyBroker::with(candles);
+        pollster::block_on(watch_one(
+            &broker,
+            None,
+            &[attempt],
+            &pos,
+            ts("2026-08-11T08:00:00Z"),
+        ));
+        assert!(
+            broker.amends.borrow().is_empty(),
+            "a break-even landing on market must never reach the broker: {:?}",
+            broker.amends.borrow(),
+        );
     }
 
     #[test]

@@ -1155,6 +1155,8 @@ mod tests {
             position_id: position_id.into(),
             order_id: order_id.into(),
             stake: 1.0,
+            entry_price: None,
+            opened_at: None,
         }
     }
 
