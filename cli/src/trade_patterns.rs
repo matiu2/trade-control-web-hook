@@ -1562,9 +1562,24 @@ fn build_mw_pattern(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
     // time against the live spread). The M/W entry/SL are pure functions of the
     // baked anchors + arm-time spread, so we can reject a too-tight stop before
     // signing — covers both tv-arm (which routes through here) and hand-crafted
-    // `build-trade --from-file` specs. Same constant + decision as the worker:
-    // `sl_spread_floor_violation`. (H&S has no build-time SL — it anchors to the
-    // fire-time signal extreme — so H&S relies on the worker gate alone.)
+    // `build-trade --from-file` specs. Shares the worker's CONSTANT
+    // (`sl_spread_floor_violation`) but DELIBERATELY NOT its decision: the
+    // fire-time gate salvages a too-tight stop by widening it
+    // (`widen_sl_to_spread_floor`), and M/W must never do that.
+    //
+    // Why no widen here: an M/W trade is exactly 1R BY CONSTRUCTION. In
+    // `mw_static_prices` the target is a reflection of the stop through the
+    // entry (`tp = entry + (entry - sl)`), so the SL is at once the minimum and
+    // the maximum stop the pattern admits. Widening it drags the TP out by the
+    // same distance, past what the double-top/bottom actually projects — the
+    // result is no longer an M/W trade. The widen's `min_r` re-check, which is
+    // what makes it safe for H&S (independent fixed TP), is vacuous here: R
+    // stays 1.0 however far the stop moves. So a pattern whose own stop sits
+    // inside 10x the spread is untradeable at that spread, and refusing to arm
+    // is the correct outcome. See BUG-mw-arm-time-spread-floor-no-widen.md.
+    //
+    // (H&S has no build-time SL — it anchors to the fire-time signal extreme —
+    // so H&S relies on the worker gate alone, where widening IS correct.)
     {
         let params = mw.to_params();
         let spread_price = params.spread_pips * params.pip_size;
