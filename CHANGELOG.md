@@ -1,5 +1,104 @@
 # Changelog
 
+## v143 — 2026-09-10 — an M/W enter deduped nowhere: `entry_dedup` splits the cap from the gate
+
+**Why.** On 2026-08-20 an EUR/GBP H1 M-top (plan `m-eur-gbp-642f7851`) placed
+and filled **three entries on three consecutive bars**, holding all three
+positions simultaneously — 3× the intended risk. Broker-confirmed on TradeNation
+demo (orders `26936222` / `26936430` / `26936584`). It stopped at exactly three
+only because of the blunt account-wide open-positions cap.
+
+Two individually-correct decisions met in a gap where nobody owned entry dedup.
+The engine deliberately never latches an `EveryBar` enter (M/W re-prices its
+resting order each bar, so the engine must keep firing) and says outright that
+"the worker's run_enter owns the actual placement/dedup". But `run_enter`
+entered the retry gate — the only thing that reconciles a fire against prior
+attempts — on the condition `max_retries != Static(0)`, and the M/W builder set
+exactly `Static(0)` to mean "a stop-out ends the setup". The delegated owner was
+never invoked. The `trade-already-open` rejection works fine; it was simply
+never reached.
+
+The defect is that `Static(0)` was **overloaded**: "don't re-enter after a
+stop-out" (a cap) and "skip the gate entirely" (dedup ownership) are different
+questions. For H&S they coincide by accident (`FireMode::Once` latches, so it
+truly cannot fire twice). M/W is the first pattern where they came apart.
+
+**What changed.**
+
+- New `Intent::entry_dedup` (`core/src/intent/entry_dedup.rs`), an
+  `Option<EntryDedup::{EngineLatched, GateOwned}>` that states dedup ownership
+  outright. The gate-entry condition in `core/src/dispatch/enter.rs` now reads
+  `effective_entry_dedup().needs_retry_gate()` and no longer looks at the cap.
+  **Absent is not the same as an explicit `EngineLatched`**: a present value is
+  authoritative in both directions, while an absent one (a pre-field intent) is
+  healed at read time by re-deriving the legacy `max_retries` rule — so every
+  plan already armed, and all 4041 corpus enters, keep the gate they had.
+  Healing only ever adds the gate, never removes it.
+- The M/W enter builder sets **both** halves: `GateOwned` (reconcile every bar,
+  re-pricing the resting order) and `max_retries: 1` (one entry — a stop-out
+  stays terminal). `build_enter_alert` sets `GateOwned` iff `max_retries > 0`,
+  so strategy-v2 multi-shot is unchanged.
+- Because `Intent` is built by struct literal in ~20 places, the new field is a
+  **compile error** at each until answered — a future pattern author cannot
+  recreate the gap by picking a cap.
+
+**Also fixed (found while fixing the above): cancel-then-reject at the cap.**
+The gate's `Pending` arm cancels the prior resting order and then falls through
+to `attempts.len() >= max_retries`. The cancelled row still counted, so at
+`max_retries: 1` the gate would cancel an order and then **reject its own
+replacement** — the rail `order_control::reprice` calls "never cancel an order
+you cannot re-place", reappearing inside the gate's own cap check rather than in
+a later gate (the 2026-08 reorder closed only the *other-gate* case). Latent
+because strategy-v2 runs with slack and **no test covered the combination**;
+under M/W it would have been every re-price bar. `EntryAttempt::superseded`
+marks an attempt cancelled-to-re-place, and the cap now counts entries into the
+market rather than rows. `next_attempt_no` also moved from `len() + 1` to
+`max(attempt_no) + 1` — `attempt_no` is row identity, and a count already
+collided after a sweep hard-delete.
+
+**Breaking.** None on the wire. `entry_dedup` is skip-serialized when absent, as
+is `EntryAttempt::superseded` (`false`), so pre-existing intents and stored rows
+keep their exact bytes — and, via the read-time healing, their behaviour.
+
+**Config.** M/W enters now emit `entry_dedup: gate_owned` and `max_retries: 1`
+(was: `max_retries` elided). Re-arming an M/W setup is required to pick this up;
+plans already armed keep the old, unguarded intent.
+
+**DB.** No SQL migration — `entry_attempt` stores one `jsonb` body, and the new
+field is `#[serde(default)]`. `StateStore::set_entry_attempt_superseded` follows
+the existing `set_entry_attempt_broker_trade_id` `jsonb_set` shape.
+
+**Tests.** `mw_everybar_dedup_tests` (`core/src/dispatch/enter.rs`) drives the
+real `run_enter` and asserts on broker traffic; arm-time coverage in
+`cli/src/trade_patterns.rs`; the previously-uncovered cancel-then-cap
+combination in `core/src/retry_gate.rs`. Mutation-tested — note the **first**
+version of the M/W tests survived reverting the fix (they all carried
+`max_retries: 1`, which the old condition also admits, so they never isolated
+the variable). `the_gate_is_entered_on_entry_dedup_alone_not_on_the_cap` is the
+discriminating test added to close that: identical caps, differing only in
+`entry_dedup`. **Seven** mutations run, all killed — including two on the
+healing itself, which is what forced `entry_dedup` to become an `Option`
+(healing on the bare enum left the value derivable from the cap in every case,
+and mutation 1 survived against that design).
+
+⚠️ **Corpus: 6 of 2759 cells diverge and are deliberately left UN-BLESSED**
+(`nzd-jpy-h1-2026-08-05-strategy-v2-*`, all six variants of one setup; the other
+1344 strategy-v2 cells are unchanged). Verified against the unmodified baseline:
+that fixture hit `retry-cap (5)` **22 times**, with four prior attempts logged
+`CANCELLED WITHOUT EVER FILLING` — and in strategy-v2 those cancels are the
+*designed* mechanism ("whichever of the two fires first wins: the retry gate
+cancels the other's resting order"). The cap was being eaten by orders that never
+entered the market. With the fix the plan takes 4 legs instead of 2
+(−2.00R → +1.23R), duplicates still refused by the open-position backstop. Since
+re-blessing is a live-money change to **strategy-v2** — wider than the M/W bug
+this release fixes — the decision is left to the operator. See the BUG doc's
+"Open decision".
+
+**Follow-up.** The account-wide open-positions cap remains the only backstop for
+a plan that somehow bypasses the gate; it is blunt (account-wide, not per-plan)
+and was what limited this incident to three. Worth considering a per-plan
+position count as defence-in-depth — not done here.
+
 ## v141 — 2026-09-09 — symmetric entry recovery, and entry failures say WHY
 
 Two changes to the same path: the recovery *default* (below) and the

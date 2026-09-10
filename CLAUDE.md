@@ -389,6 +389,70 @@ call for — and records a `CancelOutcome`:
 Every outcome lands in `LifecycleReport.cancel_failed`. Before this, a failed cancel
 appeared in *none* of the report's lists — invisible to the caller.
 
+### `max_retries` is a CAP, not a dedup switch — `entry_dedup` decides the gate
+
+Two different questions, and conflating them cost real money on 2026-08-20:
+
+1. **How many placements may this trade make?** → `max_retries`. A cap.
+2. **Can this enter fire more than once, so must each fire be reconciled
+   against prior attempts?** → **`Intent::entry_dedup`**
+   (`core/src/intent/entry_dedup.rs`). A dedup-ownership question.
+
+`run_enter`'s retry gate is the **only** thing that asks "is one of this
+trade's orders already resting / already filled". Entering it used to be
+conditional on `max_retries != Static(0)`, i.e. question 2 was *inferred* from
+question 1. For H&S the two coincide by accident (`FireMode::Once`, the engine
+latches, it truly cannot fire twice). For **M/W they come apart**: an M/W enter
+is `FireMode::EveryBar` — the engine deliberately never latches it, *because
+the worker is supposed to own the dedup* — yet its builder set `Static(0)` to
+mean "one placement only". That value was read as "no gate needed", so nothing
+anywhere deduped: three orders on three consecutive bars, all filled, 3× risk
+(EUR/GBP `m-eur-gbp-642f7851`; stopped only by the blunt account-wide
+open-positions cap). See `BUG-mw-everybar-enter-skips-retry-gate.md`.
+
+Rules a refactorer must preserve:
+
+- **The gate-entry condition asks `entry_dedup`, never the cap.** Do not
+  reintroduce a `max_retries` test at `core/src/dispatch/enter.rs`. An
+  `EveryBar` enter with a cap of 1 is a perfectly legitimate config (it *is*
+  M/W), and it must still reach the gate.
+- **`Option<EntryDedup>`: absent ≠ explicit `EngineLatched`, and that gap is
+  load-bearing.** Read it via `Intent::effective_entry_dedup()`, never the raw
+  field. **Present** ⇒ authoritative, obeyed in both directions (an explicit
+  `EngineLatched` is *not* second-guessed from the cap — that is what keeps the
+  two questions separate at runtime instead of re-deriving one from the other).
+  **Absent** ⇒ a pre-field intent, healed by re-deriving the legacy rule:
+  single-shot stays latched, multi-shot becomes gate-owned. Drop the healing and
+  every plan already armed — plus all 4041 corpus enters, all `max_retries: 5` —
+  silently loses its gate on deploy. Healing only ever *adds* the gate.
+- **A new enter-bearing pattern must answer question 2 explicitly.** `Intent`
+  is built by struct literal in ~20 places, so the field is a **compile error**
+  until it's answered — that is the point. Don't paper over it with
+  `..Default::default()`.
+- **M/W is `GateOwned` + `max_retries: 1`** — reconcile every bar (re-price the
+  resting order), but only ever one entry, so a stop-out stays terminal. Both
+  halves, or it's a bug: cap-without-owner is the original incident,
+  owner-without-cap-of-1 makes M/W re-entrant.
+- **`GateOwned` + `max_retries: 0` is incoherent** and the gate rejects it
+  (`max-retries-zero`). Set both together.
+
+⚠️ **A cancelled-to-re-price attempt must NOT burn a cap slot**
+(`EntryAttempt::superseded`). The gate's `Pending` arm cancels the resting
+order and then falls through to the cap; if the cancelled row still counted,
+the gate would **cancel an order and then reject its replacement** — the rail
+`order_control::reprice` calls "never cancel an order you cannot re-place",
+reappearing inside the gate's own cap check rather than in a later gate. Moving
+the gate last (2026-08) closed the *other-gate* case, not this one. Latent
+until M/W, where at `max_retries: 1` it is every re-price bar. Related:
+`next_attempt_no` is `max(attempt_no) + 1`, **not** a count — `attempt_no` is
+row identity (half the unique index `(account, trade_id, attempt_no)`), and a
+count collides with a live row after a sweep-delete.
+
+⚠️ **The replay could not have caught this.** It stops at one entry only
+because its fake broker has *its own* open-positions cap
+(`replay_candles/replay_broker.rs`) — masking, not agreement. A green fixture
+corpus is not evidence about entry dedup.
+
 ### "retry" / `max_retries` does NOT mean retrying failed placements
 
 This naming has bitten more than one debugging session. `max_retries`,

@@ -1541,6 +1541,7 @@ mod tests {
             clears: Vec::new(),
             trade_id: Some("sim-test".into()),
             max_retries: Tunable::Static(0),
+            entry_dedup: None,
             expiry_bars: None,
             allow_entry: None,
             allow_close: None,

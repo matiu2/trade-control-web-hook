@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 mod blackout;
 mod breakeven;
+mod entry_dedup;
 mod entry_level_veto;
 mod expiry;
 mod mw_resolution;
@@ -21,6 +22,8 @@ pub use blackout::{
     windows_from_session,
 };
 pub use breakeven::{Breakeven, DEFAULT_BREAKEVEN_THRESHOLD};
+pub use entry_dedup::EntryDedup;
+use entry_dedup::effective_entry_dedup;
 pub use entry_level_veto::{EntryLevelVeto, VetoSide};
 // `OffsetError` / `resolve_offset` are defined in this file (below) but
 // re-stated here in the doc-facing surface; no re-export needed since they're
@@ -611,6 +614,27 @@ pub struct Intent {
     /// retries should not be in the field in the first place).
     #[serde(default, skip_serializing_if = "is_default_max_retries")]
     pub max_retries: crate::tunable::Tunable<u32>,
+    /// **Who owns entry dedup for this enter** — see [`EntryDedup`].
+    ///
+    /// Deliberately a separate field from [`max_retries`](Self::max_retries),
+    /// which answers the different question "how many placements may this trade
+    /// make?". Conflating the two is what let an M/W (`FireMode::EveryBar`)
+    /// enter skip the retry gate and stack three simultaneous live positions on
+    /// 2026-08-20 — the enter's cap of one was read as "needs no dedup". See
+    /// `BUG-mw-everybar-enter-skips-retry-gate.md`.
+    ///
+    /// Defaults to [`EntryDedup::EngineLatched`] (the engine's `FireMode::Once`
+    /// latch guarantees a single fire, so no gate is needed), which keeps the
+    /// wire form and the behaviour of every pre-existing intent byte-identical.
+    /// [`EntryDedup::GateOwned`] requires a `trade_id`, enforced in
+    /// [`Self::validate`].
+    /// `None` = **absent on the wire** (an intent armed before this field
+    /// existed). That is NOT the same as an explicit `EngineLatched`, and the
+    /// difference is load-bearing: only an absent value is healed by
+    /// [`Self::effective_entry_dedup`], so a legacy multi-shot intent keeps its
+    /// gate while an explicit `EngineLatched` is obeyed as written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_dedup: Option<EntryDedup>,
     /// Optional bar-based expiry for a pending `enter` order. When set
     /// (1..=5), the worker derives a `cancel_at` for the resting order
     /// by indexing the shell's `next_candle_timestamp_1..5` menu (which
@@ -1041,6 +1065,13 @@ pub enum IntentValidationError {
     /// `max_retries` non-default on a non-Enter action — retries only
     /// make sense for `enter`.
     MaxRetriesOnNonEnter,
+    /// `entry_dedup: GateOwned` without a `trade_id` — the retry gate that
+    /// owns the dedup is keyed on `(account, trade_id)`, so there is nothing
+    /// to correlate prior attempts by without one.
+    EntryDedupWithoutTradeId,
+    /// `entry_dedup: GateOwned` on a non-Enter action — entry dedup only
+    /// means anything for `enter`.
+    EntryDedupOnNonEnter,
     /// `allow_entry: Some(_)` on a non-Enter action — the gate is
     /// only checked on `enter`.
     AllowEntryOnNonEnter,
@@ -1157,6 +1188,12 @@ impl core::fmt::Display for IntentValidationError {
                 f.write_str("max_retries requires trade_id to be set")
             }
             Self::MaxRetriesOnNonEnter => f.write_str("max_retries is only valid on action: enter"),
+            Self::EntryDedupWithoutTradeId => {
+                f.write_str("entry_dedup: gate_owned requires trade_id to be set")
+            }
+            Self::EntryDedupOnNonEnter => {
+                f.write_str("entry_dedup: gate_owned is only valid on action: enter")
+            }
             Self::AllowEntryOnNonEnter => f.write_str("allow_entry is only valid on action: enter"),
             Self::AllowCloseOnNonClose => f.write_str("allow_close is only valid on action: close"),
             Self::NeedsGoldenOnDisallowedAction => {
@@ -1229,6 +1266,18 @@ impl core::fmt::Display for IntentValidationError {
 impl std::error::Error for IntentValidationError {}
 
 impl Intent {
+    /// Who owns entry dedup for this enter, **healed for pre-field intents**.
+    ///
+    /// Always use this rather than reading [`Self::entry_dedup`] directly when
+    /// deciding whether to run the retry gate. An intent minted before the field
+    /// existed carries no value, and serde's default (`EngineLatched`) is only
+    /// correct for the single-shot case — a legacy MULTI-shot intent was
+    /// gate-owned under the old `max_retries != Static(0)` rule, and must stay
+    /// so. See [`entry_dedup::effective_entry_dedup`].
+    pub fn effective_entry_dedup(&self) -> EntryDedup {
+        effective_entry_dedup(self.entry_dedup, &self.max_retries)
+    }
+
     /// Post-deserialise validation for fields that have a shape contract
     /// beyond what serde can express. Called by the incoming-payload
     /// pipeline; the field-by-field deser still works on its own so
@@ -1274,6 +1323,17 @@ impl Intent {
             }
             if self.action != Action::Enter {
                 return Err(IntentValidationError::MaxRetriesOnNonEnter);
+            }
+        }
+        // Gate-owned dedup: the gate correlates prior attempts by
+        // `(account, trade_id)` and only ever runs on the enter path, so both
+        // are hard requirements rather than silently-ignored config.
+        if self.entry_dedup == Some(EntryDedup::GateOwned) {
+            if self.trade_id.is_none() {
+                return Err(IntentValidationError::EntryDedupWithoutTradeId);
+            }
+            if self.action != Action::Enter {
+                return Err(IntentValidationError::EntryDedupOnNonEnter);
             }
         }
         if self.allow_entry.is_some() && self.action != Action::Enter {
@@ -3792,6 +3852,61 @@ mod tests {
         intent.validate().unwrap();
         let back = serde_yaml::to_string(&intent).unwrap();
         assert!(back.contains("max_retries: 3"));
+    }
+
+    /// `entry_dedup` is a SIGNED field: it round-trips through the wire, and a
+    /// body that never set it stays byte-identical to a pre-feature one (no
+    /// `entry_dedup:` line at all). The elision is asserted, not assumed —
+    /// dropping `skip_serializing_if` still compiles and still round-trips, so
+    /// only an explicit "the key is absent" check catches it.
+    #[test]
+    fn entry_dedup_round_trips_and_is_elided_when_absent() {
+        let base = r#"{
+            "v": 1,
+            "id": "t-1",
+            "not_after": "2026-06-01T00:00:00Z",
+            "action": "enter",
+            "instrument": "EUR_USD",
+            "trade_id": "t-1"
+        }"#;
+        let absent: Intent = serde_json::from_str(base).expect("parse");
+        assert_eq!(absent.entry_dedup, None);
+        let out = serde_json::to_string(&absent).expect("serialize");
+        assert!(
+            !out.contains("entry_dedup"),
+            "an absent entry_dedup must not appear on the wire: {out}"
+        );
+
+        let with = base.replace(
+            r#""trade_id": "t-1""#,
+            r#""trade_id": "t-1", "entry_dedup": "gate_owned""#,
+        );
+        let parsed: Intent = serde_json::from_str(&with).expect("parse gate_owned");
+        assert_eq!(parsed.entry_dedup, Some(EntryDedup::GateOwned));
+        let out = serde_json::to_string(&parsed).expect("serialize");
+        assert!(out.contains(r#""entry_dedup":"gate_owned""#), "{out}");
+    }
+
+    /// `gate_owned` needs a `trade_id` — the gate correlates prior attempts by
+    /// `(account, trade_id)`, so there is nothing to key on without one.
+    #[test]
+    fn validate_rejects_gate_owned_without_trade_id() {
+        let intent: Intent = serde_json::from_str(
+            r#"{
+                "v": 1,
+                "id": "t-1",
+                "not_after": "2026-06-01T00:00:00Z",
+                "action": "enter",
+                "instrument": "EUR_USD",
+                "entry_dedup": "gate_owned"
+            }"#,
+        )
+        .expect("parse");
+        assert!(matches!(
+            intent.validate(),
+            Err(IntentValidationError::EntryDedupWithoutTradeId
+                | IntentValidationError::MissingTradeId)
+        ));
     }
 
     #[test]

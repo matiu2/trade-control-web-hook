@@ -62,14 +62,24 @@
 //! 3. Enforce the placement cap. Crucially: only the `EntryAttempt`
 //!    rows count — strategy-side gates that prevent a placement
 //!    (cooldown, prep order, veto, `allow_entry` script) don't burn a
-//!    slot. This is also what the `attempts.len() >= max_retries`
-//!    check expresses naturally: we count attempts that actually
-//!    reached `place_entry`.
+//!    slot, because we count attempts that actually reached
+//!    `place_entry`. **Nor do superseded rows**: an attempt this gate
+//!    cancelled unfilled in job 2, to re-place at a new price, opened no
+//!    position and is excluded (`EntryAttempt::superseded`). Counting it
+//!    would let the cap reject the very replacement the cancel was made
+//!    for — cancel-then-reject, an order destroyed with nothing to put
+//!    back. At `max_retries: 1` (M/W) that is every re-price bar, not an
+//!    edge case.
 //!
-//! When `intent.max_retries` is the default `Static(0)`, callers must
-//! skip this module entirely — the byte-for-byte single-shot
-//! behaviour predates the gate and is verified by an explicit
-//! regression test in the worker suite.
+//! **Who reaches this gate is `Intent::effective_entry_dedup()`, NOT
+//! `max_retries`.** `EntryDedup::EngineLatched` skips this module entirely —
+//! the engine's `FireMode::Once` latch already guarantees a single fire, and
+//! the byte-for-byte single-shot behaviour predates the gate. Only
+//! `EntryDedup::GateOwned` comes here. Those are two different questions
+//! ("can this enter fire twice?" vs "how many entries may it place?") and
+//! inferring the first from the second is what let an M/W `EveryBar` enter
+//! skip this gate and stack three live positions on 2026-08-20 — see
+//! `BUG-mw-everybar-enter-skips-retry-gate.md`.
 
 use crate::broker::{AttemptState, Broker, LookupError};
 use crate::intent::{Intent, Shell};
@@ -133,11 +143,10 @@ fn resolve_max_retries(tunable: &Tunable<u32>, shell: &Shell) -> Result<u32, Ret
     })
 }
 
-/// Walk the gate. See module docs for the algorithm. Only call this
-/// when `intent.max_retries` is non-default (i.e. not `Static(0)`) —
-/// the caller is responsible for keeping the single-shot path free of
-/// any state-store / broker lookups so the byte-identical baseline
-/// holds.
+/// Walk the gate. See module docs for the algorithm. Only call this when
+/// `intent.effective_entry_dedup().needs_retry_gate()` — the caller is responsible for
+/// keeping the engine-latched path free of any state-store / broker lookups so
+/// the byte-identical baseline holds.
 pub async fn evaluate<B: Broker, S: StateStore>(
     broker: &B,
     store: &S,
@@ -220,6 +229,11 @@ pub async fn evaluate<B: Broker, S: StateStore>(
         return outcome;
     }
 
+    // Attempts this pass has just superseded (cancelled-to-replace). The store
+    // write above updates the persisted row, but `attempts` was read before it,
+    // so the cap check below reads this list too rather than re-fetching.
+    let mut superseded_now: Vec<u32> = Vec::new();
+
     // Walk newest-first. The plan's collapse rule: stop at the first
     // attempt whose state blocks a placement, otherwise (open, raced
     // cancel) bubble it back as a 412; on a pending we cancel and
@@ -237,7 +251,31 @@ pub async fn evaluate<B: Broker, S: StateStore>(
             Ok(AttemptState::Pending) => {
                 let acct = account.unwrap_or("");
                 match broker.cancel_order(acct, &attempt.broker_order_id).await {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        // This order came off the book WITHOUT EVER FILLING, and
+                        // the caller places a replacement immediately. It opened
+                        // no position, so it must not consume a placement-cap
+                        // slot — otherwise the cap can reject the very
+                        // replacement this cancel was made for, destroying a
+                        // live order with nothing to put back (the rail
+                        // `order_control::reprice` states as "never cancel an
+                        // order you cannot re-place"). At `max_retries: 1` —
+                        // the M/W config — that is not an edge case, it is
+                        // every single re-price bar.
+                        if let Err(err) = store
+                            .set_entry_attempt_superseded(account, trade_id, attempt.attempt_no)
+                            .await
+                        {
+                            // Fail SAFE: without the mark the cap may reject the
+                            // replacement, which forfeits a setup but never
+                            // stacks a duplicate. Placing anyway on an unwritten
+                            // mark is the unsafe direction, so we continue and
+                            // let the cap decide.
+                            tracing::error!("KV set_entry_attempt_superseded: {err}");
+                        }
+                        superseded_now.push(attempt.attempt_no);
+                        break;
+                    }
                     Err(_) => {
                         // Race: order may have filled between observing
                         // Pending and our cancel. Re-lookup to find out.
@@ -270,6 +308,14 @@ pub async fn evaluate<B: Broker, S: StateStore>(
                                     outcome: "rejected: raced-with-cancel".into(),
                                 };
                             }
+                            // Cancelled / closed after a FAILED cancel. Not
+                            // marked superseded, deliberately: our cancel
+                            // errored, so we did not withdraw this order to
+                            // replace it — it came off the book on its own (or
+                            // filled and closed). Only a cancel WE made
+                            // successfully, on the understanding that a
+                            // replacement follows immediately, earns the
+                            // cap-slot refund. Conservative: it keeps counting.
                             Ok(_) => break,
                             Err(LookupError::Transient) => {
                                 return RetryGateOutcome::Rejected {
@@ -365,7 +411,17 @@ pub async fn evaluate<B: Broker, S: StateStore>(
         }
     }
 
-    if attempts.len() as u32 >= max_retries {
+    // The cap counts ENTRIES INTO THE MARKET, not rows. A superseded attempt is
+    // an order that was cancelled unfilled and immediately replaced at a new
+    // price — it opened nothing, so charging it a slot would let the cap reject
+    // the replacement its own cancel was made for. See
+    // `EntryAttempt::superseded` and
+    // `BUG-mw-everybar-enter-skips-retry-gate.md`.
+    let placed_entries = attempts
+        .iter()
+        .filter(|a| !a.superseded && !superseded_now.contains(&a.attempt_no))
+        .count() as u32;
+    if placed_entries >= max_retries {
         return RetryGateOutcome::Rejected {
             status: 429,
             message: "retry cap reached",
@@ -373,9 +429,13 @@ pub async fn evaluate<B: Broker, S: StateStore>(
         };
     }
 
-    RetryGateOutcome::Proceed {
-        next_attempt_no: attempts.len() as u32 + 1,
-    }
+    // `attempt_no` is ROW IDENTITY, not a counter — it is half the unique index
+    // `(account, trade_id, attempt_no)`. Derive the next one from the highest
+    // in use rather than from a count, so it can never collide with a live row.
+    // (A count collides after the sweep hard-deletes an expired attempt, and
+    // would collide again now that the cap ignores superseded rows.)
+    let next_attempt_no = attempts.iter().map(|a| a.attempt_no).max().unwrap_or(0) + 1;
+    RetryGateOutcome::Proceed { next_attempt_no }
 }
 
 /// Independent open-position backstop for the retry gate (Bug #11).
@@ -509,6 +569,7 @@ pub async fn record_placement<S: StateStore>(
         // as the fields above: the cron finds an order at the broker and has no
         // intent in hand.
         order_control,
+        superseded: false,
     };
     if let Err(err) = store.record_entry_attempt(attempt).await {
         tracing::error!("KV record_entry_attempt: {err}");
@@ -688,6 +749,7 @@ mod tests {
         mark_retry_calls: RefCell<u32>,
         record_calls: RefCell<u32>,
         set_btid_calls: RefCell<u32>,
+        set_superseded_calls: RefCell<u32>,
     }
 
     impl CountingStore {
@@ -925,6 +987,22 @@ mod tests {
                 && let Some(row) = list.iter_mut().find(|a| a.attempt_no == attempt_no)
             {
                 row.broker_trade_id = Some(broker_trade_id.to_string());
+            }
+            Ok(())
+        }
+        async fn set_entry_attempt_superseded(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            attempt_no: u32,
+        ) -> Result<(), StateError> {
+            *self.set_superseded_calls.borrow_mut() += 1;
+            let key = Self::attempt_key(account, trade_id);
+            let mut map = self.attempts.borrow_mut();
+            if let Some(list) = map.get_mut(&key)
+                && let Some(row) = list.iter_mut().find(|a| a.attempt_no == attempt_no)
+            {
+                row.superseded = true;
             }
             Ok(())
         }
@@ -1198,6 +1276,10 @@ mod tests {
             clears: Vec::new(),
             trade_id: Some("trade-xyz".into()),
             max_retries,
+            // These tests call `evaluate` directly, so this field does not
+            // gate their entry — but the fixture models an intent that
+            // REACHES the gate, and the only intents that do are gate-owned.
+            entry_dedup: Some(crate::intent::EntryDedup::GateOwned),
             expiry_bars: None,
             allow_entry: None,
             allow_close: None,
@@ -1903,6 +1985,165 @@ mod tests {
 
         let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
         assert_rejected(out, 429, "retry-cap (1)");
+    }
+
+    /// THE RAIL, inside the gate's own cap. A cap-1 trade whose single prior
+    /// attempt is still RESTING: the gate cancels that order to re-price it, so
+    /// it must then PROCEED — cancelling and then rejecting at the cap would
+    /// destroy a live order with nothing to put back.
+    ///
+    /// This is the combination no test covered before (every prior cap test
+    /// drove the walk with collapsed states, so the cancel and the 429 never
+    /// met). It is also the M/W steady state: one resting order, re-priced
+    /// every bar.
+    #[test]
+    fn a_cancelled_to_reprice_attempt_does_not_burn_the_cap_slot() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(1);
+
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "order-1",
+            Direction::Long,
+            1.05,
+            None,
+            None,
+            None,
+        ));
+        // The prior order is still on the book, so the gate cancels it.
+        broker.push_lookup(AttemptState::Pending);
+        broker.push_cancel_ok();
+
+        let out = run(evaluate(
+            &broker,
+            &store,
+            &intent,
+            &shell_at(ts("2026-05-25T14:00:00Z")),
+        ));
+        // It MUST proceed: a cancel that is not followed by a placement is the
+        // rail violation.
+        assert_proceed(out, 2);
+        assert_eq!(
+            broker.cancel_calls.borrow().len(),
+            1,
+            "the stale order should have been cancelled exactly once"
+        );
+        assert_eq!(
+            *store.set_superseded_calls.borrow(),
+            1,
+            "the cancelled attempt must be MARKED superseded, or the next bar's \
+             cap check charges it a slot all over again"
+        );
+    }
+
+    /// The mark must PERSIST, not just hold within one pass: a later bar re-reads
+    /// the rows, so a superseded attempt has to still be excluded from the cap
+    /// on the next fire. Otherwise M/W re-prices once and then jams at 429.
+    #[test]
+    fn a_superseded_attempt_stays_excluded_on_a_later_bar() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(1);
+
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "order-1",
+            Direction::Long,
+            1.05,
+            None,
+            None,
+            None,
+        ));
+        broker.push_lookup(AttemptState::Pending);
+        broker.push_cancel_ok();
+        assert_proceed(
+            run(evaluate(
+                &broker,
+                &store,
+                &intent,
+                &shell_at(ts("2026-05-25T14:00:00Z")),
+            )),
+            2,
+        );
+        // Bar 3: attempt #1 is a persisted superseded row, #2 is the live
+        // resting order the gate now cancels in turn.
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T14:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T14:00:01Z"),
+            2,
+            "order-2",
+            Direction::Long,
+            1.05,
+            None,
+            None,
+            None,
+        ));
+        broker.push_lookup(AttemptState::Pending);
+        broker.push_cancel_ok();
+        assert_proceed(
+            run(evaluate(
+                &broker,
+                &store,
+                &intent,
+                &shell_at(ts("2026-05-25T15:00:00Z")),
+            )),
+            3,
+        );
+    }
+
+    /// A superseded row must not be re-used as an `attempt_no`. `attempt_no` is
+    /// half the unique index `(account, trade_id, attempt_no)`, so deriving the
+    /// next one from a FILTERED count would collide with a live row and the
+    /// upsert would overwrite it.
+    #[test]
+    fn next_attempt_no_never_collides_with_a_superseded_row() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(3);
+
+        for n in 1..=2u32 {
+            run(record_placement(
+                &store,
+                &intent,
+                ts("2026-05-25T13:00:00Z"),
+                intent.not_after,
+                ts("2026-05-25T13:00:01Z"),
+                n,
+                &format!("order-{n}"),
+                Direction::Long,
+                1.05,
+                None,
+                None,
+                None,
+            ));
+        }
+        // Newest (#2) is resting → cancelled + superseded. #1 already closed.
+        broker.push_lookup(AttemptState::Pending);
+        broker.push_cancel_ok();
+
+        let out = run(evaluate(
+            &broker,
+            &store,
+            &intent,
+            &shell_at(ts("2026-05-25T15:00:00Z")),
+        ));
+        // Two rows exist, so the next id is 3 — NOT 2 (which a filtered count
+        // would produce, clobbering the row just superseded).
+        assert_proceed(out, 3);
     }
 
     /// Backstop correlation on the stored entry `order_id` (the other half

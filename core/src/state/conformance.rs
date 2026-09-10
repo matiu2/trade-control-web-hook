@@ -643,6 +643,7 @@ fn sample_attempt(
         blackout_close: BlackoutCloseAction::default(),
         breakeven: None,
         order_control: None,
+        superseded: false,
     }
 }
 

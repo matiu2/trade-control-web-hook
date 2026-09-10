@@ -342,6 +342,7 @@ mod tests {
             blackout_close,
             breakeven: None,
             order_control: None,
+            superseded: false,
         }
     }
 
