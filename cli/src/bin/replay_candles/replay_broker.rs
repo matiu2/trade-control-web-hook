@@ -990,6 +990,17 @@ impl Broker for ReplayBroker {
         //    offline proxy for the account-wide count, and conservative (it can
         //    only reject, never over-fill). Advance to the current `as_of` first so
         //    a fill/close that happened by this bar is reflected.
+        //
+        //    ⚠️ This is an ACCOUNT-WIDE BACKSTOP, not entry dedup, and it must
+        //    not be mistaken for one. Until 2026-09 it was the only reason a
+        //    replayed M/W plan stopped at one entry — the enter skipped the
+        //    retry gate entirely, so the duplicates were suppressed here by a
+        //    cap rather than refused by a gate. That MASKED the live bug (three
+        //    simultaneous EUR/GBP positions, 2026-08-20) rather than agreeing
+        //    with live. Per-plan dedup is `retry_gate::evaluate`, reached via
+        //    `Intent::entry_dedup`; see
+        //    `BUG-mw-everybar-enter-skips-retry-gate.md`. A green fixture
+        //    corpus is not evidence about entry dedup.
         self.advance(*self.as_of.borrow());
         let open_now = self.open.borrow().len();
         if open_now as u32 >= max_open_positions {

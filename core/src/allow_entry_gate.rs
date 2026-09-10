@@ -187,6 +187,7 @@ mod tests {
             clears: Vec::new(),
             trade_id: None,
             max_retries: crate::tunable::Tunable::Static(0),
+            entry_dedup: None,
             expiry_bars: None,
             allow_entry: gate,
             allow_close: None,

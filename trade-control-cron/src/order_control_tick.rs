@@ -418,6 +418,7 @@ mod tests {
             blackout_close: Default::default(),
             breakeven: None,
             order_control: snapshot,
+            superseded: false,
         }
     }
 

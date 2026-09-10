@@ -1786,8 +1786,13 @@ fn build_mw_overshoot_alert(
 /// `05-enter` for M / W. A per-bar stop entry carrying the baked `mw`
 /// params; the worker derives entry/SL/TP from them + the live shell, so
 /// `entry`, `stop_loss`, and `take_profit` are all left `None`. Gated by
-/// the three M/W vetos and no preps. `max_retries: 0` — a stop-out is
-/// terminal (no re-entry).
+/// the three M/W vetos and no preps.
+///
+/// `max_retries: 1` + `entry_dedup: GateOwned` — ONE placement (a stop-out is
+/// terminal, no re-entry), but the retry gate owns dedup because the M/W enter
+/// is `FireMode::EveryBar` and re-prices its resting order each bar. Do not
+/// collapse those two back into a single value; see
+/// `BUG-mw-everybar-enter-skips-retry-gate.md`.
 #[allow(clippy::too_many_arguments)]
 fn build_mw_enter_alert(
     instrument: &str,
@@ -1843,8 +1848,22 @@ fn build_mw_enter_alert(
     if dry_run {
         intent.dry_run = Some(true);
     }
-    // Single-shot: a stop-out ends the setup. No re-entry, no preps.
-    intent.max_retries = trade_control_core::tunable::Tunable::Static(0);
+    // ONE placement only — a stop-out ends the setup. No re-entry, no preps.
+    //
+    // The cap and the DEDUP OWNER are two different questions, and answering
+    // only the first is what caused the 2026-08-20 EUR/GBP triple-entry
+    // (`BUG-mw-everybar-enter-skips-retry-gate.md`). An M/W enter is
+    // `FireMode::EveryBar` — the engine deliberately never latches it, because
+    // M/W recomputes its geometry from each new shell and a resting order
+    // should track it — so `run_enter`'s retry gate MUST own the dedup:
+    // re-price the resting order each bar, reject once one is filled.
+    //
+    // `max_retries: 1` is the cap that keeps a stop-out terminal; the gate
+    // walks past a closed attempt and then rejects at the cap. `GateOwned` is
+    // what actually gets the gate invoked. Setting the cap WITHOUT the owner
+    // (the old `Static(0)`) silently disabled every duplicate check there is.
+    intent.max_retries = trade_control_core::tunable::Tunable::Static(1);
+    intent.entry_dedup = Some(trade_control_core::intent::EntryDedup::GateOwned);
     intent.allow_entry = allow_entry.map(trade_control_core::tunable::Tunable::from_script);
     intent.needs_golden = needs_golden;
     intent.needs_confirmed = needs_confirmed;
@@ -2006,6 +2025,10 @@ fn skeleton(
         account: Some(account.to_string()),
         trade_id: Some(trade_id.to_string()),
         max_retries: trade_control_core::tunable::Tunable::Static(0),
+        // Default: the engine's `FireMode::Once` latch guarantees a single
+        // fire. Any builder whose enter is `FireMode::EveryBar` (M/W) or
+        // multi-shot MUST override this to `GateOwned` — see `EntryDedup`.
+        entry_dedup: None,
         expiry_bars: None,
         allow_entry: None,
         allow_close: None,
@@ -2441,6 +2464,21 @@ fn build_enter_alert(
         intent.dry_run = Some(true);
     }
     intent.max_retries = trade_control_core::tunable::Tunable::Static(max_retries);
+    // A multi-shot enter fires on many bars, so the retry gate owns its dedup;
+    // a single-shot enter is `FireMode::Once` and the engine latches it, so it
+    // needs no gate (and must keep making zero extra broker/state calls).
+    //
+    // This is the ONE place the two questions legitimately track each other —
+    // and even here they are stated separately rather than one being inferred
+    // from the other downstream. See `EntryDedup` and
+    // `BUG-mw-everybar-enter-skips-retry-gate.md`.
+    intent.entry_dedup = if max_retries == 0 {
+        // Absent, not an explicit `EngineLatched`: a single-shot enter's wire
+        // form stays byte-identical to every intent minted before this field.
+        None
+    } else {
+        Some(trade_control_core::intent::EntryDedup::GateOwned)
+    };
     intent.expiry_bars = expiry_bars.map(trade_control_core::tunable::Tunable::Static);
     intent.allow_entry = allow_entry.map(trade_control_core::tunable::Tunable::from_script);
     intent.needs_golden = needs_golden;
@@ -4383,6 +4421,81 @@ mod tests {
         assert!(err.to_string().contains("must not carry `mw`"), "got {err}");
     }
 
+    /// THE ARM-TIME HALF of `BUG-mw-everybar-enter-skips-retry-gate.md`.
+    ///
+    /// An M/W enter is `FireMode::EveryBar` — the engine never latches it — so
+    /// the signed intent MUST hand dedup to the retry gate. It must also keep a
+    /// cap of exactly one placement: a stop-out stays terminal.
+    ///
+    /// Both halves are asserted together because either alone is a bug: the cap
+    /// without the owner is the original incident (nothing dedups, entries
+    /// stack), and the owner without a cap of 1 would make M/W re-entrant.
+    #[test]
+    fn mw_enter_hands_dedup_to_the_gate_with_a_one_placement_cap() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
+        spec.mw = Some(sample_mw());
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict)
+            .expect("a well-formed M spec builds");
+        let enter = trade
+            .alerts
+            .iter()
+            .find(|a| a.intent.action == Action::Enter)
+            .expect("the M/W trade has an enter alert");
+        assert_eq!(
+            enter.intent.entry_dedup,
+            Some(trade_control_core::intent::EntryDedup::GateOwned),
+            "an EveryBar M/W enter must route through the retry gate — without \
+             this NOTHING dedups its placements (2026-08-20: three simultaneous \
+             live positions on EUR/GBP)"
+        );
+        assert!(
+            matches!(
+                enter.intent.max_retries,
+                trade_control_core::tunable::Tunable::Static(1)
+            ),
+            "M/W caps at ONE placement — a stop-out ends the setup, got {:?}",
+            enter.intent.max_retries
+        );
+    }
+
+    /// The mirror: a single-shot H&S enter is `FireMode::Once` and the engine
+    /// latches it, so it must stay OFF the gate. This is what keeps the fix a
+    /// no-op for H&S — routing it through the gate would add broker/state calls
+    /// to the byte-identical baseline.
+    #[test]
+    fn single_shot_hs_enter_stays_engine_latched() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        assert_eq!(spec.max_retries, 0, "the sample H&S spec is single-shot");
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let enter = trade
+            .alerts
+            .iter()
+            .find(|a| a.intent.action == Action::Enter)
+            .expect("enter alert");
+        assert_eq!(enter.intent.entry_dedup, None,);
+    }
+
+    /// A multi-shot H&S/strategy-v2 enter DOES need the gate — it fires on many
+    /// bars by design. Pins that the two fields move together on this path.
+    #[test]
+    fn multi_shot_enter_hands_dedup_to_the_gate() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.max_retries = 5;
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let enter = trade
+            .alerts
+            .iter()
+            .find(|a| a.intent.action == Action::Enter)
+            .expect("enter alert");
+        assert_eq!(
+            enter.intent.entry_dedup,
+            Some(trade_control_core::intent::EntryDedup::GateOwned),
+        );
+    }
+
     /// A well-formed M (short) path geometry for tests. Worked numbers
     /// from `mw_geometry`: A=1.1000, B=1.1200, C=1.1120.
     fn sample_mw() -> MwSpec {
@@ -4507,10 +4620,21 @@ mod tests {
                 "trade-expiry".to_string(),
             ]
         );
+        // ONE placement, and the retry gate owns the dedup. This asserted
+        // `Static(0)` until 2026-09: that value capped placements at one AND
+        // (because the gate-entry condition read it) switched the gate off, so
+        // an EveryBar M/W enter deduped nowhere and stacked three live
+        // positions. The cap moved to an explicit `1` and the owner to its own
+        // field. See `BUG-mw-everybar-enter-skips-retry-gate.md` and
+        // `mw_enter_hands_dedup_to_the_gate_with_a_one_placement_cap`.
         assert!(matches!(
             enter.max_retries,
-            trade_control_core::tunable::Tunable::Static(0)
+            trade_control_core::tunable::Tunable::Static(1)
         ));
+        assert_eq!(
+            enter.entry_dedup,
+            Some(trade_control_core::intent::EntryDedup::GateOwned)
+        );
         enter.validate().expect("mw enter intent valid");
     }
 

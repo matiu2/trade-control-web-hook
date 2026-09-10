@@ -934,6 +934,30 @@ impl PgStateStore {
         .map_err(backend)?;
         Ok(())
     }
+
+    /// Mark an attempt superseded — its resting order was cancelled by the
+    /// retry gate so a fresh placement could replace it. Same read-modify-write
+    /// `jsonb_set` shape as `set_entry_attempt_broker_trade_id_impl` (the row is
+    /// one jsonb body, so there is no column and no migration). Idempotent.
+    async fn set_entry_attempt_superseded_impl(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        attempt_no: u32,
+    ) -> Result<(), StateError> {
+        sqlx::query(
+            "UPDATE entry_attempt
+             SET body = jsonb_set(body, '{superseded}', to_jsonb(true), true)
+             WHERE account IS NOT DISTINCT FROM $1 AND trade_id = $2 AND attempt_no = $3",
+        )
+        .bind(account)
+        .bind(trade_id)
+        .bind(attempt_no as i32)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
 }
 
 // ───────────── spread_blackout_window (singleton marker, TTL) ───────────────
@@ -1763,6 +1787,15 @@ impl StateStore for PgStateStore {
         broker_trade_id: &str,
     ) -> Result<(), StateError> {
         self.set_entry_attempt_broker_trade_id_impl(account, trade_id, attempt_no, broker_trade_id)
+            .await
+    }
+    async fn set_entry_attempt_superseded(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        attempt_no: u32,
+    ) -> Result<(), StateError> {
+        self.set_entry_attempt_superseded_impl(account, trade_id, attempt_no)
             .await
     }
     async fn is_retry_fire_seen(

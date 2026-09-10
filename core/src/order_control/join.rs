@@ -90,6 +90,7 @@ mod tests {
             blackout_close: crate::intent::BlackoutCloseAction::default(),
             breakeven: None,
             order_control: None,
+            superseded: false,
         }
     }
 

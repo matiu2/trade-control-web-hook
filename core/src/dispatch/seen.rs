@@ -374,6 +374,15 @@ mod dispatcher_outcome_tests {
         ) -> Result<(), StateError> {
             Ok(())
         }
+
+        async fn set_entry_attempt_superseded(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _attempt_no: u32,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
         async fn is_retry_fire_seen(
             &self,
             _account: Option<&str>,
@@ -629,6 +638,7 @@ mod dispatcher_outcome_tests {
                 clears: Vec::new(),
                 trade_id: Some("hs-chf-jpy-test".into()),
                 max_retries: Tunable::Static(0),
+                entry_dedup: None,
                 expiry_bars: None,
                 allow_entry: None,
                 allow_close: None,

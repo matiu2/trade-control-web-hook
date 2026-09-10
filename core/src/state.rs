@@ -277,6 +277,37 @@ pub struct EntryAttempt {
     /// such a row rather than guessing. See [`OrderControlSnapshot`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order_control: Option<OrderControlSnapshot>,
+    /// True once the retry gate **cancelled this attempt's still-resting order
+    /// to supersede it** with a fresh placement at a new price.
+    ///
+    /// Such an attempt never opened a position: the order came off the book
+    /// unfilled and a replacement took its place on the same bar. It is
+    /// therefore NOT an entry into the market, and must not consume a
+    /// [`Intent::max_retries`](crate::intent::Intent::max_retries) slot — the
+    /// cap bounds *entries*, not *placements that were immediately withdrawn*.
+    ///
+    /// # Why this field has to exist
+    ///
+    /// Without it the cap counts every row, so a re-price is charged a slot it
+    /// never used. At `max_retries: 1` — the M/W configuration — that makes the
+    /// gate **cancel the resting order and then reject the replacement at the
+    /// cap**: an order destroyed with nothing placed. That is exactly the rail
+    /// (`order_control::reprice`: "never cancel an order you cannot re-place")
+    /// whose violation forfeited a live EUR/CAD setup on 2026-08-07, reappearing
+    /// inside the gate's own cap check rather than in a later gate.
+    ///
+    /// Rows written before this field deserialize to `false` via
+    /// `#[serde(default)]`, which is the correct historical reading: nothing
+    /// was superseding anything. No SQL migration — the row is one `jsonb`
+    /// body.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub superseded: bool,
+}
+
+/// Skip-serializing predicate for [`EntryAttempt::superseded`], so a row that
+/// was never superseded keeps its pre-feature `jsonb` shape byte-for-byte.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// What a resting order must be re-judged against, snapshotted at placement.
@@ -990,6 +1021,18 @@ pub trait StateStore {
         trade_id: &str,
         attempt_no: u32,
         broker_trade_id: &str,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Mark a previously-recorded attempt as **superseded**: its resting order
+    /// was cancelled by the retry gate so a fresh placement could take its
+    /// place at a new price. See [`EntryAttempt::superseded`] — the row stays
+    /// (the cron still needs its order id and geometry) but stops counting
+    /// against the placement cap. Idempotent.
+    fn set_entry_attempt_superseded(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        attempt_no: u32,
     ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Returns true if this `(account, trade_id, shell_time)` fire
@@ -1980,6 +2023,23 @@ mod memstore {
                 && let Some(row) = list.iter_mut().find(|a| a.attempt_no == attempt_no)
             {
                 row.broker_trade_id = Some(broker_trade_id.to_string());
+            }
+            Ok(())
+        }
+
+        async fn set_entry_attempt_superseded(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            attempt_no: u32,
+        ) -> Result<(), StateError> {
+            let scope = account_scope(account).to_string();
+            let key = (scope, trade_id.to_string());
+            let mut attempts = self.attempts.borrow_mut();
+            if let Some(list) = attempts.get_mut(&key)
+                && let Some(row) = list.iter_mut().find(|a| a.attempt_no == attempt_no)
+            {
+                row.superseded = true;
             }
             Ok(())
         }
@@ -3507,6 +3567,7 @@ mod tests {
             blackout_close: BlackoutCloseAction::default(),
             breakeven: None,
             order_control: None,
+            superseded: false,
         }
     }
 
@@ -3649,6 +3710,9 @@ mod tests {
                 min_r: 1.5,
                 bar_seconds: Some(3600),
             }),
+            // Non-default for the same reason as the two fields above: `false`
+            // is the serde default and would round-trip trivially.
+            superseded: true,
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         let parsed: EntryAttempt = serde_yaml::from_str(&yaml).unwrap();
@@ -3739,6 +3803,7 @@ mod tests {
             blackout_close: BlackoutCloseAction::default(),
             breakeven: None,
             order_control: None,
+            superseded: false,
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         assert!(!yaml.contains("broker_trade_id"));

@@ -120,6 +120,7 @@ fn base_intent(action: Action, id: &str) -> Intent {
         clears: Vec::new(),
         trade_id: Some("ihs-gbp-usd-5175abbe".into()),
         max_retries: Tunable::Static(0),
+        entry_dedup: None,
         expiry_bars: None,
         allow_entry: None,
         allow_close: None,

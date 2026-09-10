@@ -821,18 +821,36 @@ pub async fn run_enter<B: Broker, S: StateStore>(
         r_multiple,
     );
 
-    // Retry gate — when the intent opts into multi-shot mode via
-    // `max_retries`, the gate inspects prior attempts (cancel-and-
+    // Retry gate — when the intent says the GATE owns entry dedup
+    // (`entry_dedup: GateOwned`), it inspects prior attempts (cancel-and-
     // replace a still-pending one, reject a fresh placement when an
     // earlier attempt is still open, allow another placement when
     // earlier attempts have closed) and enforces the placement cap.
     // "Retry" here means re-entry into a setup after a prior fill
     // closed (typically at SL), *not* a re-attempt of a failed
     // placement — broker failures are terminal and 502 out. See
-    // `core::retry_gate` for the full semantics. The single-shot
-    // path (`max_retries: Static(0)`, the default) skips this branch
+    // `core::retry_gate` for the full semantics. The engine-latched
+    // path (`EntryDedup::EngineLatched`, the default) skips this branch
     // entirely so no new KV/broker calls land on the byte-identical
     // baseline.
+    //
+    // ## Ask the RIGHT question here — this condition caused a live-money bug
+    //
+    // This used to read `max_retries != Static(0)`, i.e. it inferred "does this
+    // enter need dedup?" from "how many placements may it make?". Those are
+    // different questions and they came apart for M/W: an M/W enter is
+    // `FireMode::EveryBar` (the engine deliberately never latches it — see
+    // `engine/src/evaluate.rs` — precisely BECAUSE this gate is meant to own the
+    // dedup), yet its builder set `max_retries: Static(0)` to mean "only ever one
+    // placement". That value was then read as "no dedup needed", the delegated
+    // owner was never invoked, and nothing anywhere deduped: on 2026-08-20 an
+    // EUR/GBP double-top placed and filled THREE entries on three consecutive
+    // bars, 3x the intended risk, stopped only by the blunt account-wide
+    // open-positions cap. See `BUG-mw-everybar-enter-skips-retry-gate.md`.
+    //
+    // `EntryDedup` states the answer outright so a future pattern author cannot
+    // recreate the gap by picking a cap. Do NOT reintroduce a `max_retries` test
+    // here — the cap is the gate's business, not the gate-entry condition'''s.
     //
     // ## Why this gate is LAST — the rail: never cancel an order you cannot
     // re-place
@@ -878,11 +896,11 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // `retry-fire-replay`-rejected on its own already-seen `shell.time` and the
     // order is never re-placed (a live-money bug for multi-shot resting orders,
     // hidden until now behind the replay's phantom fill).
-    let retry_attempt_no = if !restore
-        && !matches!(
-            verified.intent.max_retries,
-            crate::tunable::Tunable::Static(0)
-        ) {
+    // `effective_entry_dedup`, NOT the raw field: an intent armed before
+    // `entry_dedup` existed carries no value, and for a legacy MULTI-shot enter
+    // serde's `EngineLatched` default would silently switch its dedup off.
+    let retry_attempt_no = if !restore && verified.intent.effective_entry_dedup().needs_retry_gate()
+    {
         match crate::retry_gate::evaluate(broker, store, &verified.intent, &verified.shell).await {
             crate::retry_gate::RetryGateOutcome::Proceed { next_attempt_no } => {
                 Some(next_attempt_no)
@@ -1836,6 +1854,11 @@ mod gate_order_tests {
     pub(super) fn enter_verified_with_entry(entry: &str) -> crate::incoming::Verified {
         let mut v = enter_verified_full("[]", "[]", entry);
         v.intent.max_retries = crate::tunable::Tunable::Static(0);
+        // Both halves, together: a cap of zero and a gate that would run is an
+        // incoherent pair (the gate rejects `max-retries-zero`). These tests are
+        // about outcome WORDING on a plain first placement, so drop out of the
+        // gate entirely — the engine-latched single-shot path.
+        v.intent.entry_dedup = Some(crate::intent::EntryDedup::EngineLatched);
         v
     }
 
@@ -1859,6 +1882,7 @@ mod gate_order_tests {
                 "trade_id": "t-1",
                 "pip_size": 0.0001,
                 "max_retries": 2,
+                "entry_dedup": "gate_owned",
                 "vetos": {vetos},
                 "requires_preps": {requires_preps}
             }}"#
@@ -1894,6 +1918,7 @@ mod gate_order_tests {
             blackout_close: Default::default(),
             breakeven: None,
             order_control: None,
+            superseded: false,
         }
     }
 
@@ -2793,5 +2818,466 @@ mod units_below_minimum_tests {
         let store2 = MemStateStore::default();
         let failed = dispatch(|| EntryError::EntryTooCloseToMarket, &store2);
         assert!(matches!(seen_decision(&failed), SeenDecision::Skip { .. }));
+    }
+}
+
+/// M/W duplicate-entry regression (`BUG-mw-everybar-enter-skips-retry-gate.md`).
+///
+/// An M/W enter is `FireMode::EveryBar` — the engine deliberately does NOT latch
+/// it, delegating placement dedup to `run_enter`'s retry gate. Before the fix
+/// that delegation was silently dropped: the gate-entry condition asked
+/// `max_retries != Static(0)`, and the M/W builder set exactly `Static(0)` to
+/// mean "one placement only". So the enter fired every bar, skipped the only
+/// gate that reconciles prior attempts, and stacked three simultaneous live
+/// positions on EUR/GBP H1 (2026-08-20, plan `m-eur-gbp-642f7851`).
+///
+/// These tests drive the REAL caller (`run_enter`), not `retry_gate::evaluate`
+/// below it — the gap was entirely in the caller's entry condition, so a test
+/// at the gate layer cannot see it. Each asserts on observable BROKER traffic
+/// (what was placed / cancelled), which is the thing that cost real money.
+#[cfg(test)]
+mod mw_everybar_dedup_tests {
+    use super::gate_order_tests::{cfg, describe, store_at_incident};
+    use super::*;
+    use crate::broker::{
+        AmendError, AttemptState, CancelError, Candle, CandleError, EntryError, EntryRequest,
+        Granularity, LookupError, OpenPosition, PendingOrder, Placement, Quote,
+    };
+    use crate::intent::{Direction, Intent, Shell};
+    use crate::state::{EntryAttempt, MemStateStore, StateStore};
+    use chrono::{DateTime, Utc};
+    use std::cell::RefCell;
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s)
+            .expect("valid test timestamp")
+            .with_timezone(&Utc)
+    }
+
+    /// A broker that records its traffic and reports a caller-chosen state for
+    /// any prior attempt. Placements hand back incrementing order ids so a test
+    /// can tell a re-price (cancel N, place N+1) from a duplicate stack.
+    struct SpyBroker {
+        cancels: RefCell<Vec<String>>,
+        places: RefCell<Vec<String>>,
+        attempt_state: AttemptState,
+        /// Positions `list_open_positions` reports — the retry gate's
+        /// independent Bug #11 backstop reads this.
+        open: Vec<OpenPosition>,
+    }
+
+    impl SpyBroker {
+        fn with_state(attempt_state: AttemptState) -> Self {
+            Self {
+                cancels: RefCell::new(Vec::new()),
+                places: RefCell::new(Vec::new()),
+                attempt_state,
+                open: Vec::new(),
+            }
+        }
+        fn cancelled(&self) -> Vec<String> {
+            self.cancels.borrow().clone()
+        }
+        fn placed(&self) -> Vec<String> {
+            self.places.borrow().clone()
+        }
+    }
+
+    impl Broker for SpyBroker {
+        async fn place_entry(
+            &self,
+            _max_risk_pct: f64,
+            _max_open_positions: u32,
+            req: &EntryRequest<'_>,
+        ) -> Result<Placement, EntryError> {
+            let mut p = self.places.borrow_mut();
+            p.push(req.instrument.to_string());
+            Ok(Placement::id_only(format!("order-{}", p.len())))
+        }
+        async fn close_positions(&self, _instrument: &str) -> crate::broker::CloseOutcome {
+            crate::broker::CloseOutcome::NothingOpen
+        }
+        async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
+            0
+        }
+        async fn lookup_attempt_state(
+            &self,
+            _instrument: &str,
+            _broker_order_id: &str,
+            _broker_trade_id: Option<&str>,
+        ) -> Result<AttemptState, LookupError> {
+            Ok(self.attempt_state.clone())
+        }
+        async fn cancel_order(
+            &self,
+            _account_id: &str,
+            broker_order_id: &str,
+        ) -> Result<(), CancelError> {
+            self.cancels.borrow_mut().push(broker_order_id.to_string());
+            Ok(())
+        }
+        async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
+            Err(LookupError::Transient)
+        }
+        async fn list_open_positions(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<OpenPosition>, LookupError> {
+            Ok(self.open.clone())
+        }
+        async fn amend_stop(
+            &self,
+            _account_id: &str,
+            _position_or_order_id: &str,
+            _new_stop: f64,
+        ) -> Result<(), AmendError> {
+            unimplemented!("amend_stop unused by these tests")
+        }
+        async fn list_pending_orders(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<PendingOrder>, LookupError> {
+            unimplemented!("list_pending_orders unused by these tests")
+        }
+        async fn get_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<Candle>, CandleError> {
+            Ok(vec![])
+        }
+    }
+
+    fn now() -> DateTime<Utc> {
+        at("2026-08-20T19:00:01Z")
+    }
+
+    /// An M/W enter exactly as `cli::trade_patterns::build_mw_enter_alert` mints
+    /// it: a per-bar stop entry, no preps, one placement only. Built by
+    /// DESERIALISING wire JSON so the test cannot drift from what a signed M/W
+    /// alert actually carries.
+    ///
+    /// `entry_dedup` is threaded as raw JSON so a test can assert the *absence*
+    /// of the field (the pre-fix / legacy H&S wire form) as well as its presence.
+    fn mw_verified(extra: &str, shell_time: &str) -> crate::incoming::Verified {
+        let json = format!(
+            r#"{{
+                "v": 1,
+                "id": "m-1-enter-{shell_time}",
+                "not_after": "2026-08-25T00:00:00Z",
+                "action": "enter",
+                "instrument": "EUR_GBP",
+                "direction": "short",
+                "entry": {{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 0.85778 }},
+                "stop_loss": {{ "absolute": 0.86100 }},
+                "take_profit": {{ "absolute": 0.85100 }},
+                "broker": "tradenation",
+                "trade_id": "m-eur-gbp-642f7851",
+                "pip_size": 0.0001{extra}
+            }}"#
+        );
+        let intent: Intent = serde_json::from_str(&json).expect("valid M/W enter intent");
+        let shell = Shell::from_candle(&Candle {
+            time: at(shell_time),
+            o: 0.85800,
+            h: 0.85820,
+            l: 0.85760,
+            c: 0.85770,
+        });
+        crate::incoming::Verified { shell, intent }
+    }
+
+    /// The wire fields the FIXED M/W builder emits: gate-owned dedup with a
+    /// one-placement cap.
+    const MW_FIXED: &str = r#", "entry_dedup": "gate_owned", "max_retries": 1"#;
+
+    /// A store whose clock is pinned to the incident so nothing under test
+    /// expires against real wall-clock.
+    fn store() -> MemStateStore {
+        store_at_incident_at(now())
+    }
+
+    fn store_at_incident_at(t: DateTime<Utc>) -> MemStateStore {
+        let s = store_at_incident();
+        s.set_clock(t);
+        s
+    }
+
+    /// The prior attempt the 18:00 bar placed — order `26936222` in the incident.
+    fn prior_attempt(order_id: &str, shell_time: &str) -> EntryAttempt {
+        EntryAttempt {
+            trade_id: "m-eur-gbp-642f7851".into(),
+            account: None,
+            instrument: "EUR_GBP".into(),
+            attempt_no: 1,
+            broker_order_id: order_id.into(),
+            broker_trade_id: None,
+            direction: Direction::Short,
+            placed_at: at(shell_time),
+            shell_time: at(shell_time),
+            expires_at: at("2026-08-25T01:00:00Z"),
+            stop_loss_price: Some(0.86100),
+            cancel_at: None,
+            pip_size: Some(0.0001),
+            blackout_close: Default::default(),
+            breakeven: None,
+            order_control: None,
+            superseded: false,
+        }
+    }
+
+    /// THE INCIDENT, at the real entry point. The 19:00 bar re-fires the same
+    /// M/W enter while the 18:00 bar's order is STILL RESTING. Correct behaviour
+    /// is a RE-PRICE: cancel the stale order, place exactly one fresh one — never
+    /// two live orders for one plan.
+    ///
+    /// Pre-fix this placed a second order without cancelling the first.
+    #[test]
+    fn mw_refire_while_resting_reprices_instead_of_stacking() {
+        let broker = SpyBroker::with_state(AttemptState::Pending);
+        let store = store();
+        let verified = mw_verified(MW_FIXED, "2026-08-20T19:00:00Z");
+        pollster::block_on(async {
+            store
+                .record_entry_attempt(prior_attempt("26936222", "2026-08-20T18:00:00Z"))
+                .await
+                .expect("seed the 18:00 attempt");
+            let result =
+                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            assert!(
+                matches!(&result, ActionResult::Ok(_)),
+                "the re-price fire should place, got {}",
+                describe(&result)
+            );
+        });
+        assert_eq!(
+            broker.cancelled(),
+            vec!["26936222".to_string()],
+            "the stale resting order must be cancelled before the re-price"
+        );
+        assert_eq!(
+            broker.placed().len(),
+            1,
+            "exactly ONE fresh order replaces it — two placements is the bug"
+        );
+    }
+
+    /// The half that cost the money: once an M/W entry has FILLED, a later bar's
+    /// re-fire must be rejected `trade-already-open`, not stacked on top.
+    ///
+    /// Pre-fix all three EUR/GBP orders filled and ran simultaneously.
+    #[test]
+    fn mw_refire_while_position_open_is_rejected_not_stacked() {
+        let broker = SpyBroker::with_state(AttemptState::OpenPosition {
+            broker_trade_id: "pos-1".into(),
+        });
+        let store = store();
+        let verified = mw_verified(MW_FIXED, "2026-08-20T20:00:00Z");
+        let result = pollster::block_on(async {
+            store
+                .record_entry_attempt(prior_attempt("26936222", "2026-08-20T18:00:00Z"))
+                .await
+                .expect("seed the filled attempt");
+            run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await
+        });
+        assert!(
+            matches!(&result, ActionResult::Rejected { outcome, .. }
+                if outcome.contains("trade-already-open")),
+            "a re-fire over an open M/W position must be rejected, got {}",
+            describe(&result)
+        );
+        assert!(
+            broker.placed().is_empty(),
+            "NOTHING may be placed on top of a live position, but placed {:?}",
+            broker.placed()
+        );
+        assert!(
+            broker.cancelled().is_empty(),
+            "a rejected fire cancels nothing (RAIL: never cancel what you cannot re-place)"
+        );
+    }
+
+    /// Requirement 2 — the cap stays at ONE. A stopped-out M/W is TERMINAL: the
+    /// gate walks past the collapsed attempt, then the `max_retries: 1` cap
+    /// rejects. M/W must not become re-entrant as a side effect of this fix.
+    #[test]
+    fn mw_stopped_out_does_not_become_reentrant() {
+        let broker =
+            SpyBroker::with_state(AttemptState::ClosedLossOrBreakeven { realized_pl: -12.0 });
+        let store = store();
+        let verified = mw_verified(MW_FIXED, "2026-08-20T21:00:00Z");
+        let result = pollster::block_on(async {
+            store
+                .record_entry_attempt(prior_attempt("26936222", "2026-08-20T18:00:00Z"))
+                .await
+                .expect("seed the stopped-out attempt");
+            run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await
+        });
+        assert!(
+            matches!(&result, ActionResult::Rejected { outcome, .. }
+                if outcome.contains("retry-cap")),
+            "a stop-out ends an M/W setup — expected the cap to reject, got {}",
+            describe(&result)
+        );
+        assert!(
+            broker.placed().is_empty(),
+            "no re-entry after an M/W stop-out, but placed {:?}",
+            broker.placed()
+        );
+    }
+
+    /// Same-bar dedup: two arrivals carrying one `shell.time` collapse to one
+    /// placement. The M/W heartbeat fires per bar, so this is the layer that
+    /// stops a double-tick from double-placing.
+    #[test]
+    fn mw_same_bar_refire_collapses_to_one_placement() {
+        let broker = SpyBroker::with_state(AttemptState::Cancelled);
+        let store = store();
+        let first = mw_verified(MW_FIXED, "2026-08-20T19:00:00Z");
+        // A distinct intent id (as a real re-fire carries) on the SAME bar.
+        let mut second = mw_verified(MW_FIXED, "2026-08-20T19:00:00Z");
+        second.intent.id = "m-1-enter-second-tick".into();
+        let second_result = pollster::block_on(async {
+            let a = run_enter(&broker, &store, &first, &cfg(), now(), None, None, false).await;
+            assert!(
+                matches!(&a, ActionResult::Ok(_)),
+                "the first arrival on the bar should place, got {}",
+                describe(&a)
+            );
+            run_enter(&broker, &store, &second, &cfg(), now(), None, None, false).await
+        });
+        assert!(
+            matches!(&second_result, ActionResult::Rejected { outcome, .. }
+                if outcome.contains("retry-fire-replay")),
+            "the second arrival on the same bar must dedup, got {}",
+            describe(&second_result)
+        );
+        assert_eq!(
+            broker.placed().len(),
+            1,
+            "one bar means one placement, but placed {:?}",
+            broker.placed()
+        );
+    }
+
+    /// **The discriminating test — this is the one that pins the actual defect.**
+    ///
+    /// The other tests in this module all carry `max_retries: 1`, which the OLD
+    /// gate-entry condition (`max_retries != Static(0)`) also admits — so they
+    /// pass with the fix reverted and prove nothing about it. This one holds
+    /// `max_retries` at a value the old condition reads as "SKIP THE GATE" and
+    /// varies ONLY `entry_dedup`. It therefore fails the moment the entry
+    /// condition goes back to asking about the cap.
+    ///
+    /// The scenario is the incident itself: a prior order is still resting and a
+    /// later bar re-fires. `entry_dedup: gate_owned` must reconcile against it.
+    ///
+    /// (`max_retries: 2` rather than the M/W `1` is deliberate: the cap must not
+    /// be what decides, and a cap of 2 leaves headroom so the assertion is about
+    /// the GATE HAVING RUN, not about a cap rejection.)
+    #[test]
+    fn the_gate_is_entered_on_entry_dedup_alone_not_on_the_cap() {
+        // Both arms carry the SAME `max_retries` and differ ONLY in an
+        // EXPLICIT `entry_dedup`. A cap-reading condition cannot produce a split
+        // here, so this test fails the moment the gate-entry condition goes back
+        // to asking about the cap.
+        //
+        // This works because `entry_dedup` is authoritative when present: an
+        // explicit `engine_latched` is obeyed as written and is NOT
+        // second-guessed from `max_retries` (only an ABSENT field is healed from
+        // the legacy rule — see `Intent::effective_entry_dedup`).
+        let dedup_owned = r#", "max_retries": 2, "entry_dedup": "gate_owned""#;
+        let dedup_latched = r#", "max_retries": 2, "entry_dedup": "engine_latched""#;
+
+        // Arm A — GateOwned: the resting prior order IS reconciled (cancelled).
+        let broker_a = SpyBroker::with_state(AttemptState::Pending);
+        let store_a = store();
+        pollster::block_on(async {
+            store_a
+                .record_entry_attempt(prior_attempt("26936222", "2026-08-20T18:00:00Z"))
+                .await
+                .expect("seed");
+            run_enter(
+                &broker_a,
+                &store_a,
+                &mw_verified(dedup_owned, "2026-08-20T19:00:00Z"),
+                &cfg(),
+                now(),
+                None,
+                None,
+                false,
+            )
+            .await
+        });
+
+        // Arm B — explicit EngineLatched, IDENTICAL cap: the gate never runs,
+        // so the resting order is untouched.
+        let broker_b = SpyBroker::with_state(AttemptState::Pending);
+        let store_b = store();
+        pollster::block_on(async {
+            store_b
+                .record_entry_attempt(prior_attempt("26936222", "2026-08-20T18:00:00Z"))
+                .await
+                .expect("seed");
+            run_enter(
+                &broker_b,
+                &store_b,
+                &mw_verified(dedup_latched, "2026-08-20T19:00:00Z"),
+                &cfg(),
+                now(),
+                None,
+                None,
+                false,
+            )
+            .await
+        });
+
+        assert_eq!(
+            broker_a.cancelled(),
+            vec!["26936222".to_string()],
+            "gate_owned MUST reconcile the resting prior order"
+        );
+        assert!(
+            broker_b.cancelled().is_empty(),
+            "engine_latched must NOT reach the gate — but it cancelled {:?}. \
+             Both arms carry the same max_retries, so only `entry_dedup` can \
+             decide this; if they behave alike the gate-entry condition is \
+             reading the cap again (the original bug).",
+            broker_b.cancelled()
+        );
+    }
+
+    /// The H&S single-shot baseline must stay byte-identical: an enter with NO
+    /// `entry_dedup` on the wire (the legacy form) still skips the gate
+    /// entirely, so the fix adds zero broker/state traffic to that path.
+    ///
+    /// This is the guard that keeps the fix from being "route everything
+    /// through the gate", which would change H&S behaviour too.
+    #[test]
+    fn engine_latched_enter_still_skips_the_gate_entirely() {
+        let broker = SpyBroker::with_state(AttemptState::Pending);
+        let store = store();
+        // No `entry_dedup`, no `max_retries` — a pre-fix H&S wire body.
+        let verified = mw_verified("", "2026-08-20T19:00:00Z");
+        let result = pollster::block_on(async {
+            store
+                .record_entry_attempt(prior_attempt("26936222", "2026-08-20T18:00:00Z"))
+                .await
+                .expect("seed a prior attempt the gate WOULD have found");
+            run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await
+        });
+        assert!(
+            matches!(&result, ActionResult::Ok(_)),
+            "the single-shot baseline places unconditionally, got {}",
+            describe(&result)
+        );
+        // The prior attempt is Pending — had the gate run, it would have
+        // cancelled it. Zero cancels proves the gate was never entered.
+        assert!(
+            broker.cancelled().is_empty(),
+            "the engine-latched path must make NO broker reconciliation calls"
+        );
     }
 }

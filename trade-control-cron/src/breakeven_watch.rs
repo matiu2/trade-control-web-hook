@@ -391,6 +391,7 @@ mod tests {
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
             breakeven: snap,
             order_control: None,
+            superseded: false,
         }
     }
 
