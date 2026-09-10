@@ -133,6 +133,24 @@ pub struct OpenPosition {
     pub order_id: String,
     /// TradeNation stake / OANDA units.
     pub stake: f64,
+    /// The price this position actually **filled** at, as the broker records
+    /// it: OANDA `Trade.price` (execution price) / TradeNation
+    /// `Position.opening_price`. `None` when the broker did not report one —
+    /// never a guess, and never the order's *trigger*. An entry trigger and a
+    /// fill are different numbers, and treating one as the other put a
+    /// break-even stop on the losing side of a live fill
+    /// (`BUG-breakeven-arms-off-pre-fill-history.md`, Defect 2).
+    pub entry_price: Option<f64>,
+    /// When this position **filled**, as the broker records it: OANDA
+    /// `Trade.open_time` / TradeNation `Position.creation_time`. `None` when
+    /// the broker did not report one (or reported it unparseably).
+    ///
+    /// Deliberately distinct from `EntryAttempt::placed_at`, which is when the
+    /// *order* was placed. A resting stop/limit order can sit for hours or days
+    /// before it fills (46 minutes on the incident above), so `placed_at` is
+    /// **not** a lower bound on the position's own price history — anything
+    /// that must only look at post-fill bars has to bound on this field.
+    pub opened_at: Option<DateTime<Utc>>,
 }
 
 /// A resting (unfilled) entry order. `trigger` is the entry price; `is_stop`

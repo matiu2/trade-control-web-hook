@@ -1,6 +1,7 @@
 # BUG: break-even watcher arms off pre-fill history and targets the trigger, not the fill
 
-**Status:** OPEN (not fixed as of `2cfeaf62`, 2026-09-10)
+**Status:** FIXED on `fix/breakeven-arms-off-pre-fill-history` (v143). Both defects
+closed; see "What was actually changed" at the foot of this file.
 **Severity:** HIGH — silently converts winners into ~0R scratches, live only
 **First confirmed incident:** NZD_CAD H4 short, 2026-08-10 (OANDA main account, tickets 2320→2326)
 **File:** `trade-control-cron/src/breakeven_watch.rs` (both defects)
@@ -172,3 +173,130 @@ the system's own logs.
   "correct entry, premature exit" shape but no transaction trail pulled yet. **Both are worth
   re-checking against this signature.**
 - Trade 135 (CAD/SGD) — SL→BE 142 s after fill with the threshold unmet; likely the same root cause.
+
+
+---
+
+## What was actually changed (2026-09-10, v143)
+
+Both defects are closed, plus the noise-floor guard. The one thing the report
+suggested that was **not** done as written is fix 3 — see below, it turned out
+to need no new persistence at all.
+
+### The premise that turned out to be wrong (and made the fix simpler)
+
+The report frames fix 1 as bounding on `EntryAttempt.placed_at`, with fix 3
+(carrying a fill price back onto the snapshot) as the better-but-harder
+alternative. Both were unnecessary: **the brokers already report the fill on the
+very call the watcher was already making.**
+
+`list_open_positions` reads OANDA `Trade` (which carries `price` — the execution
+price — and `openTime`) and TradeNation `Position` (`opening_price`,
+`creation_time`), and `core::broker::OpenPosition` was simply dropping both on
+the floor. So the true fill price *and* the true fill time were one struct field
+away, needing no round-trip, no migration, and no reconciliation pass over
+`EntryAttempt`.
+
+That matters for the `placed_at` trap the report flags: `placed_at` is when the
+*order* was placed and would still have admitted the 46 minutes of pre-fill bars
+on this incident. **The window is bounded on `OpenPosition.opened_at` — the
+broker's own record of when the position filled** — so the trap is avoided
+rather than mitigated.
+
+### Changes
+
+1. **`OpenPosition` gained `entry_price: Option<f64>` and `opened_at:
+   Option<DateTime<Utc>>`** (`core/src/broker.rs`), populated by both live
+   adapters from the broker's own execution record and by the replay broker from
+   the simulator's known fill. `None` means "the broker did not report one" —
+   never a fabricated value; an unparseable OANDA `openTime` warns and yields
+   `None`.
+
+2. **The decision moved out of the wiring** into a new pure module
+   `trade-control-cron/src/breakeven_decision.rs`. `best_close_toward_tp` and the
+   inline `decide_move` call in `watch_one` are gone; `watch_one` is now a thin
+   broker wrapper around `decide()`, which returns `Hold` / `Amend` /
+   `Blocked(..)`. Both defects lived in logic that no test could reach, which is
+   the reason for the split.
+
+3. **Defect 1 — the window is bounded at the fill.** `armable_candles` keeps only
+   bars satisfying `c.time + bar > fill_at` as well as the pre-existing
+   "has it closed" bound. `BREAKEVEN_LOOKBACK_BARS` now bounds the *fetch* only,
+   and its doc says so.
+
+   The bound is on the bar's **close**, not its open, deliberately: `fill_sim`'s
+   post-fill window is `&candles[i + 1..]` where `i + 1` is the fill bar, and its
+   own comment says it "**includes** the fill bar itself". Bounding on the open
+   would have made live one bar stricter than replay on every trade — a fresh
+   divergence introduced by the fix for a divergence.
+
+4. **Defect 2 — the target is the broker fill.** `target_entry` prefers
+   `position.entry_price` and falls back to the placement snapshot only when the
+   broker reports none. Note the asymmetry, which is intentional: a missing fill
+   *time* fails **closed** (block, don't arm), a missing fill *price* fails
+   **open** (use the snapshot). An unbounded window is unboundedly wrong; a
+   snapshot price is off by the slippage on one fill, and refusing break-even
+   over it would cost more than it saves.
+
+5. **Fix 2 (noise floor) — implemented**, as `BREAKEVEN_MIN_ATR_FRACTION = 0.1`.
+   It refuses an amend landing within `0.1 × ATR` of the last close and logs at
+   `error`. It **fails open** when the ATR is unjudgeable (window shorter than
+   `atr_length_for`), matching `sl_spread_floor_violation`'s "a degenerate spread
+   is unjudgeable" discipline — a mutation that made it fail *closed* broke five
+   legitimate break-evens, so the fail-open direction is load-bearing.
+
+   The repo already holds this principle for *entries* (`intent::sl_spread_floor`
+   rejects an SL within `10 ×` the live spread, because "the spread alone can
+   stop the trade out"). A break-even amend is the same act and had no such
+   check. It is expressed in ATR rather than spread only because this cron sees
+   mid candles and cannot read a book. `0.1 × ATR` is a tripwire for absurdity,
+   not a tuning knob: a legitimate break-even sits ~50%-to-TP from market, orders
+   of magnitude clear of it.
+
+### What was deliberately NOT done
+
+- **Fix 3 as written** — no `fill_price` field was added to `EntryAttempt` and
+  no reconciliation pass was written. The broker reports the fill on the open
+  position itself, so persisting a second copy would add a migration and a
+  staleness window to duplicate data already in hand. The *outcome* fix 3 asked
+  for (a 0R scratch that is actually 0R) is delivered.
+
+- **Fix 4 as a fixture** — no replay fixture was added, because the corpus
+  **structurally cannot** exercise this path: fixtures drive `simulate_fill`,
+  which has its own break-even implementation and never calls the cron. A fixture
+  would have passed before the fix and after it, proving nothing. Parity is
+  instead pinned where it can actually fail: `the_bar_the_fill_landed_inside_arms_matching_replay`
+  asserts the live window boundary equals `fill_sim`'s, and the replay broker now
+  reports the same two fill fields the live adapters do, so the two sides answer
+  from the same shape.
+
+### The related incidents, against this fix
+
+Not verifiable from here (no broker access), so this is reasoning from the
+shapes described, not confirmation:
+
+- **AU200 −1,890, closed 82 min after fill** — *probably prevented, less
+  certain.* 82 minutes is long enough that a genuine post-fill H1 bar could have
+  closed and armed break-even legitimately. If the exit price sat at the entry it
+  is this bug and the fix prevents it; if the loss is large relative to the
+  designed stop it is more likely a real adverse move. The `entry_source=` field
+  now in the log line distinguishes the two on any future occurrence.
+- **NZD/JPY −490, closed 72 s after fill** — *prevented.* 72 seconds cannot
+  contain a closed bar on any timeframe this system trades, so no post-fill bar
+  could have armed break-even; the arm must have come from pre-fill history.
+  Defect 1 alone.
+- **Trade 135 (CAD/SGD), SL→BE 142 s after fill with the threshold unmet** —
+  *prevented.* "Threshold unmet" plus 142 seconds is the exact signature: the
+  arming evidence cannot have come from the position's own life.
+
+### Tests
+
+24 new tests. Every production change was mutation-verified — reverted
+deliberately, with the corresponding test confirmed RED — including the wiring
+between `decide` and the broker, which a first pass left uncovered: a mutation
+making `watch_one` amend on a `Blocked` decision **survived** every test of the
+pure decision. That is what the `PositionBroker` seam and the `SpyBroker` tests
+exist for; they assert what reached the broker, not what the decision returned.
+
+The full 2695-cell fixture corpus is unchanged (`--check`, exit 0), as expected —
+and the gate was itself proven able to fail by poisoning one golden (exit 5).

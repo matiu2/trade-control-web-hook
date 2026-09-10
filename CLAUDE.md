@@ -240,6 +240,54 @@ as the operator emergency-flatten, so the basenames keep the word
 `PerTradeExit` → `PerPositionClose` (2026-07-19) to match — "close",
 scoped per-position not per-trade.
 
+### Break-even reads the FILL, and only post-fill bars (v143)
+
+Two numbers around an entry look interchangeable and are not. Getting either
+wrong cost a live winner (`BUG-breakeven-arms-off-pre-fill-history.md`).
+
+**A trigger is not a fill.** `BreakevenSnapshot.entry_price` is snapshotted at
+*placement* from `resolved.entry.reference_price()` — the price the stop/limit
+order **rests at**. What the position actually **filled** at is a different
+number whenever price gaps or runs through the level, and it lives on the broker:
+`OpenPosition.entry_price` (OANDA `Trade.price`, TradeNation
+`Position.opening_price`). Break-even means "the price I got in at", so it must
+target the fill. Using the trigger put a short's break-even stop 3 ticks *above*
+its fill — a guaranteed loss wearing the word "scratch". It is
+**direction-dependent**: a short filled better than trigger, or a long filled
+worse, is the losing case; only an exact-trigger fill is harmless. Same trap
+applies to `Placement.price` from `place_entry`, whose docs say plainly it is
+the REQUESTED rate.
+
+**`placed_at` is not the fill time.** `EntryAttempt.placed_at` is when the
+*order* was placed. A resting order can sit for hours or days first (46 minutes
+on the incident). Anything that must only consider post-fill bars has to bound
+on `OpenPosition.opened_at` (OANDA `openTime` / TradeNation `creation_time`) —
+bounding on `placed_at` still admits pre-fill bars, so it is a mitigation, not a
+fix.
+
+**A lookback bounds a FETCH, never a decision.** `BREAKEVEN_LOOKBACK_BARS = 500`
+exists so one broker request covers ATR warmup plus the whole post-fill path.
+The window that may *arm* anything is narrowed separately, in
+`breakeven_decision::armable_candles`. Filtering only on "has this bar closed"
+— which is what the code did, under a doc comment claiming "since the fill" —
+is ~83 days of pre-fill history on H4. If you add another cron that folds a
+candle window into a decision, bound it at the event, not at the pull.
+
+The post-fill bound is on the bar's **close**, not its open, and that is
+deliberate parity: `fill_sim::find_fill` returns `rest: &candles[i + 1..]` where
+`i + 1` is the **fill bar itself** (its own comment says "includes the fill
+bar"). Bounding on the open would make live one bar stricter than replay on
+every trade.
+
+**Replay was right; live was wrong.** `fill_sim` had neither defect, so the
+whole fixture corpus is structurally blind to this class — it drives
+`simulate_fill`, never the cron. **No fixture is evidence about the break-even
+cron**, the same way no fixture is evidence about a timing-sensitive gate. Pin
+it with unit tests at the cron's own entry point instead, and note that testing
+the pure decision is not enough: a mutation making `watch_one` amend on a
+`Blocked` decision survived every test of `decide` and was only caught once the
+broker call went through the `PositionBroker` seam a `SpyBroker` can observe.
+
 ### A close that found nothing open is a SUCCESS, not a failure (v135)
 
 `Broker::close_positions` returns **`CloseOutcome`** — `Closed(n)` /

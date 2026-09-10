@@ -1242,6 +1242,11 @@ impl Broker for ReplayBroker {
                 position_id: format!("{}-pos", p.order_id),
                 order_id: p.order_id.clone(),
                 stake: 1.0,
+                // The simulator knows the true fill — report it, so anything
+                // that bounds on the fill (the break-even watcher) sees the
+                // same facts here as it does off a live broker.
+                entry_price: Some(p.entry_price),
+                opened_at: Some(p.fill_at),
             })
             .collect();
         Ok(positions)

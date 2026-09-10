@@ -1,5 +1,67 @@
 # Changelog
 
+## v143 — 2026-09-10 — break-even arms off post-fill bars only, and targets the fill
+
+**Why.** An NZD_CAD H4 short filled at 0.82043 and was stopped out 6m02s later
+at 0.82060 for −152.97 AUD, against a designed stop 456 ticks away. Left alone
+it hit TP three days later for +1.18R. Two independent defects in
+`trade-control-cron/src/breakeven_watch.rs`, both live-only:
+
+1. `best_close_toward_tp` fetched 500 bars (≈83 days on H4) and filtered only on
+   "has this bar closed" — never on "did this bar happen after the fill",
+   despite its own doc comment saying "since the fill". 255 of the 359 bars in
+   the incident's window closed past the arming level; the most recent was
+   **eleven days before the fill**. Break-even was armed by July price action on
+   a trade that filled in August.
+2. The break-even target was `BreakevenSnapshot.entry_price` — the resolved
+   *trigger*, snapshotted at placement and never reconciled to the fill. For
+   this short the trigger (0.82046) sat 3 ticks **above** the fill (0.82043), so
+   the "scratch" was a guaranteed loss. Direction-dependent: longs get the
+   mirror image.
+
+The offline replay had **neither** defect (`fill_sim` walks only `fill.rest` and
+targets `fill.entry_price`), so the entire fixture corpus was blind to this and
+returns +1.18R unanimously for this very setup. Live was brought to match
+replay; the divergence was the defect.
+
+**What changed.**
+
+- `core::broker::OpenPosition` gained `entry_price: Option<f64>` and
+  `opened_at: Option<DateTime<Utc>>`. Both brokers already reported them on the
+  call the watcher was making (OANDA `Trade.price` / `openTime`, TradeNation
+  `Position.opening_price` / `creation_time`) and the mapping was discarding
+  them. `None` means the broker reported nothing — never a fabricated value.
+- New `trade-control-cron/src/breakeven_decision.rs` holds the whole decision as
+  a pure function (`Hold` / `Amend` / `Blocked`); `watch_one` is now broker
+  wiring around it, reached through a small `PositionBroker` seam so the live
+  path itself is testable.
+- The candle window is bounded at **the fill**, on the bar's close, matching
+  `fill_sim`'s fill-bar-inclusive `&candles[i + 1..]`. `BREAKEVEN_LOOKBACK_BARS`
+  now bounds the fetch only.
+- The break-even target is `position.entry_price` (the broker fill), falling
+  back to the placement snapshot only when the broker reports none.
+- New `BREAKEVEN_MIN_ATR_FRACTION = 0.1` refuses an amend landing within
+  `0.1 × ATR` of the last close, logging loudly. Fails **open** on an
+  unjudgeable ATR, matching `sl_spread_floor_violation`.
+
+**Breaking.** `OpenPosition` gained two fields — every construction site must
+supply them. No wire or schema change: nothing about `OpenPosition` is
+persisted or signed.
+
+**Config.** None.
+
+**Tests.** 24 new. Every production change mutation-verified (reverted, test
+confirmed red), including the `decide`→broker wiring — a mutation that made
+`watch_one` amend on a `Blocked` decision survived the pure-decision tests and
+drove the `PositionBroker`/`SpyBroker` seam. Full 2695-cell fixture corpus
+unchanged, as expected for a live-only bug; the gate was proven able to fail by
+poisoning one golden.
+
+**Follow-up.** A missing fill *time* fails closed (refuse to arm) while a
+missing fill *price* fails open (use the snapshot). If a broker is ever seen
+routinely omitting `opened_at`, that trade-off needs revisiting rather than
+silently losing break-even on that broker.
+
 ## v141 — 2026-09-09 — symmetric entry recovery, and entry failures say WHY
 
 Two changes to the same path: the recovery *default* (below) and the

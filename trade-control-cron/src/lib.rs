@@ -24,6 +24,7 @@
 
 mod blackout_apply;
 mod blackout_watch;
+mod breakeven_decision;
 mod breakeven_watch;
 mod broker_handle;
 mod constants;
