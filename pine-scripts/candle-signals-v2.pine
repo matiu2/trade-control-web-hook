@@ -159,10 +159,14 @@ bearish_pending_style = resolve_label_style(bearish_shape, false)
 
 f_apply_label_style(label sig_label, bool is_bullish, int state, bool is_golden) =>
     if not na(sig_label)
-        // Shape: pending = chosen shape, valid = triangle, invalid = cross
+        // Shape: pending = chosen shape, valid = triangle, invalid = arrow.
+        // The invalid arrow keeps the signal's OWN direction (up for a dead
+        // bullish, down for a dead bearish) rather than the direction-blind
+        // cross it used to draw — a faded grey arrow still reads as "this setup
+        // died" while leaving visible what the setup WAS.
         string lbl_style = switch state
             STATE_VALID   => is_bullish ? label.style_triangleup : label.style_triangledown
-            STATE_INVALID => label.style_cross
+            STATE_INVALID => is_bullish ? label.style_arrowup : label.style_arrowdown
             => is_bullish ? bullish_pending_style : bearish_pending_style
         label.set_style(sig_label, lbl_style)
 
