@@ -37,6 +37,7 @@ mod mw_geometry;
 mod mw_resolve;
 mod news_marker;
 mod news_window;
+mod pattern_banner;
 mod pipeline;
 mod plan_geometry;
 mod position_entry;

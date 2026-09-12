@@ -40,6 +40,7 @@ use crate::hs_resolve::resolve_hs_trade;
 use crate::instrument_resolution::ResolvedInstrument;
 use crate::mw_resolve::resolve_mw_trade;
 use crate::news_marker::{NewsMarker, news_marker_lines};
+use crate::pattern_banner;
 use crate::plan_geometry::PlanGeometry;
 use crate::position_entry::run_position_entry;
 use crate::register::{register_trade_plan, replace_existing_plan};
@@ -686,6 +687,16 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
         Err(ResolveError::Fatal(e)) => return Err(e),
     };
 
+    // The pattern family was just decided — implicitly, off whether a path
+    // drawing was on the chart. Say so LOUDLY before anything else scrolls past,
+    // because a stray path drawing silently turns an intended H&S arm into an
+    // M/W one (a different trade entirely). Printed again at the bottom.
+    pattern_banner::print(
+        trade_spec.pattern,
+        pattern_banner::Position::Top,
+        &instrument,
+    );
+
     info!(
         direction = direction.as_str(),
         pattern = ?trade_spec.pattern,
@@ -847,6 +858,15 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
         )
         .wrap_err("replay after arm (--replay)")?;
     }
+
+    // Same banner, last word. The operator's eye lands on the top or the bottom
+    // of the scrollback, rarely the middle — so either end alone is enough to
+    // catch "I meant to arm an H&S and this built an M/W".
+    pattern_banner::print(
+        built_trade.spec.pattern,
+        pattern_banner::Position::Bottom,
+        &instrument,
+    );
 
     Ok(0)
 }
@@ -1311,6 +1331,23 @@ mod tests {
     use clap::Parser;
     use trade_control_conventions::Direction;
 
+    /// The source text of `arm_from_inputs`' body.
+    ///
+    /// Three tests below scan it for properties the type system can't express
+    /// ("nothing you call reaches a chart", "this value is what reaches that
+    /// callee", "this call still happens"). Extracted once so a rename of the
+    /// function breaks them in one place rather than three.
+    fn arm_from_inputs_body() -> &'static str {
+        let src = include_str!("pipeline.rs");
+        let start = src
+            .find("\nfn arm_from_inputs(")
+            .expect("arm_from_inputs must exist — did it get renamed?");
+        // The body ends at the next column-0 `}`.
+        let rest = &src[start + 1..];
+        let end = rest.find("\n}\n").map_or(rest.len(), |i| i + 2);
+        &rest[..end]
+    }
+
     /// `arm_from_inputs` must make **no chart calls**. That is the entire point
     /// of the split — everything below the seam has to work identically whether
     /// its `SetupInputs` came from TradingView or from a frozen file.
@@ -1326,14 +1363,7 @@ mod tests {
     /// whole file: the chart half legitimately contains all of these.
     #[test]
     fn arm_from_inputs_makes_no_chart_calls() {
-        let src = include_str!("pipeline.rs");
-        let start = src
-            .find("\nfn arm_from_inputs(")
-            .expect("arm_from_inputs must exist — did it get renamed?");
-        // The body ends at the next column-0 `}`.
-        let rest = &src[start + 1..];
-        let end = rest.find("\n}\n").map_or(rest.len(), |i| i + 2);
-        let body = &rest[..end];
+        let body = arm_from_inputs_body();
 
         for banned in [
             "TvMcp",
@@ -1367,6 +1397,52 @@ mod tests {
         );
     }
 
+    /// The pattern banner must actually be PRINTED, at both ends of the arm.
+    ///
+    /// `pattern_banner`'s own unit tests pin what the banner *says* — but every
+    /// one of them passes with both call sites deleted, which is precisely the
+    /// failure that matters: a banner nobody prints is exactly the silence the
+    /// feature exists to break. So this scans `arm_from_inputs` for the two
+    /// calls, the same source-scan idiom the two tests around it use, and for
+    /// the same reason: the property is about a *call happening* inside a
+    /// function that needs a live chart to run.
+    ///
+    /// It also asserts the banner is fed the built trade's OWN pattern. Passing
+    /// a constant, or the operator's requested pattern rather than the resolved
+    /// one, would print a confident banner that lies — worse than no banner,
+    /// because the operator would then trust it.
+    #[test]
+    fn the_pattern_banner_is_printed_at_both_ends() {
+        let body = arm_from_inputs_body();
+
+        let top = body
+            .find("pattern_banner::Position::Top")
+            .expect("the arm must print a pattern banner at the TOP — see pattern_banner");
+        let bottom = body
+            .find("pattern_banner::Position::Bottom")
+            .expect("the arm must print a pattern banner at the BOTTOM — see pattern_banner");
+        assert!(
+            top < bottom,
+            "the Top banner must be printed before the Bottom one"
+        );
+
+        // Both must read a real resolved pattern, not a literal. Compared with
+        // whitespace collapsed, so `cargo fmt` splitting a call across lines
+        // can't turn this into a false failure (it did exactly that once).
+        let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("pattern_banner::print( trade_spec.pattern,")
+                || flat.contains("pattern_banner::print(trade_spec.pattern,"),
+            "the top banner must print the RESOLVED spec's pattern, so it cannot \
+             disagree with the trade that was actually built"
+        );
+        assert!(
+            flat.contains("built_trade.spec.pattern,"),
+            "the bottom banner must print the BUILT trade's pattern, so it cannot \
+             disagree with what was armed"
+        );
+    }
+
     /// The trade bundle must be built at the **effective arm time**, not raw
     /// wall-clock — otherwise a `--start` re-arm is not reproducible.
     ///
@@ -1388,13 +1464,7 @@ mod tests {
     /// with `effective_arm_time`'s own unit tests below, which pin the value.
     #[test]
     fn the_trade_bundle_is_built_at_the_effective_arm_time_not_wallclock() {
-        let src = include_str!("pipeline.rs");
-        let start = src
-            .find("\nfn arm_from_inputs(")
-            .expect("arm_from_inputs must exist — did it get renamed?");
-        let rest = &src[start + 1..];
-        let end = rest.find("\n}\n").map_or(rest.len(), |i| i + 2);
-        let body = &rest[..end];
+        let body = arm_from_inputs_body();
 
         let call = body
             .find("build_trade_from_spec(")
