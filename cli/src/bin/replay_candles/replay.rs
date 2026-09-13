@@ -327,19 +327,39 @@ pub async fn run(
         // wall-clock-vs-cursor trap that drops blackout state in replay.
         store.set_clock(now);
 
-        // Open the System-1 spread-blackout window marker on an NY-close-edge bar,
-        // exactly as the live cron's `apply_if_ny_close_edge` does — SAME
-        // `is_ny_close_edge` gate, SAME shared 3h TTL constant. This is what makes
-        // `run_enter`'s OWN spread-blackout gate fire offline: once the marker is
-        // set the gate samples `ReplayBroker::get_quote` (which synthesizes the
-        // fire-bar / spread-hour-elevated spread) and rejects for real — instead of
-        // the decision being re-derived by the `spread_blackout_reject` proxy. Off
-        // the edge the marker isn't written; the store clock is bar-pinned so a
-        // marker opened on a prior edge bar naturally lapses after its 3h TTL.
-        if trade_control_core::ny_clock::is_ny_close_edge(now)
+        // Open the System-1 spread-blackout window marker when this tick covers
+        // the NY close, exactly as the live cron's `apply_if_ny_close_edge` does
+        // — SAME shared predicate, SAME shared 3h TTL constant. This is what
+        // makes `run_enter`'s OWN spread-blackout gate fire offline: once the
+        // marker is set the gate samples `ReplayBroker::get_quote` (which
+        // synthesizes the fire-bar / spread-hour-elevated spread) and rejects for
+        // real — instead of the decision being re-derived by the
+        // `spread_blackout_reject` proxy. Off the edge the marker isn't written;
+        // the store clock is bar-pinned so a marker opened on a prior edge tick
+        // naturally lapses after its 3h TTL.
+        //
+        // SPAN, not instant. Live samples the edge on a wall-clock loop (900s
+        // upkeep), so it lands inside the close hour ~4× and reliably opens the
+        // marker. Replay has ONE instant per tick — the newest bar's close — so
+        // an instant check only fires when a bar happens to close on the close
+        // hour. The corpus's H4 grid is NY-session anchored (21:00 UTC in EDT,
+        // 22:00 in EST — `candle_cache::session_anchor`), so H4 lands on it every
+        // day by construction; but a midnight-anchored D1 close (00:00 UTC) never
+        // does, and a wider `--cron-gap` cadence can step over it on any
+        // granularity. Those ticks never opened the marker and the entry gate
+        // failed OPEN offline while live rejected. Asking the span question makes
+        // replay agree with live on every grid.
+        //
+        // Stamped at the EDGE instant, not at `now`: the marker's TTL runs from
+        // when it was opened, so stamping a spanned edge at the (later) tick end
+        // would hold the window open past where live lets it lapse — swapping
+        // fail-open for fail-closed. A tick that lands ON the edge still stamps
+        // its own instant, so every already-hitting series is byte-identical.
+        if let Some(edge_at) =
+            trade_control_core::ny_clock::last_ny_close_edge_in_span(prev_close, now)
             && let Err(e) = store
                 .set_spread_blackout_window(
-                    now,
+                    edge_at,
                     trade_control_core::spread_blackout::NY_CLOSE_WINDOW_MARKER_TTL_SECONDS,
                 )
                 .await
@@ -1694,6 +1714,198 @@ mod tests {
             reason.contains("spread-blackout"),
             "expected a spread-blackout rejection from run_enter's seeded gate, got {reason:?}"
         );
+    }
+
+    /// Finding #3 of the 2026-09-13 replay↔live audit, at the entry point.
+    ///
+    /// The replay samples the NY-close edge ONCE per tick, at the newest bar's
+    /// close. Live samples it on a wall-clock loop (900 s upkeep), so it lands
+    /// inside the close hour ~4× and reliably opens the System-1 spread-blackout
+    /// window marker. Whenever a replay tick's span exceeds an hour — a cron
+    /// catch-up (`--cron-gap`), a gap, a restart, or simply a coarse grid whose
+    /// bar closes miss the hour — the single sample steps straight over the edge:
+    /// the marker is never opened, `run_enter`'s spread-blackout gate has nothing
+    /// to read, and it fails OPEN offline while live rejects the same entry.
+    ///
+    /// Here a 4-bar catch-up tick batches 19:00–22:00Z under one `now` of
+    /// 2026-07-06T23:00Z. The EDT close hour (21:00Z) is inside that span but is
+    /// not the tick instant. The entry fires on a 30-pip book against EUR/USD's
+    /// flat 8-pip threshold, so with the marker open it must be rejected.
+    #[tokio::test]
+    async fn catch_up_tick_spanning_the_ny_close_still_rejects_on_spread_blackout() {
+        // Warm-up bars on a tight 2-pip book, below the enter level. Ten of them,
+        // so the `SEED_BARS` floor is met and the batch below is live.
+        let mut candles: Vec<EngineCandle> = (9..=18)
+            .map(|h| {
+                ohlc_at_spread(
+                    &format!("2026-07-06T{h:02}:00:00Z"),
+                    1.1040,
+                    1.1042,
+                    1.1038,
+                    1.1040,
+                    0.0002,
+                )
+            })
+            .collect();
+        // The catch-up batch: bars opening 19:00, 20:00, 21:00, 22:00Z — ONE tick
+        // whose `now` is the last bar's close, 23:00Z. The enter's level is
+        // crossed on the first of them, on a WIDE 30-pip book.
+        candles.push(ohlc_at_spread(
+            "2026-07-06T19:00:00Z",
+            1.1045,
+            1.1060,
+            1.1043,
+            1.1055,
+            0.0030,
+        ));
+        for h in 20..=22 {
+            candles.push(ohlc_at_spread(
+                &format!("2026-07-06T{h:02}:00:00Z"),
+                1.1055,
+                1.1065,
+                1.1050,
+                1.1060,
+                0.0030,
+            ));
+        }
+
+        // Pin the premise: the tick instant is NOT the close hour, its span is.
+        let tick_now: DateTime<Utc> = "2026-07-06T23:00:00Z".parse().unwrap();
+        let tick_prev: DateTime<Utc> = "2026-07-06T19:00:00Z".parse().unwrap();
+        assert!(
+            !trade_control_core::ny_clock::is_ny_close_edge(tick_now),
+            "premise: the catch-up tick does NOT land on the NY close hour"
+        );
+        assert!(
+            trade_control_core::ny_clock::ny_close_edge_in_span(tick_prev, tick_now),
+            "premise: the tick's span DOES cover the 21:00Z EDT NY close"
+        );
+
+        let live_at: DateTime<Utc> = "2026-07-06T19:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-07-08T00:00:00Z".parse().unwrap();
+
+        let r = super::run(
+            &plain_enter_plan("EUR/USD", 1.1050),
+            &candles,
+            Granularity::H1,
+            live_at,
+            expires_at,
+            no_marks(),
+            None,
+            CronCadence::new(4),
+        )
+        .await;
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("enter fired");
+        let reason = enter.rejected_reason().unwrap_or_else(|| {
+            panic!(
+                "enter must be REJECTED by the spread-blackout gate — the marker \
+                 must open on a tick whose SPAN covers the NY close, not only on \
+                 one whose instant lands on it"
+            )
+        });
+        assert!(
+            reason.contains("spread-blackout"),
+            "expected a spread-blackout rejection, got {reason:?}"
+        );
+    }
+
+    /// The other half of finding #3: the spanned marker must be stamped at the
+    /// NY-close INSTANT, not at the (later) tick end.
+    ///
+    /// The marker's 3 h TTL runs from where it was opened, so live's window
+    /// lapses ~3 h after the NY close. Stamping a spanned edge at the tick's own
+    /// `now` would push the lapse that much further out and reject entries live
+    /// lets through — swapping the audit's fail-open divergence for a
+    /// fail-closed one, which is the worse of the two (it silently starves real
+    /// setups).
+    ///
+    /// Same 4-bar catch-up tick as above, so the marker opens at 2026-07-06T21:00Z
+    /// and must lapse at 2026-07-07T00:00Z. The enter fires on a wide 30-pip book
+    /// on the 01:00Z bar — comfortably past the lapse, so it must be ALLOWED. If
+    /// the marker were stamped at the tick's 23:00Z end it would still be open and
+    /// this entry would be wrongly rejected.
+    #[tokio::test]
+    async fn spanned_marker_lapses_on_lives_schedule_not_the_tick_end() {
+        let mut candles: Vec<EngineCandle> = (9..=18)
+            .map(|h| {
+                ohlc_at_spread(
+                    &format!("2026-07-06T{h:02}:00:00Z"),
+                    1.1040,
+                    1.1042,
+                    1.1038,
+                    1.1040,
+                    0.0002,
+                )
+            })
+            .collect();
+        // The catch-up batch (19:00–22:00Z, tick `now` 23:00Z) whose span covers
+        // the 21:00Z close. Kept tight and below the enter level so nothing fires
+        // here — this tick exists only to OPEN the marker.
+        for h in 19..=22 {
+            candles.push(ohlc_at_spread(
+                &format!("2026-07-06T{h:02}:00:00Z"),
+                1.1040,
+                1.1042,
+                1.1038,
+                1.1040,
+                0.0002,
+            ));
+        }
+        // The enter's level is crossed on the 23:00Z bar, whose tick `now` is
+        // 2026-07-07T00:00Z — exactly when the correctly-stamped marker (opened
+        // 21:00Z + 3 h) has lapsed, so live allows this entry despite its WIDE
+        // 30-pip book. Stamped at the tick's 23:00Z end instead, the marker would
+        // run to 02:00Z and still be open here, wrongly rejecting.
+        candles.push(ohlc_at_spread(
+            "2026-07-06T23:00:00Z",
+            1.1045,
+            1.1060,
+            1.1043,
+            1.1055,
+            0.0030,
+        ));
+        candles.push(ohlc_at_spread(
+            "2026-07-07T00:00:00Z",
+            1.1055,
+            1.1065,
+            1.1050,
+            1.1060,
+            0.0002,
+        ));
+
+        let live_at: DateTime<Utc> = "2026-07-06T19:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-07-08T00:00:00Z".parse().unwrap();
+
+        let r = super::run(
+            &plain_enter_plan("EUR/USD", 1.1050),
+            &candles,
+            Granularity::H1,
+            live_at,
+            expires_at,
+            no_marks(),
+            None,
+            CronCadence::new(4),
+        )
+        .await;
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("enter fired");
+        if let Some(reason) = enter.rejected_reason() {
+            assert!(
+                !reason.contains("spread-blackout"),
+                "the marker opened by the spanning tick must lapse 3h after the NY \
+                 CLOSE (00:00Z), not 3h after the tick end — this entry is past the \
+                 lapse and live would allow it, but got {reason:?}"
+            );
+        }
     }
 
     #[tokio::test]
