@@ -327,19 +327,39 @@ pub async fn run(
         // wall-clock-vs-cursor trap that drops blackout state in replay.
         store.set_clock(now);
 
-        // Open the System-1 spread-blackout window marker on an NY-close-edge bar,
-        // exactly as the live cron's `apply_if_ny_close_edge` does — SAME
-        // `is_ny_close_edge` gate, SAME shared 3h TTL constant. This is what makes
-        // `run_enter`'s OWN spread-blackout gate fire offline: once the marker is
-        // set the gate samples `ReplayBroker::get_quote` (which synthesizes the
-        // fire-bar / spread-hour-elevated spread) and rejects for real — instead of
-        // the decision being re-derived by the `spread_blackout_reject` proxy. Off
-        // the edge the marker isn't written; the store clock is bar-pinned so a
-        // marker opened on a prior edge bar naturally lapses after its 3h TTL.
-        if trade_control_core::ny_clock::is_ny_close_edge(now)
+        // Open the System-1 spread-blackout window marker when this tick covers
+        // the NY close, exactly as the live cron's `apply_if_ny_close_edge` does
+        // — SAME shared predicate, SAME shared 3h TTL constant. This is what
+        // makes `run_enter`'s OWN spread-blackout gate fire offline: once the
+        // marker is set the gate samples `ReplayBroker::get_quote` (which
+        // synthesizes the fire-bar / spread-hour-elevated spread) and rejects for
+        // real — instead of the decision being re-derived by the
+        // `spread_blackout_reject` proxy. Off the edge the marker isn't written;
+        // the store clock is bar-pinned so a marker opened on a prior edge tick
+        // naturally lapses after its 3h TTL.
+        //
+        // SPAN, not instant. Live samples the edge on a wall-clock loop (900s
+        // upkeep), so it lands inside the close hour ~4× and reliably opens the
+        // marker. Replay has ONE instant per tick — the newest bar's close — so
+        // an instant check only fires when a bar happens to close on the close
+        // hour. The corpus's H4 grid is NY-session anchored (21:00 UTC in EDT,
+        // 22:00 in EST — `candle_cache::session_anchor`), so H4 lands on it every
+        // day by construction; but a midnight-anchored D1 close (00:00 UTC) never
+        // does, and a wider `--cron-gap` cadence can step over it on any
+        // granularity. Those ticks never opened the marker and the entry gate
+        // failed OPEN offline while live rejected. Asking the span question makes
+        // replay agree with live on every grid.
+        //
+        // Stamped at the EDGE instant, not at `now`: the marker's TTL runs from
+        // when it was opened, so stamping a spanned edge at the (later) tick end
+        // would hold the window open past where live lets it lapse — swapping
+        // fail-open for fail-closed. A tick that lands ON the edge still stamps
+        // its own instant, so every already-hitting series is byte-identical.
+        if let Some(edge_at) =
+            trade_control_core::ny_clock::last_ny_close_edge_in_span(prev_close, now)
             && let Err(e) = store
                 .set_spread_blackout_window(
-                    now,
+                    edge_at,
                     trade_control_core::spread_blackout::NY_CLOSE_WINDOW_MARKER_TTL_SECONDS,
                 )
                 .await
@@ -548,37 +568,30 @@ pub async fn run(
                             .await;
                     }
                 }
-                // A `ClosePositions`-level veto flattens any open position AND blocks
-                // entries (the entry block is the plan going `Done`, handled by the
-                // engine). Here we do the broker-side flatten the live ClosePositions
-                // veto performs via `broker.close_positions`. A non-ClosePositions
-                // veto (StopNextEntry — the pcl-exhausted cap) leaves the open
-                // position alone: no flatten.
-                //
-                // TWO different vetos reach this arm and the journal must not conflate
-                // them: the time-fired `02-veto-trade-expiry` (the clock ran out) and
-                // the structure-invalidation veto (`too-low` for a long / `too-high`
-                // for a short — the setup broke). Classify on the veto NAME, not the
-                // level they share; keying off the level alone reported "CLOSED AT
-                // EXPIRY" for an invalidation close with the trade-expiry days away
-                // (GBP/NZD iH&S 2026-07-22, closed 15:00 on 07-23 vs a 07-27 expiry).
-                Action::Veto | Action::Invalidate
-                    if fired.intent.level
-                        == Some(trade_control_core::intent::VetoLevel::ClosePositions) =>
-                {
-                    let is_expiry = fired.intent.name.as_deref()
-                        == Some(trade_control_core::intent::TRADE_EXPIRY_VETO_NAME);
-                    replay_broker.set_close_reason(if is_expiry {
-                        ExitReason::Expiry
-                    } else {
-                        ExitReason::Invalidation
-                    });
-                    replay_broker
-                        .cancel_pending_for_instrument(&fired.intent.instrument)
-                        .await;
-                    replay_broker
-                        .close_positions(&fired.intent.instrument)
-                        .await;
+                // A fired veto routes through the SAME shared dispatch the live
+                // cron runs, so the store write (`set_veto`), the `clears:` list,
+                // and the broker-side cancel/close can't drift offline. See
+                // [`dispatch_veto`].
+                Action::Veto => {
+                    dispatch_veto(&replay_broker, &store, &fired, now).await;
+                }
+                // `Invalidate` gets the cron's OTHER arm (`run_invalidate`: set an
+                // instrument cooldown, then cancel pending) — NOT the veto split.
+                // An invalidate intent carries `cooldown_hours` and no `name`, so
+                // routing it through `run_veto_with_broker` would reject it
+                // `missing-name`. No production plan builder emits
+                // `Action::Invalidate` today (the trade-expiry veto is
+                // `Action::Veto` at `ClosePositions` — `cli/src/trade_patterns.rs`;
+                // every `Action::Invalidate` in the tree is a test fixture), but
+                // the plan format allows it, so mirror the cron rather than leave
+                // a silent hole.
+                Action::Invalidate => {
+                    let shell = Shell::from_candle(&fired.candle);
+                    let verified = Verified {
+                        shell,
+                        intent: fired.intent.clone(),
+                    };
+                    dispatch::run_invalidate(&replay_broker, &store, &verified, now).await;
                 }
                 _ => {}
             }
@@ -702,6 +715,40 @@ pub async fn run(
             &lifecycle_cfg,
             &src,
             trade_control_core::order_control::PromoteScope::Every,
+            now,
+        )
+        .await;
+
+        // …and the RE-PRICE half of that same tick, which the live
+        // `order_control_tick::run_both` runs immediately after the promotion and
+        // the replay used to skip entirely. Slice 7
+        // (`core::pending_lifecycle`) retired the `HoldReason::SpreadHour` ON-side
+        // derivation in favour of the forward-looking SL floor that ONLY this pass
+        // delivers, so without it the replay had neither the retired hold nor its
+        // replacement: a resting order sat offline at its original stop through a
+        // spread widening while live re-priced it wider or parked it below min-R
+        // (`[[strategy_changes_in_both_replayer_and_worker]]`).
+        //
+        // Promotion runs FIRST, exactly as live: an order promoted this bar was
+        // placed at the current spread, so re-pricing it in the same tick would at
+        // best be redundant and at worst cancel-and-replace an order placed a
+        // moment ago.
+        //
+        // `account: None` — the ReplayBroker doesn't scope orders by account, and
+        // unlike the promotion pass this one enumerates BROKER ORDERS (which the
+        // broker has already scoped) rather than records, so the `PromoteScope`
+        // distinction doesn't arise here.
+        //
+        // `BrokerQuotes`, not the live cron's per-tick cache: the replay's
+        // `get_quote` is a local read off the bar it is already holding, so a cache
+        // would buy nothing and could only go stale within a bar.
+        trade_control_core::order_control::reprice_due_orders(
+            &replay_broker,
+            &store,
+            &lifecycle_cfg,
+            &src,
+            &mut trade_control_core::order_control::BrokerQuotes(&replay_broker),
+            None,
             now,
         )
         .await;
@@ -872,6 +919,95 @@ fn not_taken_reason(
 /// `DispatchConfig` built with `plan.pip_size` matches what the worker resolves.
 fn plan_pip(plan: &TradePlan) -> f64 {
     plan.pip_size
+}
+
+/// Dispatch one fired `veto` through the SAME shared handlers the live cron runs
+/// (`trade-control-cron/src/engine.rs`), so the offline veto has the identical
+/// effects:
+///
+/// - **The store write.** Both [`dispatch::handle_veto`] (the `StopNextEntry`
+///   flag-only path) and [`dispatch::run_veto_with_broker`] (every higher level)
+///   call `store.set_veto(..)` and clear the intent's `clears:` list. The replay
+///   used to do NEITHER, so `run_enter`'s veto gate — which reads
+///   `store.is_vetoed(..)` and rejects with `veto-active ({name})` — could never
+///   fire offline even though the H&S enters list all three veto names.
+/// - **The pending-order cancel at EVERY level.** In `run_veto_with_broker`
+///   `cancel_pending_for_instrument` runs unconditionally; only the *close* is
+///   gated on [`VetoLevel::ClosePositions`]. The replay used to gate BOTH on
+///   `ClosePositions`, so the three `CancelPending` M/W vetos (`mw-cancel`,
+///   `mw-abort`, `mw-overshoot`) — which exist precisely to pull a resting,
+///   unfilled order — did nothing at all offline. The order stayed resting and
+///   could fill on a later bar, booking R the live worker could never take.
+///
+/// What stays local to the replay is only the **journal classification**: the
+/// exit reason the broker stamps on a `ClosePositions` flatten. That keys on the
+/// veto NAME ([`TRADE_EXPIRY_VETO_NAME`]), not the level the trade-expiry veto
+/// and the structure-invalidation veto share — conflating them printed "CLOSED
+/// AT EXPIRY" for an invalidation close with the real expiry days away (GBP/NZD
+/// iH&S 2026-07-22, closed 15:00 on 07-23 against a 07-27 expiry).
+///
+/// [`TRADE_EXPIRY_VETO_NAME`]: trade_control_core::intent::TRADE_EXPIRY_VETO_NAME
+/// [`VetoLevel::ClosePositions`]: trade_control_core::intent::VetoLevel::ClosePositions
+async fn dispatch_veto(
+    broker: &ReplayBroker,
+    store: &MemStateStore,
+    fired: &FiredIntent,
+    now: DateTime<Utc>,
+) -> ActionResult {
+    use trade_control_core::intent::{TRADE_EXPIRY_VETO_NAME, VetoLevel};
+
+    let shell = match &fired.signal {
+        Some(sig) => Shell::from_candle_and_signal(&fired.candle, sig),
+        None => Shell::from_candle(&fired.candle),
+    };
+    let verified = Verified {
+        shell,
+        intent: fired.intent.clone(),
+    };
+
+    // Stamp the journal's exit reason BEFORE the shared dispatch runs, since it
+    // is `close_positions` (inside `run_veto_with_broker`) that consumes it.
+    // Name, not level — see the doc comment above.
+    if verified.intent.level == Some(VetoLevel::ClosePositions) {
+        let is_expiry = verified.intent.name.as_deref() == Some(TRADE_EXPIRY_VETO_NAME);
+        broker.set_close_reason(if is_expiry {
+            ExitReason::Expiry
+        } else {
+            ExitReason::Invalidation
+        });
+    }
+
+    // The identical split the live cron makes: a `StopNextEntry` veto is
+    // flag-only (no broker), every higher level goes through the broker path.
+    let result = if matches!(
+        verified.intent.level.unwrap_or_default(),
+        VetoLevel::StopNextEntry
+    ) {
+        // Same `ControlResult` → `ActionResult` mapping the cron's
+        // `control_result(.., "vetoed")` applies.
+        let control = dispatch::handle_veto(store, &verified, now).await;
+        if control.is_success() {
+            ActionResult::Ok("vetoed".to_string())
+        } else {
+            let code = control.status;
+            ActionResult::Rejected {
+                status: code,
+                body: format!("control dispatch returned status {code}"),
+                outcome: format!("rejected: control-status-{code}"),
+            }
+        }
+    } else {
+        dispatch::run_veto_with_broker(broker, store, &verified, now).await
+    };
+
+    if let ActionResult::Rejected { outcome, .. } = &result {
+        tracing::error!(
+            rule = %fired.rule_id,
+            outcome = %outcome,
+            "veto dispatch rejected in replay"
+        );
+    }
+    result
 }
 
 /// Dispatch one fired `enter` through the REAL `run_enter`, returning the
@@ -1614,6 +1750,198 @@ mod tests {
         );
     }
 
+    /// Finding #3 of the 2026-09-13 replay↔live audit, at the entry point.
+    ///
+    /// The replay samples the NY-close edge ONCE per tick, at the newest bar's
+    /// close. Live samples it on a wall-clock loop (900 s upkeep), so it lands
+    /// inside the close hour ~4× and reliably opens the System-1 spread-blackout
+    /// window marker. Whenever a replay tick's span exceeds an hour — a cron
+    /// catch-up (`--cron-gap`), a gap, a restart, or simply a coarse grid whose
+    /// bar closes miss the hour — the single sample steps straight over the edge:
+    /// the marker is never opened, `run_enter`'s spread-blackout gate has nothing
+    /// to read, and it fails OPEN offline while live rejects the same entry.
+    ///
+    /// Here a 4-bar catch-up tick batches 19:00–22:00Z under one `now` of
+    /// 2026-07-06T23:00Z. The EDT close hour (21:00Z) is inside that span but is
+    /// not the tick instant. The entry fires on a 30-pip book against EUR/USD's
+    /// flat 8-pip threshold, so with the marker open it must be rejected.
+    #[tokio::test]
+    async fn catch_up_tick_spanning_the_ny_close_still_rejects_on_spread_blackout() {
+        // Warm-up bars on a tight 2-pip book, below the enter level. Ten of them,
+        // so the `SEED_BARS` floor is met and the batch below is live.
+        let mut candles: Vec<EngineCandle> = (9..=18)
+            .map(|h| {
+                ohlc_at_spread(
+                    &format!("2026-07-06T{h:02}:00:00Z"),
+                    1.1040,
+                    1.1042,
+                    1.1038,
+                    1.1040,
+                    0.0002,
+                )
+            })
+            .collect();
+        // The catch-up batch: bars opening 19:00, 20:00, 21:00, 22:00Z — ONE tick
+        // whose `now` is the last bar's close, 23:00Z. The enter's level is
+        // crossed on the first of them, on a WIDE 30-pip book.
+        candles.push(ohlc_at_spread(
+            "2026-07-06T19:00:00Z",
+            1.1045,
+            1.1060,
+            1.1043,
+            1.1055,
+            0.0030,
+        ));
+        for h in 20..=22 {
+            candles.push(ohlc_at_spread(
+                &format!("2026-07-06T{h:02}:00:00Z"),
+                1.1055,
+                1.1065,
+                1.1050,
+                1.1060,
+                0.0030,
+            ));
+        }
+
+        // Pin the premise: the tick instant is NOT the close hour, its span is.
+        let tick_now: DateTime<Utc> = "2026-07-06T23:00:00Z".parse().unwrap();
+        let tick_prev: DateTime<Utc> = "2026-07-06T19:00:00Z".parse().unwrap();
+        assert!(
+            !trade_control_core::ny_clock::is_ny_close_edge(tick_now),
+            "premise: the catch-up tick does NOT land on the NY close hour"
+        );
+        assert!(
+            trade_control_core::ny_clock::ny_close_edge_in_span(tick_prev, tick_now),
+            "premise: the tick's span DOES cover the 21:00Z EDT NY close"
+        );
+
+        let live_at: DateTime<Utc> = "2026-07-06T19:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-07-08T00:00:00Z".parse().unwrap();
+
+        let r = super::run(
+            &plain_enter_plan("EUR/USD", 1.1050),
+            &candles,
+            Granularity::H1,
+            live_at,
+            expires_at,
+            no_marks(),
+            None,
+            CronCadence::new(4),
+        )
+        .await;
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("enter fired");
+        let reason = enter.rejected_reason().unwrap_or_else(|| {
+            panic!(
+                "enter must be REJECTED by the spread-blackout gate — the marker \
+                 must open on a tick whose SPAN covers the NY close, not only on \
+                 one whose instant lands on it"
+            )
+        });
+        assert!(
+            reason.contains("spread-blackout"),
+            "expected a spread-blackout rejection, got {reason:?}"
+        );
+    }
+
+    /// The other half of finding #3: the spanned marker must be stamped at the
+    /// NY-close INSTANT, not at the (later) tick end.
+    ///
+    /// The marker's 3 h TTL runs from where it was opened, so live's window
+    /// lapses ~3 h after the NY close. Stamping a spanned edge at the tick's own
+    /// `now` would push the lapse that much further out and reject entries live
+    /// lets through — swapping the audit's fail-open divergence for a
+    /// fail-closed one, which is the worse of the two (it silently starves real
+    /// setups).
+    ///
+    /// Same 4-bar catch-up tick as above, so the marker opens at 2026-07-06T21:00Z
+    /// and must lapse at 2026-07-07T00:00Z. The enter fires on a wide 30-pip book
+    /// on the 01:00Z bar — comfortably past the lapse, so it must be ALLOWED. If
+    /// the marker were stamped at the tick's 23:00Z end it would still be open and
+    /// this entry would be wrongly rejected.
+    #[tokio::test]
+    async fn spanned_marker_lapses_on_lives_schedule_not_the_tick_end() {
+        let mut candles: Vec<EngineCandle> = (9..=18)
+            .map(|h| {
+                ohlc_at_spread(
+                    &format!("2026-07-06T{h:02}:00:00Z"),
+                    1.1040,
+                    1.1042,
+                    1.1038,
+                    1.1040,
+                    0.0002,
+                )
+            })
+            .collect();
+        // The catch-up batch (19:00–22:00Z, tick `now` 23:00Z) whose span covers
+        // the 21:00Z close. Kept tight and below the enter level so nothing fires
+        // here — this tick exists only to OPEN the marker.
+        for h in 19..=22 {
+            candles.push(ohlc_at_spread(
+                &format!("2026-07-06T{h:02}:00:00Z"),
+                1.1040,
+                1.1042,
+                1.1038,
+                1.1040,
+                0.0002,
+            ));
+        }
+        // The enter's level is crossed on the 23:00Z bar, whose tick `now` is
+        // 2026-07-07T00:00Z — exactly when the correctly-stamped marker (opened
+        // 21:00Z + 3 h) has lapsed, so live allows this entry despite its WIDE
+        // 30-pip book. Stamped at the tick's 23:00Z end instead, the marker would
+        // run to 02:00Z and still be open here, wrongly rejecting.
+        candles.push(ohlc_at_spread(
+            "2026-07-06T23:00:00Z",
+            1.1045,
+            1.1060,
+            1.1043,
+            1.1055,
+            0.0030,
+        ));
+        candles.push(ohlc_at_spread(
+            "2026-07-07T00:00:00Z",
+            1.1055,
+            1.1065,
+            1.1050,
+            1.1060,
+            0.0002,
+        ));
+
+        let live_at: DateTime<Utc> = "2026-07-06T19:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-07-08T00:00:00Z".parse().unwrap();
+
+        let r = super::run(
+            &plain_enter_plan("EUR/USD", 1.1050),
+            &candles,
+            Granularity::H1,
+            live_at,
+            expires_at,
+            no_marks(),
+            None,
+            CronCadence::new(4),
+        )
+        .await;
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("enter fired");
+        if let Some(reason) = enter.rejected_reason() {
+            assert!(
+                !reason.contains("spread-blackout"),
+                "the marker opened by the spanning tick must lapse 3h after the NY \
+                 CLOSE (00:00Z), not 3h after the tick end — this entry is past the \
+                 lapse and live would allow it, but got {reason:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn sub_bar_pause_epoch_opens_via_virtual_tick_and_suppresses_enter() {
         // PR2 parity: the pause epoch is at 10.5h — BETWEEN the bar-10 close
@@ -1815,6 +2143,19 @@ mod tests {
             ask_h: h,
             ask_l: l,
             ask_c: c,
+        }
+    }
+
+    /// The mid-only [`Candle`] the engine hands a `FiredIntent`, taken from a
+    /// bid/ask bar. Lets a test synthesise the fire the evaluator would have
+    /// produced, so it can drive one dispatch arm directly.
+    fn mid_of(c: &EngineCandle) -> trade_control_core::broker::Candle {
+        trade_control_core::broker::Candle {
+            time: c.time,
+            o: c.o,
+            h: c.h,
+            l: c.l,
+            c: c.c,
         }
     }
 
@@ -2039,6 +2380,226 @@ mod tests {
             report.contains("TP: 1  SL: 0"),
             "exactly one taken position (the limit's TP), no overlap:\n{report}"
         );
+    }
+
+    /// A single-enter LONG plan whose enter rests at 1.1100, plus one veto whose
+    /// `level` and `name` the caller picks. Shaped like an M/W setup: the veto is
+    /// `CancelPending` in the test that matters — its whole job is to pull the
+    /// resting, unfilled order before it can trigger.
+    ///
+    /// The veto fires on an `on_close` up-cross of `veto_level`; the enter on an
+    /// `on_close` up-cross of 1.1050.
+    fn enter_then_veto_plan(level: &str, name: &str, veto_level: f64) -> TradePlan {
+        serde_json::from_str(&format!(
+            r#"{{
+                "trade_id": "mw-1",
+                "instrument": "EUR_USD",
+                "direction": "long",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {{
+                        "rule_id": "05-enter",
+                        "trigger": {{ "type": "horizontal_cross", "level": 1.1050, "dir": "up", "bar": "on_close" }},
+                        "fire_mode": "once",
+                        "intent": {{
+                            "v": 1,
+                            "id": "mw-enter",
+                            "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter",
+                            "instrument": "EUR_USD",
+                            "direction": "long",
+                            "entry": {{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.1100 }},
+                            "stop_loss": {{ "absolute": 1.1000 }},
+                            "take_profit": {{ "absolute": 1.1300 }},
+                            "broker": "tradenation",
+                            "trade_id": "mw-1",
+                            "vetos": ["{name}"],
+                            "max_retries": 5
+                        }}
+                    }},
+                    {{
+                        "rule_id": "01-veto-{name}",
+                        "trigger": {{ "type": "horizontal_cross", "level": {veto_level}, "dir": "up", "bar": "on_close" }},
+                        "fire_mode": "once",
+                        "intent": {{
+                            "v": 1,
+                            "id": "mw-veto",
+                            "not_after": "2099-01-01T00:00:00Z",
+                            "action": "veto",
+                            "level": "{level}",
+                            "name": "{name}",
+                            "instrument": "EUR_USD",
+                            "trade_id": "mw-1",
+                            "ttl_hours": 48
+                        }}
+                    }}
+                ]
+            }}"#
+        ))
+        .expect("parse enter+veto plan")
+    }
+
+    /// Finding #1(b): a **`cancel-pending`** veto must cancel the trade's resting,
+    /// unfilled entry order — offline exactly as live.
+    ///
+    /// Live, `run_veto_with_broker` calls `broker.cancel_pending_for_instrument`
+    /// **unconditionally** for every level; only the *close* is gated on
+    /// `ClosePositions`. The replay used to gate BOTH on `ClosePositions`, so the
+    /// three M/W vetos (`mw-cancel`, `mw-abort`, `mw-overshoot` — all
+    /// `CancelPending`) did nothing at all: the order stayed resting and filled on
+    /// a later bar, booking R the live worker could never have taken.
+    ///
+    /// Geometry (LONG stop @1.1100, SL 1.1000, TP 1.1300):
+    /// - bars 0..9: seed at 1.1040, below every level.
+    /// - bar 10: closes 1.1055 → crosses 1.1050 → `05-enter` fires, rests @1.1100.
+    /// - bar 11: closes 1.1065 → crosses 1.1060 → the `cancel-pending` veto fires.
+    ///   The resting order has not triggered (high 1.1068 < 1.1100).
+    /// - bars 12+: price runs through 1.1100 to TP 1.1300. With the order
+    ///   cancelled, nothing fills — so the report must tally **no** trade.
+    #[tokio::test]
+    async fn a_cancel_pending_veto_cancels_the_resting_entry_order() {
+        let plan = enter_then_veto_plan("cancel-pending", "mw-cancel", 1.1060);
+        let mut candles: Vec<EngineCandle> = (0..10).map(|i| candle(i * 3600, 1.1040)).collect();
+        candles.push(ohlc(10 * 3600, 1.1045, 1.1058, 1.1042, 1.1055)); // enter fires
+        candles.push(ohlc(11 * 3600, 1.1056, 1.1068, 1.1050, 1.1065)); // veto fires
+        candles.push(ohlc(12 * 3600, 1.1060, 1.1120, 1.1055, 1.1110)); // would fill @1.1100
+        candles.push(ohlc(13 * 3600, 1.1110, 1.1200, 1.1100, 1.1190));
+        candles.push(ohlc(14 * 3600, 1.1190, 1.1310, 1.1185, 1.1300)); // would hit TP
+        candles.push(ohlc(15 * 3600, 1.1300, 1.1320, 1.1290, 1.1305));
+
+        let r = run(
+            &plan,
+            &candles,
+            Granularity::H1,
+            all_live(),
+            expires(),
+            no_marks(),
+            None,
+        )
+        .await;
+
+        // Both rules fired: the enter placed, then the veto.
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("the enter fired");
+        assert!(
+            matches!(enter.gate_outcome, EnterGateOutcome::Placed { .. }),
+            "the enter must have placed a resting order, got {:?}",
+            enter.gate_outcome
+        );
+        assert!(
+            r.fires
+                .iter()
+                .any(|f| f.fired.rule_id == "01-veto-mw-cancel"),
+            "the cancel-pending veto fired"
+        );
+
+        // The teeth: the cancelled order has NO realized outcome (a cancelled
+        // resting order fills nothing), so no trade is booked. Before the fix the
+        // order stayed resting, filled at 1.1100 on bar 12 and ran to TP.
+        assert!(
+            enter.realized.is_none(),
+            "a cancel-pending veto must leave the resting order cancelled — no fill, \
+             no realized outcome; got {:?}",
+            enter.realized
+        );
+        let report = crate::report::render(&plan, &r, true, false, None, &no_marks(), None).text;
+        assert!(
+            report.contains("TP: 0  SL: 0"),
+            "the cancelled order books no trade at all:\n{report}"
+        );
+    }
+
+    /// Finding #1(a): a fired veto must WRITE THE STORE, so `run_enter`'s veto
+    /// gate (`store.is_vetoed` → `rejected: veto-active ({{name}})`) can reject a
+    /// later enter offline exactly as live.
+    ///
+    /// ⚠️ For a realistic plan the ENGINE latch masks this gate entirely, and that
+    /// is not a flaw in the test — it is a fact about the engine that a reader
+    /// must not mistake for coverage. `evaluate_guards` runs *before* the spine on
+    /// every bar, and any fired `Action::Veto` classifies as
+    /// `RuleKind::SetupInvalidation`, so it either retires the plan
+    /// (`Phase::Done`, for `CancelPending`/`ClosePositions`) or latches
+    /// `entries_blocked` (for `StopNextEntry`) — and `evaluate_plan` then
+    /// `continue`s past the entry spine on that bar and every bar after. There is
+    /// no plan shape where the engine lets an enter fire after its own veto fired,
+    /// so the store gate is unreachable *through the engine*.
+    ///
+    /// The store write is nonetheless the live behaviour and is load-bearing for
+    /// the `clears:` list and the control-event trail, so this test drives the
+    /// replay's own dispatch entry point ([`super::dispatch_veto`]) directly and
+    /// then asks the REAL `run_enter` gate — the two halves the engine keeps
+    /// apart. Delete the `set_veto` inside `handle_veto` / `run_veto_with_broker`
+    /// and this goes red.
+    #[tokio::test]
+    async fn a_fired_stop_next_entry_veto_writes_the_store_and_rejects_a_later_enter() {
+        let plan = enter_then_veto_plan("stop-next-entry", "too-low", 1.1060);
+        let candles: Vec<EngineCandle> = (0..12)
+            .map(|i| ohlc(i * 3600, 1.1045, 1.1068, 1.1042, 1.1065))
+            .collect();
+        let broker = ReplayBroker::new(candles.clone(), plan.pip_size);
+        let store = MemStateStore::default();
+        let now = candles[11].time;
+        store.set_clock(now);
+
+        let veto_rule = plan
+            .rules
+            .iter()
+            .find(|r| r.rule_id == "01-veto-too-low")
+            .expect("veto rule in plan");
+        let enter_rule = plan
+            .rules
+            .iter()
+            .find(|r| r.rule_id == "05-enter")
+            .expect("enter rule in plan");
+
+        let fired_veto = FiredIntent {
+            rule_id: veto_rule.rule_id.clone(),
+            intent: veto_rule.intent.clone(),
+            candle: mid_of(&candles[10]),
+            signal: None,
+        };
+        let result = super::dispatch_veto(&broker, &store, &fired_veto, now).await;
+        assert!(
+            matches!(result, ActionResult::Ok(_)),
+            "the veto dispatch must succeed"
+        );
+
+        // The store write is what the enter gate reads.
+        assert!(
+            store
+                .is_vetoed(None, "mw-1", "EUR_USD", "too-low")
+                .await
+                .expect("store read"),
+            "the fired veto must have written `too-low` to the store"
+        );
+
+        // And the REAL `run_enter` gate rejects on it, with the live wording.
+        let fired_enter = FiredIntent {
+            rule_id: enter_rule.rule_id.clone(),
+            intent: enter_rule.intent.clone(),
+            candle: mid_of(&candles[11]),
+            signal: None,
+        };
+        let outcome = dispatch_enter(
+            &broker,
+            &store,
+            &fired_enter,
+            &plan.pip_size,
+            now,
+            Granularity::H1,
+        )
+        .await;
+        match outcome {
+            EnterGateOutcome::Rejected { reason } => assert_eq!(
+                reason, "rejected: veto-active (too-low)",
+                "the enter must be rejected by the store's veto gate"
+            ),
+            other => panic!("expected a veto-active rejection, got {other:?}"),
+        }
     }
 
     /// A SHORT plan with a `06-close-on-reversal` PinePattern{Long} guard: the
@@ -3163,6 +3724,26 @@ mod tests {
     /// TTL-vs-block regression guard: assert the fill lands AFTER the block start
     /// (a genuinely deferred entry) and the journal shows a taken TP, not a 0R
     /// no-fill.
+    ///
+    /// ⚠️ **The route to that deferral changed when the shared re-price pass
+    /// landed, and this test now guards BOTH halves.** The order no longer waits
+    /// for the 21:00Z block to cancel it: at **20:00Z**, an hour earlier,
+    /// AUD/CHF's baked `expected_next_hour` of 0.002143 puts the forward-looking
+    /// floor at 0.0214, which a 50-pip TP cannot clear at a 1.0 R-floor — so the
+    /// order is **DEMOTED** (pulled off the book and parked) ahead of the spike,
+    /// and **PROMOTED** again once it has passed. That is precisely the
+    /// substitution slice 7 made for the retired `HoldReason::SpreadHour`,
+    /// arriving offline for the first time.
+    ///
+    /// The observable assertions below are unchanged and still hold, which is the
+    /// point: cancel→hold→restore and demote→park→promote are two mechanisms
+    /// delivering one operator-visible behaviour — do not enter into the spike, do
+    /// enter after it.
+    ///
+    /// This test is also what caught the park being **unrecoverable offline**: a
+    /// park is recovered by trade id while every resting-order path uses the order
+    /// id, so `ReplayVerifiedSource` answered `will not verify` and the setup
+    /// silently vanished. See `ReplayBroker::armed_verified`.
     #[tokio::test]
     async fn multishot_multi_hour_block_order_is_held_then_restored_at_block_end() {
         // Warm-up bars above 0.5610 through the daytime (clean) hours, so the live
@@ -3302,6 +3883,372 @@ mod tests {
         assert!(
             report.contains("TP: 1  SL: 0"),
             "exactly one taken position (the deferred order's TP):\n{report}"
+        );
+    }
+
+    // ---- the shared re-price pass (rule 7's second half) --------------------
+
+    /// A multi-shot EUR/USD short whose entry bar is CALM and whose following
+    /// bars are WIDE. Geometry is deliberately kept out of a spread hour (EUR/USD's
+    /// only one is 21:00Z) so the widening comes from the recorded book alone and
+    /// not from the `get_quote` in-block clamp.
+    fn eurusd_reprice_plan() -> TradePlan {
+        serde_json::from_str(
+            r#"{
+                "trade_id": "eurusd-rp",
+                "instrument": "EUR/USD",
+                "direction": "short",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {
+                        "rule_id": "05-enter",
+                        "trigger": { "type": "horizontal_cross", "level": 1.1010, "dir": "down", "bar": "on_close" },
+                        "fire_mode": "once",
+                        "intent": {
+                            "v": 1, "id": "eurusd-rp-enter", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter", "instrument": "EUR/USD", "direction": "short",
+                            "entry": { "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.1000 },
+                            "stop_loss": { "absolute": 1.1020 },
+                            "take_profit": { "absolute": 1.0800 },
+                            "broker": "tradenation", "trade_id": "eurusd-rp", "max_retries": 1,
+                            "pip_size": 0.0001
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse EUR/USD re-price plan")
+    }
+
+    /// Bars for the re-price tests. 10 calm warm-up bars, a calm 12:00Z enter bar,
+    /// then `after_spread`-wide bars that never reach the 1.1000 trigger, and
+    /// finally a bar that fills and one that runs to TP.
+    ///
+    /// The order rests across the wide bars, which is the whole window in which a
+    /// re-price can happen.
+    fn reprice_candles(after_spread: f64) -> Vec<EngineCandle> {
+        let mut candles: Vec<EngineCandle> = (2..12)
+            .map(|h| {
+                ohlc_at_spread(
+                    &format!("2026-07-08T{h:02}:00:00Z"),
+                    1.1020,
+                    1.1022,
+                    1.1018,
+                    1.1020,
+                    0.00002,
+                )
+            })
+            .collect();
+        // 12:00Z calm: closes below 1.1010 → the short enter fires, stop rests.
+        candles.push(ohlc_at_spread(
+            "2026-07-08T12:00:00Z",
+            1.1016,
+            1.1017,
+            1.1006,
+            1.1008,
+            0.00002,
+        ));
+        // 13:00Z + 14:00Z: the order rests (never reaches 1.1000) while the book
+        // is `after_spread` wide. This is where a re-price fires.
+        for h in ["13", "14"] {
+            candles.push(ohlc_at_spread(
+                &format!("2026-07-08T{h}:00:00Z"),
+                1.1008,
+                1.1009,
+                1.1003,
+                1.1007,
+                after_spread,
+            ));
+        }
+        // 15:00Z: straddles 1.1000 → fills.
+        candles.push(ohlc_at_spread(
+            "2026-07-08T15:00:00Z",
+            1.1002,
+            1.1004,
+            1.0995,
+            1.0999,
+            after_spread,
+        ));
+        // 16:00Z: runs down to TP.
+        candles.push(ohlc_at_spread(
+            "2026-07-08T16:00:00Z",
+            1.0995,
+            1.0997,
+            1.0798,
+            1.0801,
+            after_spread,
+        ));
+        candles
+    }
+
+    async fn reprice_run(after_spread: f64) -> Replay {
+        run(
+            &eurusd_reprice_plan(),
+            &reprice_candles(after_spread),
+            Granularity::H1,
+            "2026-07-08T12:00:00Z".parse().unwrap(),
+            "2026-07-10T00:00:00Z".parse().unwrap(),
+            no_marks(),
+            None,
+        )
+        .await
+    }
+
+    fn reprice_stop(r: &Replay) -> f64 {
+        r.fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("the short enter must fire on the 12:00Z down-cross")
+            .realized
+            .as_ref()
+            .expect("the order must fill")
+            .stop_loss
+    }
+
+    /// THE FINDING: a resting order whose book widens after placement must have
+    /// its stop RE-PRICED WIDER before it fills — the forward-looking SL floor
+    /// that slice 7 made the sole replacement for the retired `SpreadHour` hold.
+    ///
+    /// Offline the replay ran only `promote_due_orders`, so it had neither the
+    /// retired hold nor its replacement and the order filled at its original,
+    /// too-tight stop.
+    ///
+    /// Asserted as a comparison between two runs of the SAME geometry that differ
+    /// only in the post-entry spread, so it cannot pass on an absolute number that
+    /// some unrelated flooring happens to produce. The calm run is the control.
+    #[tokio::test]
+    async fn a_resting_order_is_repriced_wider_when_the_book_widens_after_placement() {
+        let calm = reprice_stop(&reprice_run(0.00002).await);
+        let wide = reprice_stop(&reprice_run(0.00030).await);
+        assert!(
+            wide > calm + 1e-9,
+            "a short's stop must be re-priced WIDER (higher) when the book widens \
+             after placement: calm={calm} wide={wide}",
+        );
+        // 10x the 0.0003 spread = a 0.0030 floor off the 1.1000 trigger.
+        assert!(
+            (wide - 1.1030).abs() < 1e-6,
+            "the widened stop must be the 10x-spread floor off the trigger, got {wide}",
+        );
+    }
+
+    /// The control half, pinned separately: a book that does NOT widen must leave
+    /// the stop exactly where it was placed. Without this the test above would
+    /// pass for an implementation that widens every resting order every bar.
+    #[tokio::test]
+    async fn a_resting_order_in_a_calm_book_is_not_repriced() {
+        let calm = reprice_stop(&reprice_run(0.00002).await);
+        assert!(
+            (calm - 1.1020).abs() < 1e-6,
+            "a calm book must leave the DRAWN 1.1020 stop untouched, got {calm}",
+        );
+    }
+
+    /// The re-price is DIRECTIONAL, and a hardcoded `Direction::Long` is the exact
+    /// mutation that survived two prior agents' test sets. A short's stop widens
+    /// UPWARD (away from a falling target); the long mirror widens DOWNWARD. Both
+    /// runs share one geometry apart from the direction, so an implementation that
+    /// moved the stop the same way for both fails one of them.
+    #[tokio::test]
+    async fn the_long_mirror_widens_downward_not_upward() {
+        let plan: TradePlan = serde_json::from_str(
+            r#"{
+                "trade_id": "eurusd-rp-long",
+                "instrument": "EUR/USD",
+                "direction": "long",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {
+                        "rule_id": "05-enter",
+                        "trigger": { "type": "horizontal_cross", "level": 1.1010, "dir": "up", "bar": "on_close" },
+                        "fire_mode": "once",
+                        "intent": {
+                            "v": 1, "id": "eurusd-rp-long-enter", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter", "instrument": "EUR/USD", "direction": "long",
+                            "entry": { "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.1020 },
+                            "stop_loss": { "absolute": 1.1000 },
+                            "take_profit": { "absolute": 1.1220 },
+                            "broker": "tradenation", "trade_id": "eurusd-rp-long", "max_retries": 1,
+                            "pip_size": 0.0001
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse the long mirror plan");
+
+        // The mirror of `reprice_candles`, reflected about 1.1010.
+        let mut candles: Vec<EngineCandle> = (2..12)
+            .map(|h| {
+                ohlc_at_spread(
+                    &format!("2026-07-08T{h:02}:00:00Z"),
+                    1.1000,
+                    1.1002,
+                    1.0998,
+                    1.1000,
+                    0.00002,
+                )
+            })
+            .collect();
+        candles.push(ohlc_at_spread(
+            "2026-07-08T12:00:00Z",
+            1.1004,
+            1.1014,
+            1.1003,
+            1.1012,
+            0.00002,
+        ));
+        for h in ["13", "14"] {
+            candles.push(ohlc_at_spread(
+                &format!("2026-07-08T{h}:00:00Z"),
+                1.1012,
+                1.1017,
+                1.1011,
+                1.1013,
+                0.00030,
+            ));
+        }
+        candles.push(ohlc_at_spread(
+            "2026-07-08T15:00:00Z",
+            1.1018,
+            1.1025,
+            1.1016,
+            1.1021,
+            0.00030,
+        ));
+        candles.push(ohlc_at_spread(
+            "2026-07-08T16:00:00Z",
+            1.1025,
+            1.1222,
+            1.1023,
+            1.1219,
+            0.00030,
+        ));
+
+        let r = run(
+            &plan,
+            &candles,
+            Granularity::H1,
+            "2026-07-08T12:00:00Z".parse().unwrap(),
+            "2026-07-10T00:00:00Z".parse().unwrap(),
+            no_marks(),
+            None,
+        )
+        .await;
+        let stop = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("the long enter must fire")
+            .realized
+            .as_ref()
+            .expect("the long order must fill")
+            .stop_loss;
+        assert!(
+            stop < 1.1000 - 1e-9,
+            "a LONG's stop must be re-priced DOWNWARD (below the drawn 1.1000) when \
+             the book widens — a direction-blind implementation moves it up, got {stop}",
+        );
+        assert!(
+            (stop - 1.0990).abs() < 1e-6,
+            "the long's widened stop is the 10x-spread floor BELOW the 1.1020 \
+             trigger, got {stop}",
+        );
+    }
+
+    /// The MAJORITY case, and the one a "widen-only" reading of this finding
+    /// misses entirely: a stop the ENTRY path widened past the drawn level to
+    /// clear a wide book must be **SHRUNK back toward drawn** once the book calms
+    /// while the order is still resting.
+    ///
+    /// A resting order has no P&L to realise, so shrinking it is unconditionally
+    /// safe — `core::order_control::pending`'s module docs say so explicitly, and
+    /// deliberately omit the `in_profit` gate the live-position path carries.
+    ///
+    /// This is not a corner: instrumenting the pass across the whole fixture
+    /// corpus measured **1231 shrinks against 627 widens**. An implementation
+    /// that only ever widened would be wrong for two thirds of the real cases and
+    /// would pass every other test here.
+    ///
+    /// Mutation check: suppress `Adjust`s that shrink and this goes red while the
+    /// widening tests stay green.
+    #[tokio::test]
+    async fn a_stop_widened_at_entry_is_shrunk_back_when_the_book_calms() {
+        // WIDE at the 12:00Z entry bar: the SL-spread floor widens the drawn
+        // 1.1020 stop out to the 10x floor (0.0030 over the 1.1000 trigger).
+        let mut candles: Vec<EngineCandle> = (2..12)
+            .map(|h| {
+                ohlc_at_spread(
+                    &format!("2026-07-08T{h:02}:00:00Z"),
+                    1.1020,
+                    1.1022,
+                    1.1018,
+                    1.1020,
+                    0.00030,
+                )
+            })
+            .collect();
+        candles.push(ohlc_at_spread(
+            "2026-07-08T12:00:00Z",
+            1.1016,
+            1.1017,
+            1.1006,
+            1.1008,
+            0.00030,
+        ));
+        // 13:00Z + 14:00Z CALM while the order still rests: the floor collapses to
+        // 0.0002, so the desired stop falls back to the DRAWN 1.1020 (the `max`'s
+        // third term, which is what stops a shrink running past the operator's own
+        // level).
+        for h in ["13", "14"] {
+            candles.push(ohlc_at_spread(
+                &format!("2026-07-08T{h}:00:00Z"),
+                1.1008,
+                1.1009,
+                1.1003,
+                1.1007,
+                0.00002,
+            ));
+        }
+        candles.push(ohlc_at_spread(
+            "2026-07-08T15:00:00Z",
+            1.1002,
+            1.1004,
+            1.0995,
+            1.0999,
+            0.00002,
+        ));
+        candles.push(ohlc_at_spread(
+            "2026-07-08T16:00:00Z",
+            1.0995,
+            1.0997,
+            1.0798,
+            1.0801,
+            0.00002,
+        ));
+
+        let r = run(
+            &eurusd_reprice_plan(),
+            &candles,
+            Granularity::H1,
+            "2026-07-08T12:00:00Z".parse().unwrap(),
+            "2026-07-10T00:00:00Z".parse().unwrap(),
+            no_marks(),
+            None,
+        )
+        .await;
+        let stop = reprice_stop(&r);
+        assert!(
+            stop < 1.1030 - 1e-9,
+            "the entry-bar floor put the stop at 1.1030; a calm book must SHRINK \
+             it, got {stop}",
+        );
+        assert!(
+            (stop - 1.1020).abs() < 1e-6,
+            "…back to the DRAWN 1.1020 and no further — the drawn level is the \
+             floor's third term, got {stop}",
         );
     }
 }

@@ -92,6 +92,35 @@ pub enum RepriceOutcome {
 /// Errors are returned as `Err(String)` for the caller to log. On any failure the
 /// order is left in the safest state reachable from where the failure happened —
 /// see the module docs on ordering.
+/// The **drawn** geometry a park must carry so a later promotion can judge it.
+///
+/// Every field here was previously a hardcoded placeholder in `park_below_min_r`
+/// (`original_sl_distance: 0.0`, `tp_distance: 0.0200`, `min_r: 1.0`) with a doc
+/// comment claiming the drawn distance was recorded. It was not, and the
+/// consequence is a **demote↔promote ping-pong**: `sl_target` reads a
+/// non-positive `original_sl_distance` as unjudgeable and answers `Hold`, so
+/// `stored_verdict`'s `clears_min_r` is `true` for a park that has *just* been
+/// demoted for failing exactly that test. The order is re-placed, re-judged,
+/// re-demoted, every tick until its window closes — and the setup is destroyed
+/// rather than deferred.
+///
+/// It stayed latent because nothing offline demoted, so no fixture and no test
+/// ever ran a demote through to its promotion. Carrying the real numbers is what
+/// makes the park's promotion gate answer the same question the demote asked.
+///
+/// The distances are the **drawn** ones, not today's widened ones: a park is
+/// re-sized against the spread at promotion time, so freezing the widened
+/// distance in would carry a stale spread forward.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParkGeometry {
+    /// The drawn stop distance, in price units.
+    pub original_sl_distance: f64,
+    /// The distance from the entry trigger to the take-profit, in price units.
+    pub tp_distance: f64,
+    /// The trade's R-floor.
+    pub min_r: f64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn reprice_pending_order<B, S, P, V>(
     broker: &B,
@@ -101,6 +130,7 @@ pub async fn reprice_pending_order<B, S, P, V>(
     order: &PendingOrder,
     account: Option<&str>,
     action: PendingAction,
+    park_geometry: ParkGeometry,
     expires_at: DateTime<Utc>,
     bar_seconds: i64,
     now: DateTime<Utc>,
@@ -164,6 +194,7 @@ where
             &order.instrument,
             account,
             signed_intent,
+            park_geometry,
             verified.shell.time,
             expires_at,
             bar_seconds,
@@ -219,6 +250,7 @@ where
         &order.instrument,
         account,
         signed_intent,
+        park_geometry,
         verified.shell.time,
         expires_at,
         bar_seconds,
@@ -231,10 +263,11 @@ where
 /// Park a cancelled order as Stored, so a later tick can promote it.
 ///
 /// Shared by the demote path and the failed-re-place path: both end with the
-/// order off the broker and the setup needing to survive. The distance recorded
-/// is the *drawn* one — a park is re-sized when it promotes, against the spread
+/// order off the broker and the setup needing to survive. The distances recorded
+/// are the *drawn* ones — a park is re-sized when it promotes, against the spread
 /// at that time, so freezing today's widened distance into it would carry a stale
-/// spread forward.
+/// spread forward. See [`ParkGeometry`] for why they must be real numbers and not
+/// the placeholders this once wrote.
 #[allow(clippy::too_many_arguments)]
 async fn park_below_min_r<S: StateStore>(
     store: &S,
@@ -242,6 +275,7 @@ async fn park_below_min_r<S: StateStore>(
     instrument: &str,
     account: Option<&str>,
     signed_intent: String,
+    geometry: ParkGeometry,
     shell_time: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     bar_seconds: i64,
@@ -255,10 +289,15 @@ async fn park_below_min_r<S: StateStore>(
         StoredOrder {
             signed_intent,
             reason: StoredReason::BelowMinR,
-            // Sized at promotion time against the spread then — see the fn doc.
-            original_sl_distance: 0.0,
-            tp_distance: 0.0200,
-            min_r: 1.0,
+            // The DRAWN geometry, so the promotion gate re-asks the very question
+            // the demote answered. These were hardcoded placeholders
+            // (`0.0` / `0.0200` / `1.0`) whose zero distance made `sl_target`
+            // report "unjudgeable ⇒ Hold", which `stored_verdict` reads as
+            // "clears min_r" — promoting every park unconditionally, straight back
+            // into the demote that produced it. See [`ParkGeometry`].
+            original_sl_distance: geometry.original_sl_distance,
+            tp_distance: geometry.tp_distance,
+            min_r: geometry.min_r,
             stored_at: now,
             drop_at: drop_at(expires_at, bar_seconds, now),
             shell_time,
@@ -323,6 +362,11 @@ mod tests {
             &resting(),
             None,
             action,
+            ParkGeometry {
+                original_sl_distance: 0.0020,
+                tp_distance: 0.0200,
+                min_r: 1.0,
+            },
             at("2026-07-24T00:00:00Z"),
             3600,
             now,
@@ -416,6 +460,72 @@ mod tests {
                 .expect("read")
                 .is_some(),
             "...but the SETUP must survive as a park",
+        );
+    }
+
+    /// THE PING-PONG GUARD: a park must carry the **real** drawn geometry, so the
+    /// promotion gate re-asks the very question the demote just answered.
+    ///
+    /// `park_below_min_r` used to hardcode `original_sl_distance: 0.0` (with a doc
+    /// comment claiming otherwise). `sl_target` reads a non-positive original
+    /// distance as *unjudgeable* and answers `Hold`, which `stored_verdict` takes
+    /// as `clears_min_r == true` — so every park promoted unconditionally, was
+    /// re-judged, and was demoted again, every tick until the window closed. The
+    /// setup was destroyed rather than deferred.
+    ///
+    /// The bug was unreachable offline until the shared re-price pass landed
+    /// (nothing else in the replay demotes), and no test anywhere ran a demote
+    /// through to its promotion — which is why a zero distance sat behind a
+    /// comment saying it was the drawn one.
+    ///
+    /// Mutation check: put any of the three placeholders back and this goes red.
+    #[test]
+    fn a_park_carries_the_drawn_geometry_so_it_cannot_promote_straight_back() {
+        let store = MemStateStore::default();
+        let broker = SpyBroker::default();
+        run(
+            &broker,
+            &store,
+            &TestSrc::Ok,
+            PendingAction::Demote,
+            at("2026-07-22T13:30:00Z"),
+        )
+        .expect("demote");
+        let parked = pollster::block_on(stored_order(&store, "t-1"))
+            .expect("read")
+            .expect("a park");
+        assert!(
+            parked.original_sl_distance > 0.0,
+            "a zero distance is what `sl_target` calls unjudgeable, and an \
+             unjudgeable park promotes unconditionally — straight back into the \
+             demote that made it. Got {}",
+            parked.original_sl_distance,
+        );
+        assert_eq!(
+            (
+                parked.original_sl_distance,
+                parked.tp_distance,
+                parked.min_r
+            ),
+            (0.0020, 0.0200, 1.0),
+            "the park must record the geometry it was GIVEN, not a placeholder",
+        );
+
+        // …and the gate must actually act on it. At a 25-pip spread the 10x floor
+        // is 0.0250, over which the 0.0200 TP yields R = 0.8 — the kind of reading
+        // that causes a demote in the first place.
+        let target = crate::order_control::sl_target(
+            crate::order_control::SpreadInputs::measured_only(0.0025),
+            parked.original_sl_distance,
+            parked.original_sl_distance,
+            parked.tp_distance,
+            parked.min_r,
+        );
+        assert_eq!(
+            target.action,
+            crate::order_control::SlAction::BelowMinR,
+            "the parked geometry must still read as below-min-R at the demoting \
+             spread — otherwise the promotion gate is blind and the ping-pong is back",
         );
     }
 

@@ -20,14 +20,23 @@
 //! `ReplayBroker`. Same rule as [`crate::pending_lifecycle`], for the same
 //! reason.
 //!
-//! # What stays outside
+//! # The other half
 //!
-//! The **re-price** half is deliberately not here. It needs a live
+//! The **re-price** half lives beside this one, in
+//! [`reprice_pass`](super::reprice_pass), and is shared the same way and for the
+//! same reason.
+//!
+//! This comment used to assert the opposite — that re-pricing "needs a live
 //! `list_pending_orders` join against `EntryAttempt` rows and a real
-//! cancel-and-replace at a broker — machinery the replay models differently
-//! (its fills come from a held ledger, not resting broker orders). Promotion is
-//! the half that changes what a fixture *books*, so it is the half that has to
-//! be shared.
+//! cancel-and-replace at a broker, machinery the replay models differently (its
+//! fills come from a held ledger, not resting broker orders)". Every clause of
+//! that was false by the time it was read: the replay broker reports resting
+//! orders off its held ledger, writes `EntryAttempt` rows through the same
+//! `run_enter`, and models cancel-and-replace by re-activating the held order at
+//! the fresh request's levels. The assertion, not the machinery, is what kept the
+//! pass live-only — and with slice 7 having retired the `SpreadHour` hold in
+//! favour of the forward-looking SL floor that only the re-price pass delivers,
+//! that left the corpus with neither. See [`reprice_pass`](super::reprice_pass).
 
 use chrono::{DateTime, Utc};
 
