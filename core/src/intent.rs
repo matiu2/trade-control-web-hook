@@ -2548,6 +2548,7 @@ mod tests {
             signal_bar_time: candle.time,
             golden: true,
             signal_confirmed: true,
+            state: crate::signals::SigState::Valid,
             // Short pinbar wick-50% on this candle: body_top 1.1200 +
             // (high 1.3000 - 1.1200)/2 = 1.2100.
             band_anchor: 1.2100,

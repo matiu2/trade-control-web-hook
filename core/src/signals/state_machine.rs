@@ -107,6 +107,13 @@ pub struct LatchedSignal {
     pub recent_high: Option<f64>,
     /// Lowest low over the same window.
     pub recent_low: Option<f64>,
+    /// Where this signal sits in its lifecycle as of the as-of bar.
+    ///
+    /// Display-only: `signal_confirmed` is what gates read, and it stays the
+    /// authority. This exists so a chart can fade a refuted signal differently
+    /// from one still pending. `Valid` always coincides with
+    /// `signal_confirmed == true`.
+    pub state: SigState,
     /// True iff the pattern alert (`*_signal or *_just_valid`) fires on the
     /// as-of bar — a new signal printed, or the latched signal just validated.
     pub fires: bool,
@@ -141,10 +148,34 @@ struct Tracked {
     broke: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum SigState {
+/// Where a signal sits in its confirmation lifecycle (Pine `STATE_*`).
+///
+/// Public so a chart can render the three states differently — a signal the
+/// market refuted reads very differently from one still inside its window.
+/// Nothing on the alert wire keys off this; `LatchedSignal::signal_confirmed`
+/// remains the only thing gates consult.
+///
+/// ⚠️ **Do not split `Invalid` into its causes without reading this.** Three
+/// distinct things land here: the confirm window elapsed with no push (rule 6),
+/// price traded through the signal's own extreme (rules 2/3), and an opposing
+/// signal printed in-window (rule 7). Splitting it is tempting for display, but
+/// the latch-clearing guard in `update_tracked` tests
+/// `new_state == SigState::Invalid` to set `l.confirmed = false`. Handle only
+/// one of the new variants there and a **refuted signal keeps
+/// `signal_confirmed: true` on the alert wire** — and the existing
+/// `breach_of_low_invalidates_and_unconfirms` will NOT catch it: its fixture
+/// never confirms before breaching (measured: `confirmed=false` on every bar),
+/// so clearing the latch is a no-op there. Any such split needs a fixture that
+/// confirms *and then* is refuted, plus a mutation proving the fixture bites.
+/// The Pine script has the identical structure and the identical trap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SigState {
+    /// Inside the confirm window, not yet resolved.
     Pending,
+    /// Confirmed — it got its push before the window closed.
     Valid,
+    /// Dead. See the warning above before distinguishing *why*.
     Invalid,
 }
 
@@ -249,7 +280,16 @@ pub fn latched_signal_at(
     let latch = latch?;
     let signal_bar = latch_signal_bar?;
     let (recent_high, recent_low) = recent_extremes(candles, signal_bar, cfg.sl_lookback);
+    // The latch does not carry the lifecycle state, so read it off the tracked
+    // entry the latch points at. `signal_bar` is that entry's identity, and
+    // `Tracked` rows are never removed within a scan, so this always resolves;
+    // `Pending` is the only sane fallback if a future refactor breaks that.
+    let state = tracked
+        .iter()
+        .find(|t| t.signal_bar == signal_bar)
+        .map_or(SigState::Pending, |t| t.state);
     Some(LatchedSignal {
+        state,
         direction: latch.direction,
         kind: latch.kind,
         signal_high: latch.high,
@@ -476,6 +516,13 @@ pub fn first_confirmed_signal_at(
         signal_bar_time: candles[t.signal_bar].time,
         golden: t.golden,
         signal_confirmed: true,
+        // Deliberately the entry's CURRENT state, not `Valid`, even though
+        // `signal_confirmed` is hard-coded true just above. The two disagree on
+        // purpose here: "first confirmed wins" fires the enter on the
+        // confirmation bar, so the wire must say confirmed — but by the as-of
+        // bar the market may since have refuted it (rules 2/3/7), and a chart
+        // should show that. `signal_confirmed` stays the authority for gates.
+        state: t.state,
         band_anchor: t.band_anchor,
         atr: t.atr,
         recent_high,
@@ -892,6 +939,48 @@ mod tests {
         let l = latched_signal_at(&candles, 3, &cfg()).expect("latched");
         // confirmed flips back to false because the latched signal invalidated.
         assert!(!l.signal_confirmed);
+    }
+
+    /// The guard the `SigState` warning points at: a signal that **confirms
+    /// first** and is refuted only afterwards.
+    ///
+    /// `breach_of_low_invalidates_and_unconfirms` does NOT cover this. Its
+    /// fixture never reaches `confirmed == true` (measured: false on every
+    /// bar), because `confirm_bars = 2` resolves the window at bar 3 and the
+    /// breach lands on that same bar — so clearing the latch is a no-op there
+    /// and the branch is never exercised.
+    ///
+    /// Here the window closes cleanly with a push (bar 3 confirms), and the
+    /// refutation arrives on bar 4. That makes `l.confirmed = false` in
+    /// `update_tracked` load-bearing: without it the wire would keep
+    /// reporting a refuted signal as confirmed. Anyone splitting
+    /// `SigState::Invalid` must keep this green.
+    #[test]
+    fn a_confirmed_signal_that_is_later_refuted_unconfirms_and_reports_invalid() {
+        let mut candles = bullish_pinbar_window();
+        // bar 3: closes the confirm window (print bar 1 + confirm_bars 2) with
+        // the push already latched on bar 2 → the signal validates here.
+        candles.push(k("2026-06-16T12:00:00Z", 1.205, 1.23, 1.19, 1.22));
+
+        let confirmed = latched_signal_at(&candles, 3, &cfg()).expect("latched at bar 3");
+        assert!(
+            confirmed.signal_confirmed,
+            "bar 3 must CONFIRM first — otherwise this test guards nothing"
+        );
+        assert_eq!(confirmed.state, SigState::Valid);
+
+        // bar 4: trades below the pinbar's low (1.00) → refutation (rule 3).
+        candles.push(k("2026-06-16T13:00:00Z", 1.20, 1.21, 0.95, 0.98));
+        let refuted = latched_signal_at(&candles, 4, &cfg()).expect("latched at bar 4");
+        assert_eq!(
+            refuted.signal_bar_time, confirmed.signal_bar_time,
+            "must still be the SAME signal, not a newly printed one"
+        );
+        assert!(
+            !refuted.signal_confirmed,
+            "a refuted signal must NOT stay confirmed on the alert wire"
+        );
+        assert_eq!(refuted.state, SigState::Invalid);
     }
 
     #[test]
