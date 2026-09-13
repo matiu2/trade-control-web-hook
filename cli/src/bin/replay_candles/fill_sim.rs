@@ -620,6 +620,56 @@ fn bar_seconds_of(candles: &[BidAskCandle]) -> i64 {
         .unwrap_or(0)
 }
 
+/// Bound a resting order's fill window at the bar the **live cron sweep** would
+/// have cancelled it on for a pre-fill SL breach.
+///
+/// The worker's `sweep_pending_orders` walks every still-resting `EntryAttempt`
+/// each tick and cancel-and-deletes any whose stop-loss current price has already
+/// overtaken (`trade-control-cron/src/sweep.rs`, the `maybe_breach_cancel` arm):
+/// the setup invalidated *before* it ever filled, so the order is dead and can
+/// never fill afterwards. Offline there is no sweep driver, so a resting order
+/// whose SL was blown through sat on the books and filled if price later came
+/// back through its trigger — inventing a trade production structurally could not
+/// take, and booking its R into the golden corpus.
+///
+/// This mirrors the sweep's effect on the fill path exactly as `expiry_bars`
+/// already mirrors the `bar-expiry` arm above: truncate the window at the first
+/// bar that trips the sweep, so a cross on a later bar is an order the worker
+/// would already have cancelled.
+///
+/// The breach predicate is the **shared** [`breach_detected`] from
+/// `core::sweep_gate` — the same one the live sweep and the replay's reporting
+/// [`sweep_reason`] call — so worker and replay cannot drift
+/// (`[[strategy_changes_in_both_replayer_and_worker]]`). Like `sweep_reason`, it
+/// reads each bar's **mid close** as the point price the live sweep's
+/// `get_current_price` would have sampled: intrabar wick noise is deliberately
+/// ignored, because the cron samples a quote per tick, not a bar range.
+///
+/// Scoped to the pre-fill window only. A breach *after* the fill is the
+/// position's own stop-out, which Phase 2 already handles — the sweep only ever
+/// touches a resting order, never a filled position.
+///
+/// The breaching bar itself is **kept**: the sweep runs on the cron tick that
+/// observes that bar's close, and price could have reached the trigger earlier in
+/// that same bar, so the order was still live during it. Only the bars *after*
+/// the breach are cut. This matches the `expiry_bars` precedent, whose bound is
+/// likewise exclusive of the bar the worker cancels on.
+fn truncate_at_pre_fill_sl_breach<'a>(
+    fill_window: &'a [BidAskCandle],
+    resolved: &Resolved,
+    dir: Direction,
+) -> &'a [BidAskCandle] {
+    match fill_window
+        .iter()
+        .position(|c| breach_detected(dir, c.c, resolved.stop_loss))
+    {
+        // `+ 1` keeps the breaching bar in the window: the order was still live
+        // *during* it, and only the sweep tick at its close kills it.
+        Some(breach) => fill_window.get(..breach + 1).unwrap_or(fill_window),
+        None => fill_window,
+    }
+}
+
 /// Returns `None` when the pending order never fills within the window (the
 /// caller maps that to `NeverFilled`).
 fn find_fill<'a>(
@@ -700,6 +750,7 @@ fn find_fill<'a>(
             // to avoid churning every simulator signature. `0` (a one-candle
             // window) fails safe to "short bar" in the helper → still skips.
             let bar_seconds = bar_seconds_of(candles);
+            let fill_window = truncate_at_pre_fill_sl_breach(fill_window, resolved, dir);
             let i = fill_window.iter().position(|c| {
                 book_reaches(c, entry_book, trigger_price, entry_approach)
                     && !trade_control_core::spread_blackout::suppress_on_spread_hour_bar_seconds(
@@ -3255,6 +3306,239 @@ mod tests {
         assert_eq!(
             sweep_reason(&intent, &shell, 0.0001, &wed_path),
             Some((SweepReason::SlBreached, ts("2026-06-17T12:00:00Z")))
+        );
+    }
+
+    // --- pre-fill SL breach cancels the resting order (replay==live) --------
+
+    /// The candle path that reproduces the pre-fill SL-breach divergence: a long
+    /// stop-entry (trigger 1.1050, SL 1.1000) that is NEVER reached, price then
+    /// falls clean through the 1.1000 stop-loss on bar 2 (close 1.0995), and on
+    /// bar 3 rallies back up THROUGH the 1.1050 trigger.
+    ///
+    /// Live, the cron sweep cancels the order the moment bar 2's price overtakes
+    /// the SL — the setup invalidated before it ever filled — so bar 3's rally can
+    /// never fill it. A replay that lets bar 3 fill books a trade production
+    /// structurally could not take.
+    fn breach_then_rally_path() -> [BidAskCandle; 4] {
+        [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1040), // rests, no breach
+            candle("2026-06-17T12:00:00Z", 1.1010, 1.1012, 1.0990, 1.0995), // close past the 1.1000 SL
+            candle("2026-06-17T13:00:00Z", 1.1020, 1.1060, 1.1015, 1.1055), // rallies through 1.1050
+        ]
+    }
+
+    /// A long stop-entry intent whose ONLY sweep reason can be the SL breach:
+    /// no bar-expiry, a generous alert window, and a mid-week (non-blackout) path.
+    fn breach_intent() -> Intent {
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050; SL 1.1000
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        intent.expiry_bars = None;
+        intent
+    }
+
+    /// The bug this fixes, pinned from the outside: `sweep_reason` (the shared
+    /// decision) says the live cron cancels this order for an SL breach on the
+    /// 12:00 bar — so the 13:00 rally through the trigger must NOT fill.
+    ///
+    /// Before the fix `find_fill` had no breach condition and returned
+    /// `FilledOpen` here, inventing a trade the live account could never hold.
+    #[test]
+    fn pre_fill_sl_breach_blocks_a_later_fill() {
+        let intent = breach_intent();
+        let shell = trigger_shell();
+        let path = breach_then_rally_path();
+
+        // The shared sweep decision agrees the live worker cancels this order,
+        // at the 12:00 bar, for an SL breach.
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path),
+            Some((SweepReason::SlBreached, ts("2026-06-17T12:00:00Z"))),
+            "the live cron sweep cancels this resting order on the 12:00 breach"
+        );
+
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &path),
+            SimOutcome::NeverFilled,
+            "a swept order must not fill on a later rally back through the trigger"
+        );
+    }
+
+    /// The mirror for a SHORT: price runs UP through the short's stop-loss while
+    /// the short-stop entry below is still resting, then falls back through the
+    /// trigger. `breach_detected` is direction-dependent, so both signs are pinned
+    /// — a fix that only handled `Direction::Long` would pass the test above.
+    #[test]
+    fn pre_fill_sl_breach_blocks_a_later_fill_for_a_short() {
+        let mut intent = long_stop_intent();
+        intent.direction = Some(Direction::Short);
+        // A short stop must sit BELOW the close (1.1040), and `resolve_offset`
+        // adds the offset signed as written — so a short's trigger needs a
+        // NEGATIVE offset to land under the close.
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: -10.0, // short stop → trigger 1.1030
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        intent.stop_loss = Some(PriceRef::Absolute { absolute: 1.1080 });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.0950,
+        }));
+        intent.expiry_bars = None;
+        let shell = trigger_shell();
+
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1040), // rests, no breach
+            candle("2026-06-17T12:00:00Z", 1.1070, 1.1095, 1.1068, 1.1090), // close past the 1.1080 SL
+            candle("2026-06-17T13:00:00Z", 1.1060, 1.1062, 1.1020, 1.1025), // falls through 1.1030
+        ];
+
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path),
+            Some((SweepReason::SlBreached, ts("2026-06-17T12:00:00Z"))),
+            "the live cron sweep cancels the short's resting order on the 12:00 breach"
+        );
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &path),
+            SimOutcome::NeverFilled,
+            "a swept short order must not fill on a later fall back through the trigger"
+        );
+    }
+
+    /// The teeth on the other side: an order whose SL is NEVER breached before it
+    /// fills must still fill exactly as before. Without this, "cancel everything"
+    /// would pass the two tests above while retiring the whole fill path.
+    #[test]
+    fn an_unbreached_order_still_fills_normally() {
+        let intent = breach_intent();
+        let shell = trigger_shell();
+
+        // Same shape as the breach path but bar 2 dips only to 1.1005 — above the
+        // 1.1000 SL — so nothing sweeps and the 13:00 rally fills.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1040),
+            candle("2026-06-17T12:00:00Z", 1.1030, 1.1032, 1.1005, 1.1010), // never past SL
+            candle("2026-06-17T13:00:00Z", 1.1020, 1.1060, 1.1015, 1.1055), // fills at 1.1050
+        ];
+        assert_eq!(sweep_reason(&intent, &shell, 0.0001, &path), None);
+        assert!(
+            matches!(
+                simulate_fill(&intent, &shell, 0.0001, &path),
+                SimOutcome::FilledOpen { .. }
+            ),
+            "an order the sweep never touches must still fill"
+        );
+    }
+
+    /// A fill that happens BEFORE the breach bar is a real trade and must be
+    /// kept: the sweep only ever cancels a *resting* order, so a breach after the
+    /// fill is just the position's own stop-out, not a cancel. Pins that the new
+    /// condition is scoped to the pre-fill window and does not retro-cancel.
+    #[test]
+    fn a_breach_after_the_fill_is_a_stop_out_not_a_cancel() {
+        let intent = breach_intent();
+        let shell = trigger_shell();
+
+        // Bar 1 fills at 1.1050; bar 2 then runs down through the 1.1000 SL.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1045, 1.1060, 1.1043, 1.1055), // fills
+            candle("2026-06-17T12:00:00Z", 1.1010, 1.1012, 1.0990, 1.0995), // stops out
+        ];
+        assert!(
+            matches!(
+                simulate_fill(&intent, &shell, 0.0001, &path),
+                SimOutcome::StoppedOut { .. }
+            ),
+            "a breach after the fill is the position's stop-out, not a sweep"
+        );
+    }
+
+    /// The SHORT mirror of `an_unbreached_order_still_fills_normally`, and the
+    /// test that actually pins the breach predicate's DIRECTION.
+    ///
+    /// A short's ordinary resting bars sit *below* its stop-loss, so a
+    /// wrong-direction predicate (`Long`'s `current <= sl`) reads every one of
+    /// them as a breach, truncates the window at the first bar, and still yields
+    /// `NeverFilled` — which is why the short breach test alone cannot tell a
+    /// correct implementation from a direction-swapped one. Here the short MUST
+    /// fill, so a swapped predicate cuts the window before the fill bar and goes
+    /// red. (Mutation-verified: hardcoding `Direction::Long` in
+    /// `truncate_at_pre_fill_sl_breach` survives every other test and is killed
+    /// only by this one.)
+    #[test]
+    fn an_unbreached_short_still_fills_normally() {
+        let mut intent = long_stop_intent();
+        intent.direction = Some(Direction::Short);
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: -10.0, // short stop → trigger 1.1030
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        intent.stop_loss = Some(PriceRef::Absolute { absolute: 1.1080 });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.0950,
+        }));
+        intent.expiry_bars = None;
+        let shell = trigger_shell();
+
+        // Bars rest between the 1.1030 trigger and the 1.1080 SL — no breach —
+        // then bar 2 falls through the trigger and fills.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1040),
+            candle("2026-06-17T12:00:00Z", 1.1038, 1.1040, 1.1020, 1.1025), // fills at 1.1030
+        ];
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path),
+            None,
+            "nothing sweeps this short — its closes stay below the 1.1080 SL"
+        );
+        assert!(
+            matches!(
+                simulate_fill(&intent, &shell, 0.0001, &path),
+                SimOutcome::FilledOpen { .. }
+            ),
+            "an unbreached short must still fill — a Long-direction breach test \
+             would read these below-SL bars as breaches and cut the window"
+        );
+    }
+
+    /// The boundary: a bar that BOTH reaches the trigger and closes past the SL
+    /// still fills. The live sweep acts on the cron tick that observes that bar's
+    /// close — by then the order could already have filled intrabar — so the
+    /// breaching bar stays in the window and only the bars AFTER it are cut.
+    /// This is the same exclusive-of-the-cancel-bar convention `expiry_bars` uses.
+    #[test]
+    fn the_breaching_bar_itself_can_still_fill() {
+        let intent = breach_intent();
+        let shell = trigger_shell();
+
+        // One bar that rallies through 1.1050 and then collapses past the 1.1000
+        // SL, closing at 1.0995. It fills (and Phase 2 stops it out on that bar).
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1045, 1.1060, 1.0990, 1.0995),
+        ];
+        assert!(
+            matches!(
+                simulate_fill(&intent, &shell, 0.0001, &path),
+                SimOutcome::StoppedOut { .. }
+            ),
+            "the order was live during the breaching bar, so it fills and stops out"
         );
     }
 
