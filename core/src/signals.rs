@@ -54,7 +54,8 @@ pub use band_anchor::band_anchor;
 pub use detect::{DetectFlags, Detected, SignalGeometry, detect_at};
 pub use metrics::CandleMetrics;
 pub use state_machine::{
-    DetectorConfig, LatchedSignal, SignalCriteria, first_confirmed_signal_at, latched_signal_at,
+    DetectorConfig, LatchedSignal, SigState, SignalCriteria, first_confirmed_signal_at,
+    latched_signal_at,
 };
 
 // `detector_lookback_bars` is defined below (shared by live + replay).
