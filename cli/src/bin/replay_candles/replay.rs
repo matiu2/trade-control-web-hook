@@ -548,37 +548,30 @@ pub async fn run(
                             .await;
                     }
                 }
-                // A `ClosePositions`-level veto flattens any open position AND blocks
-                // entries (the entry block is the plan going `Done`, handled by the
-                // engine). Here we do the broker-side flatten the live ClosePositions
-                // veto performs via `broker.close_positions`. A non-ClosePositions
-                // veto (StopNextEntry — the pcl-exhausted cap) leaves the open
-                // position alone: no flatten.
-                //
-                // TWO different vetos reach this arm and the journal must not conflate
-                // them: the time-fired `02-veto-trade-expiry` (the clock ran out) and
-                // the structure-invalidation veto (`too-low` for a long / `too-high`
-                // for a short — the setup broke). Classify on the veto NAME, not the
-                // level they share; keying off the level alone reported "CLOSED AT
-                // EXPIRY" for an invalidation close with the trade-expiry days away
-                // (GBP/NZD iH&S 2026-07-22, closed 15:00 on 07-23 vs a 07-27 expiry).
-                Action::Veto | Action::Invalidate
-                    if fired.intent.level
-                        == Some(trade_control_core::intent::VetoLevel::ClosePositions) =>
-                {
-                    let is_expiry = fired.intent.name.as_deref()
-                        == Some(trade_control_core::intent::TRADE_EXPIRY_VETO_NAME);
-                    replay_broker.set_close_reason(if is_expiry {
-                        ExitReason::Expiry
-                    } else {
-                        ExitReason::Invalidation
-                    });
-                    replay_broker
-                        .cancel_pending_for_instrument(&fired.intent.instrument)
-                        .await;
-                    replay_broker
-                        .close_positions(&fired.intent.instrument)
-                        .await;
+                // A fired veto routes through the SAME shared dispatch the live
+                // cron runs, so the store write (`set_veto`), the `clears:` list,
+                // and the broker-side cancel/close can't drift offline. See
+                // [`dispatch_veto`].
+                Action::Veto => {
+                    dispatch_veto(&replay_broker, &store, &fired, now).await;
+                }
+                // `Invalidate` gets the cron's OTHER arm (`run_invalidate`: set an
+                // instrument cooldown, then cancel pending) — NOT the veto split.
+                // An invalidate intent carries `cooldown_hours` and no `name`, so
+                // routing it through `run_veto_with_broker` would reject it
+                // `missing-name`. No production plan builder emits
+                // `Action::Invalidate` today (the trade-expiry veto is
+                // `Action::Veto` at `ClosePositions` — `cli/src/trade_patterns.rs`;
+                // every `Action::Invalidate` in the tree is a test fixture), but
+                // the plan format allows it, so mirror the cron rather than leave
+                // a silent hole.
+                Action::Invalidate => {
+                    let shell = Shell::from_candle(&fired.candle);
+                    let verified = Verified {
+                        shell,
+                        intent: fired.intent.clone(),
+                    };
+                    dispatch::run_invalidate(&replay_broker, &store, &verified, now).await;
                 }
                 _ => {}
             }
@@ -872,6 +865,95 @@ fn not_taken_reason(
 /// `DispatchConfig` built with `plan.pip_size` matches what the worker resolves.
 fn plan_pip(plan: &TradePlan) -> f64 {
     plan.pip_size
+}
+
+/// Dispatch one fired `veto` through the SAME shared handlers the live cron runs
+/// (`trade-control-cron/src/engine.rs`), so the offline veto has the identical
+/// effects:
+///
+/// - **The store write.** Both [`dispatch::handle_veto`] (the `StopNextEntry`
+///   flag-only path) and [`dispatch::run_veto_with_broker`] (every higher level)
+///   call `store.set_veto(..)` and clear the intent's `clears:` list. The replay
+///   used to do NEITHER, so `run_enter`'s veto gate — which reads
+///   `store.is_vetoed(..)` and rejects with `veto-active ({name})` — could never
+///   fire offline even though the H&S enters list all three veto names.
+/// - **The pending-order cancel at EVERY level.** In `run_veto_with_broker`
+///   `cancel_pending_for_instrument` runs unconditionally; only the *close* is
+///   gated on [`VetoLevel::ClosePositions`]. The replay used to gate BOTH on
+///   `ClosePositions`, so the three `CancelPending` M/W vetos (`mw-cancel`,
+///   `mw-abort`, `mw-overshoot`) — which exist precisely to pull a resting,
+///   unfilled order — did nothing at all offline. The order stayed resting and
+///   could fill on a later bar, booking R the live worker could never take.
+///
+/// What stays local to the replay is only the **journal classification**: the
+/// exit reason the broker stamps on a `ClosePositions` flatten. That keys on the
+/// veto NAME ([`TRADE_EXPIRY_VETO_NAME`]), not the level the trade-expiry veto
+/// and the structure-invalidation veto share — conflating them printed "CLOSED
+/// AT EXPIRY" for an invalidation close with the real expiry days away (GBP/NZD
+/// iH&S 2026-07-22, closed 15:00 on 07-23 against a 07-27 expiry).
+///
+/// [`TRADE_EXPIRY_VETO_NAME`]: trade_control_core::intent::TRADE_EXPIRY_VETO_NAME
+/// [`VetoLevel::ClosePositions`]: trade_control_core::intent::VetoLevel::ClosePositions
+async fn dispatch_veto(
+    broker: &ReplayBroker,
+    store: &MemStateStore,
+    fired: &FiredIntent,
+    now: DateTime<Utc>,
+) -> ActionResult {
+    use trade_control_core::intent::{TRADE_EXPIRY_VETO_NAME, VetoLevel};
+
+    let shell = match &fired.signal {
+        Some(sig) => Shell::from_candle_and_signal(&fired.candle, sig),
+        None => Shell::from_candle(&fired.candle),
+    };
+    let verified = Verified {
+        shell,
+        intent: fired.intent.clone(),
+    };
+
+    // Stamp the journal's exit reason BEFORE the shared dispatch runs, since it
+    // is `close_positions` (inside `run_veto_with_broker`) that consumes it.
+    // Name, not level — see the doc comment above.
+    if verified.intent.level == Some(VetoLevel::ClosePositions) {
+        let is_expiry = verified.intent.name.as_deref() == Some(TRADE_EXPIRY_VETO_NAME);
+        broker.set_close_reason(if is_expiry {
+            ExitReason::Expiry
+        } else {
+            ExitReason::Invalidation
+        });
+    }
+
+    // The identical split the live cron makes: a `StopNextEntry` veto is
+    // flag-only (no broker), every higher level goes through the broker path.
+    let result = if matches!(
+        verified.intent.level.unwrap_or_default(),
+        VetoLevel::StopNextEntry
+    ) {
+        // Same `ControlResult` → `ActionResult` mapping the cron's
+        // `control_result(.., "vetoed")` applies.
+        let control = dispatch::handle_veto(store, &verified, now).await;
+        if control.is_success() {
+            ActionResult::Ok("vetoed".to_string())
+        } else {
+            let code = control.status;
+            ActionResult::Rejected {
+                status: code,
+                body: format!("control dispatch returned status {code}"),
+                outcome: format!("rejected: control-status-{code}"),
+            }
+        }
+    } else {
+        dispatch::run_veto_with_broker(broker, store, &verified, now).await
+    };
+
+    if let ActionResult::Rejected { outcome, .. } = &result {
+        tracing::error!(
+            rule = %fired.rule_id,
+            outcome = %outcome,
+            "veto dispatch rejected in replay"
+        );
+    }
+    result
 }
 
 /// Dispatch one fired `enter` through the REAL `run_enter`, returning the
@@ -1818,6 +1900,19 @@ mod tests {
         }
     }
 
+    /// The mid-only [`Candle`] the engine hands a `FiredIntent`, taken from a
+    /// bid/ask bar. Lets a test synthesise the fire the evaluator would have
+    /// produced, so it can drive one dispatch arm directly.
+    fn mid_of(c: &EngineCandle) -> trade_control_core::broker::Candle {
+        trade_control_core::broker::Candle {
+            time: c.time,
+            o: c.o,
+            h: c.h,
+            l: c.l,
+            c: c.c,
+        }
+    }
+
     /// The core warm-up guarantee: a veto level breached only in the **warm-up
     /// prefix** (before `live_start`) must NOT fire — those bars seed silently.
     /// A breach in the **live** window fires. Proves the live boundary, not the
@@ -2039,6 +2134,226 @@ mod tests {
             report.contains("TP: 1  SL: 0"),
             "exactly one taken position (the limit's TP), no overlap:\n{report}"
         );
+    }
+
+    /// A single-enter LONG plan whose enter rests at 1.1100, plus one veto whose
+    /// `level` and `name` the caller picks. Shaped like an M/W setup: the veto is
+    /// `CancelPending` in the test that matters — its whole job is to pull the
+    /// resting, unfilled order before it can trigger.
+    ///
+    /// The veto fires on an `on_close` up-cross of `veto_level`; the enter on an
+    /// `on_close` up-cross of 1.1050.
+    fn enter_then_veto_plan(level: &str, name: &str, veto_level: f64) -> TradePlan {
+        serde_json::from_str(&format!(
+            r#"{{
+                "trade_id": "mw-1",
+                "instrument": "EUR_USD",
+                "direction": "long",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {{
+                        "rule_id": "05-enter",
+                        "trigger": {{ "type": "horizontal_cross", "level": 1.1050, "dir": "up", "bar": "on_close" }},
+                        "fire_mode": "once",
+                        "intent": {{
+                            "v": 1,
+                            "id": "mw-enter",
+                            "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter",
+                            "instrument": "EUR_USD",
+                            "direction": "long",
+                            "entry": {{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.1100 }},
+                            "stop_loss": {{ "absolute": 1.1000 }},
+                            "take_profit": {{ "absolute": 1.1300 }},
+                            "broker": "tradenation",
+                            "trade_id": "mw-1",
+                            "vetos": ["{name}"],
+                            "max_retries": 5
+                        }}
+                    }},
+                    {{
+                        "rule_id": "01-veto-{name}",
+                        "trigger": {{ "type": "horizontal_cross", "level": {veto_level}, "dir": "up", "bar": "on_close" }},
+                        "fire_mode": "once",
+                        "intent": {{
+                            "v": 1,
+                            "id": "mw-veto",
+                            "not_after": "2099-01-01T00:00:00Z",
+                            "action": "veto",
+                            "level": "{level}",
+                            "name": "{name}",
+                            "instrument": "EUR_USD",
+                            "trade_id": "mw-1",
+                            "ttl_hours": 48
+                        }}
+                    }}
+                ]
+            }}"#
+        ))
+        .expect("parse enter+veto plan")
+    }
+
+    /// Finding #1(b): a **`cancel-pending`** veto must cancel the trade's resting,
+    /// unfilled entry order — offline exactly as live.
+    ///
+    /// Live, `run_veto_with_broker` calls `broker.cancel_pending_for_instrument`
+    /// **unconditionally** for every level; only the *close* is gated on
+    /// `ClosePositions`. The replay used to gate BOTH on `ClosePositions`, so the
+    /// three M/W vetos (`mw-cancel`, `mw-abort`, `mw-overshoot` — all
+    /// `CancelPending`) did nothing at all: the order stayed resting and filled on
+    /// a later bar, booking R the live worker could never have taken.
+    ///
+    /// Geometry (LONG stop @1.1100, SL 1.1000, TP 1.1300):
+    /// - bars 0..9: seed at 1.1040, below every level.
+    /// - bar 10: closes 1.1055 → crosses 1.1050 → `05-enter` fires, rests @1.1100.
+    /// - bar 11: closes 1.1065 → crosses 1.1060 → the `cancel-pending` veto fires.
+    ///   The resting order has not triggered (high 1.1068 < 1.1100).
+    /// - bars 12+: price runs through 1.1100 to TP 1.1300. With the order
+    ///   cancelled, nothing fills — so the report must tally **no** trade.
+    #[tokio::test]
+    async fn a_cancel_pending_veto_cancels_the_resting_entry_order() {
+        let plan = enter_then_veto_plan("cancel-pending", "mw-cancel", 1.1060);
+        let mut candles: Vec<EngineCandle> = (0..10).map(|i| candle(i * 3600, 1.1040)).collect();
+        candles.push(ohlc(10 * 3600, 1.1045, 1.1058, 1.1042, 1.1055)); // enter fires
+        candles.push(ohlc(11 * 3600, 1.1056, 1.1068, 1.1050, 1.1065)); // veto fires
+        candles.push(ohlc(12 * 3600, 1.1060, 1.1120, 1.1055, 1.1110)); // would fill @1.1100
+        candles.push(ohlc(13 * 3600, 1.1110, 1.1200, 1.1100, 1.1190));
+        candles.push(ohlc(14 * 3600, 1.1190, 1.1310, 1.1185, 1.1300)); // would hit TP
+        candles.push(ohlc(15 * 3600, 1.1300, 1.1320, 1.1290, 1.1305));
+
+        let r = run(
+            &plan,
+            &candles,
+            Granularity::H1,
+            all_live(),
+            expires(),
+            no_marks(),
+            None,
+        )
+        .await;
+
+        // Both rules fired: the enter placed, then the veto.
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("the enter fired");
+        assert!(
+            matches!(enter.gate_outcome, EnterGateOutcome::Placed { .. }),
+            "the enter must have placed a resting order, got {:?}",
+            enter.gate_outcome
+        );
+        assert!(
+            r.fires
+                .iter()
+                .any(|f| f.fired.rule_id == "01-veto-mw-cancel"),
+            "the cancel-pending veto fired"
+        );
+
+        // The teeth: the cancelled order has NO realized outcome (a cancelled
+        // resting order fills nothing), so no trade is booked. Before the fix the
+        // order stayed resting, filled at 1.1100 on bar 12 and ran to TP.
+        assert!(
+            enter.realized.is_none(),
+            "a cancel-pending veto must leave the resting order cancelled — no fill, \
+             no realized outcome; got {:?}",
+            enter.realized
+        );
+        let report = crate::report::render(&plan, &r, true, false, None, &no_marks(), None).text;
+        assert!(
+            report.contains("TP: 0  SL: 0"),
+            "the cancelled order books no trade at all:\n{report}"
+        );
+    }
+
+    /// Finding #1(a): a fired veto must WRITE THE STORE, so `run_enter`'s veto
+    /// gate (`store.is_vetoed` → `rejected: veto-active ({{name}})`) can reject a
+    /// later enter offline exactly as live.
+    ///
+    /// ⚠️ For a realistic plan the ENGINE latch masks this gate entirely, and that
+    /// is not a flaw in the test — it is a fact about the engine that a reader
+    /// must not mistake for coverage. `evaluate_guards` runs *before* the spine on
+    /// every bar, and any fired `Action::Veto` classifies as
+    /// `RuleKind::SetupInvalidation`, so it either retires the plan
+    /// (`Phase::Done`, for `CancelPending`/`ClosePositions`) or latches
+    /// `entries_blocked` (for `StopNextEntry`) — and `evaluate_plan` then
+    /// `continue`s past the entry spine on that bar and every bar after. There is
+    /// no plan shape where the engine lets an enter fire after its own veto fired,
+    /// so the store gate is unreachable *through the engine*.
+    ///
+    /// The store write is nonetheless the live behaviour and is load-bearing for
+    /// the `clears:` list and the control-event trail, so this test drives the
+    /// replay's own dispatch entry point ([`super::dispatch_veto`]) directly and
+    /// then asks the REAL `run_enter` gate — the two halves the engine keeps
+    /// apart. Delete the `set_veto` inside `handle_veto` / `run_veto_with_broker`
+    /// and this goes red.
+    #[tokio::test]
+    async fn a_fired_stop_next_entry_veto_writes_the_store_and_rejects_a_later_enter() {
+        let plan = enter_then_veto_plan("stop-next-entry", "too-low", 1.1060);
+        let candles: Vec<EngineCandle> = (0..12)
+            .map(|i| ohlc(i * 3600, 1.1045, 1.1068, 1.1042, 1.1065))
+            .collect();
+        let broker = ReplayBroker::new(candles.clone(), plan.pip_size);
+        let store = MemStateStore::default();
+        let now = candles[11].time;
+        store.set_clock(now);
+
+        let veto_rule = plan
+            .rules
+            .iter()
+            .find(|r| r.rule_id == "01-veto-too-low")
+            .expect("veto rule in plan");
+        let enter_rule = plan
+            .rules
+            .iter()
+            .find(|r| r.rule_id == "05-enter")
+            .expect("enter rule in plan");
+
+        let fired_veto = FiredIntent {
+            rule_id: veto_rule.rule_id.clone(),
+            intent: veto_rule.intent.clone(),
+            candle: mid_of(&candles[10]),
+            signal: None,
+        };
+        let result = super::dispatch_veto(&broker, &store, &fired_veto, now).await;
+        assert!(
+            matches!(result, ActionResult::Ok(_)),
+            "the veto dispatch must succeed"
+        );
+
+        // The store write is what the enter gate reads.
+        assert!(
+            store
+                .is_vetoed(None, "mw-1", "EUR_USD", "too-low")
+                .await
+                .expect("store read"),
+            "the fired veto must have written `too-low` to the store"
+        );
+
+        // And the REAL `run_enter` gate rejects on it, with the live wording.
+        let fired_enter = FiredIntent {
+            rule_id: enter_rule.rule_id.clone(),
+            intent: enter_rule.intent.clone(),
+            candle: mid_of(&candles[11]),
+            signal: None,
+        };
+        let outcome = dispatch_enter(
+            &broker,
+            &store,
+            &fired_enter,
+            &plan.pip_size,
+            now,
+            Granularity::H1,
+        )
+        .await;
+        match outcome {
+            EnterGateOutcome::Rejected { reason } => assert_eq!(
+                reason, "rejected: veto-active (too-low)",
+                "the enter must be rejected by the store's veto gate"
+            ),
+            other => panic!("expected a veto-active rejection, got {other:?}"),
+        }
     }
 
     /// A SHORT plan with a `06-close-on-reversal` PinePattern{Long} guard: the
