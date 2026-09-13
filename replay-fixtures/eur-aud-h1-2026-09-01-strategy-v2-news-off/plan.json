@@ -1,0 +1,351 @@
+{
+  "trade_id": "ihs-eur-aud-481ba4c7",
+  "instrument": "EUR/AUD",
+  "direction": "long",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 1.61846,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-eur-aud-481ba4c7-too-low",
+        "not_after": "2026-09-08T04:30:00Z",
+        "action": "veto",
+        "instrument": "EUR/AUD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 169,
+        "level": "close-positions",
+        "trade_id": "ihs-eur-aud-481ba4c7"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 1.624725054393178,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-eur-aud-481ba4c7-too-high",
+        "not_after": "2026-09-08T04:30:00Z",
+        "action": "veto",
+        "instrument": "EUR/AUD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 169,
+        "level": "stop-next-entry",
+        "trade_id": "ihs-eur-aud-481ba4c7"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1788840000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-eur-aud-481ba4c7-trade-expiry",
+        "not_before": "2026-09-08T04:00:00Z",
+        "not_after": "2026-09-08T04:30:00Z",
+        "action": "veto",
+        "instrument": "EUR/AUD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 169,
+        "level": "close-positions",
+        "trade_id": "ihs-eur-aud-481ba4c7"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1788202800,
+          "price": 1.62136
+        },
+        "b": {
+          "at_epoch": 1787824800,
+          "price": 1.62136
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-eur-aud-481ba4c7-break-and-close",
+        "not_after": "2026-09-08T04:00:00Z",
+        "action": "prep",
+        "instrument": "EUR/AUD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "ihs-eur-aud-481ba4c7"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1788202800,
+          "price": 1.62136
+        },
+        "b": {
+          "at_epoch": 1787824800,
+          "price": 1.62136
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "down",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-eur-aud-481ba4c7-retest",
+        "not_after": "2026-09-08T04:00:00Z",
+        "action": "prep",
+        "instrument": "EUR/AUD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "ihs-eur-aud-481ba4c7"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-eur-aud-481ba4c7-enter",
+        "not_after": "2026-09-06T18:24:00Z",
+        "action": "enter",
+        "instrument": "EUR/AUD",
+        "direction": "long",
+        "entry": {
+          "type": "stop",
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5,
+          "recover_entry": {
+            "action": "limit"
+          }
+        },
+        "stop_loss": {
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 1.62557
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 1.624725054393178,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 1.61846,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-eur-aud-481ba4c7",
+        "max_retries": 5,
+        "entry_dedup": "gate_owned",
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001,
+        "contract_multiplier": 1.0
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-eur-aud-481ba4c7-enter-qm",
+        "not_after": "2026-09-06T18:24:00Z",
+        "action": "enter",
+        "instrument": "EUR/AUD",
+        "direction": "long",
+        "entry": {
+          "type": "limit",
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "recover_entry": {
+            "action": "stop"
+          }
+        },
+        "stop_loss": {
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 1.62557
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 1.624725054393178,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 1.61846,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-eur-aud-481ba4c7",
+        "max_retries": 5,
+        "entry_dedup": "gate_owned",
+        "needs_golden": true,
+        "needs_confirmed": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001,
+        "contract_multiplier": 1.0
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-eur-aud-481ba4c7-close-on-sr-reversal",
+        "not_after": "2026-09-08T04:00:00Z",
+        "action": "close",
+        "instrument": "EUR/AUD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-eur-aud-481ba4c7",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            1.64245,
+            1.64573
+          ],
+          [
+            1.63894,
+            1.64222
+          ],
+          [
+            1.63486,
+            1.63813
+          ],
+          [
+            1.62473,
+            1.62557
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1788235200,
+  "armed_at": "2026-09-01T04:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-31T04:00:00Z",
+    "period_end": "2026-09-01T04:00:00Z",
+    "overall_direction": "bearish",
+    "confidence": "medium",
+    "currencies": [
+      {
+        "currency": "AUD",
+        "direction": "bullish",
+        "net_score": 2.0,
+        "events": [
+          "Building Approvals m/m: Actual (-3.6%) beat forecast (-4.7%)",
+          "Current Account: Actual (-27.2B) beat forecast (-29.7B)"
+        ]
+      },
+      {
+        "currency": "EUR",
+        "direction": "bearish",
+        "net_score": -2.0,
+        "events": [
+          "German Prelim CPI m/m: Actual (0.2%) lower than forecast (0.3%) [context-dependent]"
+        ]
+      }
+    ]
+  }
+}

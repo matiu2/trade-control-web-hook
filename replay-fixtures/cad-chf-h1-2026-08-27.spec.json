@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1787644800,
+        "price": 0.58014
+      },
+      "b": {
+        "at_epoch": 1787749200,
+        "price": 0.58081
+      }
+    },
+    "invalidation": 0.5798716935058015,
+    "fib_head_neckline": [
+      0.57888,
+      0.5804429227823829
+    ],
+    "trade_expiry_epoch": 1788336000,
+    "sr_levels": [
+      0.58088
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:CADCHF",
+  "start": 1787821200,
+  "tv_arm_version": "v144-1-g538cd0a1-dirty"
+}

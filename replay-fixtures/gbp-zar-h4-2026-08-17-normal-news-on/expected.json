@@ -1,0 +1,95 @@
+{
+  "fires": [
+    {
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-08-17T09:00:00Z",
+      "candle_close": 21.963
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "action": "prep",
+      "candle_time": "2026-08-17T13:00:00Z",
+      "candle_close": 21.94
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-08-17T17:00:00Z",
+      "candle_close": 21.967
+    },
+    {
+      "rule_id": "01-pause-1787004000-1787032800",
+      "action": "pause",
+      "candle_time": "2026-08-17T17:00:00Z",
+      "candle_close": 21.967
+    },
+    {
+      "rule_id": "02-resume-1787004000-1787032800",
+      "action": "resume",
+      "candle_time": "2026-08-18T01:00:00Z",
+      "candle_close": 22.003
+    },
+    {
+      "rule_id": "01-news-start-1787032800-1787036400",
+      "action": "news-start",
+      "candle_time": "2026-08-18T01:00:00Z",
+      "candle_close": 22.003
+    },
+    {
+      "rule_id": "02-news-end-1787032800-1787036400",
+      "action": "news-end",
+      "candle_time": "2026-08-18T01:00:00Z",
+      "candle_close": 22.003
+    },
+    {
+      "rule_id": "01-pause-1787090400-1787119200",
+      "action": "pause",
+      "candle_time": "2026-08-18T17:00:00Z",
+      "candle_close": 21.992
+    },
+    {
+      "rule_id": "02-resume-1787090400-1787119200",
+      "action": "resume",
+      "candle_time": "2026-08-19T01:00:00Z",
+      "candle_close": 21.996
+    },
+    {
+      "rule_id": "01-news-start-1787119200-1787122800",
+      "action": "news-start",
+      "candle_time": "2026-08-19T01:00:00Z",
+      "candle_close": 21.996
+    },
+    {
+      "rule_id": "02-news-end-1787119200-1787122800",
+      "action": "news-end",
+      "candle_time": "2026-08-19T01:00:00Z",
+      "candle_close": 21.996
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-20T05:00:00Z",
+      "candle_close": 21.99
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-08-25T09:00:00Z",
+      "candle_close": 21.766
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 0.0,
+    "tp_hits": 0,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": []
+  }
+}

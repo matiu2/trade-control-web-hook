@@ -1,0 +1,17 @@
+{
+  "instrument": "EUR/USD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-24T00:00:00Z",
+  "end": "2026-08-31T07:00:00Z",
+  "message": "eur/usd h&s - -4R on the server replay but +2.15 on a skip-bcr replay",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:EURUSD",
+    "tv_arm_version": "v141-7-g538cd0a1-dirty",
+    "engine_version": "v141-7-g538cd0a1-dirty"
+  }
+}

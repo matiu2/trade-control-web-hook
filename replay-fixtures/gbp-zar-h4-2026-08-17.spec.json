@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1786438800,
+        "price": 21.945
+      },
+      "b": {
+        "at_epoch": 1786712400,
+        "price": 21.94
+      }
+    },
+    "invalidation": 21.775,
+    "fib_head_neckline": [
+      21.757,
+      21.943964012982946
+    ],
+    "trade_expiry_epoch": 1788296400,
+    "sr_levels": [
+      22.01
+    ]
+  },
+  "resolution": "240",
+  "chart_symbol": "TRADENATION:GBPZAR",
+  "start": 1786942800,
+  "tv_arm_version": "v144-1-g538cd0a1-dirty"
+}

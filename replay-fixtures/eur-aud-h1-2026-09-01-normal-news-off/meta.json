@@ -1,0 +1,17 @@
+{
+  "instrument": "EUR/AUD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-09-01T04:00:00Z",
+  "end": "2026-09-08T04:00:00Z",
+  "message": "several reversals. No support markedOC",
+  "arm": {
+    "entry_rule": "normal",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:EURAUD",
+    "tv_arm_version": "v144-2-g5c8d0260-dirty",
+    "engine_version": "v144-2-g5c8d0260-dirty"
+  }
+}

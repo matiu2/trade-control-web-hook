@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1788202800,
+        "price": 1.62136
+      },
+      "b": {
+        "at_epoch": 1787824800,
+        "price": 1.62136
+      }
+    },
+    "invalidation": 1.61846,
+    "fib_head_neckline": [
+      1.61711,
+      1.6213405857739878
+    ],
+    "trade_expiry_epoch": 1788840000,
+    "sr_levels": [
+      1.64409,
+      1.64058,
+      1.636494357837751
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:EURAUD",
+  "start": 1788235200,
+  "tv_arm_version": "v144-2-g5c8d0260-dirty"
+}

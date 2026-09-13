@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1786669200,
+        "price": 63512.0
+      },
+      "b": {
+        "at_epoch": 1786946400,
+        "price": 63608.5
+      }
+    },
+    "invalidation": 63065.18029691666,
+    "fib_head_neckline": [
+      62543.0,
+      63560.30817389583
+    ],
+    "trade_expiry_epoch": 1787216400
+  },
+  "resolution": "60",
+  "chart_symbol": "OANDA:BTCUSD",
+  "start": 1786957200,
+  "tv_arm_version": "v141-7-g538cd0a1-dirty"
+}

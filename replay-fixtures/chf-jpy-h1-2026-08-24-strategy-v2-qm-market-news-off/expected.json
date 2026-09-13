@@ -1,0 +1,86 @@
+{
+  "fires": [
+    {
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-08-24T12:00:00Z",
+      "candle_close": 198.165
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "action": "prep",
+      "candle_time": "2026-08-24T13:00:00Z",
+      "candle_close": 198.362
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-24T13:00:00Z",
+      "candle_close": 198.362
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-25T06:00:00Z",
+      "candle_close": 198.235
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-25T14:00:00Z",
+      "candle_close": 198.366
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-25T16:00:00Z",
+      "candle_close": 198.467
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-25T20:00:00Z",
+      "candle_close": 198.635
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "action": "veto",
+      "candle_time": "2026-08-25T21:00:00Z",
+      "candle_close": 198.673
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": -2.0,
+    "tp_hits": 0,
+    "sl_hits": 2,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-08-24T13:00:00Z",
+        "entry_price": 198.362,
+        "stop_loss": 198.51200000000003,
+        "take_profit": 197.218,
+        "exit_time": "2026-08-25T08:00:00Z",
+        "exit_price": 198.51200000000003,
+        "exit_reason": "stopped_out",
+        "r": -1.0
+      },
+      {
+        "entry_time": "2026-08-25T15:00:00Z",
+        "entry_price": 198.359,
+        "stop_loss": 198.547,
+        "take_profit": 197.218,
+        "exit_time": "2026-08-25T17:00:00Z",
+        "exit_price": 198.547,
+        "exit_reason": "stopped_out",
+        "r": -1.0
+      }
+    ]
+  }
+}

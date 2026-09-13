@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1786932000,
+        "price": 114.684
+      },
+      "b": {
+        "at_epoch": 1787101200,
+        "price": 114.706
+      }
+    },
+    "invalidation": 114.74928611544222,
+    "fib_head_neckline": [
+      115.202,
+      114.6981352881066
+    ],
+    "trade_expiry_epoch": 1787558400,
+    "sr_levels": [
+      114.992377885046,
+      115.364
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:CADJPY",
+  "start": 1787108400,
+  "tv_arm_version": "v141-dirty"
+}

@@ -132,23 +132,72 @@ resolving in the same spirit — the operator's standing position is that these
 rules should be symmetrical — but it is a *third* defect, in a third file, and
 should be judged on its own evidence rather than assumed.
 
+**CONFIRMED 2026-09-09 — the arm is genuinely dead.** Checked as instructed
+rather than assumed:
+
+```
+$ grep -rn --include='*.rs' 'recover_entry_plan' .   # excluding worktrees/target
+core/src/dispatch/enter.rs:1425                       # ← the ONLY caller
+core/src/recover_entry.rs                             # def + its own unit tests
+```
+
+`place_entry_too_close_fallback` is the sole caller (`enter.rs:918`), and its
+Stop-only guard (`:1409`) returns terminal for any non-`Stop` entry. So no live
+input can reach `RecoverEntryPlan::Stop` — even though its handling arm is
+**fully written** at `enter.rs:1527` (logs, sizing comment, `EntryRequest`,
+`place_entry`, error handling: ~45 lines). This is finished, tested-at-the-pure-
+layer, unreachable code. `recover_entry.rs`'s own tests keep it green forever,
+which is exactly why nobody noticed.
+
+That makes it the same shape as the headline bug — a well-tested pure layer whose
+real caller is untested — and it is worth fixing in the same change. Treat the
+`_ =>` admitting `ResolvedEntry::Limit { trigger_price }` as the likely fix, but
+mutation-test it at the **caller**, not in `recover_entry.rs`.
+
 ## Blast radius — what is and is not known
 
 **Known:** the path is never exercised offline (0 occurrences, corpus-wide), and
 nothing recorded could show it if it were.
 
-**Not known:** how often live actually hits `#19-10`, and what it cost. That is
-answerable and worth answering before choosing how far to take the fix — the
-worker logs a distinct string for exactly this reason
-(`recover_entry::outcome_for_entry_error` → `"entry-failed: too-close-to-market"`,
-and on recovery `"too-close fallback: re-placing as MARKET|LIMIT|STOP"`). Grep
-the staging worker journal and the `request_records` outcomes. If it fires
-regularly, every affected trade's as-designed R in the journal is unsound and
-that should be stated in the fix.
+**MEASURED 2026-09-09 — live has never hit `#19-10` even once.** The doc asked
+for this before choosing scope; here it is.
 
-Do not skip this measurement on the grounds that the code fix is obvious. The
-sibling bug's lesson was that an unmeasured "surely this matters" and an
-unmeasured "surely this doesn't" are the same mistake.
+| source | window | `entry-failed: too-close-to-market` | any `entry-failed` |
+|---|---|---|---|
+| staging `request_records` | 2026-07-06 → 09-08 (19,872 rows) | **0** | 3 |
+| dev `request_records` | 2026-06-26 → 09-06 (210 rows) | **0** | 0 |
+| both worker journals | 2026-09-01 → 09-09 | **0** | 0 |
+
+Method note for whoever re-runs this: a naive `LIKE '%too-close%'` /
+`grep too-close` reports **15 rows and 2 journal hits — all false**. The worker
+records each request's *body* into the outcome of the next `recording:` row, and
+the plan JSON inside contains the string. Anchor the query
+(`outcome = 'entry-failed: too-close-to-market'`, or grep for the emitting
+module) or you will measure your own echo.
+
+The 3 real rejections were all `entry-failed: broker rejected the order` —
+generic `OrderRejected`, EUR_USD on **oanda**, within 3½ minutes on 2026-09-07.
+Not disguised too-closes: the TN adapter maps `U::EntryTooCloseToMarket` to its
+own distinct variant (`broker-tradenation-adapter/src/lib.rs:803`), so a genuine
+`#19-10` could not arrive wearing the generic label.
+
+**Why zero, and why that does not retire the bug.** `#19-10` is a *TradeNation*
+rejection, and `broker-oanda` never constructs `EntryTooCloseToMarket` at all —
+it emits only `AccountFetch`, `EquityParse`, `OpenPositionsCapExceeded`,
+`OrderRejected`, `RiskCapExceeded`, `UnitsBelowMinimum`. So the measured zero is
+partly a statement about *which broker has been trading*, not about how safe the
+path is. Per `[[trade_both_brokers_forex_and_indices]]` the plan from 2026-09-06
+is to trade **both** brokers — so TN volume, and with it the first real `#19-10`,
+is ahead of us rather than behind.
+
+**Revised severity: MEDIUM-LOW *today*, restoring to MEDIUM-HIGH the moment TN
+carries live stop-entries.** Nothing in the journal is retroactively unsound —
+the "every affected trade's as-designed R is unsound" worry the original
+paragraph raised is **not** realised, because there are no affected trades. This
+is a latent divergence, not an active one. It should still be fixed (the
+operator's standing rule is that any live↔replay divergence is a bug), but it is
+a *before TN goes live* fix, not a *drop everything* one.
+
 
 ## Fix sketch (not built — shape only, verify before following)
 

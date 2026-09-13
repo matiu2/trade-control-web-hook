@@ -1,0 +1,125 @@
+{
+  "fires": [
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-24T16:00:00Z",
+      "candle_close": 1.36347
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-24T17:00:00Z",
+      "candle_close": 1.36288
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-25T15:00:00Z",
+      "candle_close": 1.36399
+    },
+    {
+      "rule_id": "01-pause-1787718600-1787747400",
+      "action": "pause",
+      "candle_time": "2026-08-26T03:00:00Z",
+      "candle_close": 1.3637
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-26T05:00:00Z",
+      "candle_close": 1.36349,
+      "suppressed_by": [
+        "1787718600-1787747400(news:GBP/USD-2026-08-26T04:30:00+00:00)"
+      ]
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-26T09:00:00Z",
+      "candle_close": 1.36269,
+      "suppressed_by": [
+        "1787718600-1787747400(news:GBP/USD-2026-08-26T04:30:00+00:00)"
+      ]
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-08-26T10:00:00Z",
+      "candle_close": 1.36203,
+      "suppressed_by": [
+        "1787718600-1787747400(news:GBP/USD-2026-08-26T04:30:00+00:00)"
+      ]
+    },
+    {
+      "rule_id": "02-resume-1787718600-1787747400",
+      "action": "resume",
+      "candle_time": "2026-08-26T11:00:00Z",
+      "candle_close": 1.3629
+    },
+    {
+      "rule_id": "01-news-start-1787747400-1787751000",
+      "action": "news-start",
+      "candle_time": "2026-08-26T11:00:00Z",
+      "candle_close": 1.3629
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-08-26T12:00:00Z",
+      "candle_close": 1.36072
+    },
+    {
+      "rule_id": "02-news-end-1787747400-1787751000",
+      "action": "news-end",
+      "candle_time": "2026-08-26T12:00:00Z",
+      "candle_close": 1.36072
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-08-26T14:00:00Z",
+      "candle_close": 1.35879
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "action": "veto",
+      "candle_time": "2026-08-28T00:00:00Z",
+      "candle_close": 1.35961
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": -2.0,
+    "tp_hits": 0,
+    "sl_hits": 2,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-08-24T16:00:00Z",
+        "entry_price": 1.36347,
+        "stop_loss": 1.36499,
+        "take_profit": 1.35779,
+        "exit_time": "2026-08-25T09:00:00Z",
+        "exit_price": 1.36499,
+        "exit_reason": "stopped_out",
+        "r": -1.0
+      },
+      {
+        "entry_time": "2026-08-25T15:00:00Z",
+        "entry_price": 1.36399,
+        "stop_loss": 1.36535,
+        "take_profit": 1.35779,
+        "exit_time": "2026-08-25T19:00:00Z",
+        "exit_price": 1.36535,
+        "exit_reason": "stopped_out",
+        "r": -1.0
+      }
+    ]
+  }
+}

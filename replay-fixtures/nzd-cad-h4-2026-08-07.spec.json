@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1785502800,
+        "price": 0.82229
+      },
+      "b": {
+        "at_epoch": 1786064400,
+        "price": 0.82209
+      }
+    },
+    "invalidation": 0.82736,
+    "fib_head_neckline": [
+      0.8293,
+      0.8223060491380492
+    ],
+    "trade_expiry_epoch": 1787230800,
+    "sr_levels": [
+      0.80588,
+      0.8195501643826778
+    ]
+  },
+  "resolution": "240",
+  "chart_symbol": "OANDA:NZDCAD",
+  "start": 1786093200,
+  "tv_arm_version": "v141-dirty"
+}

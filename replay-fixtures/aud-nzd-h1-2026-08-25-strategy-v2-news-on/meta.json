@@ -1,0 +1,17 @@
+{
+  "instrument": "AUD/NZD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-25T00:00:00Z",
+  "end": "2026-08-27T01:00:00Z",
+  "message": "went half way to profit",
+  "arm": {
+    "entry_rule": "strategy-v2",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:AUDNZD",
+    "tv_arm_version": "v144-1-g538cd0a1-dirty",
+    "engine_version": "v144-1-g538cd0a1-dirty"
+  }
+}

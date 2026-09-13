@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1787202000,
+        "price": 1.16709
+      },
+      "b": {
+        "at_epoch": 1787241600,
+        "price": 1.16705
+      }
+    },
+    "invalidation": 1.1691344946478808,
+    "fib_head_neckline": [
+      1.17117,
+      1.1670527802218356
+    ],
+    "trade_expiry_epoch": 1788159600,
+    "sr_levels": [
+      1.1395770081085983,
+      1.14265,
+      1.1412,
+      1.13811,
+      1.16483,
+      1.16705
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:EURUSD",
+  "start": 1787529600,
+  "tv_arm_version": "v141-7-g538cd0a1-dirty"
+}

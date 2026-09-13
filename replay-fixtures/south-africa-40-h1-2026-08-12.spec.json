@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1786026600,
+        "price": 106946.0
+      },
+      "b": {
+        "at_epoch": 1786519800,
+        "price": 107666.0
+      }
+    },
+    "invalidation": 108915.0,
+    "fib_head_neckline": [
+      109994.0,
+      107286.10720677952
+    ],
+    "trade_expiry_epoch": 1787740200,
+    "sr_levels": [
+      105737.0
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:SA40",
+  "start": 1786534200,
+  "tv_arm_version": "v144-1-g538cd0a1-dirty"
+}

@@ -1,0 +1,17 @@
+{
+  "instrument": "AMAZON COM",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-10T15:30:00Z",
+  "end": "2026-08-25T14:30:00Z",
+  "message": "amazon",
+  "arm": {
+    "entry_rule": "normal",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:AMZN",
+    "tv_arm_version": "v144-1-g538cd0a1-dirty",
+    "engine_version": "v144-1-g538cd0a1-dirty"
+  }
+}

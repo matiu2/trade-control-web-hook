@@ -113,33 +113,23 @@
   "final_phase": "done",
   "warnings": [],
   "outcome": {
-    "net_r": 0.9312201954180095,
+    "net_r": -0.03903345724907754,
     "tp_hits": 0,
     "sl_hits": 0,
-    "reversal_closes": 1,
+    "reversal_closes": 0,
     "expiry_closes": 1,
     "invalidation_closes": 0,
     "open_at_end": 0,
     "legs": [
       {
-        "entry_time": "2026-08-10T21:00:00Z",
-        "entry_price": 1.88222,
-        "stop_loss": 1.88604,
-        "take_profit": 1.87379,
-        "exit_time": "2026-08-14T05:00:00Z",
-        "exit_price": 1.878535,
-        "exit_reason": "reversal",
-        "r": 0.9646596858638747
-      },
-      {
         "entry_time": "2026-08-14T17:00:00Z",
         "entry_price": 1.87811,
-        "stop_loss": 1.88125,
+        "stop_loss": 1.8808,
         "take_profit": 1.87379,
         "exit_time": "2026-08-17T05:00:00Z",
         "exit_price": 1.878215,
         "exit_reason": "expiry",
-        "r": -0.03343949044586528
+        "r": -0.03903345724907754
       }
     ]
   }

@@ -1,0 +1,17 @@
+{
+  "instrument": "AUD/JPY",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-09-01T02:00:00Z",
+  "end": "2026-09-09T09:00:00Z",
+  "message": "irl nothing, but replay gave +3.26",
+  "arm": {
+    "entry_rule": "normal",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:AUDJPY",
+    "tv_arm_version": "v144-1-g538cd0a1-dirty",
+    "engine_version": "v144-1-g538cd0a1-dirty"
+  }
+}

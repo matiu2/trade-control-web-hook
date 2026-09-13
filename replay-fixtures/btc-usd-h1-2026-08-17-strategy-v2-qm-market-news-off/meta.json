@@ -1,0 +1,17 @@
+{
+  "instrument": "BTC_USD",
+  "granularity": "h1",
+  "source": "oanda",
+  "start": "2026-08-17T09:00:00Z",
+  "end": "2026-08-20T09:00:00Z",
+  "message": "bitcoin baby!",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "oanda",
+    "chart_symbol": "OANDA:BTCUSD",
+    "tv_arm_version": "v141-7-g538cd0a1-dirty",
+    "engine_version": "v141-7-g538cd0a1-dirty"
+  }
+}

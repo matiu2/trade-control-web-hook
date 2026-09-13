@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1788444000,
+        "price": 0.58736
+      },
+      "b": {
+        "at_epoch": 1788523200,
+        "price": 0.58715
+      }
+    },
+    "invalidation": 0.5889501215876355,
+    "fib_head_neckline": [
+      0.59009,
+      0.5872481178230871
+    ],
+    "trade_expiry_epoch": 1788883200,
+    "sr_levels": [
+      0.7588,
+      0.57215,
+      0.58034,
+      0.5825948449928887,
+      0.5858,
+      0.59234
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:NZDUSD",
+  "start": 1788537600,
+  "tv_arm_version": "v144-1-g538cd0a1-dirty"
+}

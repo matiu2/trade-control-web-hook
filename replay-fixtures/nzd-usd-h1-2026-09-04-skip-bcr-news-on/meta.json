@@ -1,0 +1,17 @@
+{
+  "instrument": "NZD/USD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-09-04T16:00:00Z",
+  "end": "2026-09-08T16:00:00Z",
+  "message": "h&s questionable left shoulder",
+  "arm": {
+    "entry_rule": "skip-bcr",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:NZDUSD",
+    "tv_arm_version": "v144-1-g538cd0a1-dirty",
+    "engine_version": "v144-1-g538cd0a1-dirty"
+  }
+}

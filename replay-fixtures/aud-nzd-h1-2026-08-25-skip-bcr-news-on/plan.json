@@ -1,0 +1,304 @@
+{
+  "trade_id": "hs-aud-nzd-87f705dd",
+  "instrument": "AUD/NZD",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 1.2008531787698524,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-87f705dd-too-high",
+        "not_after": "2026-08-27T01:30:00Z",
+        "action": "veto",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 50,
+        "level": "close-positions",
+        "trade_id": "hs-aud-nzd-87f705dd"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 1.1973775931190354,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-87f705dd-too-low",
+        "not_after": "2026-08-27T01:30:00Z",
+        "action": "veto",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 50,
+        "level": "stop-next-entry",
+        "trade_id": "hs-aud-nzd-87f705dd"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787792400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-87f705dd-trade-expiry",
+        "not_before": "2026-08-27T01:00:00Z",
+        "not_after": "2026-08-27T01:30:00Z",
+        "action": "veto",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 50,
+        "level": "close-positions",
+        "trade_id": "hs-aud-nzd-87f705dd"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-87f705dd-enter",
+        "not_after": "2026-08-26T15:12:00Z",
+        "action": "enter",
+        "instrument": "AUD/NZD",
+        "direction": "short",
+        "entry": {
+          "type": "stop",
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5,
+          "recover_entry": {
+            "action": "limit"
+          }
+        },
+        "stop_loss": {
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 1.19691
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "vetos": [
+          "too-high",
+          "too-low",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-low",
+            "level": 1.1973775931190354,
+            "past": "Below"
+          },
+          {
+            "name": "too-high",
+            "level": 1.2008531787698524,
+            "past": "Above"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "hs-aud-nzd-87f705dd",
+        "max_retries": 5,
+        "entry_dedup": "gate_owned",
+        "needs_golden": true,
+        "pip_size": 0.0001,
+        "tick_size": 0.00001,
+        "contract_multiplier": 1.0
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-87f705dd-close-on-sr-reversal",
+        "not_after": "2026-08-27T01:00:00Z",
+        "action": "close",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-aud-nzd-87f705dd",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            1.21221,
+            1.21463
+          ],
+          [
+            1.21795,
+            1.22039
+          ],
+          [
+            1.19691,
+            1.19738
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-87f705dd-close-on-reversal",
+        "not_after": "2026-08-27T01:00:00Z",
+        "action": "close",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-aud-nzd-87f705dd",
+        "needs_golden": true,
+        "inside_window": [
+          "news"
+        ],
+        "reason": "news-window reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "01-pause-1787679000-1787707800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787679000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-87f705dd-pause-1787679000-1787707800",
+        "not_after": "2026-08-26T01:30:00Z",
+        "action": "pause",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-aud-nzd-87f705dd",
+        "blackout_id": "1787679000-1787707800",
+        "reason": "news:AUD/NZD-2026-08-25T17:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1787679000-1787707800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787707800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-87f705dd-resume-1787679000-1787707800",
+        "not_after": "2026-08-26T02:00:00Z",
+        "action": "resume",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-aud-nzd-87f705dd",
+        "blackout_id": "1787679000-1787707800",
+        "reason": "news:AUD/NZD-2026-08-25T17:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1787707800-1787711400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787707800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-87f705dd-news-start-1787707800-1787711400",
+        "not_after": "2026-08-26T02:30:00Z",
+        "action": "news-start",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-aud-nzd-87f705dd",
+        "news_id": "1787707800-1787711400",
+        "reason": "news:AUD/NZD-2026-08-26T01:30:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1787707800-1787711400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787711400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "hs-aud-nzd-87f705dd-news-end-1787707800-1787711400",
+        "not_after": "2026-08-26T03:00:00Z",
+        "action": "news-end",
+        "instrument": "AUD/NZD",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "hs-aud-nzd-87f705dd",
+        "news_id": "1787707800-1787711400",
+        "reason": "news:AUD/NZD-2026-08-26T01:30:00+00:00"
+      },
+      "kind": "control"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1787616000,
+  "armed_at": "2026-08-25T00:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-24T00:00:00Z",
+    "period_end": "2026-08-25T00:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "low",
+    "currencies": []
+  },
+  "screenshot_url": "https://www.tradingview.com/x/FD18gMjI/"
+}

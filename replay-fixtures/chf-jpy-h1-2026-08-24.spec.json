@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1787194800,
+        "price": 198.071
+      },
+      "b": {
+        "at_epoch": 1787518800,
+        "price": 198.235
+      }
+    },
+    "invalidation": 198.658,
+    "fib_head_neckline": [
+      198.984,
+      198.10082466999455
+    ],
+    "trade_expiry_epoch": 1787889600,
+    "sr_levels": [
+      201.40887315889793
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:CHFJPY",
+  "start": 1787540400,
+  "tv_arm_version": "v144-1-g538cd0a1-dirty"
+}

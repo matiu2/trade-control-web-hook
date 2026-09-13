@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1788159600,
+        "price": 114.268
+      },
+      "b": {
+        "at_epoch": 1787792400,
+        "price": 114.309
+      }
+    },
+    "invalidation": 114.734,
+    "fib_head_neckline": [
+      114.946,
+      114.28753693104782
+    ],
+    "trade_expiry_epoch": 1788944400,
+    "sr_levels": [
+      112.104,
+      113.155,
+      112.745,
+      114.344
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:AUDJPY",
+  "start": 1788228000,
+  "tv_arm_version": "v144-1-g538cd0a1-dirty"
+}

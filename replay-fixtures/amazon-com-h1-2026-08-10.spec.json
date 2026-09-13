@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1786044600,
+        "price": 271.18
+      },
+      "b": {
+        "at_epoch": 1785519000,
+        "price": 271.18
+      }
+    },
+    "invalidation": 280.14,
+    "fib_head_neckline": [
+      286.57,
+      271.14844781730835
+    ],
+    "trade_expiry_epoch": 1787668200
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:AMZN",
+  "start": 1786375800,
+  "tv_arm_version": "v144-1-g538cd0a1-dirty"
+}

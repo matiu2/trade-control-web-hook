@@ -1,0 +1,17 @@
+{
+  "instrument": "GBP/ZAR",
+  "granularity": "h4",
+  "source": "tradenation",
+  "start": "2026-08-17T05:00:00Z",
+  "end": "2026-09-01T21:00:00Z",
+  "message": "4h ihs - possibly news saved us",
+  "arm": {
+    "entry_rule": "skip-bcr",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:GBPZAR",
+    "tv_arm_version": "v144-1-g538cd0a1-dirty",
+    "engine_version": "v144-1-g538cd0a1-dirty"
+  }
+}

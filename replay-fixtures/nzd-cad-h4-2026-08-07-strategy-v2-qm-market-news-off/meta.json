@@ -1,0 +1,17 @@
+{
+  "instrument": "NZD_CAD",
+  "granularity": "h4",
+  "source": "oanda",
+  "start": "2026-08-07T09:00:00Z",
+  "end": "2026-08-20T13:00:00Z",
+  "message": "4h h&s",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "oanda",
+    "chart_symbol": "OANDA:NZDCAD",
+    "tv_arm_version": "v141-dirty",
+    "engine_version": "v141-dirty"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "instrument": "South Africa 40",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-12T11:30:00Z",
+  "end": "2026-08-26T10:30:00Z",
+  "message": "south africa index - never reached tp",
+  "arm": {
+    "entry_rule": "skip-bcr",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:SA40",
+    "tv_arm_version": "v144-1-g538cd0a1-dirty",
+    "engine_version": "v144-1-g538cd0a1-dirty"
+  }
+}

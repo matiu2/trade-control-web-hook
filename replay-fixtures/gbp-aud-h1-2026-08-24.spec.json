@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1787540400,
+        "price": 1.904814373445611
+      },
+      "b": {
+        "at_epoch": 1787313600,
+        "price": 1.904814373445611
+      }
+    },
+    "invalidation": 1.9023,
+    "fib_head_neckline": [
+      1.9006009644291175,
+      1.9047892204898955
+    ],
+    "trade_expiry_epoch": 1787767200,
+    "prep_expiry_epochs": [
+      [
+        "break-and-close",
+        1780956000
+      ]
+    ],
+    "sr_levels": [
+      1.92090006238087,
+      1.9065005527682104
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:GBPAUD",
+  "start": 1787565600,
+  "tv_arm_version": "v144-1-g538cd0a1-dirty"
+}

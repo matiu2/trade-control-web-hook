@@ -1,0 +1,17 @@
+{
+  "instrument": "CHF/JPY",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-24T03:00:00Z",
+  "end": "2026-08-28T04:00:00Z",
+  "message": "not-taken; ppa too steep",
+  "arm": {
+    "entry_rule": "strategy-v2-qm-market",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:CHFJPY",
+    "tv_arm_version": "v144-1-g538cd0a1-dirty",
+    "engine_version": "v144-1-g538cd0a1-dirty"
+  }
+}

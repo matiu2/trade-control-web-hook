@@ -1,0 +1,464 @@
+{
+  "trade_id": "ihs-gbp-zar-91fb7ebe",
+  "instrument": "GBP/ZAR",
+  "direction": "long",
+  "granularity": "h4",
+  "pip_size": 0.01,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 21.775,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-too-low",
+        "not_after": "2026-09-01T21:30:00Z",
+        "action": "veto",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 377,
+        "level": "close-positions",
+        "trade_id": "ihs-gbp-zar-91fb7ebe"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 22.0935352233693,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-too-high",
+        "not_after": "2026-09-01T21:30:00Z",
+        "action": "veto",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 377,
+        "level": "stop-next-entry",
+        "trade_id": "ihs-gbp-zar-91fb7ebe"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1788296400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-trade-expiry",
+        "not_before": "2026-09-01T21:00:00Z",
+        "not_after": "2026-09-01T21:30:00Z",
+        "action": "veto",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 377,
+        "level": "close-positions",
+        "trade_id": "ihs-gbp-zar-91fb7ebe"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1786438800,
+          "price": 21.945
+        },
+        "b": {
+          "at_epoch": 1786712400,
+          "price": 21.94
+        },
+        "extend_forward": true,
+        "bar_seconds": 14400,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-break-and-close",
+        "not_after": "2026-09-01T21:00:00Z",
+        "action": "prep",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "ihs-gbp-zar-91fb7ebe"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1786438800,
+          "price": 21.945
+        },
+        "b": {
+          "at_epoch": 1786712400,
+          "price": 21.94
+        },
+        "extend_forward": true,
+        "bar_seconds": 14400,
+        "dir": "down",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-retest",
+        "not_after": "2026-09-01T21:00:00Z",
+        "action": "prep",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "ihs-gbp-zar-91fb7ebe"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-enter",
+        "not_after": "2026-08-29T17:48:00Z",
+        "action": "enter",
+        "instrument": "GBP/ZAR",
+        "direction": "long",
+        "entry": {
+          "type": "stop",
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5,
+          "recover_entry": {
+            "action": "limit"
+          }
+        },
+        "stop_loss": {
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 22.13093
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 22.0935352233693,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 21.775,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-gbp-zar-91fb7ebe",
+        "max_retries": 5,
+        "entry_dedup": "gate_owned",
+        "needs_golden": true,
+        "pip_size": 0.01,
+        "tick_size": 0.001,
+        "contract_multiplier": 1.0
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-close-on-sr-reversal",
+        "not_after": "2026-09-01T21:00:00Z",
+        "action": "close",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-gbp-zar-91fb7ebe",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            21.98799,
+            22.03201
+          ],
+          [
+            22.09354,
+            22.13093
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-close-on-reversal",
+        "not_after": "2026-09-01T21:00:00Z",
+        "action": "close",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-gbp-zar-91fb7ebe",
+        "needs_golden": true,
+        "inside_window": [
+          "news"
+        ],
+        "reason": "news-window reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "01-pause-1787004000-1787032800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787004000
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-pause-1787004000-1787032800",
+        "not_after": "2026-08-18T06:00:00Z",
+        "action": "pause",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-gbp-zar-91fb7ebe",
+        "blackout_id": "1787004000-1787032800",
+        "reason": "news:GBP/ZAR-2026-08-17T22:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1787004000-1787032800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787032800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-resume-1787004000-1787032800",
+        "not_after": "2026-08-18T06:30:00Z",
+        "action": "resume",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-gbp-zar-91fb7ebe",
+        "blackout_id": "1787004000-1787032800",
+        "reason": "news:GBP/ZAR-2026-08-17T22:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-pause-1787090400-1787119200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787090400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-pause-1787090400-1787119200",
+        "not_after": "2026-08-19T06:00:00Z",
+        "action": "pause",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-gbp-zar-91fb7ebe",
+        "blackout_id": "1787090400-1787119200",
+        "reason": "news:GBP/ZAR-2026-08-18T22:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1787090400-1787119200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787119200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-resume-1787090400-1787119200",
+        "not_after": "2026-08-19T06:30:00Z",
+        "action": "resume",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-gbp-zar-91fb7ebe",
+        "blackout_id": "1787090400-1787119200",
+        "reason": "news:GBP/ZAR-2026-08-18T22:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1787032800-1787036400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787032800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-news-start-1787032800-1787036400",
+        "not_after": "2026-08-18T07:00:00Z",
+        "action": "news-start",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-gbp-zar-91fb7ebe",
+        "news_id": "1787032800-1787036400",
+        "reason": "news:GBP/ZAR-2026-08-18T06:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1787032800-1787036400",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787036400
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-news-end-1787032800-1787036400",
+        "not_after": "2026-08-18T07:30:00Z",
+        "action": "news-end",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-gbp-zar-91fb7ebe",
+        "news_id": "1787032800-1787036400",
+        "reason": "news:GBP/ZAR-2026-08-18T06:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1787119200-1787122800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787119200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-news-start-1787119200-1787122800",
+        "not_after": "2026-08-19T07:00:00Z",
+        "action": "news-start",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-gbp-zar-91fb7ebe",
+        "news_id": "1787119200-1787122800",
+        "reason": "news:GBP/ZAR-2026-08-19T06:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1787119200-1787122800",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1787122800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-gbp-zar-91fb7ebe-news-end-1787119200-1787122800",
+        "not_after": "2026-08-19T07:30:00Z",
+        "action": "news-end",
+        "instrument": "GBP/ZAR",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-gbp-zar-91fb7ebe",
+        "news_id": "1787119200-1787122800",
+        "reason": "news:GBP/ZAR-2026-08-19T06:00:00+00:00"
+      },
+      "kind": "control"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1786942800,
+  "armed_at": "2026-08-17T05:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-08-14T05:00:00Z",
+    "period_end": "2026-08-17T05:00:00Z",
+    "overall_direction": "bearish",
+    "confidence": "low",
+    "currencies": [
+      {
+        "currency": "GBP",
+        "direction": "bearish",
+        "net_score": -1.0,
+        "events": [
+          "Rightmove HPI m/m: Actual (-2.0%) declined from previous (-1.0%)"
+        ]
+      }
+    ]
+  },
+  "screenshot_url": "https://www.tradingview.com/x/WkEJr6xY/"
+}

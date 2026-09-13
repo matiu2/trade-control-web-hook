@@ -1,0 +1,124 @@
+{
+  "fires": [
+    {
+      "rule_id": "01-pause-1786077000-1786105800",
+      "action": "pause",
+      "candle_time": "2026-08-07T05:00:00Z",
+      "candle_close": 0.82331
+    },
+    {
+      "rule_id": "02-resume-1786077000-1786105800",
+      "action": "resume",
+      "candle_time": "2026-08-07T05:00:00Z",
+      "candle_close": 0.82331
+    },
+    {
+      "rule_id": "01-news-start-1786105800-1786109400",
+      "action": "news-start",
+      "candle_time": "2026-08-07T05:00:00Z",
+      "candle_close": 0.82331
+    },
+    {
+      "rule_id": "02-news-end-1786105800-1786109400",
+      "action": "news-end",
+      "candle_time": "2026-08-07T09:00:00Z",
+      "candle_close": 0.82258
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-08-07T13:00:00Z",
+      "candle_close": 0.821
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "action": "prep",
+      "candle_time": "2026-08-07T17:00:00Z",
+      "candle_close": 0.82162
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-09T21:00:00Z",
+      "candle_close": 0.82086
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-10T09:00:00Z",
+      "candle_close": 0.82068
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-08-10T13:00:00Z",
+      "candle_close": 0.8201
+    },
+    {
+      "rule_id": "01-veto-too-low",
+      "action": "veto",
+      "candle_time": "2026-08-12T05:00:00Z",
+      "candle_close": 0.81652
+    },
+    {
+      "rule_id": "01-pause-1786941000-1786969800",
+      "action": "pause",
+      "candle_time": "2026-08-16T21:00:00Z",
+      "candle_close": 0.81932
+    },
+    {
+      "rule_id": "02-resume-1786941000-1786969800",
+      "action": "resume",
+      "candle_time": "2026-08-17T05:00:00Z",
+      "candle_close": 0.82044
+    },
+    {
+      "rule_id": "01-news-start-1786969800-1786973400",
+      "action": "news-start",
+      "candle_time": "2026-08-17T05:00:00Z",
+      "candle_close": 0.82044
+    },
+    {
+      "rule_id": "02-news-end-1786969800-1786973400",
+      "action": "news-end",
+      "candle_time": "2026-08-17T09:00:00Z",
+      "candle_close": 0.81956
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-08-18T09:00:00Z",
+      "candle_close": 0.81683
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "action": "veto",
+      "candle_time": "2026-08-20T13:00:00Z",
+      "candle_close": 0.81934
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": [],
+  "outcome": {
+    "net_r": 2.076923076922801,
+    "tp_hits": 1,
+    "sl_hits": 0,
+    "reversal_closes": 0,
+    "expiry_closes": 0,
+    "invalidation_closes": 0,
+    "open_at_end": 0,
+    "legs": [
+      {
+        "entry_time": "2026-08-10T01:00:00Z",
+        "entry_price": 0.82071,
+        "stop_loss": 0.8233100000000004,
+        "take_profit": 0.81531,
+        "exit_time": "2026-08-13T01:00:00Z",
+        "exit_price": 0.81531,
+        "exit_reason": "took_profit",
+        "r": 2.076923076922801
+      }
+    ]
+  }
+}

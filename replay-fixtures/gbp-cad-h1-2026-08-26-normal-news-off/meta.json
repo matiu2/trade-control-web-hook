@@ -1,0 +1,17 @@
+{
+  "instrument": "GBP/CAD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-08-26T05:00:00Z",
+  "end": "2026-08-31T23:00:00Z",
+  "message": "c&h but the handle is really high",
+  "arm": {
+    "entry_rule": "normal",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:GBPCAD",
+    "tv_arm_version": "v144-1-g538cd0a1-dirty",
+    "engine_version": "v144-1-g538cd0a1-dirty"
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "geom": {
+    "neckline": {
+      "a": {
+        "at_epoch": 1787248800,
+        "price": 1.36275
+      },
+      "b": {
+        "at_epoch": 1787558400,
+        "price": 1.36217
+      }
+    },
+    "invalidation": 1.3655911874426705,
+    "fib_head_neckline": [
+      1.36757,
+      1.3626796950920037
+    ],
+    "trade_expiry_epoch": 1787875200,
+    "sr_levels": [
+      1.3299506047478773,
+      1.3416373979487315,
+      1.33352,
+      1.3389,
+      1.3314813058039472,
+      1.33635
+    ]
+  },
+  "resolution": "60",
+  "chart_symbol": "TRADENATION:GBPUSD",
+  "start": 1787572800,
+  "tv_arm_version": "v144-1-g538cd0a1-dirty"
+}
