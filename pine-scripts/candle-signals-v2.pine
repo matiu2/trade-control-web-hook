@@ -63,7 +63,8 @@ indicator("Candle Signals", shorttitle="Candle Signals", overlay=true, max_label
 //   bars_elapsed == confirm_bars: valid iff a push occurred at any point in
 //   the window, invalid otherwise. Invalidation rules (opposite-extreme
 //   breach, in-window opposer) are unchanged and still take effect
-//   immediately. Requires a manual republish of the study after pulling
+//   immediately — though they now land in PROVEN_WRONG rather than INVALID,
+//   a display-only distinction (see SIGNAL STATE RULES). Requires a manual republish of the study after pulling
 //   this version. The Rust worker port (core/src/signals/state_machine.rs)
 //   carries the identical change — keep the two in sync.
 //
@@ -74,19 +75,29 @@ indicator("Candle Signals", shorttitle="Candle Signals", overlay=true, max_label
 // =============================================================================
 // SIGNAL STATE RULES
 // =============================================================================
+// A signal ends in one of three terminal states. The two DEAD ones are
+// distinguished because they mean different things to a reader of the chart:
+//   VALID         confirmed — it got its push.
+//   INVALID       "unconfirmed" — the window ran out with no push; it fizzled.
+//   PROVEN_WRONG  the market actively refuted it (rules 2, 3 and 7 below).
+// Display only: both dead states are drawn as faded grey arrows, PROVEN_WRONG
+// the fainter of the two. Nothing on the alert wire changes.
+//
 // 1. Every detected signal starts in the pending state when it prints.
-// 2. If price trades above the high of a bearish signal, it becomes invalid.
-// 3. If price trades below the low of a bullish signal, it becomes invalid.
+// 2. If price trades above the high of a bearish signal, it is PROVEN WRONG.
+// 3. If price trades below the low of a bullish signal, it is PROVEN WRONG.
 // 4. A bullish pending signal becomes valid at the END of the `confirm_bars`
 //    window iff price pushed above its high at any point within the window
 //    (the push is latched on its bar; validation is deferred to window end).
 // 5. A bearish pending signal becomes valid at the END of the `confirm_bars`
 //    window iff price pushed below its low at any point within the window.
-// 6. Any pending signal with no in-window push becomes invalid at the end of
-//    the `confirm_bars` window.
+// 6. Any pending signal with no in-window push becomes INVALID (unconfirmed)
+//    at the end of the `confirm_bars` window.
 // 7. An opposing-direction signal printing inside the `confirm_bars` window
-//    invalidates the original (this can flip a previously-VALID signal back
-//    to INVALID — confirmation only counts if no opposer printed in-window).
+//    PROVES the original WRONG (this can flip a previously-VALID signal back
+//    — confirmation only counts if no opposer printed in-window). It counts as
+//    refutation rather than a fizzle precisely because it can undo a
+//    confirmation.
 //    Exception: if the original is golden and the opposer is NOT golden, the
 //    opposer is ignored and the original stands. All other combos
 //    (gold-vs-gold, non-gold-vs-gold, non-gold-vs-non-gold) invalidate.
@@ -108,7 +119,8 @@ show_small_candles = input.bool(false, "Show Small Candles", tooltip="Show signa
 
 // State visibility
 hide_pending = input.bool(false, "Hide Pending Signals")
-hide_invalid = input.bool(true, "Hide Invalid Signals")
+hide_invalid = input.bool(true, "Hide Unconfirmed Signals", tooltip="Signals whose confirm window elapsed with no confirming push — they simply never got going.")
+hide_proven_wrong = input.bool(true, "Hide Proven-Wrong Signals", tooltip="Signals the market actively refuted: price traded through the signal's own extreme, or an opposing signal printed inside the confirm window.")
 
 // Confirmation window — how many bars after a pending signal prints we still
 // accept a confirming push above/below its extreme. Used by both the visual
@@ -132,7 +144,18 @@ bearish_shape = input.string("Triangle", "Bearish Pending Shape", options=["Arro
 // ===== Constants =============================================================
 const int STATE_PENDING = 0
 const int STATE_VALID = 1
+// A dead signal, split by WHY it died — the two read very differently on a
+// chart and used to render identically.
+//   STATE_INVALID      "unconfirmed": the confirm window elapsed with no
+//                      confirming push. The setup simply never got going.
+//   STATE_PROVEN_WRONG the market actively refuted it — price traded through
+//                      the signal's own extreme, or an opposing signal printed
+//                      inside the confirm window (which can flip an already-
+//                      VALID signal back, i.e. refutation, not a fizzle).
+// Display-only: `state` is never plotted, so the alert payload
+// (`signal_confirmed`) and the Rust detector are unaffected by this split.
 const int STATE_INVALID = 2
+const int STATE_PROVEN_WRONG = 3
 
 // signal_kind float encoding — keep in sync with Rust SignalKind serde adapter.
 const float KIND_PINBAR            = 1.0
@@ -159,14 +182,15 @@ bearish_pending_style = resolve_label_style(bearish_shape, false)
 
 f_apply_label_style(label sig_label, bool is_bullish, int state, bool is_golden) =>
     if not na(sig_label)
-        // Shape: pending = chosen shape, valid = triangle, invalid = arrow.
-        // The invalid arrow keeps the signal's OWN direction (up for a dead
-        // bullish, down for a dead bearish) rather than the direction-blind
-        // cross it used to draw — a faded grey arrow still reads as "this setup
-        // died" while leaving visible what the setup WAS.
+        // Shape: pending = chosen shape, confirmed = triangle, both dead states
+        // = arrow. Every shape keeps the signal's OWN direction (up for a
+        // bullish, down for a bearish) rather than the direction-blind cross
+        // the dead states used to draw — so a faded arrow still shows what the
+        // setup WAS. The two dead tiers are told apart by OPACITY, not shape.
         string lbl_style = switch state
-            STATE_VALID   => is_bullish ? label.style_triangleup : label.style_triangledown
-            STATE_INVALID => is_bullish ? label.style_arrowup : label.style_arrowdown
+            STATE_VALID        => is_bullish ? label.style_triangleup : label.style_triangledown
+            STATE_INVALID      => is_bullish ? label.style_arrowup : label.style_arrowdown
+            STATE_PROVEN_WRONG => is_bullish ? label.style_arrowup : label.style_arrowdown
             => is_bullish ? bullish_pending_style : bearish_pending_style
         label.set_style(sig_label, lbl_style)
 
@@ -175,16 +199,22 @@ f_apply_label_style(label sig_label, bool is_bullish, int state, bool is_golden)
         string lbl_size = base_size
         label.set_size(sig_label, lbl_size)
 
-        // Color: valid golden = full opacity; valid small + pending = 50%; invalid = gray
+        // Colour is one axis — opacity — so the tiers read as a ramp:
+        //   confirmed golden  full colour
+        //   confirmed small / pending   50%
+        //   unconfirmed (fizzled)   grey 60%
+        //   proven wrong (refuted)  grey 85% — very faint, deliberately the
+        //                           faintest thing on the chart
         color base_col = is_bullish ? bullish_color : bearish_color
         color fill = switch state
-            STATE_VALID   => is_golden ? base_col : color.new(base_col, 50)
-            STATE_INVALID => color.new(color.gray, 60)
+            STATE_VALID        => is_golden ? base_col : color.new(base_col, 50)
+            STATE_INVALID      => color.new(color.gray, 60)
+            STATE_PROVEN_WRONG => color.new(color.gray, 85)
             => color.new(base_col, 50)
         label.set_color(sig_label, fill)
 
         // Visibility
-        bool hidden = (state == STATE_PENDING and hide_pending) or (state == STATE_INVALID and hide_invalid)
+        bool hidden = (state == STATE_PENDING and hide_pending) or (state == STATE_INVALID and hide_invalid) or (state == STATE_PROVEN_WRONG and hide_proven_wrong)
         label.set_size(sig_label, hidden ? size.auto : lbl_size)
         label.set_color(sig_label, hidden ? color.new(color.white, 100) : fill)
 
@@ -436,16 +466,18 @@ while bullish_index >= 0
         if bars_elapsed >= confirm_bars
             new_state := broke ? STATE_VALID : STATE_INVALID
 
+    // Price traded through the signal's own low: actively refuted.
     if low < sig_low
-        new_state := STATE_INVALID
+        new_state := STATE_PROVEN_WRONG
 
     // Opposing-signal invalidation inside the confirm window. Gold-protect
     // clause: skip invalidation only when the pending signal is golden and
     // the opposer is not. Applies to PENDING or recently-VALID signals; a
-    // valid signal can flip back to invalid if an opposer prints in-window.
-    if bars_elapsed <= confirm_bars and bearish_signal and new_state != STATE_INVALID
+    // valid signal can flip back if an opposer prints in-window — which is
+    // why this counts as REFUTED rather than merely unconfirmed.
+    if bars_elapsed <= confirm_bars and bearish_signal and new_state != STATE_PROVEN_WRONG
         if not (is_golden and not bear_sig_golden)
-            new_state := STATE_INVALID
+            new_state := STATE_PROVEN_WRONG
 
     if new_state != state
         array.set(bullish_states, idx, new_state)
@@ -457,7 +489,10 @@ while bullish_index >= 0
             // overwritten the latch.
             if signal_high_v == sig_high and signal_low_v == sig_low
                 signal_confirmed_v := 1.0
-        else if state != STATE_INVALID and new_state == STATE_INVALID
+        // "Died" = either dead state. Testing only STATE_INVALID here would let
+        // a PROVEN_WRONG signal keep a stale confirmation latched — the
+        // refutation case this split was made for.
+        else if (state != STATE_INVALID and state != STATE_PROVEN_WRONG) and (new_state == STATE_INVALID or new_state == STATE_PROVEN_WRONG)
             bullish_just_invalid := true
             // Clear latched confirmation if the invalidated signal is the
             // currently-latched one — an in-window opposer retroactively
@@ -491,14 +526,15 @@ while bearish_index >= 0
         if bars_elapsed >= confirm_bars
             new_state := broke ? STATE_VALID : STATE_INVALID
 
+    // Price traded through the signal's own high: actively refuted.
     if high > sig_high
-        new_state := STATE_INVALID
+        new_state := STATE_PROVEN_WRONG
 
     // Opposing-signal invalidation inside the confirm window. See bullish
     // branch for rationale.
-    if bars_elapsed <= confirm_bars and bullish_signal and new_state != STATE_INVALID
+    if bars_elapsed <= confirm_bars and bullish_signal and new_state != STATE_PROVEN_WRONG
         if not (is_golden and not bull_sig_golden)
-            new_state := STATE_INVALID
+            new_state := STATE_PROVEN_WRONG
 
     if new_state != state
         array.set(bearish_states, idx, new_state)
@@ -508,7 +544,10 @@ while bearish_index >= 0
             // currently-latched signal (see bullish branch above).
             if signal_high_v == sig_high and signal_low_v == sig_low
                 signal_confirmed_v := 1.0
-        else if state != STATE_INVALID and new_state == STATE_INVALID
+        // "Died" = either dead state. Testing only STATE_INVALID here would let
+        // a PROVEN_WRONG signal keep a stale confirmation latched — the
+        // refutation case this split was made for.
+        else if (state != STATE_INVALID and state != STATE_PROVEN_WRONG) and (new_state == STATE_INVALID or new_state == STATE_PROVEN_WRONG)
             bearish_just_invalid := true
             if signal_high_v == sig_high and signal_low_v == sig_low
                 signal_confirmed_v := 0.0
