@@ -388,13 +388,33 @@ impl ReplayBroker {
     /// pip (it needs it to key the record's OFF-side pips math). The plan's baked
     /// `pip_size` is stamped on when the intent didn't carry its own, mirroring
     /// how `dispatch_config` / `run_enter` fall back to the plan pip in replay.
-    /// `None` only for an **unknown** order id — a cancelled order still exposes
+    /// `None` only for an **unknown** key — a cancelled order still exposes
     /// its armed Verified, because the lifecycle's restore side re-drives it
     /// *after* the cancel (the cancel flag gates the fill outcome, not the payload
     /// seam).
-    pub fn armed_verified(&self, order_id: &str) -> Option<Verified> {
+    ///
+    /// # `key` is an order id OR a trade id
+    ///
+    /// The resting-order paths (`pending_order_lifecycle`, the re-price cancel)
+    /// hold a broker **order id**. A **parked** order has no broker id at all — it
+    /// was never placed — so `promote_stored_order` keys its recovery on the
+    /// **trade id** instead, as that module's docs state. One seam serves both
+    /// callers, so both are accepted; the order id is tried first because it is
+    /// the exact identity and the overwhelmingly common case.
+    ///
+    /// Without the trade-id arm a park is **unpromotable offline**: it verifies on
+    /// the way down (the cancel holds an order id) and fails on the way back up
+    /// with `will not verify`, so a demoted order stays parked forever and the
+    /// setup silently vanishes from the replay. That was latent until the
+    /// re-price pass started producing parks offline — nothing else offline
+    /// demotes.
+    pub fn armed_verified(&self, key: &str) -> Option<Verified> {
         let placed = self.placed.borrow();
-        let attempt = placed.iter().find(|a| a.order_id == order_id)?;
+        let attempt = placed.iter().find(|a| a.order_id == key).or_else(|| {
+            placed
+                .iter()
+                .find(|a| a.intent.trade_id.as_deref() == Some(key))
+        })?;
         let mut intent = attempt.intent.clone();
         if !intent.pip_size.is_some_and(|p| p > 0.0 && p.is_finite()) {
             intent.pip_size = Some(self.pip_size);
@@ -1733,6 +1753,38 @@ mod tests {
         assert!(
             b.closed.borrow().is_empty(),
             "no trade may be closed before the loop reaches bar 1"
+        );
+    }
+
+    /// A parked order is recovered by its **trade id**, every resting-order path
+    /// by its **order id**, and one seam answers both. The regression this pins:
+    /// with only the order-id arm, `promote_stored_order` gets `will not verify`
+    /// and a demoted order is stranded parked forever — the setup silently
+    /// disappears from the replay.
+    ///
+    /// Mutation check: drop the `trade_id` fallback and the second assertion goes
+    /// red while the first stays green, which is exactly how the bug hid.
+    #[tokio::test]
+    async fn armed_verified_resolves_by_trade_id_as_well_as_order_id() {
+        let b = ReplayBroker::new(vec![candle(0, 1.1010)], 0.0001);
+        let shell = Shell::from_candle(&candle(0, 1.1010).mid());
+        b.arm_placement("o1".into(), short_enter_intent(), shell);
+        b.place_entry(1.0, 3, &entry_req(RiskBudget::Percent(0.5)))
+            .await
+            .expect("placed");
+
+        assert!(
+            b.armed_verified("o1").is_some(),
+            "the order-id arm is what the lifecycle and the re-price cancel use",
+        );
+        assert!(
+            b.armed_verified("t").is_some(),
+            "…and the trade-id arm is what a PARK's promotion uses — without it a \
+             demoted order can never be re-placed",
+        );
+        assert!(
+            b.armed_verified("nope").is_none(),
+            "an unknown key must still resolve to nothing, not to some other trade",
         );
     }
 }

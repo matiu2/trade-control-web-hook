@@ -719,6 +719,40 @@ pub async fn run(
         )
         .await;
 
+        // …and the RE-PRICE half of that same tick, which the live
+        // `order_control_tick::run_both` runs immediately after the promotion and
+        // the replay used to skip entirely. Slice 7
+        // (`core::pending_lifecycle`) retired the `HoldReason::SpreadHour` ON-side
+        // derivation in favour of the forward-looking SL floor that ONLY this pass
+        // delivers, so without it the replay had neither the retired hold nor its
+        // replacement: a resting order sat offline at its original stop through a
+        // spread widening while live re-priced it wider or parked it below min-R
+        // (`[[strategy_changes_in_both_replayer_and_worker]]`).
+        //
+        // Promotion runs FIRST, exactly as live: an order promoted this bar was
+        // placed at the current spread, so re-pricing it in the same tick would at
+        // best be redundant and at worst cancel-and-replace an order placed a
+        // moment ago.
+        //
+        // `account: None` — the ReplayBroker doesn't scope orders by account, and
+        // unlike the promotion pass this one enumerates BROKER ORDERS (which the
+        // broker has already scoped) rather than records, so the `PromoteScope`
+        // distinction doesn't arise here.
+        //
+        // `BrokerQuotes`, not the live cron's per-tick cache: the replay's
+        // `get_quote` is a local read off the bar it is already holding, so a cache
+        // would buy nothing and could only go stale within a bar.
+        trade_control_core::order_control::reprice_due_orders(
+            &replay_broker,
+            &store,
+            &lifecycle_cfg,
+            &src,
+            &mut trade_control_core::order_control::BrokerQuotes(&replay_broker),
+            None,
+            now,
+        )
+        .await;
+
         if eval.done {
             done = true;
             break;
@@ -3690,6 +3724,26 @@ mod tests {
     /// TTL-vs-block regression guard: assert the fill lands AFTER the block start
     /// (a genuinely deferred entry) and the journal shows a taken TP, not a 0R
     /// no-fill.
+    ///
+    /// ⚠️ **The route to that deferral changed when the shared re-price pass
+    /// landed, and this test now guards BOTH halves.** The order no longer waits
+    /// for the 21:00Z block to cancel it: at **20:00Z**, an hour earlier,
+    /// AUD/CHF's baked `expected_next_hour` of 0.002143 puts the forward-looking
+    /// floor at 0.0214, which a 50-pip TP cannot clear at a 1.0 R-floor — so the
+    /// order is **DEMOTED** (pulled off the book and parked) ahead of the spike,
+    /// and **PROMOTED** again once it has passed. That is precisely the
+    /// substitution slice 7 made for the retired `HoldReason::SpreadHour`,
+    /// arriving offline for the first time.
+    ///
+    /// The observable assertions below are unchanged and still hold, which is the
+    /// point: cancel→hold→restore and demote→park→promote are two mechanisms
+    /// delivering one operator-visible behaviour — do not enter into the spike, do
+    /// enter after it.
+    ///
+    /// This test is also what caught the park being **unrecoverable offline**: a
+    /// park is recovered by trade id while every resting-order path uses the order
+    /// id, so `ReplayVerifiedSource` answered `will not verify` and the setup
+    /// silently vanished. See `ReplayBroker::armed_verified`.
     #[tokio::test]
     async fn multishot_multi_hour_block_order_is_held_then_restored_at_block_end() {
         // Warm-up bars above 0.5610 through the daytime (clean) hours, so the live
@@ -3829,6 +3883,372 @@ mod tests {
         assert!(
             report.contains("TP: 1  SL: 0"),
             "exactly one taken position (the deferred order's TP):\n{report}"
+        );
+    }
+
+    // ---- the shared re-price pass (rule 7's second half) --------------------
+
+    /// A multi-shot EUR/USD short whose entry bar is CALM and whose following
+    /// bars are WIDE. Geometry is deliberately kept out of a spread hour (EUR/USD's
+    /// only one is 21:00Z) so the widening comes from the recorded book alone and
+    /// not from the `get_quote` in-block clamp.
+    fn eurusd_reprice_plan() -> TradePlan {
+        serde_json::from_str(
+            r#"{
+                "trade_id": "eurusd-rp",
+                "instrument": "EUR/USD",
+                "direction": "short",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {
+                        "rule_id": "05-enter",
+                        "trigger": { "type": "horizontal_cross", "level": 1.1010, "dir": "down", "bar": "on_close" },
+                        "fire_mode": "once",
+                        "intent": {
+                            "v": 1, "id": "eurusd-rp-enter", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter", "instrument": "EUR/USD", "direction": "short",
+                            "entry": { "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.1000 },
+                            "stop_loss": { "absolute": 1.1020 },
+                            "take_profit": { "absolute": 1.0800 },
+                            "broker": "tradenation", "trade_id": "eurusd-rp", "max_retries": 1,
+                            "pip_size": 0.0001
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse EUR/USD re-price plan")
+    }
+
+    /// Bars for the re-price tests. 10 calm warm-up bars, a calm 12:00Z enter bar,
+    /// then `after_spread`-wide bars that never reach the 1.1000 trigger, and
+    /// finally a bar that fills and one that runs to TP.
+    ///
+    /// The order rests across the wide bars, which is the whole window in which a
+    /// re-price can happen.
+    fn reprice_candles(after_spread: f64) -> Vec<EngineCandle> {
+        let mut candles: Vec<EngineCandle> = (2..12)
+            .map(|h| {
+                ohlc_at_spread(
+                    &format!("2026-07-08T{h:02}:00:00Z"),
+                    1.1020,
+                    1.1022,
+                    1.1018,
+                    1.1020,
+                    0.00002,
+                )
+            })
+            .collect();
+        // 12:00Z calm: closes below 1.1010 → the short enter fires, stop rests.
+        candles.push(ohlc_at_spread(
+            "2026-07-08T12:00:00Z",
+            1.1016,
+            1.1017,
+            1.1006,
+            1.1008,
+            0.00002,
+        ));
+        // 13:00Z + 14:00Z: the order rests (never reaches 1.1000) while the book
+        // is `after_spread` wide. This is where a re-price fires.
+        for h in ["13", "14"] {
+            candles.push(ohlc_at_spread(
+                &format!("2026-07-08T{h}:00:00Z"),
+                1.1008,
+                1.1009,
+                1.1003,
+                1.1007,
+                after_spread,
+            ));
+        }
+        // 15:00Z: straddles 1.1000 → fills.
+        candles.push(ohlc_at_spread(
+            "2026-07-08T15:00:00Z",
+            1.1002,
+            1.1004,
+            1.0995,
+            1.0999,
+            after_spread,
+        ));
+        // 16:00Z: runs down to TP.
+        candles.push(ohlc_at_spread(
+            "2026-07-08T16:00:00Z",
+            1.0995,
+            1.0997,
+            1.0798,
+            1.0801,
+            after_spread,
+        ));
+        candles
+    }
+
+    async fn reprice_run(after_spread: f64) -> Replay {
+        run(
+            &eurusd_reprice_plan(),
+            &reprice_candles(after_spread),
+            Granularity::H1,
+            "2026-07-08T12:00:00Z".parse().unwrap(),
+            "2026-07-10T00:00:00Z".parse().unwrap(),
+            no_marks(),
+            None,
+        )
+        .await
+    }
+
+    fn reprice_stop(r: &Replay) -> f64 {
+        r.fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("the short enter must fire on the 12:00Z down-cross")
+            .realized
+            .as_ref()
+            .expect("the order must fill")
+            .stop_loss
+    }
+
+    /// THE FINDING: a resting order whose book widens after placement must have
+    /// its stop RE-PRICED WIDER before it fills — the forward-looking SL floor
+    /// that slice 7 made the sole replacement for the retired `SpreadHour` hold.
+    ///
+    /// Offline the replay ran only `promote_due_orders`, so it had neither the
+    /// retired hold nor its replacement and the order filled at its original,
+    /// too-tight stop.
+    ///
+    /// Asserted as a comparison between two runs of the SAME geometry that differ
+    /// only in the post-entry spread, so it cannot pass on an absolute number that
+    /// some unrelated flooring happens to produce. The calm run is the control.
+    #[tokio::test]
+    async fn a_resting_order_is_repriced_wider_when_the_book_widens_after_placement() {
+        let calm = reprice_stop(&reprice_run(0.00002).await);
+        let wide = reprice_stop(&reprice_run(0.00030).await);
+        assert!(
+            wide > calm + 1e-9,
+            "a short's stop must be re-priced WIDER (higher) when the book widens \
+             after placement: calm={calm} wide={wide}",
+        );
+        // 10x the 0.0003 spread = a 0.0030 floor off the 1.1000 trigger.
+        assert!(
+            (wide - 1.1030).abs() < 1e-6,
+            "the widened stop must be the 10x-spread floor off the trigger, got {wide}",
+        );
+    }
+
+    /// The control half, pinned separately: a book that does NOT widen must leave
+    /// the stop exactly where it was placed. Without this the test above would
+    /// pass for an implementation that widens every resting order every bar.
+    #[tokio::test]
+    async fn a_resting_order_in_a_calm_book_is_not_repriced() {
+        let calm = reprice_stop(&reprice_run(0.00002).await);
+        assert!(
+            (calm - 1.1020).abs() < 1e-6,
+            "a calm book must leave the DRAWN 1.1020 stop untouched, got {calm}",
+        );
+    }
+
+    /// The re-price is DIRECTIONAL, and a hardcoded `Direction::Long` is the exact
+    /// mutation that survived two prior agents' test sets. A short's stop widens
+    /// UPWARD (away from a falling target); the long mirror widens DOWNWARD. Both
+    /// runs share one geometry apart from the direction, so an implementation that
+    /// moved the stop the same way for both fails one of them.
+    #[tokio::test]
+    async fn the_long_mirror_widens_downward_not_upward() {
+        let plan: TradePlan = serde_json::from_str(
+            r#"{
+                "trade_id": "eurusd-rp-long",
+                "instrument": "EUR/USD",
+                "direction": "long",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {
+                        "rule_id": "05-enter",
+                        "trigger": { "type": "horizontal_cross", "level": 1.1010, "dir": "up", "bar": "on_close" },
+                        "fire_mode": "once",
+                        "intent": {
+                            "v": 1, "id": "eurusd-rp-long-enter", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter", "instrument": "EUR/USD", "direction": "long",
+                            "entry": { "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.1020 },
+                            "stop_loss": { "absolute": 1.1000 },
+                            "take_profit": { "absolute": 1.1220 },
+                            "broker": "tradenation", "trade_id": "eurusd-rp-long", "max_retries": 1,
+                            "pip_size": 0.0001
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse the long mirror plan");
+
+        // The mirror of `reprice_candles`, reflected about 1.1010.
+        let mut candles: Vec<EngineCandle> = (2..12)
+            .map(|h| {
+                ohlc_at_spread(
+                    &format!("2026-07-08T{h:02}:00:00Z"),
+                    1.1000,
+                    1.1002,
+                    1.0998,
+                    1.1000,
+                    0.00002,
+                )
+            })
+            .collect();
+        candles.push(ohlc_at_spread(
+            "2026-07-08T12:00:00Z",
+            1.1004,
+            1.1014,
+            1.1003,
+            1.1012,
+            0.00002,
+        ));
+        for h in ["13", "14"] {
+            candles.push(ohlc_at_spread(
+                &format!("2026-07-08T{h}:00:00Z"),
+                1.1012,
+                1.1017,
+                1.1011,
+                1.1013,
+                0.00030,
+            ));
+        }
+        candles.push(ohlc_at_spread(
+            "2026-07-08T15:00:00Z",
+            1.1018,
+            1.1025,
+            1.1016,
+            1.1021,
+            0.00030,
+        ));
+        candles.push(ohlc_at_spread(
+            "2026-07-08T16:00:00Z",
+            1.1025,
+            1.1222,
+            1.1023,
+            1.1219,
+            0.00030,
+        ));
+
+        let r = run(
+            &plan,
+            &candles,
+            Granularity::H1,
+            "2026-07-08T12:00:00Z".parse().unwrap(),
+            "2026-07-10T00:00:00Z".parse().unwrap(),
+            no_marks(),
+            None,
+        )
+        .await;
+        let stop = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("the long enter must fire")
+            .realized
+            .as_ref()
+            .expect("the long order must fill")
+            .stop_loss;
+        assert!(
+            stop < 1.1000 - 1e-9,
+            "a LONG's stop must be re-priced DOWNWARD (below the drawn 1.1000) when \
+             the book widens — a direction-blind implementation moves it up, got {stop}",
+        );
+        assert!(
+            (stop - 1.0990).abs() < 1e-6,
+            "the long's widened stop is the 10x-spread floor BELOW the 1.1020 \
+             trigger, got {stop}",
+        );
+    }
+
+    /// The MAJORITY case, and the one a "widen-only" reading of this finding
+    /// misses entirely: a stop the ENTRY path widened past the drawn level to
+    /// clear a wide book must be **SHRUNK back toward drawn** once the book calms
+    /// while the order is still resting.
+    ///
+    /// A resting order has no P&L to realise, so shrinking it is unconditionally
+    /// safe — `core::order_control::pending`'s module docs say so explicitly, and
+    /// deliberately omit the `in_profit` gate the live-position path carries.
+    ///
+    /// This is not a corner: instrumenting the pass across the whole fixture
+    /// corpus measured **1231 shrinks against 627 widens**. An implementation
+    /// that only ever widened would be wrong for two thirds of the real cases and
+    /// would pass every other test here.
+    ///
+    /// Mutation check: suppress `Adjust`s that shrink and this goes red while the
+    /// widening tests stay green.
+    #[tokio::test]
+    async fn a_stop_widened_at_entry_is_shrunk_back_when_the_book_calms() {
+        // WIDE at the 12:00Z entry bar: the SL-spread floor widens the drawn
+        // 1.1020 stop out to the 10x floor (0.0030 over the 1.1000 trigger).
+        let mut candles: Vec<EngineCandle> = (2..12)
+            .map(|h| {
+                ohlc_at_spread(
+                    &format!("2026-07-08T{h:02}:00:00Z"),
+                    1.1020,
+                    1.1022,
+                    1.1018,
+                    1.1020,
+                    0.00030,
+                )
+            })
+            .collect();
+        candles.push(ohlc_at_spread(
+            "2026-07-08T12:00:00Z",
+            1.1016,
+            1.1017,
+            1.1006,
+            1.1008,
+            0.00030,
+        ));
+        // 13:00Z + 14:00Z CALM while the order still rests: the floor collapses to
+        // 0.0002, so the desired stop falls back to the DRAWN 1.1020 (the `max`'s
+        // third term, which is what stops a shrink running past the operator's own
+        // level).
+        for h in ["13", "14"] {
+            candles.push(ohlc_at_spread(
+                &format!("2026-07-08T{h}:00:00Z"),
+                1.1008,
+                1.1009,
+                1.1003,
+                1.1007,
+                0.00002,
+            ));
+        }
+        candles.push(ohlc_at_spread(
+            "2026-07-08T15:00:00Z",
+            1.1002,
+            1.1004,
+            1.0995,
+            1.0999,
+            0.00002,
+        ));
+        candles.push(ohlc_at_spread(
+            "2026-07-08T16:00:00Z",
+            1.0995,
+            1.0997,
+            1.0798,
+            1.0801,
+            0.00002,
+        ));
+
+        let r = run(
+            &eurusd_reprice_plan(),
+            &candles,
+            Granularity::H1,
+            "2026-07-08T12:00:00Z".parse().unwrap(),
+            "2026-07-10T00:00:00Z".parse().unwrap(),
+            no_marks(),
+            None,
+        )
+        .await;
+        let stop = reprice_stop(&r);
+        assert!(
+            stop < 1.1030 - 1e-9,
+            "the entry-bar floor put the stop at 1.1030; a calm book must SHRINK \
+             it, got {stop}",
+        );
+        assert!(
+            (stop - 1.1020).abs() < 1e-6,
+            "…back to the DRAWN 1.1020 and no further — the drawn level is the \
+             floor's third term, got {stop}",
         );
     }
 }
