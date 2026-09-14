@@ -439,8 +439,14 @@ pub fn simulate_fill_resolved_zoom(
     // positive gap between consecutive bars) so a session gap between two bars
     // doesn't inflate it; zero when `rest` has < 2 bars (⇒ no zoom, pessimistic).
     let bar_len = infer_bar_len(rest);
+    // The bar cadence in minutes, for the shared break-even noise floor's ATR
+    // length. Derived from the same inferred `bar_len` the zoom uses rather than
+    // from a `Granularity` the fill sim does not carry; zero (a single-bar
+    // series) simply leaves the ATR unwarmed, which the floor treats as
+    // unjudgeable and fails open on.
+    let bar_minutes = bar_len.num_minutes();
     let mut active_stop = resolved.stop_loss;
-    for c in rest {
+    for (i, c) in rest.iter().enumerate() {
         // The stop the live broker holds on THIS bar: the widened stop while the
         // transient widen is active (`[effective_from, restored_at)`), else the
         // break-even-managed stop. The widen moves the stop AWAY from price, so it
@@ -491,6 +497,12 @@ pub fn simulate_fill_resolved_zoom(
         // entry >= original SL, a short's entry <= it, so `active_stop` only
         // tightens).
         //
+        // TWO independent gates gate this one arming site, and they compose:
+        // Rule 2 decides whether this BAR may arm at all; the noise floor then
+        // decides whether the STOP it would produce is sane. Neither subsumes
+        // the other — a bar outside every widen can still yield an absurd
+        // target, and a bar inside one is refused however sane its target looks.
+        //
         // Rule 2: a bar INSIDE an active widen does not arm. Those are the same
         // "rubbish candles" the engine suppresses entries, detection and crosses
         // on, so a 50%-to-TP close printed by one is much more likely to be the
@@ -500,11 +512,55 @@ pub fn simulate_fill_resolved_zoom(
         // already amended the stop back by then). See
         // `core::order_control::in_force_stop` for the full reasoning, including
         // the honest note that there is no statistical evidence for this choice.
-        if let (Some(be), Some(level)) = (resolved.breakeven, be_arms_at) {
-            let gate =
-                trade_control_core::order_control::breakeven_arm_gate(&widen_episodes, c.time);
-            if gate.armable() && be.close_arms(dir, level, c.c) {
-                active_stop = be.target_stop(entry_price);
+        //
+        // THE NOISE FLOOR (finding #8 of the 2026-09-13 replay↔live divergence
+        // audit). The live cron refuses an amend whose target lands within
+        // `BREAKEVEN_MIN_ATR_FRACTION × ATR` of the latest close and keeps the
+        // ORIGINAL stop (`breakeven_decision::decide` →
+        // `BreakevenBlock::InsideNoise`); replay had no such check, so a
+        // mis-derived target was loud on live and silent offline — where it books
+        // a ~0R scratch on the next bar's noise. The predicate is the SHARED one
+        // in `core::order_control::breakeven_noise`, called from both halves
+        // (`[[strategy_changes_in_both_replayer_and_worker]]`); do not
+        // re-implement the comparison here.
+        //
+        // It is a tripwire for absurdity, not a tuning knob: a correctly-derived
+        // break-even sits ~50% of the way to TP, many multiples of ATR clear of
+        // this line, so it should never fire on a real setup. Consequently NO
+        // FIXTURE IS EVIDENCE about it — the whole corpus is expected to be
+        // unchanged — and the tests that prove it works construct deliberately
+        // absurd targets instead.
+        if let (Some(be), Some(level)) = (resolved.breakeven, be_arms_at)
+            && trade_control_core::order_control::breakeven_arm_gate(&widen_episodes, c.time)
+                .armable()
+            && be.close_arms(dir, level, c.c)
+        {
+            let new_stop = be.target_stop(entry_price);
+            // The window the floor judges against: the post-fill bars up to and
+            // INCLUDING this one, mid prices. Structurally the same window the
+            // live cron's `armable_candles` yields at the tick that would make
+            // this amend — bars that closed at or after the fill, latest last —
+            // so both halves measure the same ATR against the same reference
+            // close.
+            let window: Vec<_> = rest[..=i].iter().map(BidAskCandle::mid).collect();
+            let verdict = trade_control_core::order_control::judge_breakeven_stop_at_bar_minutes(
+                &window,
+                new_stop,
+                bar_minutes,
+            );
+            if verdict.blocks() {
+                // Loud offline, exactly as it is loud live: the operator must be
+                // able to SEE a refused break-even in a replay run rather than
+                // inferring it from an unexpectedly full stop-out.
+                tracing::warn!(
+                    "replay: REFUSING break-even to {new_stop} at {} — inside the noise floor \
+                     ({verdict:?}). The original stop stands, matching the live cron's \
+                     BreakevenBlock::InsideNoise. A break-even this close to market is not a \
+                     scratch; something upstream produced a wrong target.",
+                    c.time,
+                );
+            } else {
+                active_stop = new_stop;
             }
         }
     }
@@ -2442,6 +2498,234 @@ mod tests {
                 );
             }
             other => panic!("BE: expected break-even stop-out at entry, got {other:?}"),
+        }
+    }
+
+    /// A long H1 path whose bars each span `range`, walking down from `start` at
+    /// `step` per bar. Used to warm the ATR for the noise-floor tests: 40 bars
+    /// clears the H1 ATR length (24) with room to spare, and the constant range
+    /// makes the resulting ATR a number the test can state.
+    fn walk_down(first_time: &str, n: i64, start: f64, step: f64, range: f64) -> Vec<BidAskCandle> {
+        let t0 = ts(first_time);
+        (0..n)
+            .map(|i| {
+                let close = start - step * i as f64;
+                let mid = |v: f64| v;
+                BidAskCandle {
+                    time: t0 + chrono::Duration::hours(i),
+                    o: mid(close + step),
+                    h: mid(close + range / 2.0),
+                    l: mid(close - range / 2.0),
+                    c: mid(close),
+                    bid_o: close + step,
+                    bid_h: close + range / 2.0,
+                    bid_l: close - range / 2.0,
+                    bid_c: close,
+                    ask_o: close + step,
+                    ask_h: close + range / 2.0,
+                    ask_l: close - range / 2.0,
+                    ask_c: close,
+                }
+            })
+            .collect()
+    }
+
+    /// THE POINT OF THIS WHOLE CHANGE (finding #8 of the 2026-09-13 replay↔live
+    /// divergence audit).
+    ///
+    /// The live cron refuses a break-even amend whose target lands within
+    /// `BREAKEVEN_MIN_ATR_FRACTION × ATR` of the latest close
+    /// (`breakeven_decision::noise_violation` → `BreakevenBlock::InsideNoise`),
+    /// and keeps the ORIGINAL stop. The replay had no such check, so the same
+    /// absurd target was applied silently offline — booking a ~0R scratch on the
+    /// next bar's noise where live would have run the original stop.
+    ///
+    /// This constructs a target that IS absurd, using a geometry the rest of the
+    /// system accepts: a normal short (entry 1.1000, SL 1.1040, TP 1.0900 — R
+    /// 2.5, so the min-R gate is satisfied) carrying a **mis-derived 1% arming
+    /// threshold**. That arms break-even at 1.0990, one pip from entry, so the
+    /// stop is moved to a price sitting essentially on top of the close that
+    /// armed it. A correctly-derived break-even never looks like this — the floor
+    /// is a tripwire for absurdity, not a tuning knob — which is exactly why the
+    /// whole fixture corpus is expected not to move, and why this unit test
+    /// rather than any fixture is the evidence that the floor works.
+    ///
+    /// The assertion is on the OUTCOME (which stop the position exits at), not on
+    /// an internal flag: the event that *arms* is deliberately a different bar
+    /// from the event that *acts* (the later bar that reaches back to a stop), so
+    /// a change that merely stopped arming would not pass this by accident.
+    #[test]
+    fn replay_refuses_a_breakeven_that_lands_inside_the_noise_floor() {
+        use trade_control_core::intent::Breakeven;
+
+        // Short stop-entry at 1.1000, original SL 1.1040 (above), TP 1.0900 —
+        // an ordinary R 2.5 setup that clears the min-R gate. The MIS-DERIVATION
+        // is the threshold: 0.001 ⇒ arms at 1.1000 + 0.001×(1.0900−1.1000)
+        // = 1.09990, one tick below entry. The break-even target is the fill
+        // 1.1000, i.e. 0.00010 from the close that armed it.
+        let mut intent = short_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.1040, 1.0900);
+        intent.breakeven = Some(Breakeven { threshold: 0.001 });
+        let shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
+        );
+
+        let mut path = vec![fire_bar()];
+        // Fill bar: reaches the 1.1000 sell-stop on the bid and closes at 1.10010
+        // — ABOVE the 1.09990 arming level, so it does NOT arm.
+        path.push(candle(
+            "2026-06-17T11:00:00Z",
+            1.1005,
+            1.1006,
+            1.09985,
+            1.10010,
+        ));
+        // 30 quiet H1 bars of 0.0020 range (⇒ ATR 0.0020 ⇒ floor 0.00020) closing
+        // at 1.10010, still above the arming level. They exist to WARM the ATR:
+        // the floor fails open on an unwarmed window (24 bars on H1), and an arm
+        // landing before warmup would make this test prove nothing — which is
+        // exactly the trap the first draft of it fell into.
+        path.extend(walk_down("2026-06-17T12:00:00Z", 30, 1.10010, 0.0, 0.0020));
+        // NOW the arming bar: closes at 1.09990, the arming level, targeting the
+        // fill 1.1000 — 0.00010 away, inside the 0.00020 floor.
+        path.push(candle(
+            "2026-06-18T18:00:00Z",
+            1.10010,
+            1.10015,
+            1.09985,
+            1.09990,
+        ));
+        // Finally a bar that runs UP through 1.1040, the ORIGINAL stop — passing
+        // THROUGH the (refused) break-even level 1.1000 on the way, so the two
+        // candidate stops give different exit prices.
+        path.push(candle(
+            "2026-06-18T19:00:00Z",
+            1.0999,
+            1.1045,
+            1.0998,
+            1.1042,
+        ));
+
+        let outcome = simulate_fill(&intent, &shell, 0.0001, &path);
+        match outcome {
+            SimOutcome::StoppedOut { exit_price, .. } => assert!(
+                (exit_price - 1.1040).abs() < 1e-9,
+                "the break-even target 1.1000 sits inside the noise floor, so the ORIGINAL stop \
+                 1.1040 must still be in force; exited at {exit_price} instead — the floor was \
+                 not applied"
+            ),
+            other => panic!("expected a stop-out at the original SL, got {other:?}"),
+        }
+    }
+
+    /// The mirror of the test above, and the guard against "fix" it by simply
+    /// never arming: with the SAME shape but a TP far enough away that the
+    /// break-even target clears the floor, the stop DOES move and the position
+    /// scratches at entry. If both tests can't hold at once, the floor is either
+    /// absent (first fails) or swallowing correct break-evens (this one fails).
+    #[test]
+    fn replay_still_arms_a_breakeven_that_clears_the_noise_floor() {
+        use trade_control_core::intent::Breakeven;
+
+        // Same short, but TP 1.0900 — the 50% level is 1.0950 and the break-even
+        // target 1.1000 is 0.0050 from the arming close: 25× the 0.00020 floor.
+        let mut intent = short_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.1040, 1.0900);
+        intent.breakeven = Some(Breakeven::at_half());
+        let shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
+        );
+
+        let mut path = vec![fire_bar()];
+        // Fill bar reaches the 1.1000 sell-stop.
+        path.push(candle(
+            "2026-06-17T11:00:00Z",
+            1.1005,
+            1.1006,
+            1.09990,
+            1.09995,
+        ));
+        // Runs past the 1.0950 level on a close, arming break-even at 1.1000.
+        path.push(candle(
+            "2026-06-17T12:00:00Z",
+            1.0990,
+            1.0992,
+            1.0945,
+            1.0950,
+        ));
+        // 40 quiet bars — the SAME 0.0020 range (⇒ ATR 0.0020 ⇒ floor 0.00020) as
+        // the refusing test, so the only thing that differs between the two is the
+        // break-even DISTANCE: 0.0050 here versus 0.00010 there.
+        path.extend(walk_down("2026-06-17T13:00:00Z", 40, 1.09500, 0.0, 0.0020));
+        // A bar that runs back up THROUGH the moved stop (1.1000) and on to the
+        // original (1.1040): whichever stop is in force decides the exit price.
+        path.push(candle(
+            "2026-06-19T10:00:00Z",
+            1.0950,
+            1.1045,
+            1.0949,
+            1.1042,
+        ));
+
+        let outcome = simulate_fill(&intent, &shell, 0.0001, &path);
+        match outcome {
+            SimOutcome::StoppedOut {
+                exit_price,
+                entry_price,
+                ..
+            } => {
+                assert!(
+                    (exit_price - 1.1000).abs() < 1e-9,
+                    "this break-even clears the floor by 25×, so the stop must have moved to the \
+                     fill 1.1000; exited at {exit_price} — the floor is suppressing a CORRECT \
+                     break-even"
+                );
+                assert!((exit_price - entry_price).abs() < 1e-9, "a 0R scratch");
+            }
+            other => panic!("expected a break-even stop-out at entry, got {other:?}"),
+        }
+    }
+
+    /// FAIL-OPEN, at the replay entry point. Same absurd geometry as
+    /// `replay_refuses_a_breakeven_that_lands_inside_the_noise_floor`, but with a
+    /// post-fill path too short to warm the ATR. Unjudgeable ATR means NO
+    /// opinion, so the break-even arms as it always did and the position
+    /// scratches at entry.
+    ///
+    /// This is the test a "tighten it up by failing closed" change breaks, and it
+    /// is deliberately asserted at the entry point rather than on the pure
+    /// predicate: a fail-closed floor at the pure layer would be caught here as a
+    /// changed EXIT PRICE, which is what the corpus scores.
+    #[test]
+    fn replay_breakeven_fails_open_when_the_atr_is_unjudgeable() {
+        use trade_control_core::intent::Breakeven;
+
+        let mut intent = short_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.1040, 1.0900);
+        intent.breakeven = Some(Breakeven { threshold: 0.001 });
+        let shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
+        );
+
+        // Only two post-fill bars — far short of the 24-bar H1 ATR length, so the
+        // ATR is `None` and the floor has no opinion.
+        let path = [
+            fire_bar(),
+            // Fill + arm at 1.09990, target the fill 1.1000 — the SAME absurd
+            // 0.00010 distance as the test above, which there is refused.
+            candle("2026-06-17T11:00:00Z", 1.1005, 1.1006, 1.09985, 1.09990),
+            // Runs up through the moved stop 1.1000 and on to 1.1040.
+            candle("2026-06-17T12:00:00Z", 1.09990, 1.10450, 1.09980, 1.10420),
+        ];
+
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::StoppedOut { exit_price, .. } => assert!(
+                (exit_price - 1.1000).abs() < 1e-9,
+                "an unwarmed ATR is unjudgeable, so the floor must FAIL OPEN and the break-even \
+                 stop at 1.1000 stands; exited at {exit_price} — the floor fabricated a block out \
+                 of a window it could not judge"
+            ),
+            other => panic!("expected a break-even stop-out at entry, got {other:?}"),
         }
     }
 

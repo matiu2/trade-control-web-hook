@@ -13,8 +13,30 @@ use crate::broker::{Candle, Granularity};
 /// bar length in minutes — the Pine uses `timeframe.in_seconds() / 60` and the
 /// same cut-offs.
 pub fn atr_length_for(granularity: Granularity) -> usize {
-    let tf_mins = granularity.seconds() / 60;
-    match tf_mins {
+    atr_length_for_bar_minutes(granularity.seconds() / 60)
+}
+
+/// [`atr_length_for`] keyed directly on the bar length in **minutes**, for a
+/// caller that holds a bar *duration* rather than a [`Granularity`].
+///
+/// # Why this exists
+///
+/// The offline replay's fill simulator (`fill_sim`) carries no `Granularity` —
+/// it infers the bar cadence from the candle series it was handed
+/// (`infer_bar_len`). To apply the shared break-even noise floor
+/// (`order_control::breakeven_noise`) on the same ATR the live cron uses, it
+/// needs the length from that duration. Mapping minutes back to a `Granularity`
+/// first would be a lossy invented round-trip with its own failure modes; this
+/// exposes the cut-off table the function was *already* keyed on, so the two
+/// halves share one table and cannot drift
+/// (`[[strategy_changes_in_both_replayer_and_worker]]`).
+///
+/// A non-positive `bar_minutes` (a degenerate or single-bar series) falls in the
+/// first arm and yields the shortest-timeframe length — which simply means the
+/// ATR stays unwarmed for such a series, and the noise floor fails open. That is
+/// the intended behaviour, not a special case worth branching on.
+pub fn atr_length_for_bar_minutes(bar_minutes: i64) -> usize {
+    match bar_minutes {
         m if m <= 15 => 96,    // 15m: 24*4 (one day)
         m if m <= 60 => 24,    // 1h: 24 (one day)
         m if m <= 240 => 36,   // 4h: 6*6 (6 days, 6 candles/day)
