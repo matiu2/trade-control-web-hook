@@ -59,7 +59,7 @@ use trade_control_core::intent::{
     Direction, Intent, Resolved, ResolvedEntry, Shell, SlWiden, widen_sl_to_spread_floor,
 };
 use trade_control_core::sweep_gate::{
-    SweepReason, bar_expiry_due, breach_detected, market_blackout_due_symbol,
+    SweepReason, bar_adverse_extreme, bar_expiry_due, breach_detected, market_blackout_due_symbol,
 };
 
 /// What the simulator decided happened to one fired enter over the candle path.
@@ -640,10 +640,42 @@ fn bar_seconds_of(candles: &[BidAskCandle]) -> i64 {
 /// The breach predicate is the **shared** [`breach_detected`] from
 /// `core::sweep_gate` — the same one the live sweep and the replay's reporting
 /// [`sweep_reason`] call — so worker and replay cannot drift
-/// (`[[strategy_changes_in_both_replayer_and_worker]]`). Like `sweep_reason`, it
-/// reads each bar's **mid close** as the point price the live sweep's
-/// `get_current_price` would have sampled: intrabar wick noise is deliberately
-/// ignored, because the cron samples a quote per tick, not a bar range.
+/// (`[[strategy_changes_in_both_replayer_and_worker]]`).
+///
+/// # WICK, not close (2026-09-14) — and why close was rejected
+///
+/// The rule both sides implement is **"has price TRADED past the stop since
+/// placement"**, so this reads each bar's **adverse extreme** — the low for a
+/// Long, the high for a Short — via `core::sweep_gate::bar_adverse_extreme`.
+///
+/// It used to read the bar's mid **close**, on the theory that the live cron
+/// samples one point price per tick rather than a bar range. That was a faithful
+/// mirror of what live *did*, and both were wrong together: live read an
+/// instantaneous spot quote, so its answer depended on where the cron tick
+/// landed on the price path, and an excursion between two ticks was invisible.
+/// Live is now stateful (a running adverse extreme persisted on the
+/// `EntryAttempt`, see `trade-control-cron/src/sweep.rs::maybe_breach_cancel`),
+/// which makes it monotonic; the bar's adverse extreme is the bar-resolution
+/// analogue of the same question. Close-sampling was explicitly **REJECTED**
+/// because it lets a bar trade clean through the stop and back inside with the
+/// order surviving — the exact case the rule exists to catch.
+///
+/// The mid book is deliberate on both sides: the live quote is a mid quote, and
+/// the question is where the *market* went, not which book the order would have
+/// filled on.
+///
+/// # The fixture corpus CANNOT justify this rule
+///
+/// Measured over the full 2847-cell corpus
+/// (`EXPERIMENT-pre-fill-sl-breach-sweep.md`): close-mode truncation fired on
+/// **854 orders** and changed the outcome of **ZERO** of them — disabling the
+/// truncation entirely was byte-identical. That is because the rule only changes
+/// an outcome when a breached order would *later* return through its trigger and
+/// fill, which inside an alert window essentially never happens. It is a no-op
+/// on *outcomes*, not a no-op in *mechanism*. And the goldens were themselves
+/// recorded under close-sampling, so by construction they contain almost no bar
+/// that wicked past the stop and closed back inside. **A green corpus after
+/// deleting this proves nothing — do not simplify it away on that strength.**
 ///
 /// Scoped to the pre-fill window only. A breach *after* the fill is the
 /// position's own stop-out, which Phase 2 already handles — the sweep only ever
@@ -661,7 +693,7 @@ fn truncate_at_pre_fill_sl_breach<'a>(
 ) -> &'a [BidAskCandle] {
     match fill_window
         .iter()
-        .position(|c| breach_detected(dir, c.c, resolved.stop_loss))
+        .position(|c| breach_detected(dir, bar_adverse_extreme(dir, c.h, c.l), resolved.stop_loss))
     {
         // `+ 1` keeps the breaching bar in the window: the order was still live
         // *during* it, and only the sweep tick at its close kills it.
@@ -927,11 +959,19 @@ pub fn sweep_reason(
         if market_blackout_due_symbol(&intent.instrument, c.time) {
             return Some((SweepReason::Blackout, c.time));
         }
-        // SL-breach uses the bar's mid close as the "current price" the live
-        // sweep would read from `get_current_price` (a mid quote). Intrabar
-        // wick noise is intentionally ignored: the sweep samples a point price
-        // per tick, not the bar range.
-        if breach_detected(dir, c.c, sl) {
+        // SL-breach reads the bar's ADVERSE EXTREME (low for a Long, high for a
+        // Short), not its close — the bar-resolution form of the rule both sides
+        // implement: "has price TRADED past the stop since placement".
+        //
+        // This mirrors `truncate_at_pre_fill_sl_breach`, which is the arm that
+        // actually alters outcomes; keeping the two in step is what stops the
+        // journal from labelling an order `sl-breached` at a *later* bar than
+        // the one the fill window was truncated at. See that function's doc for
+        // the full why — in short: live used to read an instantaneous spot quote
+        // (tick-alignment lottery) and now carries a persisted running extreme,
+        // and close-sampling here was REJECTED because it lets a bar trade
+        // through the stop and back with the order surviving.
+        if breach_detected(dir, bar_adverse_extreme(dir, c.h, c.l), sl) {
             return Some((SweepReason::SlBreached, c.time));
         }
     }
@@ -3412,6 +3452,112 @@ mod tests {
             simulate_fill(&intent, &shell, 0.0001, &path),
             SimOutcome::NeverFilled,
             "a swept short order must not fill on a later fall back through the trigger"
+        );
+    }
+
+    /// WICK, not close (2026-09-14). A bar that trades clean through the stop and
+    /// **closes back inside** is a breach: the rule is "has price TRADED past the
+    /// stop since placement".
+    ///
+    /// This bar's low (1.0990) is past the 1.1000 SL while its close (1.1035) is
+    /// comfortably above it. Under the previous close-sampling the sweep saw
+    /// nothing, the window was never truncated, and the 13:00 rally filled an
+    /// order the live worker (which polls a quote per tick, and now carries a
+    /// persisted running extreme) would have cancelled. That is exactly the case
+    /// the rule exists to catch, and the reason close-sampling was rejected.
+    ///
+    /// Both the truncation (which changes outcomes) and `sweep_reason` (which
+    /// labels them) are asserted, because they are two separate call sites of the
+    /// same decision and a fix to one alone leaves the journal lying about the
+    /// other.
+    #[test]
+    fn a_bar_that_wicks_through_the_sl_and_closes_back_is_a_breach() {
+        let intent = breach_intent();
+        let shell = trigger_shell();
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1040),
+            // Low 1.0990 pierces the 1.1000 SL; close 1.1035 is back above it.
+            candle("2026-06-17T12:00:00Z", 1.1030, 1.1038, 1.0990, 1.1035),
+            candle("2026-06-17T13:00:00Z", 1.1020, 1.1060, 1.1015, 1.1055), // would fill at 1.1050
+        ];
+
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path),
+            Some((SweepReason::SlBreached, ts("2026-06-17T12:00:00Z"))),
+            "the wick through the stop is the breach — the close is irrelevant",
+        );
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &path),
+            SimOutcome::NeverFilled,
+            "a wick-breached order must not fill on the later rally",
+        );
+    }
+
+    /// The SHORT mirror: a bar whose HIGH pierces the short's stop while its close
+    /// sits back below it. Pinned separately because
+    /// `bar_adverse_extreme` is direction-dependent, and a Long-hardcoded reading
+    /// would take this bar's low — which for a short is the favourable side and
+    /// never breaches.
+    #[test]
+    fn a_short_bar_that_wicks_through_the_sl_and_closes_back_is_a_breach() {
+        let mut intent = long_stop_intent();
+        intent.direction = Some(Direction::Short);
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: -10.0, // short stop → trigger 1.1030
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        intent.stop_loss = Some(PriceRef::Absolute { absolute: 1.1080 });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.0950,
+        }));
+        intent.expiry_bars = None;
+        let shell = trigger_shell();
+
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1040),
+            // High 1.1095 pierces the 1.1080 SL; close 1.1045 is back below it.
+            candle("2026-06-17T12:00:00Z", 1.1050, 1.1095, 1.1044, 1.1045),
+            candle("2026-06-17T13:00:00Z", 1.1060, 1.1062, 1.1020, 1.1025), // would fill at 1.1030
+        ];
+
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path),
+            Some((SweepReason::SlBreached, ts("2026-06-17T12:00:00Z"))),
+            "a short breaches on the HIGH — a Long-hardcoded extreme reads the low and misses it",
+        );
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &path),
+            SimOutcome::NeverFilled,
+        );
+    }
+
+    /// Teeth on the other side of the wick rule: a bar that comes CLOSE to the
+    /// stop without reaching it is not a breach. Without this, "any bar near the
+    /// stop breaches" would pass both wick tests above while cancelling every
+    /// resting order in the corpus.
+    #[test]
+    fn a_wick_that_stops_short_of_the_sl_is_not_a_breach() {
+        let intent = breach_intent();
+        let shell = trigger_shell();
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1040),
+            // Low 1.1001 — one tick ABOVE the 1.1000 SL. Not a breach.
+            candle("2026-06-17T12:00:00Z", 1.1030, 1.1038, 1.1001, 1.1035),
+            candle("2026-06-17T13:00:00Z", 1.1020, 1.1060, 1.1015, 1.1055),
+        ];
+        assert_eq!(sweep_reason(&intent, &shell, 0.0001, &path), None);
+        assert!(
+            matches!(
+                simulate_fill(&intent, &shell, 0.0001, &path),
+                SimOutcome::FilledOpen { .. }
+            ),
+            "a wick that never reaches the stop leaves the order alone",
         );
     }
 

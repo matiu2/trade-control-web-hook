@@ -8,8 +8,9 @@
 //! * its alert window (`expires_at` / `not_after`) has passed,
 //! * its bar-based `cancel_at` (`expiry_bars` after the fire bar) has passed,
 //! * it sits inside a market-hours close→open blackout window, or
-//! * current price has overtaken its stop-loss (the setup invalidated before it
-//!   ever filled).
+//! * price has **traded past** its stop-loss at any point since placement (the
+//!   setup invalidated before it ever filled) — wick semantics, not a
+//!   point-in-time reading. See [`update_adverse_extreme`].
 //!
 //! These predicates lived in the worker crate (`src/cron/sweep.rs`), which is a
 //! `cdylib` the `cli` / `engine` cannot depend on — so the offline replay could
@@ -39,8 +40,10 @@ pub enum SweepReason {
     /// The bar-based `cancel_at` (`expiry_bars` bars after the fire bar) passed
     /// with the order still resting.
     BarExpiry,
-    /// Current price overtook the resting order's stop-loss before it filled —
-    /// the setup invalidated before entry.
+    /// Price traded past the resting order's stop-loss before it filled — the
+    /// setup invalidated before entry. Judged on the adverse extreme (live: the
+    /// running one on the row; replay: the bar's), never on a point-in-time
+    /// close/spot reading — see [`update_adverse_extreme`].
     SlBreached,
     /// The order was resting inside a market-hours close→open blackout window.
     /// (The offline replay can't always reconstruct the no-entry windows; it
@@ -61,10 +64,104 @@ pub fn now_utc_minute_of_day(now: DateTime<Utc>) -> u32 {
 
 /// Pure breach predicate. Long is breached when current ≤ SL; short
 /// when current ≥ SL. Kept tiny and pure so it's trivially testable.
+///
+/// # What to FEED this (2026-09-14)
+///
+/// The predicate itself is correct and unchanged. What changed is the *price*
+/// each caller hands it, because the rule is:
+///
+/// > **has price TRADED past the stop since placement** — wick semantics, over
+/// > the whole life of the resting order.
+///
+/// Not "is spot past the stop *right now*". Feed this the **adverse extreme**:
+///
+/// * live — the running extreme persisted on the row
+///   ([`EntryAttempt::adverse_extreme`](crate::state::EntryAttempt::adverse_extreme)),
+///   maintained by [`update_adverse_extreme`];
+/// * replay — the **bar's** adverse extreme (`l` for a Long, `h` for a Short).
+///
+/// See [`update_adverse_extreme`] for the full rationale; that doc is the one
+/// place this decision is written down.
 pub fn breach_detected(direction: Direction, current_price: f64, stop_loss: f64) -> bool {
     match direction {
         Direction::Long => current_price <= stop_loss,
         Direction::Short => current_price >= stop_loss,
+    }
+}
+
+/// Fold one observed price into a resting order's **running adverse extreme** —
+/// the worst price seen *against* the trade since the order was placed. Long
+/// keeps the lowest, Short keeps the highest. `prior` is `None` for the first
+/// observation (and for a legacy row that predates the field), which seeds from
+/// `observed` — a missing extreme is **never** read as "breached".
+///
+/// # Why this exists — read before "simplifying" it away
+///
+/// The pre-fill SL-breach sweep cancels a resting entry order whose stop-loss
+/// price has already overtaken it: the setup's thesis is falsified before we
+/// ever got in, so entering now would mean entering a trade whose invalidation
+/// level price has ALREADY proven it can reach.
+///
+/// The live sweep used to read `Broker::get_current_price` — an **instantaneous
+/// spot quote**, sampled on the ~900s upkeep loop — and pass that straight to
+/// [`breach_detected`]. That is not a rule, it is a sampling lottery: whether a
+/// REAL order gets cancelled depended on where the cron tick happened to land
+/// relative to the price path. Two identical price paths gave different answers,
+/// and any excursion that opened and closed between two ticks was invisible.
+///
+/// Carrying the extreme on the persisted row makes the decision **monotonic**:
+/// once the extreme is past the stop it stays past, so the sweep answers "has
+/// price traded past the stop since placement" rather than "where is spot this
+/// instant". That persistence is the whole point — it cannot be recovered by
+/// re-reading the quote, which is why this is a stored field and not a
+/// recomputation.
+///
+/// The replay's analogue is the **bar's** adverse extreme (low for a Long, high
+/// for a Short). Close-sampling was explicitly **REJECTED**: it lets a bar trade
+/// clean through the stop and back inside with the order surviving, which is the
+/// exact case the rule exists to catch.
+///
+/// # The fixture corpus CANNOT justify this rule — do not "simplify" on green
+///
+/// Measured over the full 2847-cell corpus
+/// (`EXPERIMENT-pre-fill-sl-breach-sweep.md`): close-mode truncation fired on
+/// **854 orders** and changed the outcome of **ZERO** of them — disabling the
+/// rule entirely was byte-identical. The reason is narrow and specific: the
+/// sweep only changes an outcome when a breached order would *later* come back
+/// through its trigger and fill, and inside an alert window that essentially
+/// never happens. It is a no-op on *outcomes* in that corpus, **not** a no-op in
+/// mechanism, and emphatically not evidence the rule is pointless. The goldens
+/// were themselves recorded under close-sampling, so by construction they
+/// contain almost no bar that wicked past the stop and closed back inside — no
+/// fixture is evidence about a sampling rule the fixtures were generated under.
+///
+/// So: a green corpus after deleting this proves nothing. The justification is
+/// the operator's thesis-falsification rationale above, plus live's per-tick
+/// sampling reaching states no bar-grain replay can.
+pub fn update_adverse_extreme(direction: Direction, prior: Option<f64>, observed: f64) -> f64 {
+    match prior {
+        None => observed,
+        Some(prior) => match direction {
+            Direction::Long => prior.min(observed),
+            Direction::Short => prior.max(observed),
+        },
+    }
+}
+
+/// The **bar-resolution** analogue of the live running extreme: the worst price
+/// a single bar traded at, against the trade. Long → the low, Short → the high.
+///
+/// This is what the replay feeds [`breach_detected`], so both sides answer the
+/// same question ("did price trade past the stop") and differ only in
+/// resolution. The mid book is deliberate — the live sweep's spot quote is a mid
+/// quote, and the rule is about where the *market* went, not which book an order
+/// would have filled on.
+///
+/// See [`update_adverse_extreme`] for why close-sampling was rejected.
+pub fn bar_adverse_extreme(direction: Direction, high: f64, low: f64) -> f64 {
+    match direction {
+        Direction::Long => low,
+        Direction::Short => high,
     }
 }
 
@@ -117,6 +214,97 @@ mod tests {
 
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
+    }
+
+    // --- running adverse extreme -------------------------------------------
+
+    /// A Long's adverse extreme is the LOWEST price seen. Mutation guard: a
+    /// direction swap (`max` here) makes this red — the swapped version would
+    /// track the favourable extreme and never breach.
+    #[test]
+    fn long_extreme_keeps_the_lowest_price_seen() {
+        let d = Direction::Long;
+        let e = update_adverse_extreme(d, None, 1.1000);
+        assert_eq!(e, 1.1000, "the first observation seeds the extreme");
+        let e = update_adverse_extreme(d, Some(e), 1.0900);
+        assert_eq!(e, 1.0900, "a worse (lower) price advances a Long's extreme");
+        let e = update_adverse_extreme(d, Some(e), 1.1200);
+        assert_eq!(e, 1.0900, "a better price must NOT retract the extreme");
+    }
+
+    /// Mirror for Short: the HIGHEST price seen. Both signs are pinned because a
+    /// direction-hardcoded implementation otherwise survives (a short's resting
+    /// bars sit below its SL, so the wrong branch can still yield "not
+    /// breached").
+    #[test]
+    fn short_extreme_keeps_the_highest_price_seen() {
+        let d = Direction::Short;
+        let e = update_adverse_extreme(d, None, 1.1000);
+        assert_eq!(e, 1.1000);
+        let e = update_adverse_extreme(d, Some(e), 1.1100);
+        assert_eq!(
+            e, 1.1100,
+            "a worse (higher) price advances a Short's extreme"
+        );
+        let e = update_adverse_extreme(d, Some(e), 1.0800);
+        assert_eq!(e, 1.1100, "a better price must NOT retract the extreme");
+    }
+
+    /// The whole point of persisting the extreme: an excursion past the stop
+    /// that has since RECOVERED still reads as breached. An instantaneous spot
+    /// read (the old behaviour) would say "not breached" here — that is the bug.
+    #[test]
+    fn a_recovered_excursion_still_reads_as_breached() {
+        let (d, sl) = (Direction::Long, 1.0950);
+        // Tick 1: well above the stop. Tick 2: an excursion through it.
+        // Tick 3: fully recovered — spot alone says "fine".
+        let e = update_adverse_extreme(d, None, 1.1000);
+        let e = update_adverse_extreme(d, Some(e), 1.0900);
+        let e = update_adverse_extreme(d, Some(e), 1.1050);
+        assert!(
+            breach_detected(d, e, sl),
+            "the extreme is monotonic — a recovered excursion stays a breach",
+        );
+        assert!(
+            !breach_detected(d, 1.1050, sl),
+            "spot alone reads 'not breached' — this is precisely the divergence",
+        );
+    }
+
+    /// A legacy row (no extreme yet) seeds from the observation and must NOT be
+    /// treated as breached on the strength of its absence.
+    #[test]
+    fn a_missing_extreme_seeds_and_is_not_a_breach() {
+        let (d, sl) = (Direction::Short, 1.1000);
+        let e = update_adverse_extreme(d, None, 1.0900);
+        assert_eq!(e, 1.0900);
+        assert!(!breach_detected(d, e, sl));
+    }
+
+    /// The bar-grain analogue: low for a Long, high for a Short. Pinned both
+    /// ways because a direction hardcode is the mutation that survives.
+    #[test]
+    fn bar_adverse_extreme_reads_the_wick_per_direction() {
+        assert_eq!(bar_adverse_extreme(Direction::Long, 1.1200, 1.0800), 1.0800);
+        assert_eq!(
+            bar_adverse_extreme(Direction::Short, 1.1200, 1.0800),
+            1.1200
+        );
+    }
+
+    /// The close↔wick divergence in one assertion: a bar that trades through the
+    /// stop and closes back inside. Wick semantics breach; close semantics do
+    /// not. This is the case the rule exists for and the one close-sampling
+    /// silently let through.
+    #[test]
+    fn a_bar_that_wicks_through_and_closes_back_is_a_breach() {
+        let (d, sl) = (Direction::Long, 1.0950);
+        let (high, low, close) = (1.1100, 1.0900, 1.1050);
+        assert!(breach_detected(d, bar_adverse_extreme(d, high, low), sl));
+        assert!(
+            !breach_detected(d, close, sl),
+            "close-sampling misses it — the rejected design",
+        );
     }
 
     #[test]

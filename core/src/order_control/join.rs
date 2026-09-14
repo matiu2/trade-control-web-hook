@@ -85,6 +85,7 @@ mod tests {
             shell_time: ts("2026-03-12T20:00:00Z"),
             expires_at: ts("2026-03-13T00:00:00Z"),
             stop_loss_price: Some(1.8000),
+            adverse_extreme: None,
             cancel_at: None,
             pip_size: Some(0.0001),
             blackout_close: crate::intent::BlackoutCloseAction::default(),

@@ -229,6 +229,40 @@ pub struct EntryAttempt {
     /// expire normally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_loss_price: Option<f64>,
+    /// The **running adverse extreme** since placement: the worst price seen
+    /// against this resting order — lowest for a Long, highest for a Short.
+    /// `None` until the first sweep tick observes the row (and on rows written
+    /// before this field existed); a missing extreme is **never** read as
+    /// breached, it seeds from that first observation.
+    ///
+    /// # Why this is persisted rather than re-read
+    ///
+    /// The SL-breach sweep asks **"has price TRADED past the stop since
+    /// placement"**. It used to ask a different, weaker question: it read
+    /// `Broker::get_current_price` — an *instantaneous* spot quote, sampled on
+    /// the ~900s upkeep loop — and handed that straight to
+    /// [`breach_detected`](crate::sweep_gate::breach_detected). That made the
+    /// answer depend on where the cron tick happened to land relative to the
+    /// price path: two identical price paths gave different answers, and an
+    /// excursion that opened and closed between two ticks was invisible.
+    /// Cancelling a REAL order on a sampling lottery is what this field removes.
+    ///
+    /// Folding each tick's quote in via
+    /// [`update_adverse_extreme`](crate::sweep_gate::update_adverse_extreme)
+    /// makes the decision **monotonic** — once the extreme is past the stop it
+    /// stays past. That history cannot be recovered by re-reading the quote,
+    /// which is the entire reason it lives on the row.
+    ///
+    /// The replay's matching half reads each bar's adverse extreme (low/high)
+    /// rather than its close; close-sampling was explicitly **rejected** because
+    /// it lets a bar trade through the stop and back with the order surviving.
+    /// See [`update_adverse_extreme`](crate::sweep_gate::update_adverse_extreme)
+    /// — including why the fixture corpus cannot justify any of this.
+    ///
+    /// No SQL migration: the row is one `jsonb` body, so this is a
+    /// `#[serde(default)]` field like its neighbours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adverse_extreme: Option<f64>,
     /// Bar-based pending-order expiry, distinct from [`Self::expires_at`].
     /// Derived at placement from the intent's `expiry_bars` against the
     /// shell's `next_candle_timestamp` menu (capped at `not_after`). The
@@ -1033,6 +1067,22 @@ pub trait StateStore {
         account: Option<&str>,
         trade_id: &str,
         attempt_no: u32,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Persist a resting attempt's advanced **running adverse extreme**. Called
+    /// by the SL-breach sweep each tick after folding the observed price in with
+    /// [`update_adverse_extreme`](crate::sweep_gate::update_adverse_extreme).
+    ///
+    /// Writing it is what makes the breach decision monotonic across ticks — see
+    /// [`EntryAttempt::adverse_extreme`]. Skipping the write turns the sweep back
+    /// into the instantaneous-spot sampling lottery this replaced, so the caller
+    /// must not treat it as optional bookkeeping. Idempotent.
+    fn set_entry_attempt_adverse_extreme(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        attempt_no: u32,
+        adverse_extreme: f64,
     ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Returns true if this `(account, trade_id, shell_time)` fire
@@ -2040,6 +2090,24 @@ mod memstore {
                 && let Some(row) = list.iter_mut().find(|a| a.attempt_no == attempt_no)
             {
                 row.superseded = true;
+            }
+            Ok(())
+        }
+
+        async fn set_entry_attempt_adverse_extreme(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            attempt_no: u32,
+            adverse_extreme: f64,
+        ) -> Result<(), StateError> {
+            let scope = account_scope(account).to_string();
+            let key = (scope, trade_id.to_string());
+            let mut attempts = self.attempts.borrow_mut();
+            if let Some(list) = attempts.get_mut(&key)
+                && let Some(row) = list.iter_mut().find(|a| a.attempt_no == attempt_no)
+            {
+                row.adverse_extreme = Some(adverse_extreme);
             }
             Ok(())
         }
@@ -3562,6 +3630,7 @@ mod tests {
             shell_time: now,
             expires_at: now + chrono::Duration::hours(24),
             stop_loss_price: None,
+            adverse_extreme: None,
             cancel_at: None,
             pip_size: None,
             blackout_close: BlackoutCloseAction::default(),
@@ -3697,6 +3766,7 @@ mod tests {
             shell_time: now,
             expires_at: now + chrono::Duration::hours(24),
             stop_loss_price: Some(1.0500),
+            adverse_extreme: None,
             cancel_at: Some(now + chrono::Duration::hours(3)),
             pip_size: None,
             // Non-default so the round-trip proves the field survives the wire.
@@ -3780,6 +3850,12 @@ mod tests {
         // `blackout_close`; they must decode to the safe default
         // (CancelResting — cancel a resting order, never close a position).
         assert_eq!(attempt.blackout_close, BlackoutCloseAction::CancelResting);
+        // Rows written before the running adverse extreme landed lack it too.
+        // `None` must mean "not yet observed" — the sweep seeds it from the first
+        // quote it reads and NEVER reads the absence as a breach, which would
+        // cancel every healthy resting order on the first tick after deploy.
+        // See `EntryAttempt::adverse_extreme`.
+        assert!(attempt.adverse_extreme.is_none());
         assert_eq!(attempt.broker_order_id, "ord-1");
     }
 
@@ -3798,6 +3874,7 @@ mod tests {
             shell_time: now,
             expires_at: now + chrono::Duration::hours(24),
             stop_loss_price: None,
+            adverse_extreme: None,
             cancel_at: None,
             pip_size: None,
             blackout_close: BlackoutCloseAction::default(),
@@ -3812,6 +3889,31 @@ mod tests {
         assert!(!yaml.contains("blackout_close"));
         let parsed: EntryAttempt = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.broker_trade_id, None);
+
+        // The running adverse extreme is likewise skip-serialized while unset,
+        // so a freshly-placed row keeps its pre-field `jsonb` shape byte for
+        // byte (the store writes one body; there is no column and no migration).
+        //
+        // Asserted against **JSON**, the shape Postgres actually stores.
+        // Checking YAML/TOML here would assert nothing: those serialisers omit a
+        // `None` whether or not `skip_serializing_if` is present, so the test
+        // would stay green with the attribute deleted.
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(
+            !json.contains("adverse_extreme"),
+            "an unset extreme must not be written; got {json}",
+        );
+        let with_extreme = EntryAttempt {
+            adverse_extreme: Some(1.0925),
+            ..a
+        };
+        let json = serde_json::to_string(&with_extreme).unwrap();
+        assert!(
+            json.contains("\"adverse_extreme\":1.0925"),
+            "a set extreme must be written as a number; got {json}",
+        );
+        let parsed: EntryAttempt = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.adverse_extreme, Some(1.0925));
     }
 
     #[test]

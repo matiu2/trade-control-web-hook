@@ -553,6 +553,12 @@ pub async fn record_placement<S: StateStore>(
         shell_time,
         expires_at,
         stop_loss_price: Some(stop_loss_price),
+        // The running adverse extreme starts EMPTY, not at the placement price:
+        // placement is not an observation of where the market traded, and the
+        // sweep must never treat a missing extreme as a breach. The first sweep
+        // tick that observes this row seeds it from that tick's quote. See
+        // `EntryAttempt::adverse_extreme`.
+        adverse_extreme: None,
         cancel_at,
         // Snapshot the baked pip so the spread-blackout apply cron can
         // source it for a cron-found open position (it has no intent in
@@ -1003,6 +1009,22 @@ mod tests {
                 && let Some(row) = list.iter_mut().find(|a| a.attempt_no == attempt_no)
             {
                 row.superseded = true;
+            }
+            Ok(())
+        }
+        async fn set_entry_attempt_adverse_extreme(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            attempt_no: u32,
+            adverse_extreme: f64,
+        ) -> Result<(), StateError> {
+            let key = Self::attempt_key(account, trade_id);
+            let mut map = self.attempts.borrow_mut();
+            if let Some(list) = map.get_mut(&key)
+                && let Some(row) = list.iter_mut().find(|a| a.attempt_no == attempt_no)
+            {
+                row.adverse_extreme = Some(adverse_extreme);
             }
             Ok(())
         }
