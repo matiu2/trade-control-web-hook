@@ -32,7 +32,7 @@ use trade_control_core::blackout_widen::{clamp_widen, spread_hour_widen_size, wi
 use trade_control_core::broker::{AmendError, Broker, OpenPosition};
 use trade_control_core::hold::{HoldReason, Holders};
 use trade_control_core::ny_clock::is_ny_close_edge;
-use trade_control_core::order_control::{join_position_to_attempt, may_widen};
+use trade_control_core::order_control::join_position_to_attempt;
 use trade_control_core::spread_blackout::{
     NY_CLOSE_WINDOW_MARKER_TTL_SECONDS, spread_hour_widen_frac, widen_frac_to_pips,
 };
@@ -108,23 +108,41 @@ where
 ///
 /// # Break-even positions are NOT widened
 ///
-/// An earlier version applied to every open position *including* break-even
-/// ones, on the reasoning that a stop sitting exactly at entry is the most
-/// spread-vulnerable. That reasoning ignored what widening such a stop costs:
-/// it moves the stop back **past break-even**, re-exposing a trade whose risk
-/// the operator had already banked, and it records the break-even level as the
-/// "original" this system later restores to — silently redefining the trade's
-/// original stop.
+/// # A break-even stop IS widened, and IS restored back to break-even
 ///
-/// A spread hour is a reason to give a stop more room against its **original**
-/// risk, never a reason to re-introduce risk that was eliminated. `widen_one`
-/// now consults `order_control::may_widen`; paired with the `restore_decision`
-/// guard on the restore side, the two systems are commutative — whichever runs
-/// first, a locked-in break-even survives.
+/// Operator rule, 2026-09-14: *"allow SL to be widened and reset even after it
+/// has been set to BE, but we need to make sure that it gets set back to BE."*
 ///
-/// The trade-off is accepted deliberately: a break-even stop clipped by a
-/// spread spike exits at ~0R, which is the outcome break-even was chosen to
-/// guarantee. Widening past it risks a real loss instead.
+/// So a spread hour gives the **in-force** stop more room, whatever that stop
+/// is. The widen captures `position.stop_loss` — the stop the broker is holding
+/// *right now* — so when break-even has already moved it to the fill price,
+/// that is the level widened from and the level `original_stops` remembers. The
+/// restore then puts it back to break-even, not to the placement stop. The
+/// banked scratch is handed back at the end of the episode, not discarded.
+///
+/// Between 2026-08-01 and 2026-09-14 this function did the opposite: an
+/// `order_control::may_widen` guard **refused** the widen outright whenever the
+/// stop was at or past break-even, on the reasoning that widening re-exposes
+/// banked risk. The operator inspected a real trade and rejected that trade-off:
+/// a break-even stop sitting in a spread spike is stopped out by the spread
+/// itself, turning a trade that was still running into a forced scratch, and the
+/// widen is transient — the risk is re-exposed only for the length of the
+/// turbulence. The guard and its call site were removed rather than inverted, so
+/// there is no dormant flag anyone can flip back by accident.
+///
+/// ## What still protects the break-even
+///
+/// `order_control::restore_decision` on the restore side is **unchanged** and
+/// still load-bearing. It skips the restore whenever the stop currently at the
+/// broker is *tighter* than the remembered one — so if some other system moved
+/// the stop further in the trade's favour mid-episode, the restore leaves that
+/// tighter stop alone instead of widening it back.
+///
+/// That guard cannot be reached by break-even any more, because
+/// `core::order_control::in_force_stop` Rule 2 forbids break-even from arming
+/// off a bar inside an active widen. The two rules compose: the in-force stop is
+/// constant for an episode's duration, so what is remembered at the widen is
+/// still the right level at the restore.
 pub async fn widen_open_stops_for_spread_hours<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
 where
     S: StateStore,
@@ -324,27 +342,22 @@ async fn widen_one<S: StateStore>(
         Some(p90) => spread_hour_widen_size(p90, spread_pips),
         None => clamp_widen(spread_pips),
     };
-    // Don't widen a stop break-even has already secured. `original_sl` is the
-    // LIVE stop, so if System F moved it to entry first, widening would (a)
-    // push it back past break-even, re-exposing a trade whose risk had been
-    // eliminated, and (b) record break-even as the "original" this system later
-    // restores to — silently redefining the trade's original stop.
+    // NOTE — deliberately NO break-even guard here.
     //
-    // A spread hour is a reason to give a stop more room against its ORIGINAL
-    // risk, never a reason to re-introduce risk the operator already banked.
-    // Paired with the `restore_decision` guard on the restore side, this makes
-    // the two systems commutative: whichever runs first, break-even survives.
-    if let Some(be) = attempt.breakeven.as_ref()
-        && !may_widen(position.direction, original_sl, be.entry_price)
-    {
-        tracing::info!(
-            "blackout widen[{}]: trade {trade_id} stop {original_sl} is at/past break-even \
-             (entry={}); NOT widening — a spread hour must not re-expose a secured trade",
-            account.unwrap_or("<global>"),
-            be.entry_price,
-        );
-        return;
-    }
+    // `original_sl` is `position.stop_loss`, i.e. the stop the broker is holding
+    // *right now*. When break-even has already moved it to the fill, that is
+    // what gets widened and what `original_stops` (below) remembers — so the
+    // restore puts it back to BREAK-EVEN, not to the placement stop. That is the
+    // operator's rule verbatim: widened and reset even after BE, but set back to
+    // BE. Reading the live stop is the whole mechanism; a guard that skipped
+    // break-even positions, or a capture of the placement stop instead, would
+    // each break it in a different direction.
+    //
+    // A `may_widen` refusal lived here from 2026-08-01 until 2026-09-14 and was
+    // removed on operator instruction — see this module's doc comment for the
+    // reasoning and for what still protects a break-even (`restore_decision`,
+    // plus `in_force_stop` Rule 2 keeping the in-force stop constant for an
+    // episode's duration).
 
     let new_sl = widened_stop(position.direction, original_sl, widen_pips, pip_size);
 

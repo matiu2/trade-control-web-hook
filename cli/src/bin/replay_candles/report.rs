@@ -817,7 +817,9 @@ fn render_fire(
 
     // Break-even arming: the bar whose close runs past 50%-to-TP. The live cron
     // (`breakeven_watch`) amends the broker SL to entry here.
-    if let Some(armed_at) = breakeven_armed_at_resolved(placed, intent, &shell, lifetime) {
+    if let Some(armed_at) =
+        breakeven_armed_at_resolved(placed, intent, &shell, plan.pip_size, lifetime)
+    {
         events.push(EntryEvent {
             at: armed_at,
             note: format!("{ev} SL→break-even (a candle closed past 50%-to-TP)"),

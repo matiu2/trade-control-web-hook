@@ -490,10 +490,22 @@ pub fn simulate_fill_resolved_zoom(
         // the 50% level. Latched: once moved to entry it never reverts (a long's
         // entry >= original SL, a short's entry <= it, so `active_stop` only
         // tightens).
-        if let (Some(be), Some(level)) = (resolved.breakeven, be_arms_at)
-            && be.close_arms(dir, level, c.c)
-        {
-            active_stop = be.target_stop(entry_price);
+        //
+        // Rule 2: a bar INSIDE an active widen does not arm. Those are the same
+        // "rubbish candles" the engine suppresses entries, detection and crosses
+        // on, so a 50%-to-TP close printed by one is much more likely to be the
+        // spread than the market. The crossing is forgotten, not deferred — a
+        // fresh reading is taken from the first ordinary bar after the restore
+        // (the restore bar itself counts as ordinary, since the live cron has
+        // already amended the stop back by then). See
+        // `core::order_control::in_force_stop` for the full reasoning, including
+        // the honest note that there is no statistical evidence for this choice.
+        if let (Some(be), Some(level)) = (resolved.breakeven, be_arms_at) {
+            let gate =
+                trade_control_core::order_control::breakeven_arm_gate(&widen_episodes, c.time);
+            if gate.armable() && be.close_arms(dir, level, c.c) {
+                active_stop = be.target_stop(entry_price);
+            }
         }
     }
 
@@ -839,7 +851,7 @@ fn breakeven_armed_at(
     // "stopped out before arming" and suppressing the SL→break-even line.
     let resolved =
         resolve_effective_bracket(intent, shell, pip_size, candles, entry_spread_price).ok()?;
-    breakeven_armed_at_resolved(&resolved, intent, shell, candles)
+    breakeven_armed_at_resolved(&resolved, intent, shell, pip_size, candles)
 }
 
 /// [`breakeven_armed_at`] over a bracket the caller has ALREADY resolved + floored
@@ -850,6 +862,7 @@ pub fn breakeven_armed_at_resolved(
     resolved: &Resolved,
     intent: &Intent,
     shell: &Shell,
+    pip_size: f64,
     candles: &[BidAskCandle],
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let be = intent.breakeven?;
@@ -858,6 +871,24 @@ pub fn breakeven_armed_at_resolved(
 
     let exit_book = book_for(Leg::Exit, dir);
     let level = be.arms_at(fill.entry_price, resolved.take_profit);
+    // Rule 2 must reach this walk too, or the JOURNAL and the SCORED OUTCOME
+    // disagree: the report would print "SL→break-even" against a bar
+    // `simulate_fill` refused to arm from, and the operator reads a trace that
+    // contradicts its own R. This is a second walk of the same path (the "orders
+    // are state" display path), so it needs the same gate — reconstructed from
+    // the same shared episode function, not re-derived here.
+    let widen_trigger =
+        trade_control_core::spread_blackout::elevated_threshold_pips(&intent.instrument);
+    let widen_episodes = trade_control_core::order_control::WidenEpisodes::new(
+        widen_episodes_at_resolved(resolved, intent, shell, pip_size, candles, widen_trigger)
+            .into_iter()
+            .map(|w| trade_control_core::order_control::WidenEpisode {
+                effective_from: w.effective_from,
+                restored_at: w.restored_at,
+                widened_stop: w.widened_stop,
+            })
+            .collect(),
+    );
     // Walk the post-fill path exactly as Phase 2 does: an exit (SL/TP) before any
     // arming close means break-even never armed during the position's life.
     for c in fill.rest {
@@ -866,7 +897,8 @@ pub fn breakeven_armed_at_resolved(
         {
             return None;
         }
-        if be.close_arms(dir, level, c.c) {
+        let gate = trade_control_core::order_control::breakeven_arm_gate(&widen_episodes, c.time);
+        if gate.armable() && be.close_arms(dir, level, c.c) {
             return Some(c.time);
         }
     }
@@ -1222,7 +1254,30 @@ pub fn widen_episodes_at_resolved(
         return Vec::new();
     };
     let exit_book = book_for(Leg::Exit, dir);
-    let original_stop = resolved.stop_loss;
+
+    // The stop IN FORCE, bar by bar — the placement stop until break-even arms,
+    // the fill price after (Rule 1). `resolved.stop_loss` alone is the PLACEMENT
+    // stop, frozen at placement, and using it as each episode's `original_stop`
+    // is the bug this tracking exists to fix: a widen that starts after
+    // break-even armed would widen from — and restore to — a level the broker
+    // stopped holding hours earlier.
+    //
+    // Measured on `gbp-zar-h1-2026-07-27`: break-even armed 07-29T01:00 moving
+    // the stop to 22.260, a widen fired at 06:30, and the replay widened from
+    // (and restored to) 22.350 — ~9 pips wider than live, silently discarding
+    // the banked break-even.
+    //
+    // This is a RULE difference, not a resolution difference. No amount of bar
+    // granularity or sub-bar zoom fixes reading the wrong SOURCE number: a finer
+    // series would still be measured against the placement stop.
+    //
+    // The rules and their reasoning live in
+    // `core::order_control::in_force_stop`, shared with the live half.
+    let mut in_force_stop =
+        trade_control_core::order_control::InForceStop::placed_at(resolved.stop_loss);
+    let be_arms_at = resolved
+        .breakeven
+        .map(|be| be.arms_at(fill.entry_price, resolved.take_profit));
 
     // The bar length, so the System-2 widen can be reported at its exact
     // sub-candle instant (BUG-spread-hour-widen-no-subhour-lead.md). The replay
@@ -1250,7 +1305,7 @@ pub fn widen_episodes_at_resolved(
         let in_force = episodes
             .iter()
             .find(|w| c.time >= w.effective_from && w.restored_at.is_none_or(|r| c.time < r))
-            .map_or(original_stop, |w| w.widened_stop);
+            .map_or(in_force_stop.level(), |w| w.widened_stop);
         if book_reaches(c, exit_book, in_force, stop_approach(dir))
             || book_reaches(c, exit_book, resolved.take_profit, tp_approach(dir))
         {
@@ -1260,12 +1315,32 @@ pub fn widen_episodes_at_resolved(
         // live cron's `applied` guard refuses to widen again (and would re-capture
         // an already-widened stop as "original" if it did). Only once the restore
         // has cleared that record can the next spread hour widen.
+        //
+        // A bar inside an active episode is ALSO a bar break-even may not arm off
+        // (Rule 2) — which is why the `continue` happens here, before the arming
+        // step below, and why the arming step sits after this guard rather than
+        // at the top of the loop.
         if episodes
             .last()
             .is_some_and(|w| w.restored_at.is_none_or(|r| c.time < r))
         {
+            // Rule 2: a bar inside an active widen does NOT arm break-even, so
+            // this `continue` deliberately skips the arming step every other
+            // `continue` in this loop performs. That asymmetry IS the rule.
             continue;
         }
+        // Rule 1's input, captured BEFORE this bar can arm anything.
+        //
+        // `original_stop` is what an episode opening on THIS bar widens from and
+        // restores to. It must be the stop in force as the bar *opens*, because a
+        // bar that starts a widen is itself inside that widen — and Rule 2 says a
+        // bar inside a widen does not arm break-even. Reading the level after the
+        // arm below would let the widen bar's own close move the stop it is
+        // widening from, which is exactly the `covers(effective_from)` case
+        // `WidenEpisodes` treats as shielded and `simulate_fill` refuses to arm
+        // on. Capturing first is what keeps this scan and `simulate_fill` in
+        // agreement about that one bar.
+        let original_stop = in_force_stop.level();
         // Per-instrument spread-hour gate — mirror the live cron's System 2
         // (`widen_open_stops_for_spread_hours`). `spread_hour_widen_instant`
         // returns `Some(baked_p90)` iff this bar's instrument is in (or leading
@@ -1295,10 +1370,26 @@ pub fn widen_episodes_at_resolved(
             trade_control_core::spread_blackout::widen_frac_to_pips(frac, original_stop, pip_size)
         });
         if baked_p90.is_none() && !trade_control_core::ny_clock::is_ny_close_edge(c.time) {
+            arm_breakeven_on_ordinary_bar(
+                &mut in_force_stop,
+                resolved,
+                be_arms_at,
+                dir,
+                c.c,
+                fill.entry_price,
+            );
             continue;
         }
         let spread_pips = (c.ask_c - c.bid_c) / pip_size;
         if !spread_pips.is_finite() {
+            arm_breakeven_on_ordinary_bar(
+                &mut in_force_stop,
+                resolved,
+                be_arms_at,
+                dir,
+                c.c,
+                fill.entry_price,
+            );
             continue;
         }
         // A baked spread-hour bar widens regardless of the live spread reading
@@ -1312,7 +1403,17 @@ pub fn widen_episodes_at_resolved(
             None if spread_pips >= widen_trigger_pips => {
                 trade_control_core::blackout_widen::clamp_widen(spread_pips)
             }
-            None => continue,
+            None => {
+                arm_breakeven_on_ordinary_bar(
+                    &mut in_force_stop,
+                    resolved,
+                    be_arms_at,
+                    dir,
+                    c.c,
+                    fill.entry_price,
+                );
+                continue;
+            }
         };
         let widened = trade_control_core::blackout_widen::widened_stop(
             dir,
@@ -1327,6 +1428,10 @@ pub fn widen_episodes_at_resolved(
         // anchored to the bar time.
         let widen_at = widen_instant.map(|(at, _frac)| at).unwrap_or(c.time);
         let restored_at = restore_bar(&fill.rest[i + 1..], c.time, pip_size, &intent.instrument);
+        // This bar opens an episode, so under Rule 2 it does NOT arm break-even
+        // — control reaches `episodes.push` below and skips the arm at the foot
+        // of the loop via `continue`. Every path that reached here and did NOT
+        // open an episode falls through to that arm instead.
         episodes.push(SpreadWiden {
             at: widen_at,
             effective_from: c.time,
@@ -1335,8 +1440,41 @@ pub fn widen_episodes_at_resolved(
             widened_stop: widened,
             restored_at,
         });
+        continue;
     }
     episodes
+}
+
+/// Arm break-even off an ordinary bar during the episode scan.
+///
+/// Split out so the scan's several `continue` paths — "not a spread hour", "the
+/// live spread never reached the trigger" — all reach the SAME arming step
+/// rather than each needing their own copy. Those bars are ordinary: nothing
+/// about them being examined by the widen scan makes them un-armable, and an
+/// earlier draft that armed only on the fall-through path silently dropped every
+/// break-even that would have armed on a non-spread-hour bar.
+fn arm_breakeven_on_ordinary_bar(
+    in_force_stop: &mut trade_control_core::order_control::InForceStop,
+    resolved: &Resolved,
+    be_arms_at: Option<f64>,
+    dir: trade_control_core::intent::Direction,
+    close_price: f64,
+    entry_price: f64,
+) {
+    if let (Some(be), Some(level)) = (resolved.breakeven, be_arms_at) {
+        in_force_stop.consider_arm(
+            // The caller has already established this bar is not inside an
+            // active episode, so the gate is `Armable` by construction. It is
+            // passed explicitly rather than skipping `consider_arm`'s gate
+            // parameter so the one arming API stays the same on both sides.
+            trade_control_core::order_control::BreakevenArmGate::Armable,
+            be,
+            dir,
+            level,
+            close_price,
+            entry_price,
+        );
+    }
 }
 
 /// When the live recovery watcher (`blackout_watch::watch_recovery`) would
@@ -4035,6 +4173,392 @@ mod tests {
                 |c| c.time >= ts("2026-06-17T13:00:00Z") && c.time < ts("2026-06-17T14:00:00Z")
             ),
             "fetched outside the recorded window: {fetched:?}"
+        );
+    }
+
+    // ---- Rule 1 + Rule 2 at the ENTRY POINT --------------------------------
+    //
+    // `core::order_control::in_force_stop` holds the pure rules; these drive
+    // `simulate_fill`, `widen_episodes_at_resolved` and `breakeven_armed_at` —
+    // the functions the replay actually calls — because a pure-layer test cannot
+    // see whether the caller wired the rule up. Every one of these was RED
+    // against unmodified production code.
+
+    /// Shared geometry for the Rule 1 / Rule 2 entry-point tests.
+    ///
+    /// A GBP/AUD **short**: entry 1.1000, placement SL 1.1030, TP **1.0800**.
+    /// The 50%-to-TP break-even level is therefore **1.0900**, far from both the
+    /// stop and the target — so a bar that closes past it can only *arm or not*,
+    /// never exit. (An earlier draft used the default 1.0950 TP; a "past 50%"
+    /// close then also touched TP, and the test measured the wrong thing.)
+    ///
+    /// GBP/AUD carries TN spread-hour mask `[21]`, so the 21:00Z bar is a
+    /// spread hour and the 20:00Z bar leads into it — the same gate the live
+    /// cron uses.
+    fn be_widen_intent() -> (Intent, Shell) {
+        use trade_control_core::intent::Breakeven;
+        let mut intent = short_stop_intent();
+        intent.instrument = "GBP/AUD".into();
+        intent.breakeven = Some(Breakeven::at_half());
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.0800,
+        }));
+        let shell = Shell::from_candle(
+            &candle("2026-07-13T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
+        );
+        (intent, shell)
+    }
+
+    /// The bar the short fills on (bid reaches the 1.1000 sell-stop).
+    fn be_fill_bar() -> BidAskCandle {
+        ba_candle("2026-07-13T19:00:00Z", 1.1000, 1.0999, 1.1002, 1.1001)
+    }
+
+    /// The 20:00Z bar leading into the 21:00Z spread hour. Deliberately quiet:
+    /// its ask high **1.09950** stays clear of every stop the trade can be
+    /// holding — the 1.1030 placement stop AND the 1.1000 break-even stop — and
+    /// its close is nowhere near the 1.0900 arming level, so it neither exits
+    /// nor arms under either rule.
+    ///
+    /// The break-even clearance matters: once Rule 1 is in force the exit test
+    /// uses the IN-FORCE stop, so a lead bar poking above 1.1000 ends the scan
+    /// before the spread hour is ever reached and the widen silently disappears.
+    fn be_lead_bar() -> BidAskCandle {
+        ba_candle("2026-07-13T20:00:00Z", 1.09930, 1.09920, 1.09950, 1.09940)
+    }
+
+    /// **RULE 1 at the entry point.** An episode that starts AFTER break-even
+    /// armed must widen from — and restore to — the break-even stop (the entry
+    /// price 1.1000), not the placement stop (1.1030).
+    ///
+    /// Before the fix `widen_episodes_at_resolved` took every episode's
+    /// `original_stop` from `resolved.stop_loss`, frozen at placement, so it
+    /// widened from 1.1030 and restored to it — handing back a stop 30 pips
+    /// wider than the one the operator had banked, exactly the GBP/ZAR
+    /// 2026-07-27 divergence (22.350 vs the banked 22.260).
+    ///
+    /// This is a **RULE** difference, not a resolution one: no bar granularity
+    /// and no sub-bar zoom changes which source number is read.
+    #[test]
+    fn a_widen_after_break_even_widens_from_the_break_even_stop() {
+        let (intent, shell) = be_widen_intent();
+        // 18:00Z — QUIET (no spread hour), closes at ~1.0880, past the 1.0900
+        // arming level ⇒ break-even arms here, three hours before any widen.
+        let arms_be = ba_candle("2026-07-13T18:00:00Z", 1.08800, 1.08790, 1.08810, 1.08800);
+        // 21:00Z spread hour, and a 22:00Z recovered bar so the episode restores.
+        let spike = ba_candle("2026-07-13T21:00:00Z", 1.08900, 1.08850, 1.08980, 1.08930);
+        let recovered = ba_candle("2026-07-13T22:00:00Z", 1.08900, 1.08890, 1.08910, 1.08900);
+        let path = [
+            fire_bar(),
+            be_fill_bar(),
+            arms_be,
+            be_lead_bar(),
+            spike,
+            recovered,
+        ];
+
+        let resolved = Resolved::from_intent(&intent, &shell, 0.0001, replay_tick(&intent, 0.0001))
+            .expect("test bracket resolves");
+        // Premise guard: the placement stop really is 1.1030, so "1.1000 not
+        // 1.1030" below is a genuine two-value distinction.
+        assert!(
+            (resolved.stop_loss - 1.1030).abs() < 1e-9,
+            "premise: placement stop is 1.1030, got {}",
+            resolved.stop_loss
+        );
+        // Premise guard: break-even really did arm before the spread hour.
+        assert_eq!(
+            breakeven_armed_at(&intent, &shell, 0.0001, &path, None),
+            Some(ts("2026-07-13T18:00:00Z")),
+            "premise: break-even arms on the quiet 18:00Z bar"
+        );
+
+        let eps = widen_episodes_at_resolved(&resolved, &intent, &shell, 0.0001, &path, 22.0);
+        let ep = eps.first().expect("the 21:00Z spread hour must widen");
+        assert!(
+            (ep.original_stop - 1.1000).abs() < 1e-9,
+            "Rule 1: the widen must move the stop IN FORCE (break-even 1.1000), \
+             not the placement stop 1.1030; got original_stop {}",
+            ep.original_stop,
+        );
+        // ...and because the widened level is derived from it, it lands below
+        // the placement stop rather than ~14 pips above it.
+        assert!(
+            ep.widened_stop < 1.1030,
+            "a widen from break-even lands below the placement stop 1.1030, got {}",
+            ep.widened_stop,
+        );
+    }
+
+    /// The restore half of Rule 1, read at the **exit price** — the number the
+    /// corpus scores. After the episode restores, the stop in force is
+    /// break-even again, so a bar whose ask reaches 1.1002 (past break-even
+    /// 1.1000, well short of the placement stop 1.1030) closes the trade at 0R.
+    ///
+    /// ⚠️ **This half was already correct before the fix, and the test says so.**
+    /// `simulate_fill` asks `WidenEpisodes::stop_on_bar(bar, active_stop)`, and
+    /// once an episode no longer covers the bar that call falls through to
+    /// `active_stop` — the break-even-managed stop — so the *restore* already
+    /// landed on break-even. What was wrong was the number the episode widened
+    /// **from** (and therefore the level in force *during* the episode), which is
+    /// `a_widen_after_break_even_widens_from_the_break_even_stop`. This test is
+    /// kept as a **regression guard on the correct half**: the in-force rewrite
+    /// touches exactly this code path, and silently restoring to the placement
+    /// stop would be the easiest way to break it.
+    ///
+    /// The second assertion below — on the level in force *inside* the episode —
+    /// is the part that was RED.
+    #[test]
+    fn the_restore_puts_the_stop_back_to_break_even_not_the_placement_stop() {
+        let (intent, shell) = be_widen_intent();
+        let arms_be = ba_candle("2026-07-13T18:00:00Z", 1.08800, 1.08790, 1.08810, 1.08800);
+        let spike = ba_candle("2026-07-13T21:00:00Z", 1.08900, 1.08850, 1.08980, 1.08930);
+        let recovered = ba_candle("2026-07-13T22:00:00Z", 1.08900, 1.08890, 1.08910, 1.08900);
+        // 23:00Z — ask high 1.10020: past the restored break-even stop 1.1000,
+        // 28 pips short of the placement stop 1.1030.
+        let reaches_break_even =
+            ba_candle("2026-07-13T23:00:00Z", 1.09000, 1.08900, 1.10020, 1.08950);
+        let path = [
+            fire_bar(),
+            be_fill_bar(),
+            arms_be,
+            be_lead_bar(),
+            spike,
+            recovered,
+            reaches_break_even,
+        ];
+
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::StoppedOut {
+                exit_price,
+                entry_price,
+                ..
+            } => {
+                assert!(
+                    (exit_price - 1.1000).abs() < 1e-9,
+                    "must exit at the RESTORED break-even stop 1.1000, got {exit_price}"
+                );
+                assert!(
+                    (exit_price - entry_price).abs() < 1e-9,
+                    "which is a 0R scratch — exit == entry"
+                );
+            }
+            other => panic!(
+                "the restored break-even stop must close the trade; got {other:?} \
+                 (a restore to the placement stop 1.1030 leaves it open)"
+            ),
+        }
+
+        // The half that WAS red: the stop in force DURING the episode is the
+        // widen of break-even, not the widen of the placement stop. A widen of
+        // 1.1030 sits above 1.1030; a widen of 1.1000 sits below it.
+        let resolved = Resolved::from_intent(&intent, &shell, 0.0001, replay_tick(&intent, 0.0001))
+            .expect("resolves");
+        let eps = widen_episodes_at_resolved(&resolved, &intent, &shell, 0.0001, &path, 22.0);
+        let ep = eps.first().expect("the 21:00Z spread hour widens");
+        assert_eq!(
+            ep.effective_from,
+            ts("2026-07-13T20:00:00Z"),
+            "premise: the 30-min lead makes the LEAD bar the one that opens the \
+             episode, so that is the bar Rule 2 has to shield"
+        );
+        assert!(
+            ep.widened_stop < 1.1030,
+            "the level in force during the episode must be a widen of break-even \
+             (1.1000), so below the placement stop 1.1030; got {}",
+            ep.widened_stop
+        );
+    }
+
+    /// **RULE 2 at the entry point — the operator's required sequence.**
+    ///
+    /// 1. a widen happens,
+    /// 2. price goes more than half way to TP DURING the widen,
+    /// 3. the widen ends (restore).
+    ///
+    /// Break-even must NOT have armed from the mid-widen bar, and MUST arm from
+    /// a qualifying bar after the restore.
+    ///
+    /// The evidence is the **exit price**, which is what the corpus scores. In
+    /// the first path a later bar reaches the placement stop 1.1030 ⇒ −1R; had
+    /// the mid-widen bar armed break-even, that same bar would have exited at
+    /// 1.1000 ⇒ 0R. Two different numbers, so the assertion cannot pass under
+    /// the wrong rule.
+    #[test]
+    fn break_even_does_not_arm_inside_a_widen_but_does_after_the_restore() {
+        let (intent, shell) = be_widen_intent();
+        // (1)+(2) 21:00Z — INSIDE the widen, closing at ~1.0880, well past the
+        // 1.0900 arming level. Its ask high 1.08810 is clear of every stop and
+        // its bid low 1.08790 is clear of the 1.0800 TP, so the only thing this
+        // bar can do is arm or not.
+        let mid_widen = ba_candle("2026-07-13T21:00:00Z", 1.08800, 1.08790, 1.08810, 1.08800);
+        // (3) 22:00Z — spread recovered (≤4p) ⇒ the widen restores here. Closes
+        // at ~1.0990, ABOVE the 1.0900 level, so this bar does not arm either.
+        let restore = ba_candle("2026-07-13T22:00:00Z", 1.09900, 1.09890, 1.09910, 1.09900);
+        // 23:00Z — ask high 1.10310 reaches the PLACEMENT stop 1.1030.
+        let hits_placement_stop =
+            ba_candle("2026-07-13T23:00:00Z", 1.09950, 1.09900, 1.10310, 1.09980);
+        let path = [
+            fire_bar(),
+            be_fill_bar(),
+            be_lead_bar(),
+            mid_widen,
+            restore,
+            hits_placement_stop,
+        ];
+
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::StoppedOut { exit_price, .. } => {
+                assert!(
+                    (exit_price - 1.1030).abs() < 1e-9,
+                    "Rule 2: the mid-widen close must NOT arm break-even, so the \
+                     stop is still the placement stop 1.1030; got {exit_price} \
+                     (1.1000 means the rubbish candle armed it)"
+                );
+            }
+            other => panic!("expected a stop-out at the placement stop, got {other:?}"),
+        }
+
+        // The SECOND half — a qualifying bar AFTER the restore does arm. Same
+        // prefix, but instead of the stop-out bar: a 00:00Z bar that closes past
+        // 1.0900 (a fresh reading, outside any widen), then a 01:00Z bar that
+        // reaches break-even 1.1000 only.
+        let arms_after_restore =
+            ba_candle("2026-07-14T00:00:00Z", 1.08800, 1.08790, 1.08810, 1.08800);
+        let reaches_break_even =
+            ba_candle("2026-07-14T01:00:00Z", 1.09000, 1.08900, 1.10020, 1.08950);
+        let path2 = [
+            fire_bar(),
+            be_fill_bar(),
+            be_lead_bar(),
+            mid_widen,
+            restore,
+            arms_after_restore,
+            reaches_break_even,
+        ];
+        match simulate_fill(&intent, &shell, 0.0001, &path2) {
+            SimOutcome::StoppedOut {
+                exit_price,
+                entry_price,
+                ..
+            } => {
+                assert!(
+                    (exit_price - 1.1000).abs() < 1e-9,
+                    "a qualifying bar AFTER the restore takes a fresh reading and \
+                     arms break-even → exit at entry 1.1000, got {exit_price}"
+                );
+                assert!((exit_price - entry_price).abs() < 1e-9, "0R scratch");
+            }
+            other => panic!("expected a break-even scratch after the restore, got {other:?}"),
+        }
+    }
+
+    /// The journal line must agree with the scored outcome. `breakeven_armed_at`
+    /// is a **second** walk of the candle path (the report's "SL→break-even"
+    /// line), so Rule 2 has to reach it too — otherwise the journal claims
+    /// break-even armed at 21:00 on a bar the simulator refused, and the operator
+    /// reads a trace that contradicts its own R.
+    #[test]
+    fn the_breakeven_journal_line_also_skips_mid_widen_bars() {
+        let (intent, shell) = be_widen_intent();
+        let mid_widen = ba_candle("2026-07-13T21:00:00Z", 1.08800, 1.08790, 1.08810, 1.08800);
+        let restore = ba_candle("2026-07-13T22:00:00Z", 1.09900, 1.09890, 1.09910, 1.09900);
+        let arms_after = ba_candle("2026-07-14T00:00:00Z", 1.08800, 1.08790, 1.08810, 1.08800);
+        let path = [
+            fire_bar(),
+            be_fill_bar(),
+            be_lead_bar(),
+            mid_widen,
+            restore,
+            arms_after,
+        ];
+
+        assert_eq!(
+            breakeven_armed_at(&intent, &shell, 0.0001, &path, None),
+            Some(ts("2026-07-14T00:00:00Z")),
+            "the journal must report the POST-RESTORE arming bar, not the \
+             21:00Z rubbish candle inside the widen"
+        );
+    }
+
+    /// Premise guard for every Rule 2 test above: the SAME arming close, on a
+    /// bar **no** widen covers, DOES arm. Without this, a rule that accidentally
+    /// suppressed break-even everywhere — or a bar that silently failed to
+    /// qualify for some unrelated reason — would pass all of them.
+    ///
+    /// The ordinary bar is at **10:00Z**, not 21:00Z: GBP/AUD's mask flags 21:00
+    /// and the legacy NY-close-edge fallback *also* flags 21:00Z in July (17:00
+    /// EDT), so 21:00Z is a spread hour on essentially every instrument. Only a
+    /// mid-session hour is genuinely clear, and the guard is worthless unless it
+    /// is.
+    #[test]
+    fn the_same_close_arms_break_even_when_no_widen_covers_it() {
+        let (intent, shell) = be_widen_intent();
+        // Same 1.0880 close as the Rule 2 tests, on a mid-session bar.
+        let fill_bar = ba_candle("2026-07-13T08:00:00Z", 1.1000, 1.0999, 1.1002, 1.1001);
+        let quiet = ba_candle("2026-07-13T09:00:00Z", 1.09930, 1.09920, 1.09950, 1.09940);
+        let same_bar = ba_candle("2026-07-13T10:00:00Z", 1.08800, 1.08790, 1.08810, 1.08800);
+        let path = [fire_bar(), fill_bar, quiet, same_bar];
+        assert_eq!(
+            breakeven_armed_at(&intent, &shell, 0.0001, &path, None),
+            Some(ts("2026-07-13T10:00:00Z")),
+            "premise guard: with no widen covering it, this close arms normally"
+        );
+    }
+
+    /// The bar that **opens** an episode is itself inside it, so under Rule 2 it
+    /// does not arm break-even — and the widen it opens must therefore widen from
+    /// the PRE-arm stop.
+    ///
+    /// This is the one bar the two replay walks can disagree about.
+    /// `simulate_fill` asks `WidenEpisodes::covers`, which is true at
+    /// `effective_from`, so it refuses. `widen_episodes_at_resolved` builds the
+    /// episodes and so has no episode to ask about *yet* when it reaches that
+    /// bar — an earlier draft armed there and then widened from the just-armed
+    /// level, making the two walks report different `original_stop`s for the same
+    /// trade.
+    ///
+    /// The fixture's 21:00Z bar both (a) starts the spread hour and (b) closes
+    /// past the 1.0900 arming level, so the two behaviours give different
+    /// numbers: widen-from-1.1030 (correct) vs widen-from-1.1000 (the bug).
+    #[test]
+    fn the_bar_that_opens_an_episode_does_not_arm_break_even() {
+        let (intent, shell) = be_widen_intent();
+        // The bar that OPENS the episode is the **20:00Z lead bar**, not the
+        // 21:00Z spread hour itself: `spread_hour_widen_instant` gives the live
+        // cron's 30-minute lead, so `effective_from` is the lead bar's open. So
+        // the lead bar is the one that must be prevented from arming — and this
+        // fixture makes it a bar that otherwise WOULD (close ~1.0880, past the
+        // 1.0900 level). An earlier draft of this test put the qualifying close
+        // on the 21:00Z bar, which `effective_from` had already shielded, and the
+        // test passed against the very bug it was written for.
+        let lead_opens_and_would_arm =
+            ba_candle("2026-07-13T20:00:00Z", 1.08800, 1.08790, 1.08810, 1.08800);
+        let spike = ba_candle("2026-07-13T21:00:00Z", 1.08900, 1.08850, 1.08980, 1.08930);
+        let recovered = ba_candle("2026-07-13T22:00:00Z", 1.09900, 1.09890, 1.09910, 1.09900);
+        let path = [
+            fire_bar(),
+            be_fill_bar(),
+            lead_opens_and_would_arm,
+            spike,
+            recovered,
+        ];
+
+        let resolved = Resolved::from_intent(&intent, &shell, 0.0001, replay_tick(&intent, 0.0001))
+            .expect("resolves");
+        let eps = widen_episodes_at_resolved(&resolved, &intent, &shell, 0.0001, &path, 22.0);
+        let ep = eps.first().expect("the 21:00Z spread hour widens");
+        assert!(
+            (ep.original_stop - 1.1030).abs() < 1e-9,
+            "the bar opening the episode must not have armed break-even, so the \
+             widen is measured from the placement stop 1.1030; got {}",
+            ep.original_stop
+        );
+        // ...and the journal walk must agree that nothing armed on that bar.
+        assert_eq!(
+            breakeven_armed_at(&intent, &shell, 0.0001, &path, None),
+            None,
+            "the journal must not report an arm on the bar that opens the widen"
         );
     }
 }
