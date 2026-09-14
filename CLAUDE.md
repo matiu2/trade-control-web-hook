@@ -322,17 +322,71 @@ Things a refactorer must preserve:
 - **The `ClosePositions` veto uses the same mapping**, and its log line
   distinguishes `closed=nothing-open` from `closed=failed`.
 
-### `--market-entry` / `--limit-entry` place NOTHING that the crons manage
+### Manual entries: `--market-entry` is fire-and-forget, `--stop-entry` / `--limit-entry` are MANAGED
 
-The doc comment on `tv-arm/src/position_entry.rs` ("no plan, no engine rules, no
-preps or vetos") is accurate and worth taking literally. Beyond that, because
-these intents are built with `max_retries: Tunable::Static(0)`,
-`retry_attempt_no` is `None` in `run_enter` and **`record_placement` is never
-called** — so there is **no `EntryAttempt` row**. Everything keyed off attempts
-therefore ignores such a position: the pending-order sweep, order-control
-re-check, breakeven watch, and blackout apply/watch.
+⚠️ **The split is "does the order REST?", not the flag name.** There are three
+manual flags, not two — `--stop-entry` exists and is fully wired
+(`tv-arm/src/args.rs`, in the exclusive group with the other two). All three
+funnel through one builder, `build_position_enter`
+(`cli/src/trade_patterns.rs`), and the *only* thing that differs is
+`PositionEntryKind`.
 
-What *does* persist is the `request_records` row, keyed by the minted
+| kind | fills | `entry_dedup` | `max_retries` | `EntryAttempt` row | cron-managed |
+|---|---|---|---|---|---|
+| `Market` | on receipt | absent | `Static(0)` | **no** | **no** — fire-and-forget |
+| `Stop` | rests | `GateOwned` | `Static(1)` | **yes** | **yes** |
+| `Limit` | rests | `GateOwned` | `Static(1)` | **yes** | **yes** |
+
+**Why the resting kinds had to change (v145).** All five attempt-keyed crons —
+the pending-order sweep, break-even watch, both blackout passes and the
+order-control re-price — enumerate `store.list_all_entry_attempts()`. **None of
+them joins via a plan.** So the single thing that turns them on is an
+`EntryAttempt` row, written only inside `record_placement`, which `run_enter`
+reaches only when the retry gate ran (`if let Some(attempt_no) =
+retry_attempt_no`) — and the gate runs only for `EntryDedup::GateOwned`.
+
+The protection that matters, and which **has no broker-side substitute**: an
+unfilled order has no working stop at the broker, so when price trades *through*
+the drawn stop before the order fills, the setup is dead but the order still
+rests and can fill later on the way back — a guaranteed loser. Only the sweep's
+pre-fill SL-breach cancel kills it, and it needs the row. (The motivating case: a
+manual sell-stop resting at 1.2640 with its stop at 1.2720; price rallies to
+1.2735, and nothing cancelled the order.)
+
+**`Market` is deliberately excluded and must stay so.** It fills on receipt, so
+there is no resting order to sweep and no expiry to enforce, and its broker
+bracket covers it from the instant of the fill. Its documented fire-and-forget
+contract is coherent *for an order that fills instantly* — it was never a
+statement about orders that rest.
+
+Things a refactorer must preserve:
+
+- **Both fields move together, always.** `GateOwned` + `max_retries: 0` is
+  incoherent and the gate rejects it outright (412 `max-retries-zero`,
+  `core::retry_gate::evaluate`) — **every manual entry would fail to place, with
+  no order reaching the broker**. The inverse, a cap with no owner, is a gate
+  that never runs (the EUR/GBP 3x-risk incident). `Static(1)` is the minimal
+  gate-owned config: one placement, routed through the gate.
+- **State `entry_dedup` explicitly; do not lean on the healing.**
+  `effective_entry_dedup` heals an *absent* field by re-deriving from the cap, so
+  at `max_retries: 1` deleting the assignment is behaviourally invisible — a real
+  mutation survivor. But absent ≠ explicit: healing exists to rescue pre-field
+  intents, and re-deriving dedup from a cap is exactly the conflation that caused
+  the incident. `the_dedup_owner_and_the_cap_never_disagree` asserts the **raw**
+  field for all three kinds.
+- **No latency is added to placement.** The gate's open-position backstop is
+  skipped when `attempts` is empty (`retry_gate.rs`), so a *first* fire makes
+  **zero** broker round-trips — measured, not assumed. Only a re-fire (which has
+  a prior attempt to correlate against) calls the broker.
+- **A manual entry still cannot be placed twice.** A re-fire finding its order
+  still resting takes the gate's `Pending` arm: cancel, then re-place at the new
+  price — a re-price, never a duplicate. Once an entry has actually *filled*, the
+  cap of 1 makes a stop-out terminal.
+- **The replay corpus is structurally blind to all of this** — manual entries are
+  a tv-arm → worker HTTP path, never a plan the replay drives. No fixture is
+  evidence either way; the unit tests at the dispatch entry point are.
+
+What persists for *every* kind is the `request_records` row, keyed by the minted
 `pos-<instrument>-<8hex>` `trade_id` — which is why `plan timeline <trade_id>`
 can answer "did it fill?" (the broker order id is in that record's outcome), and
 why the CLI now prints that command at placement time.
