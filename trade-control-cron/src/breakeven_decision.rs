@@ -165,9 +165,24 @@ fn target_entry(inputs: &BreakevenInputs<'_>) -> f64 {
 ///
 /// A bar that closed at or before the fill is excluded either way: nothing it
 /// shows happened while the position existed.
+///
+/// # Why a spread-hour bar is excluded too (Rule 2, 2026-09-14)
+///
+/// `instrument` is here for the third bound: a bar that closed **inside an
+/// active spread-hour widen does not arm break-even**. See
+/// [`is_inside_a_widen`] for the reasoning; the short version is that these are
+/// the same bars the engine already refuses to trade on.
+///
+/// The exclusion is applied **here**, in the window, and not as a skip at the
+/// arming test — because [`decide`] folds the *most-progressed* close since the
+/// fill, so a bar merely skipped on the tick it arrives would still win that
+/// fold on every later tick. Dropping it from the window is what makes the
+/// crossing genuinely **forgotten** rather than deferred to the restore, which
+/// is the alternative the operator rejected.
 fn armable_candles(
     candles: Vec<Candle>,
     granularity: Granularity,
+    instrument: &str,
     fill_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Vec<Candle> {
@@ -175,7 +190,62 @@ fn armable_candles(
     candles
         .into_iter()
         .filter(|c| c.time + bar <= now && c.time + bar > fill_at)
+        .filter(|c| !is_inside_a_widen(instrument, c.time))
         .collect()
+}
+
+/// Is the bar opening at `bar_open` one the spread-hour widen is in force on?
+///
+/// # Rule 2 — break-even does not arm off a bar inside an active widen
+///
+/// Decided by the operator on 2026-09-14. If price runs past the 50%-to-TP level
+/// *while a widen is in force*, that crossing is treated as **turbulence, not a
+/// real move**: it does not arm break-even, and a fresh reading is taken after
+/// the widen is restored. The rejected alternative was to remember the crossing
+/// and apply break-even at restore time.
+///
+/// The operator's stated reason is simplicity. The stronger one, and the one to
+/// weigh if this is ever revisited: **the bars inside a spread-hour widen are
+/// the same bars the engine already treats as untradeable.**
+/// `suppress_on_spread_hour_bar_seconds` suppresses entries, pattern detection
+/// and level crosses on exactly these bars — the replay journal calls them
+/// "rubbish candle — entry/detection/crosses suppressed". Arming break-even off
+/// one would mean trusting, for the single purpose of giving up a trade's
+/// remaining upside, a bar the system distrusts for every other purpose.
+///
+/// **There is no statistical evidence for this choice.** The operator noted
+/// explicitly that we likely have no real-world examples of the situation and
+/// certainly nothing approaching significance. It is a reasoned default chosen
+/// for consistency with how the rest of the system treats these bars, not a
+/// measured one.
+///
+/// # Why this predicate and not the stored widen record
+///
+/// The live cron *does* hold a `HeldTradeRecord` naming the episode, but reading
+/// it here would answer a different question — "is a widen in force **now**" —
+/// when what a *bar* needs is "was one in force when this bar closed". The
+/// history a break-even arms off is bars, not ticks, so the test has to be
+/// per-bar.
+///
+/// # Known side-effect: the noise floor's window narrows too
+///
+/// [`armable_candles`] feeds [`noise_violation`] as well as the arming fold, so
+/// excluding spread-hour bars also removes them from the ATR window and from the
+/// "latest close" the floor measures against. That is **deliberate and
+/// defensible** — a rubbish candle is a poor volatility reference, and the floor
+/// is explicitly a tripwire for absurdity rather than a tuned number — but it is
+/// a coupling, not a no-op, so it is recorded here rather than left to be
+/// rediscovered. If the floor ever becomes load-bearing, give it its own
+/// unfiltered window rather than re-admitting these bars to the arming fold.
+///
+/// [`is_spread_hour`] is also the **same** predicate both the widen side
+/// (`blackout_apply`, via `spread_hour_widen_frac` with the identical NY-close
+/// fallback) and the replay reconstruction
+/// (`fill_sim::widen_episodes_at_resolved`) gate on, so all three answer this
+/// from one baked table and cannot drift
+/// (`[[strategy_changes_in_both_replayer_and_worker]]`).
+fn is_inside_a_widen(instrument: &str, bar_open: DateTime<Utc>) -> bool {
+    trade_control_core::spread_blackout::is_spread_hour(instrument, bar_open)
 }
 
 /// Decide what to do with one open position, given the candles the broker
@@ -189,7 +259,13 @@ pub fn decide(
         return BreakevenDecision::Blocked(BreakevenBlock::NoFillTime);
     };
     let direction = inputs.position.direction;
-    let armable = armable_candles(candles, inputs.snapshot.granularity, fill_at, now);
+    let armable = armable_candles(
+        candles,
+        inputs.snapshot.granularity,
+        &inputs.position.instrument,
+        fill_at,
+        now,
+    );
     // The close that ran furthest toward TP since the fill. Break-even is
     // latched, so an arm on a bar that has since retraced must not be missed.
     let Some(best) = armable.iter().copied().reduce(|a, b| {
