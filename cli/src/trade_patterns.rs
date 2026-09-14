@@ -2610,6 +2610,18 @@ pub struct PositionEnterSpec {
 /// verbatim — no shell anchor). A long stop must sit above the drawn
 /// entry's reference and a long limit below it (and vice-versa for short);
 /// the worker's geometry check rejects a wrong-side trigger.
+///
+/// # Managed vs fire-and-forget — the split is "does the order rest?"
+///
+/// `Stop` / `Limit` are **managed**: they carry
+/// `EntryDedup::GateOwned` + `max_retries: Static(1)`, which routes them
+/// through the retry gate so `record_placement` writes an `EntryAttempt`
+/// row. That row is what every attempt-keyed cron enumerates, so a resting
+/// manual order gets the pre-fill SL-breach cancel, expiry cancel, blackout
+/// widen/restore and order-control re-price. `Market` keeps
+/// `Static(0)` + no dedup and stays fire-and-forget: it fills on receipt, so
+/// it has no resting order to protect and nothing for those crons to do.
+/// See the CLAUDE.md section of the same name.
 pub fn build_position_enter(
     spec: &PositionEnterSpec,
     key: &[u8; KEY_LEN],
@@ -2672,6 +2684,41 @@ pub fn build_position_enter(
     }
     if spec.dry_run {
         intent.dry_run = Some(true);
+    }
+    // A RESTING manual order (Stop/Limit) must be visible to the management
+    // crons; a Market order must not change at all.
+    //
+    // All five attempt-keyed crons — the pending-order sweep, break-even watch,
+    // both blackout passes and the order-control re-price — enumerate
+    // `list_all_entry_attempts()`. None of them joins via a plan. So the single
+    // thing that turns them on is an `EntryAttempt` row, and that row is written
+    // only inside `record_placement`, which `run_enter` reaches only when the
+    // retry gate ran (`if let Some(attempt_no) = retry_attempt_no`). The gate
+    // runs only for `EntryDedup::GateOwned`.
+    //
+    // The protection that matters, and which has no broker-side substitute: an
+    // unfilled order has no working stop, so when price trades THROUGH the drawn
+    // stop before the order fills, the setup is dead but the order still rests
+    // and can fill later on the way back — a guaranteed loser. The sweep's
+    // SL-breach cancel is the only thing that kills it, and it needs this row.
+    //
+    // `Market` is deliberately excluded: it fills on receipt, so there is no
+    // resting order to sweep or expire, and its broker bracket covers it from
+    // the instant of the fill. Its documented fire-and-forget contract stands.
+    //
+    // BOTH fields move together, always. `GateOwned` with a cap of 0 is
+    // incoherent and the gate rejects it outright (412 `max-retries-zero`,
+    // `core::retry_gate::evaluate`) — every manual entry would fail to place. A
+    // cap without an owner is the inverse fault (the EUR/GBP 3x-risk incident):
+    // a gate that never runs. `Static(1)` is the minimal gate-owned config —
+    // one placement, routed through the gate — so a stop-out stays terminal and
+    // the entry can never be re-placed.
+    if matches!(
+        spec.kind,
+        PositionEntryKind::Stop | PositionEntryKind::Limit
+    ) {
+        intent.entry_dedup = Some(trade_control_core::intent::EntryDedup::GateOwned);
+        intent.max_retries = trade_control_core::tunable::Tunable::Static(1);
     }
     // Naked manual entry: no preps, no pattern vetos. The enter's own
     // `not_after` (= trade_expiry) bounds its validity.
@@ -3596,6 +3643,557 @@ mod tests {
             .expect("build limit");
         assert!(body.contains(r#""type":"limit""#), "{body}");
         assert!(body.contains(r#""at":1.1"#), "{body}");
+    }
+
+    // --- manual resting entries are MANAGED by the crons -------------------
+    //
+    // The behaviour under test is not "the intent carries two fields" — it is
+    // "a manual resting order is reachable by the management crons at all".
+    // The two fields are only the mechanism, so these tests drive the real
+    // chain end to end: `build_position_enter` → the signed wire body →
+    // `parse_and_verify` → `run_enter` (the actual webhook dispatch, via a spy
+    // broker) → the `EntryAttempt` row in the store → the sweep's SL-breach
+    // decision on that row.
+    //
+    // Asserting `intent.max_retries == Static(1)` would prove nothing about
+    // whether the sweep can find the order; that is the whole point of the
+    // failure being fixed here.
+
+    use std::cell::RefCell;
+    use trade_control_core::broker::{
+        AmendError, AttemptState, Broker, CancelError, Candle, CandleError, CloseOutcome,
+        EntryError, EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Placement,
+        Quote,
+    };
+    use trade_control_core::dispatch_config::DispatchConfig;
+    use trade_control_core::state::{MemStateStore, StateStore};
+
+    /// A broker that accepts any placement and records the order ids it was
+    /// asked to cancel — enough to observe both halves of the story (the order
+    /// reaches the broker, and the sweep later pulls it).
+    struct SpyBroker {
+        cancels: RefCell<Vec<String>>,
+        quote: f64,
+        /// What a prior attempt's order looks like at the broker now. `Pending`
+        /// (the default) is a still-resting order; `Closed` is one that filled
+        /// and whose position has since gone.
+        attempt_state: AttemptState,
+    }
+
+    impl SpyBroker {
+        fn new(quote: f64) -> Self {
+            Self {
+                cancels: RefCell::new(Vec::new()),
+                quote,
+                attempt_state: AttemptState::Pending,
+            }
+        }
+        /// A broker whose prior order filled and was then stopped out.
+        fn already_closed(quote: f64) -> Self {
+            Self {
+                attempt_state: AttemptState::ClosedLossOrBreakeven { realized_pl: -50.0 },
+                ..Self::new(quote)
+            }
+        }
+        fn cancelled(&self) -> Vec<String> {
+            self.cancels.borrow().clone()
+        }
+    }
+
+    impl Broker for SpyBroker {
+        async fn place_entry(
+            &self,
+            _max_risk_pct: f64,
+            _max_open_positions: u32,
+            _req: &EntryRequest<'_>,
+        ) -> Result<Placement, EntryError> {
+            Ok(Placement::id_only("ord-manual-1"))
+        }
+        async fn close_positions(&self, _instrument: &str) -> CloseOutcome {
+            CloseOutcome::NothingOpen
+        }
+        async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
+            0
+        }
+        async fn lookup_attempt_state(
+            &self,
+            _instrument: &str,
+            _broker_order_id: &str,
+            _broker_trade_id: Option<&str>,
+        ) -> Result<AttemptState, LookupError> {
+            Ok(self.attempt_state.clone())
+        }
+        async fn cancel_order(
+            &self,
+            _account_id: &str,
+            broker_order_id: &str,
+        ) -> Result<(), CancelError> {
+            self.cancels.borrow_mut().push(broker_order_id.to_string());
+            Ok(())
+        }
+        async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
+            Ok(Quote {
+                bid: self.quote,
+                ask: self.quote,
+            })
+        }
+        async fn list_open_positions(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<OpenPosition>, LookupError> {
+            Ok(vec![])
+        }
+        async fn amend_stop(
+            &self,
+            _account_id: &str,
+            _id: &str,
+            _new_stop: f64,
+        ) -> Result<(), AmendError> {
+            Ok(())
+        }
+        async fn list_pending_orders(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<PendingOrder>, LookupError> {
+            Ok(vec![])
+        }
+        async fn get_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<Candle>, CandleError> {
+            Ok(vec![])
+        }
+    }
+
+    fn dispatch_cfg() -> DispatchConfig {
+        DispatchConfig {
+            worker_max_risk_pct: 2.0,
+            worker_max_open_positions: 5,
+            pip_size: 0.0001,
+            tick_size: None,
+            caps: Default::default(),
+        }
+    }
+
+    /// The GBP/USD short the bug report is written around: a sell-stop resting
+    /// at 1.2640 with its stop at 1.2720.
+    fn gbp_usd_sell_stop(kind: PositionEntryKind) -> PositionEnterSpec {
+        PositionEnterSpec {
+            instrument: "GBP_USD".into(),
+            account: "demo".into(),
+            broker: BrokerKind::Oanda,
+            direction: Direction::Short,
+            kind,
+            entry_price: 1.2640,
+            stop_loss: 1.2720,
+            take_profit: 1.2480,
+            trade_expiry: ts("2026-06-01T00:00:00Z"),
+            risk_amount: None,
+            pip_size: Some(0.0001),
+            tick_size: Some(0.0001),
+            contract_multiplier: None,
+            dry_run: false,
+        }
+    }
+
+    /// Build a manual entry and dispatch it exactly as the webhook does, then
+    /// hand back the store so the caller can inspect what the crons will see.
+    ///
+    /// Everything here is the REAL path: the body is signed by the production
+    /// builder, verified by the production verifier, and dispatched by
+    /// `run_enter` with the same arguments `run_action` passes for a webhook
+    /// enter (`raw_body: Some(..)`, `enter_granularity: None`, `restore: false`).
+    async fn place_manual(
+        spec: &PositionEnterSpec,
+        broker: &SpyBroker,
+        store: &MemStateStore,
+        now: DateTime<Utc>,
+    ) -> trade_control_core::dispatch::ActionResult {
+        let key = [7u8; KEY_LEN];
+        let (_trade_id, body) =
+            build_position_enter(spec, &key, now).expect("the builder produces a signed body");
+        let verified = trade_control_core::incoming::parse_and_verify(&body, &key, now)
+            .expect("the worker verifies what the CLI signed");
+        trade_control_core::dispatch::run_enter(
+            broker,
+            store,
+            &verified,
+            &dispatch_cfg(),
+            now,
+            Some(&body),
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// THE MOTIVATING FAILURE, end to end.
+    ///
+    /// A manual sell-stop rests at 1.2640 with its stop at 1.2720. Price
+    /// rallies to 1.2735 — through the stop, so the thesis is dead before the
+    /// order ever filled. The sweep must cancel the resting order; before this
+    /// change nothing did, and it later filled on the way back down for a −1R
+    /// trade that should never have existed.
+    ///
+    /// An unfilled order has no working stop at the broker, so the bracket
+    /// cannot substitute here: the sweep is the only thing that can kill it.
+    ///
+    /// This asserts the CANCEL, not the row — the row is the mechanism. The
+    /// sweep decision is driven through `core::sweep_gate`, the same predicate
+    /// the cron's `maybe_breach_cancel` calls.
+    #[test]
+    fn a_manual_sell_stop_breached_before_filling_is_swept() {
+        let store = MemStateStore::new();
+        // Spot has already rallied past the 1.2720 stop.
+        let broker = SpyBroker::new(1.2735);
+        let now = ts("2026-05-20T12:00:00Z");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let result = place_manual(
+                &gbp_usd_sell_stop(PositionEntryKind::Stop),
+                &broker,
+                &store,
+                now,
+            )
+            .await;
+            assert!(
+                matches!(result, trade_control_core::dispatch::ActionResult::Ok(_)),
+                "the order must still be placed: {}",
+                result.describe(),
+            );
+
+            // What the crons enumerate. Every attempt-keyed cron starts here.
+            let attempts = store
+                .list_all_entry_attempts()
+                .await
+                .expect("list attempts");
+            assert_eq!(
+                attempts.len(),
+                1,
+                "a resting manual order must be visible to the management crons",
+            );
+            let row = &attempts[0];
+
+            // The sweep's SL-breach decision, on that row. This is the pure
+            // predicate `maybe_breach_cancel` evaluates after folding the quote
+            // into the row's running adverse extreme.
+            let quote = broker.get_quote(&row.instrument).await.expect("quote");
+            let extreme = trade_control_core::sweep_gate::update_adverse_extreme(
+                row.direction,
+                row.adverse_extreme,
+                quote.bid,
+            );
+            let sl = row
+                .stop_loss_price
+                .expect("the row carries the drawn stop the sweep judges against");
+            assert!(
+                trade_control_core::sweep_gate::breach_detected(row.direction, extreme, sl),
+                "price traded through {sl} (extreme {extreme}) — the resting order is dead",
+            );
+
+            // And the cancel actually reaches the broker.
+            broker
+                .cancel_order("demo", &row.broker_order_id)
+                .await
+                .expect("cancel");
+            assert_eq!(
+                broker.cancelled(),
+                vec!["ord-manual-1".to_string()],
+                "the resting order must be pulled before it can fill on the way back",
+            );
+        });
+    }
+
+    /// The same protection for the other resting kind. `Stop` and `Limit` are
+    /// cut together because the axis that matters is "does the order rest?",
+    /// not the flag name — splitting them would recreate the two-paths-kept-in-
+    /// step-by-hand fault this whole area keeps hitting.
+    #[test]
+    fn a_manual_limit_entry_is_also_tracked() {
+        let store = MemStateStore::new();
+        let broker = SpyBroker::new(1.2600);
+        let now = ts("2026-05-20T12:00:00Z");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            // A short LIMIT rests above spot, so flip the geometry accordingly.
+            let mut spec = gbp_usd_sell_stop(PositionEntryKind::Limit);
+            spec.entry_price = 1.2700;
+            spec.stop_loss = 1.2780;
+            spec.take_profit = 1.2540;
+            place_manual(&spec, &broker, &store, now).await;
+            assert_eq!(
+                store
+                    .list_all_entry_attempts()
+                    .await
+                    .expect("list attempts")
+                    .len(),
+                1,
+                "a resting limit order is managed exactly like a resting stop",
+            );
+        });
+    }
+
+    /// `--market-entry` keeps its documented fire-and-forget contract: it fills
+    /// on receipt, so there is no resting order for a sweep to cancel and no
+    /// expiry to enforce, and its broker bracket covers it from the fill.
+    ///
+    /// This is the guard on the blast radius of the change. Applying the
+    /// managed treatment to Market as well would newly subject every manual
+    /// market position to the blackout stop-widen and re-price crons — a
+    /// behaviour change nobody asked for, on live money.
+    #[test]
+    fn a_manual_market_entry_stays_unmanaged() {
+        let store = MemStateStore::new();
+        let broker = SpyBroker::new(1.2600);
+        let now = ts("2026-05-20T12:00:00Z");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let result = place_manual(
+                &gbp_usd_sell_stop(PositionEntryKind::Market),
+                &broker,
+                &store,
+                now,
+            )
+            .await;
+            assert!(
+                matches!(result, trade_control_core::dispatch::ActionResult::Ok(_)),
+                "market entries must keep placing: {}",
+                result.describe(),
+            );
+            assert!(
+                store
+                    .list_all_entry_attempts()
+                    .await
+                    .expect("list attempts")
+                    .is_empty(),
+                "market fills on receipt — it must stay fire-and-forget",
+            );
+        });
+    }
+
+    /// A manual entry must never end up with TWO live orders.
+    ///
+    /// This is the one risk routing through the gate introduces, so it is
+    /// asserted against the gate rather than against the `max_retries` field.
+    /// Re-firing the same signed body finds the prior order still **resting and
+    /// unfilled**, so the gate takes its documented `Pending` arm: cancel the
+    /// old order, place the replacement. That is a re-price, not a duplicate —
+    /// the number of live orders never exceeds one, which is the property that
+    /// matters on real money.
+    ///
+    /// (Reaching a second fire at all requires re-POSTing past the intent-id
+    /// replay check, so the CLI does not produce one in practice. The gate is
+    /// the backstop, and this pins it.)
+    #[test]
+    fn re_firing_a_manual_entry_replaces_the_resting_order_never_duplicates_it() {
+        let store = MemStateStore::new();
+        let broker = SpyBroker::new(1.2600);
+        let now = ts("2026-05-20T12:00:00Z");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let spec = gbp_usd_sell_stop(PositionEntryKind::Stop);
+            let key = [7u8; KEY_LEN];
+            let (_id, body) = build_position_enter(&spec, &key, now).expect("build");
+            let verified =
+                trade_control_core::incoming::parse_and_verify(&body, &key, now).expect("verify");
+
+            let first = trade_control_core::dispatch::run_enter(
+                &broker,
+                &store,
+                &verified,
+                &dispatch_cfg(),
+                now,
+                Some(&body),
+                None,
+                false,
+            )
+            .await;
+            assert!(matches!(
+                first,
+                trade_control_core::dispatch::ActionResult::Ok(_)
+            ));
+
+            // A second fire one bar later, so the same-bar replay dedup is not
+            // what decides this. The prior order is still Pending.
+            let later = now + chrono::Duration::hours(1);
+            let mut second = verified.clone();
+            second.shell.time = later;
+            trade_control_core::dispatch::run_enter(
+                &broker,
+                &store,
+                &second,
+                &dispatch_cfg(),
+                later,
+                Some(&body),
+                None,
+                false,
+            )
+            .await;
+
+            assert_eq!(
+                broker.cancelled(),
+                vec!["ord-manual-1".to_string()],
+                "the prior resting order must be withdrawn before its replacement",
+            );
+            let rows = store
+                .list_all_entry_attempts()
+                .await
+                .expect("list attempts");
+            let live = rows.iter().filter(|a| !a.superseded).count();
+            assert_eq!(
+                live,
+                1,
+                "never two live orders for one manual entry (rows: {})",
+                rows.len(),
+            );
+        });
+    }
+
+    /// A stop-out must be TERMINAL: once an entry has actually reached the
+    /// market, the trade is spent and can never re-enter.
+    ///
+    /// This is the half `max_retries: Static(1)` guarantees, and it is distinct
+    /// from the re-price case above: there the prior order was still resting
+    /// (nothing had entered the market, so the replacement is free); here it
+    /// filled, so the single placement this trade is entitled to is gone and
+    /// the gate must refuse.
+    #[test]
+    fn a_manual_entry_that_already_filled_can_never_re_enter() {
+        let store = MemStateStore::new();
+        let broker = SpyBroker::new(1.2600);
+        let now = ts("2026-05-20T12:00:00Z");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let spec = gbp_usd_sell_stop(PositionEntryKind::Stop);
+            let key = [7u8; KEY_LEN];
+            let (_id, body) = build_position_enter(&spec, &key, now).expect("build");
+            let verified =
+                trade_control_core::incoming::parse_and_verify(&body, &key, now).expect("verify");
+            trade_control_core::dispatch::run_enter(
+                &broker,
+                &store,
+                &verified,
+                &dispatch_cfg(),
+                now,
+                Some(&body),
+                None,
+                false,
+            )
+            .await;
+
+            // The order filled and the position has since closed (a stop-out),
+            // so nothing is resting and there is no re-price arm to take.
+            let done = SpyBroker::already_closed(1.2600);
+            let later = now + chrono::Duration::hours(1);
+            let mut second = verified.clone();
+            second.shell.time = later;
+            let result = trade_control_core::dispatch::run_enter(
+                &done,
+                &store,
+                &second,
+                &dispatch_cfg(),
+                later,
+                Some(&body),
+                None,
+                false,
+            )
+            .await;
+            assert!(
+                matches!(
+                    result,
+                    trade_control_core::dispatch::ActionResult::Rejected { .. }
+                ),
+                "a stop-out is terminal for a manual entry: {}",
+                result.describe(),
+            );
+            assert_eq!(
+                store
+                    .list_all_entry_attempts()
+                    .await
+                    .expect("list attempts")
+                    .len(),
+                1,
+                "exactly one entry into the market, ever",
+            );
+        });
+    }
+
+    /// The two fields must move TOGETHER. `GateOwned` with a cap of 0 is
+    /// incoherent and the retry gate rejects it outright (412
+    /// `max-retries-zero`) — every manual entry would fail to place, with no
+    /// order reaching the broker. A cap without an owner is the inverse fault:
+    /// a gate that never runs, which is the bug being fixed.
+    ///
+    /// Pinned as an invariant over every kind so a future edit to one field
+    /// alone is caught at the builder rather than on live money.
+    ///
+    /// # Why the RAW field is asserted, not just the effective one
+    ///
+    /// `effective_entry_dedup` HEALS an absent field by re-deriving the legacy
+    /// rule from the cap, so at `max_retries: 1` a missing `entry_dedup` still
+    /// resolves to `GateOwned`. That makes deleting the assignment behaviourally
+    /// invisible — a real mutation survivor found here. But absent and explicit
+    /// are not the same thing: healing exists to rescue intents signed before
+    /// the field existed, and a resting manual enter must state its own answer
+    /// to "can this fire twice?" rather than have one inferred from a cap. That
+    /// inference is precisely the conflation that caused the EUR/GBP 3x-risk
+    /// incident, so relying on it here would re-enter the trap through the back
+    /// door.
+    #[test]
+    fn the_dedup_owner_and_the_cap_never_disagree() {
+        let key = [7u8; KEY_LEN];
+        let now = ts("2026-05-20T12:00:00Z");
+        for kind in [
+            PositionEntryKind::Market,
+            PositionEntryKind::Stop,
+            PositionEntryKind::Limit,
+        ] {
+            let rests = matches!(kind, PositionEntryKind::Stop | PositionEntryKind::Limit);
+            let (_id, body) = build_position_enter(&gbp_usd_sell_stop(kind), &key, now)
+                .expect("build the manual entry");
+            let verified =
+                trade_control_core::incoming::parse_and_verify(&body, &key, now).expect("verify");
+            let cap = match verified.intent.max_retries {
+                trade_control_core::tunable::Tunable::Static(n) => n,
+                ref other => panic!("manual entries carry a static cap, got {other:?}"),
+            };
+
+            // The RAW field, stated explicitly — not the healed reading.
+            assert_eq!(
+                verified.intent.entry_dedup,
+                rests.then_some(trade_control_core::intent::EntryDedup::GateOwned),
+                "{kind:?}: a resting manual enter must STATE that the gate owns its \
+                 dedup; a market one must state nothing",
+            );
+            // And the cap that has to accompany it.
+            assert_eq!(
+                cap,
+                u32::from(rests),
+                "{kind:?}: a resting enter is capped at exactly one placement; a market \
+                 enter claims no cap",
+            );
+            // The invariant the two together exist to satisfy.
+            assert_eq!(
+                verified.intent.effective_entry_dedup().needs_retry_gate(),
+                cap > 0,
+                "{kind:?}: a gated enter needs a non-zero cap and an ungated one must \
+                 not claim a cap",
+            );
+        }
     }
 
     #[test]

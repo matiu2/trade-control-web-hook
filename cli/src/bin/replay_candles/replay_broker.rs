@@ -1291,11 +1291,57 @@ impl Broker for ReplayBroker {
         // unreliable recovery signal: it dips narrow on some bars and would make
         // the OFF-side (`pending_lifecycle::off_now`) FALSELY "recover" the trade
         // early, restoring a cancelled resting order that then gets re-cancelled the
-        // next in-block bar — a cancel↔restore ping-pong. It also mis-lets an entry
-        // fire inside the trough. So in-block we report a spread AT the elevated
-        // threshold: the OFF-side stays held until the baked hour ENDS (its stated
-        // deterministic off-signal), and the entry gate correctly sees the trough.
+        // next in-block bar — a cancel↔restore ping-pong. So in-block we report a
+        // spread AT the elevated threshold and the OFF-side stays held until the
+        // baked hour ENDS (its stated deterministic off-signal).
         // Out of block, the real close-spread flows through unchanged.
+        //
+        // ⚠️ AUDITED 2026-09-15 — three corrections to the paragraph above, all
+        // of which a reader would otherwise take on trust. See finding #10 in
+        // `BUG-replay-vs-live-divergence-audit-2026-09-13.md` and the measured
+        // `EVIDENCE-spread-hour-trough-duration.md`.
+        //
+        // 1. "the entry gate correctly sees the trough" was **FALSE** and has
+        //    been struck. `spread_blackout_decision` is strictly
+        //    `spread_pips > threshold_pips`, and this returns EXACTLY
+        //    `elevated_threshold_pips` — so `8.0 > 8.0` is false and the entry
+        //    gate **never rejects** under the clamp. The clamp sits on the
+        //    permissive boundary. Consequence for anyone retuning this: changing
+        //    the VALUE here wakes a currently-inert gate across the whole corpus
+        //    (a prototype swapping in `hour_p90_frac` flipped 99 of 109 masked
+        //    instrument-hours from ALLOW to REJECT). That is a behaviour change
+        //    needing its own P&L measurement, NOT a side effect of a spread fix.
+        //
+        // 2. The anti-ping-pong property is **CONSTANCY WITHIN THE HOUR, NOT
+        //    MAGNITUDE.** It is tempting to reason "the clamp is safe because it
+        //    always exceeds the 4.0p recovery cutoff" — untrue: 9 of 109 masked
+        //    hours already clamp BELOW it (TN `AUD/USD` 2.00p, `EUR/USD` 2.50p).
+        //    They still can't oscillate, because the value is constant for the
+        //    hour. Any replacement must keep that; the number itself is free.
+        //
+        // 3. This clamp IS a known replay↔live divergence, accepted not fixed.
+        //    Live releases a hold on baked-hour-end OR real-spread-recovery
+        //    (<= `SPREAD_BLACKOUT_RECOVERED_PIPS`); replay can only take the
+        //    first. Measured: EUR/USD's spread genuinely recovers before its
+        //    baked hour ends on **9 of 14 days (64%)** — its clamp is 8.0p,
+        //    exactly 2× the cutoff, so recovery is unreachable by construction.
+        //    GBP/AUD 0/14 and AUD/CHF 0/13 (their spike fills the hour), so this
+        //    bites TIGHT-spread instruments only. Replay is therefore
+        //    systematically MORE CONSERVATIVE than live in spread hours —
+        //    fixtures under-report trades production takes.
+        //
+        // Don't "fix" it with `hour_p90_frac`: that column is a PEAK statistic
+        // (p90 of within-hour minute spreads, generated to size a stop widen),
+        // while early release is driven by the TYPICAL late-hour minute. It
+        // moves EUR/USD 8.00p → 6.85p against a 4.0p cutoff — the wrong
+        // statistic, not a near miss. The shape that would work is to DECOUPLE
+        // the consumers (real bar spread to the entry gate, baked clock to the
+        // hold release), which makes ping-pong impossible by construction.
+        //
+        // NOTE the SL-vs-spread floor does NOT read this: `run_enter` prefers
+        // `windowed_entry_spread` → `get_bidask_candles` (real unclamped bid/ask),
+        // falling back to `get_quote` only when `enter_granularity == None`, which
+        // replay never passes. No corpus entry sizes its stop off this value.
         if is_spread_hour(instrument, as_of)
             && let Some(c) = self.candle_at_as_of()
         {
