@@ -11,6 +11,16 @@
 //! Only the retry-gate-relevant methods do real work
 //! (`lookup_attempt_state`, `list_open_positions`, `cancel_order`); the replay
 //! never places real orders, so `place_entry` and the rest are stubs.
+//!
+//! **A stub here must never LIE.** Where a method cannot do the real thing it
+//! either reports what the simulator genuinely knows or fails loudly — it does
+//! not return a cheerful success having changed nothing. `amend_stop` used to do
+//! exactly that (ignore its id and level, return `Ok(())`) while
+//! `list_open_positions` reported every position with no stop attached. Together
+//! those two would let any live stop-management cron run offline, report success,
+//! move nothing, and leave the entire fixture corpus green — a corpus that
+//! appears to validate behaviour that never executed. See
+//! `[[broker_adapter_stubs_are_lies]]`.
 
 use std::cell::RefCell;
 
@@ -94,6 +104,16 @@ struct HeldOrder {
     /// cancel-and-replace). A cancelled resting order fills nothing and appears in
     /// neither the open nor the pending list; a restore re-activates it.
     cancelled: bool,
+    /// The stop level a [`Broker::amend_stop`] moved this RESTING order's SL to,
+    /// or `None` while it still rests at its placed stop.
+    ///
+    /// Deliberately **beside** `placed` rather than overwriting it: `placed` is
+    /// the "orders are state" record the fill simulator scores against
+    /// (`resolved_for_sim`), and moving the scored stop is a different change
+    /// with a different blast radius (audit findings #5/#8). This field records
+    /// what the broker was *told*, so `list_open_positions` can report it back
+    /// honestly; who *acts* on it is decided separately.
+    amended_stop: Option<f64>,
 }
 
 /// A filled position the broker holds: promoted from a [`HeldOrder`] when a bar
@@ -110,6 +130,15 @@ struct HeldPosition {
     direction: Direction,
     entry_price: f64,
     fill_at: DateTime<Utc>,
+    /// The stop level a [`Broker::amend_stop`] moved this position's SL to, or
+    /// `None` while it still rests at its placed stop. This is what the live
+    /// break-even watcher and the System-2 spread widen do to an open position.
+    ///
+    /// Deliberately **beside** `placed` rather than overwriting it — see
+    /// [`HeldOrder::amended_stop`] for why. `list_open_positions` reports
+    /// `amended_stop.or(placed stop)`, so a cron that amends and re-reads sees
+    /// its own move, while the simulator keeps scoring the placed bracket.
+    amended_stop: Option<f64>,
 }
 
 /// Why a held position left the book — drives the report's exit label and R sign.
@@ -367,6 +396,8 @@ impl ReplayBroker {
             shell: shell.clone(),
             placed: placed.clone(),
             cancelled: false,
+            // Rests at its placed stop until a cron amends it.
+            amended_stop: None,
         });
         self.placed.borrow_mut().push(PlacedAttempt {
             order_id,
@@ -788,6 +819,12 @@ impl ReplayBroker {
                         direction: resolved.direction,
                         entry_price,
                         fill_at,
+                        // An amend that landed while the order was still resting
+                        // carries onto the filled position — the real broker
+                        // attaches the order's SL to the trade it opens, so
+                        // dropping it here would make the amend silently expire at
+                        // the fill.
+                        amended_stop: order.amended_stop,
                     });
                 }
                 SimOutcome::StoppedOut {
@@ -926,6 +963,36 @@ impl ReplayBroker {
     /// Remove an open position by id (closed by bracket, reversal, or expiry).
     fn remove_open(&self, order_id: &str) {
         self.open.borrow_mut().retain(|p| p.order_id != order_id);
+    }
+
+    /// Does `id` address this held position? Accepts BOTH spellings the broker
+    /// itself hands out: the bare `order_id`, and the `{order_id}-pos`
+    /// `position_id` reported by [`Broker::list_open_positions`].
+    ///
+    /// Both are needed because the live callers disagree on which they hold:
+    /// `breakeven_watch` and `blackout_apply` amend by `position.order_id`, while
+    /// the blackout *restore* pass matches a remembered stop on `order_id` **or**
+    /// `position_id` (`blackout_watch.rs`). Accepting only one spelling is the
+    /// id-mismatch class that has already cost this series a stranded park
+    /// (recovered by `trade_id` while every resting path used `order_id`).
+    fn position_addressed_by(pos: &HeldPosition, id: &str) -> bool {
+        pos.order_id == id || format!("{}-pos", pos.order_id) == id
+    }
+
+    /// The stop level to REPORT for a held position: the amended level if a cron
+    /// moved it, else the placed stop it rests at.
+    ///
+    /// Returns `None` only when the intent cannot resolve at all — i.e. we
+    /// genuinely do not know the bracket, which is the one honest use of `None`
+    /// here. It must never be the blanket answer: `None` reads to every live
+    /// stop-management cron as "no stop attached", and all three of them
+    /// (`breakeven_watch`, `blackout_apply`, `blackout_watch`) silently
+    /// early-return on it.
+    fn reported_bracket(&self, pos: &HeldPosition) -> (Option<f64>, Option<f64>) {
+        let resolved = self.resolved_for_sim_probe(&pos.intent, &pos.shell, &pos.placed);
+        let placed_stop = resolved.as_ref().map(|r| r.stop_loss);
+        let take_profit = resolved.as_ref().map(|r| r.take_profit);
+        (pos.amended_stop.or(placed_stop), take_profit)
     }
 
     /// The held-order variant of [`pending_from_attempt`] (S7): same trigger/
@@ -1265,31 +1332,110 @@ impl Broker for ReplayBroker {
             .open
             .borrow()
             .iter()
-            .map(|p| OpenPosition {
-                instrument: p.intent.instrument.clone(),
-                direction: p.direction,
-                stop_loss: None,
-                take_profit: None,
-                position_id: format!("{}-pos", p.order_id),
-                order_id: p.order_id.clone(),
-                stake: 1.0,
-                // The simulator knows the true fill — report it, so anything
-                // that bounds on the fill (the break-even watcher) sees the
-                // same facts here as it does off a live broker.
-                entry_price: Some(p.entry_price),
-                opened_at: Some(p.fill_at),
+            .map(|p| {
+                // Report the REAL bracket: the stop this position rests on (the
+                // placed levels, or whatever a later `amend_stop` moved it to) and
+                // its target. Hard-coding `None` here — as this did — is the same
+                // class of lie as an empty position list: all three live
+                // stop-management crons read `None` as "no stop attached" and
+                // silently skip the position, so wiring any of them to this broker
+                // would produce a fully green, entirely vacuous run. Held to the
+                // same standard as `entry_price`/`opened_at` below, and for the
+                // same reason.
+                let (stop_loss, take_profit) = self.reported_bracket(p);
+                OpenPosition {
+                    instrument: p.intent.instrument.clone(),
+                    direction: p.direction,
+                    stop_loss,
+                    take_profit,
+                    position_id: format!("{}-pos", p.order_id),
+                    order_id: p.order_id.clone(),
+                    stake: 1.0,
+                    // The simulator knows the true fill — report it, so anything
+                    // that bounds on the fill (the break-even watcher) sees the
+                    // same facts here as it does off a live broker.
+                    entry_price: Some(p.entry_price),
+                    opened_at: Some(p.fill_at),
+                }
             })
             .collect();
         Ok(positions)
     }
 
+    /// Record a stop move against the held order/position `position_or_order_id`
+    /// addresses, mirroring the trait's stated matching order: open positions
+    /// first, then resting orders.
+    ///
+    /// **Why this is not a stub.** It used to underscore-ignore both arguments and
+    /// return `Ok(())`. Nothing in replay manages stops *today*, so that was not an
+    /// active bug — but it made an entire class of wiring bug undetectable: point
+    /// any live stop-management cron (`breakeven_watch`, `blackout_apply`'s
+    /// System-2 widen, the blackout restore) at this broker and it would RUN,
+    /// REPORT SUCCESS, MOVE NOTHING, and leave the whole fixture corpus green. A
+    /// corpus that appears to validate stop management which never executed is
+    /// worse than one that fails loudly. See `[[broker_adapter_stubs_are_lies]]`.
+    ///
+    /// Hence both halves: the amend is **recorded** (so a caller that re-reads
+    /// sees its own move) and an id we do not hold is **rejected** with
+    /// [`AmendError::NotFound`] — the variant the trait documents for an unmatched
+    /// id, and the one the live crons already treat as benign-but-logged. An amend
+    /// against an id that never existed is exactly the wiring bug the old `Ok(())`
+    /// concealed.
+    ///
+    /// The recorded level deliberately does **not** move what the fill simulator
+    /// scores (that walks the stored [`PlacedLevels`], untouched here). This
+    /// method makes the broker tell the truth; which subsystem *acts* on the
+    /// amended stop is a separate decision — see audit findings #5/#8.
     async fn amend_stop(
         &self,
         _account_id: &str,
-        _position_or_order_id: &str,
-        _new_stop: f64,
+        position_or_order_id: &str,
+        new_stop: f64,
     ) -> Result<(), AmendError> {
-        Ok(())
+        // Advance the held state to `as_of` first, exactly as every other held-state
+        // reader does (`list_open_positions`, `list_pending_orders`,
+        // `held_attempt_state`). Without it an order that has already FILLED by this
+        // bar but not yet been advanced is still sitting in `resting`, so the amend
+        // would land on the stale resting record while `list_open_positions` — which
+        // does advance — reports the position and reads back the unamended stop. The
+        // amend would appear to succeed and then vanish.
+        self.advance(*self.as_of.borrow());
+        // Open positions first (the trait's documented matching order, and what
+        // every production caller of this method actually holds — all three amend
+        // an OpenPosition they just listed).
+        if let Some(pos) = self
+            .open
+            .borrow_mut()
+            .iter_mut()
+            .find(|p| Self::position_addressed_by(p, position_or_order_id))
+        {
+            tracing::debug!(
+                "ReplayBroker::amend_stop: position {position_or_order_id} stop -> {new_stop}"
+            );
+            pos.amended_stop = Some(new_stop);
+            return Ok(());
+        }
+        // Then resting orders — a pending entry's SL can also be amended. A
+        // cancelled order is not amendable: it rests on no book, so an amend
+        // against it is as much a wiring bug as an unknown id.
+        if let Some(order) = self
+            .resting
+            .borrow_mut()
+            .iter_mut()
+            .find(|o| o.order_id == position_or_order_id && !o.cancelled)
+        {
+            tracing::debug!(
+                "ReplayBroker::amend_stop: resting order {position_or_order_id} stop -> {new_stop}"
+            );
+            order.amended_stop = Some(new_stop);
+            return Ok(());
+        }
+        tracing::error!(
+            "ReplayBroker::amend_stop: no open position or resting order with id \
+             {position_or_order_id} (asked to move its stop to {new_stop}) — reporting NotFound \
+             rather than a silent Ok, which would hide the wiring bug"
+        );
+        Err(AmendError::NotFound)
     }
 
     async fn list_pending_orders(
@@ -1785,6 +1931,252 @@ mod tests {
         assert!(
             b.armed_verified("nope").is_none(),
             "an unknown key must still resolve to nothing, not to some other trade",
+        );
+    }
+
+    // --- finding #9: the broker must TELL THE TRUTH about stops ---
+    //
+    // `amend_stop` used to underscore-ignore both its id and its level and return
+    // `Ok(())`, and `list_open_positions` hard-coded `stop_loss: None` /
+    // `take_profit: None`. That pair is worse than an unimplemented stub: wire any
+    // live stop-management cron (`breakeven_watch`, `blackout_apply`'s System-2
+    // widen, the restore) to this broker and it RUNS, REPORTS SUCCESS, MOVES
+    // NOTHING, and leaves every fixture green — a corpus that appears to validate
+    // stop management that never executed. See
+    // `[[broker_adapter_stubs_are_lies]]`. These tests pin all three halves of the
+    // honesty: report the placed stop, record an amend, and reject an id we do not
+    // hold.
+    //
+    // NOTE these exercise the BROKER's reporting only. What the fill simulator
+    // scores against is deliberately untouched (it has its own `active_stop`
+    // model) — that is findings #5/#8's job, not this change's.
+
+    /// Drive an order to a filled, held position at `as_of` = bar 1, returning the
+    /// broker. Short stop-entry at 1.1000, SL 1.1020, TP 1.0950 (from
+    /// [`short_enter_intent`]), placed through `place_entry` so the position
+    /// carries real [`PlacedLevels`] rather than the legacy re-derive path.
+    async fn broker_with_open_position() -> ReplayBroker {
+        let fire = candle(0, 1.1010); // above the sell-stop: no fill on the fire bar
+        let fill = candle(3600, 1.1000); // bid reaches the 1.1000 sell-stop → fills
+        let b = ReplayBroker::new(vec![fire, fill], 0.0001);
+        b.arm_placement(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&fire.mid()),
+        );
+        b.place_entry(1.0, 3, &entry_req(RiskBudget::Percent(0.5)))
+            .await
+            .expect("placed");
+        b.set_as_of(Utc.timestamp_opt(3600, 0).unwrap());
+        b
+    }
+
+    /// The placed bracket must come back on the open position, exactly as it does
+    /// off a live broker. Before this, every replayed position reported
+    /// `stop_loss: None` — which `breakeven_watch:197`, `blackout_apply:235` and
+    /// `blackout_watch:235` each read as "no stop attached" and silently
+    /// early-return from, so all three crons would no-op offline while looking
+    /// perfectly healthy.
+    #[tokio::test]
+    async fn open_position_reports_its_placed_stop_and_target() {
+        let b = broker_with_open_position().await;
+        let positions = b.list_open_positions("").await.unwrap();
+        assert_eq!(positions.len(), 1, "the order filled on bar 1");
+        let p = &positions[0];
+        assert_eq!(
+            p.stop_loss,
+            Some(1.1020),
+            "the position rests on the PLACED stop — reporting None makes every \
+             live stop-management cron silently skip it"
+        );
+        assert_eq!(
+            p.take_profit,
+            Some(1.0950),
+            "the take-profit is known for exactly the same reason the stop is"
+        );
+    }
+
+    /// An amend against a held position must be RECORDED, and the next read must
+    /// show the moved stop. This is the break-even / widen round-trip: amend, then
+    /// re-list and see your own move. A stub returning `Ok(())` passes the amend
+    /// and fails this read-back — which is precisely the undetectable-wiring-bug
+    /// shape being closed.
+    #[tokio::test]
+    async fn amend_stop_moves_the_reported_stop() {
+        let b = broker_with_open_position().await;
+        // Break-even on a short filled at ~1.1000: move the 1.1020 stop down to entry.
+        b.amend_stop("", "o1", 1.1000)
+            .await
+            .expect("amending a held position must succeed");
+
+        let positions = b.list_open_positions("").await.unwrap();
+        assert_eq!(
+            positions[0].stop_loss,
+            Some(1.1000),
+            "the amended stop must be what the broker reports back — an amend that \
+             reports success but changes nothing is the lie this fixes"
+        );
+        assert_eq!(
+            positions[0].take_profit,
+            Some(1.0950),
+            "amend_stop moves the STOP only; the take-profit is left untouched"
+        );
+    }
+
+    /// The last amend wins, and it is still reported after the position is
+    /// re-advanced (the amend lives on the held record, not on a transient).
+    #[tokio::test]
+    async fn the_latest_amend_is_the_one_reported() {
+        let b = broker_with_open_position().await;
+        b.amend_stop("", "o1", 1.1010).await.expect("first amend");
+        b.amend_stop("", "o1", 1.1000).await.expect("second amend");
+        let positions = b.list_open_positions("").await.unwrap();
+        assert_eq!(
+            positions[0].stop_loss,
+            Some(1.1000),
+            "a second amend supersedes the first"
+        );
+    }
+
+    /// `blackout_watch` matches a remembered stop by `order_id` **or**
+    /// `position_id` (`blackout_watch.rs:224`), so the broker must accept the
+    /// `-pos` form it hands out in `list_open_positions` too. Accepting only one
+    /// spelling is the id-mismatch class that has already bitten this series (a
+    /// park recovered by `trade_id` while every resting path used `order_id`).
+    #[tokio::test]
+    async fn amend_accepts_the_position_id_form_as_well_as_the_order_id() {
+        let b = broker_with_open_position().await;
+        let position_id = b.list_open_positions("").await.unwrap()[0]
+            .position_id
+            .clone();
+        assert_eq!(
+            position_id, "o1-pos",
+            "the id form the broker itself reports"
+        );
+        b.amend_stop("", &position_id, 1.1005)
+            .await
+            .expect("the position_id form must be accepted");
+        assert_eq!(
+            b.list_open_positions("").await.unwrap()[0].stop_loss,
+            Some(1.1005),
+            "…and it must move the same position"
+        );
+    }
+
+    /// An amend against an id the broker does not hold is a WIRING BUG, and must
+    /// surface as one. Returning `Ok(())` here is what let the old stub hide a
+    /// cron amending an id that never existed — the failure mode that makes a
+    /// green corpus meaningless. `AmendError::NotFound` is the honest variant and
+    /// the one the trait documents ("an unmatched id yields NotFound"); the live
+    /// crons already handle it as benign-but-logged.
+    #[tokio::test]
+    async fn amend_against_an_unknown_id_is_not_found() {
+        let b = broker_with_open_position().await;
+        let err = b
+            .amend_stop("", "never-placed", 1.1000)
+            .await
+            .expect_err("an id we do not hold must NOT report success");
+        assert_eq!(err, AmendError::NotFound);
+    }
+
+    /// A resting (unfilled) order's SL can also be amended — the trait matches
+    /// open positions first, then pending orders. Pins that the resting arm is
+    /// wired rather than falling through to `NotFound`.
+    #[tokio::test]
+    async fn amend_reaches_a_still_resting_order() {
+        let fire = candle(0, 1.1010); // no fill: price never reaches the sell-stop
+        let b = ReplayBroker::new(vec![fire, candle(3600, 1.1012)], 0.0001);
+        b.arm_placement(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&fire.mid()),
+        );
+        b.place_entry(1.0, 3, &entry_req(RiskBudget::Percent(0.5)))
+            .await
+            .expect("placed");
+        b.set_as_of(Utc.timestamp_opt(3600, 0).unwrap());
+        assert_eq!(
+            b.list_open_positions("").await.unwrap().len(),
+            0,
+            "precondition: nothing filled, so this can only match the resting arm"
+        );
+        b.amend_stop("", "o1", 1.1030)
+            .await
+            .expect("a resting order's stop must be amendable");
+    }
+
+    /// An amend that arrives BEFORE anything has advanced the held state must
+    /// still land on the position, not on the stale resting record it was
+    /// promoted from.
+    ///
+    /// The hazard: `advance()` moves a filled order out of `resting` into `open`,
+    /// but only the readers that call it see that. `amend_stop` is a WRITER — if
+    /// it skipped the advance, an amend arriving on the fill bar before any read
+    /// would set `amended_stop` on the resting record, and the very next
+    /// `list_open_positions` (which does advance) would promote a *fresh*
+    /// position and report the unamended stop. The amend would report success and
+    /// then evaporate — the exact silent-no-op shape this whole change exists to
+    /// remove.
+    #[tokio::test]
+    async fn an_amend_before_any_read_still_lands_on_the_filled_position() {
+        let fire = candle(0, 1.1010);
+        let fill = candle(3600, 1.1000);
+        let b = ReplayBroker::new(vec![fire, fill], 0.0001);
+        b.arm_placement(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&fire.mid()),
+        );
+        b.place_entry(1.0, 3, &entry_req(RiskBudget::Percent(0.5)))
+            .await
+            .expect("placed");
+        // Move to the fill bar but do NOT read anything — the held state still has
+        // the order in `resting`.
+        b.set_as_of(Utc.timestamp_opt(3600, 0).unwrap());
+        // Address it by the POSITION id form — the spelling `blackout_watch`
+        // may hold. Only the position arm answers to `o1-pos`, so without the
+        // advance the order is still `resting` (which matches on the bare
+        // `order_id` only) and the amend is rejected NotFound outright.
+        b.amend_stop("", "o1-pos", 1.1000)
+            .await
+            .expect("the position-id form must resolve once the fill has advanced");
+
+        let positions = b.list_open_positions("").await.unwrap();
+        assert_eq!(positions.len(), 1, "the order filled on this bar");
+        assert_eq!(
+            positions[0].stop_loss,
+            Some(1.1000),
+            "the amend must survive the promotion — landing it on the stale resting \
+             record would make it silently vanish at the next read"
+        );
+    }
+
+    /// The amend must NOT move what the simulator scores. `placed` is the
+    /// "orders are state" record every fill/exit test walks; the amended stop is
+    /// recorded beside it. This is the scope line for finding #9: the broker now
+    /// tells the truth about stops, and a SEPARATE change (#5/#8) decides who
+    /// listens. If this test ever goes red, the scoring path has been touched and
+    /// the corpus will move.
+    #[tokio::test]
+    async fn amend_does_not_move_the_stop_the_simulator_scores() {
+        let b = broker_with_open_position().await;
+        b.amend_stop("", "o1", 1.1000).await.expect("amended");
+        // Read the held record itself, not the reported view. `list_open_positions`
+        // both advances the held state and is the thing under test elsewhere; here
+        // we want the underlying `placed` bracket the simulator walks.
+        assert_eq!(b.list_open_positions("").await.unwrap().len(), 1);
+        let pos = b.open.borrow()[0].clone();
+        let placed = pos.placed.as_ref().expect("placed via place_entry");
+        assert_eq!(
+            placed.stop_loss, 1.1020,
+            "the PLACED bracket the simulator scores must be untouched by an amend"
+        );
+        let resolved = b
+            .resolved_for_sim_probe(&pos.intent, &pos.shell, &pos.placed)
+            .expect("resolves");
+        assert_eq!(
+            resolved.stop_loss, 1.1020,
+            "…and so must the Resolved the fill sim walks"
         );
     }
 }
