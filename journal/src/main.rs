@@ -48,6 +48,29 @@ struct Args {
     /// A smoke test for the CLI wiring and parsers.
     #[arg(long)]
     dump: bool,
+
+    /// Drive `local-chart` instead of TradingView on `l` (load). Bare flag
+    /// uses `local-chart`'s own default port; an optional URL overrides it
+    /// (the port local-chart itself was started on, if not 8790).
+    ///
+    /// A startup flag, not a runtime toggle — see `tv::ChartBackend`'s doc
+    /// comment for why this is the honest shape here (a chart read for
+    /// operator *context*, unlike `tv-arm`, which never gets a flag like
+    /// this because it produces a signed plan).
+    #[arg(long, value_name = "URL", num_args = 0..=1, default_missing_value = tv::DEFAULT_LOCAL_CHART_URL)]
+    new_tv: Option<String>,
+}
+
+impl Args {
+    /// Resolve the flag into the [`tv::ChartBackend`] the app runs with.
+    fn chart_backend(&self) -> tv::ChartBackend {
+        match &self.new_tv {
+            Some(base_url) => tv::ChartBackend::LocalChart {
+                base_url: base_url.clone(),
+            },
+            None => tv::ChartBackend::TradingView,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -58,9 +81,10 @@ fn main() -> Result<()> {
     if args.dump {
         return dump_plans();
     }
+    let backend = args.chart_backend();
 
     let mut terminal = setup_terminal()?;
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, backend);
     restore_terminal(&mut terminal)?;
     result
 }
@@ -68,8 +92,8 @@ fn main() -> Result<()> {
 /// The main render/input loop. Background jobs (replay, timeline) run on their
 /// own threads and post results to `app.drain_jobs`; the short poll timeout is
 /// the redraw tick that animates the "loading…" spinner and picks up results.
-fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    let mut app = App::new()?;
+fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, backend: tv::ChartBackend) -> Result<()> {
+    let mut app = App::new(backend)?;
     while !app.should_quit {
         // A refresh (Ctrl-L) clears the back buffer so the next draw repaints
         // every cell — recovers from any residual corruption on the screen.
@@ -147,4 +171,58 @@ fn init_tracing() {
         .with(fmt::layer().with_writer(std::io::stderr))
         .with(ErrorLayer::default())
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Default (no `--new-tv`): TradingView, byte-identical to before the
+    /// flag existed. This is the path in daily use — it must never change by
+    /// accident.
+    #[test]
+    fn no_flag_defaults_to_tradingview() {
+        let args = Args::parse_from(["journal"]);
+        assert_eq!(args.chart_backend(), tv::ChartBackend::TradingView);
+    }
+
+    /// The bare flag (no URL) resolves to local-chart's own default port.
+    #[test]
+    fn bare_new_tv_uses_the_default_local_chart_url() {
+        let args = Args::parse_from(["journal", "--new-tv"]);
+        assert_eq!(
+            args.chart_backend(),
+            tv::ChartBackend::LocalChart {
+                base_url: tv::DEFAULT_LOCAL_CHART_URL.to_string()
+            }
+        );
+    }
+
+    /// `--new-tv <url>` overrides the default — for a local-chart instance
+    /// started on a non-default port.
+    #[test]
+    fn new_tv_with_url_overrides_the_default() {
+        let args = Args::parse_from(["journal", "--new-tv", "http://127.0.0.1:9999"]);
+        assert_eq!(
+            args.chart_backend(),
+            tv::ChartBackend::LocalChart {
+                base_url: "http://127.0.0.1:9999".to_string()
+            }
+        );
+    }
+
+    /// `--dump` composes with `--new-tv` at the parse level (main() checks
+    /// `--dump` first and returns before `chart_backend()` is even read, but
+    /// the flags must still parse together without clap rejecting the pair).
+    #[test]
+    fn dump_and_new_tv_parse_together() {
+        let args = Args::parse_from(["journal", "--dump", "--new-tv"]);
+        assert!(args.dump);
+        assert_eq!(
+            args.chart_backend(),
+            tv::ChartBackend::LocalChart {
+                base_url: tv::DEFAULT_LOCAL_CHART_URL.to_string()
+            }
+        );
+    }
 }

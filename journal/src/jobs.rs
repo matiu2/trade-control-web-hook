@@ -121,23 +121,30 @@ pub fn spawn_save_fixture(
     });
 }
 
-/// Spawn the TradingView **load** job — set the live chart's symbol + timeframe
-/// for this plan. The operator scrolls/zooms to the setup manually; no
+/// Spawn the chart-load job — set the active backend's chart to this plan's
+/// symbol + timeframe. The operator scrolls/zooms to the setup manually; no
 /// scroll-to-anchor, no range, no drawing. `instrument`/`granularity` come from
-/// the plan row; `broker` from the fetched detail (drives the exchange prefix).
+/// the plan row; `broker` from the fetched detail (drives the TradingView
+/// exchange prefix; unused by the local-chart backend, which is single-broker).
+/// `backend` is `App::chart_backend` — TradingView by default, local-chart
+/// under `--new-tv` — cloned in at spawn time since the job runs off-thread.
 ///
-/// Cheap when the chart is already right: `load_chart` reads the chart first and
-/// no-ops if it matches (see `tv`'s module doc), so this stays a background job
-/// mainly for the miss case.
+/// Cheap when the chart is already right ON THE TRADINGVIEW PATH: `load_chart`
+/// reads the chart first and no-ops if it matches (see `tv`'s module doc). The
+/// local-chart backend has no such fast path — see `tv::local_chart`'s module
+/// doc for why — so this job always does real work there, still off-thread so
+/// the UI doesn't stall on the browser-open.
 pub fn spawn_load_tv(
     tx: Sender<JobResult>,
     trade_id: String,
     instrument: String,
     broker: String,
     granularity: String,
+    backend: crate::tv::ChartBackend,
 ) {
     spawn(tx, trade_id, JobKind::LoadTv, move || {
-        let already_there = crate::tv::load_chart(&instrument, &broker, &granularity)?;
+        let already_there =
+            crate::tv::load_chart_backend(&backend, &instrument, &broker, &granularity)?;
         Ok(JobOutcome::LoadTv { already_there })
     });
 }
