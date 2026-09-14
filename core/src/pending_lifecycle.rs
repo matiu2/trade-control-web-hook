@@ -2775,4 +2775,150 @@ mod tests {
         assert_eq!(report.cancelled, vec!["t-enter-o1".to_string()]);
         assert!(report.cancel_failed.is_empty());
     }
+
+    // --- engine-path placements are protectable (the fix under test) ---------
+    //
+    // These drive the REAL entry point — `run_enter` with `raw_body: None`,
+    // which is exactly what `trade-control-cron::engine::dispatch_action` passes
+    // — and then run the LIVE `SignedBodySource` lifecycle over the resulting
+    // resting order. Testing `put_order_body` in isolation would not catch a
+    // caller that never stores, so the round trip is the unit.
+
+    /// Place one enter the way `trade-control-cron::engine::dispatch_action`
+    /// now does: re-sign the already-`Verified` intent and hand those bytes to
+    /// `run_enter` as its `raw_body`.
+    ///
+    /// This mirrors, rather than calls, the cron's `engine_order_body` — `core`
+    /// cannot depend on the cron crate. The cron's own
+    /// `an_engine_fired_enter_stores_a_recoverable_order_body` drives the real
+    /// helper, so the two halves are both covered; this one owns the
+    /// lifecycle round trip that only `core` can reach.
+    fn place_via_engine_path(
+        broker: &MockBroker,
+        store: &MemStateStore,
+        now: DateTime<Utc>,
+    ) -> crate::dispatch::ActionResult {
+        let verified = armed_verified("AUD/CHF");
+        let cfg = DispatchConfig {
+            worker_max_risk_pct: 1.0,
+            worker_max_open_positions: 3,
+            pip_size: 0.0001,
+            tick_size: None,
+            caps: AccountCaps::default(),
+        };
+        let body = crate::resign::resign(&verified, &KEY).expect("re-sign the fired enter");
+        run(crate::dispatch::run_enter(
+            broker,
+            store,
+            &verified,
+            &cfg,
+            now,
+            Some(&body),
+            Some(Granularity::H1),
+            false,
+        ))
+    }
+
+    /// THE BUG. An engine-placed resting order must be recoverable through the
+    /// LIVE `SignedBodySource` seam, so a news pause can cancel it.
+    ///
+    /// Before the fix `run_enter` stored nothing when `raw_body` was `None`, so
+    /// `get_order_body` answered `None`, the seam said `Unrecoverable`, and RAIL
+    /// 2 left the order resting through the event it should have been pulled
+    /// from. Note the failure mode is a MISSING PROTECTION, not a lost order —
+    /// which is why this asserts the cancel HAPPENS rather than that nothing
+    /// broke.
+    #[test]
+    fn an_engine_placed_order_is_cancelled_by_a_news_pause() {
+        let broker = MockBroker::with_pending(pending("order-redriven", "AUD/CHF"));
+        let store = MemStateStore::new();
+        let now = ts("2026-07-08T12:00:00Z"); // clean bar — only the pause can cancel
+        store.set_clock(now);
+
+        let placed = place_via_engine_path(&broker, &store, now);
+        assert!(
+            matches!(placed, crate::dispatch::ActionResult::Ok(_)),
+            "engine-path enter must place: {}",
+            placed.describe()
+        );
+
+        run(pause_trade(&store, now));
+        let report = run(pending_order_lifecycle(
+            &broker,
+            &store,
+            &StubCfg,
+            // The LIVE seam, with the SAME key the worker signs with.
+            &src(),
+            Some("reversals"),
+            now,
+            ClearPolicy::LeaveForCaller,
+        ));
+
+        assert_eq!(
+            report.cancelled,
+            vec!["order-redriven".to_string()],
+            "an engine-placed order must be cancellable by a news pause",
+        );
+        assert!(
+            report.skipped.is_empty(),
+            "it must not be skipped as unrecoverable: {:?}",
+            report.skipped,
+        );
+    }
+
+    /// The other half of the round trip: the cancelled engine-placed order is
+    /// RESTORED once the pause lifts. Asserting only the cancel would let a
+    /// change ship that pulls orders it can never put back — the exact thing
+    /// RAIL 2 exists to prevent.
+    #[test]
+    fn an_engine_placed_order_is_restored_when_the_pause_lifts() {
+        let broker = MockBroker::with_pending(pending("order-redriven", "AUD/CHF"));
+        broker.set_quote(0.5600, 0.5602);
+        let store = MemStateStore::new();
+        let now = ts("2026-07-08T12:00:00Z");
+        store.set_clock(now);
+
+        assert!(matches!(
+            place_via_engine_path(&broker, &store, now),
+            crate::dispatch::ActionResult::Ok(_)
+        ));
+
+        // ON: pause armed ⇒ cancelled + recorded.
+        run(pause_trade(&store, now));
+        let on = run(pending_order_lifecycle(
+            &broker,
+            &store,
+            &StubCfg,
+            &src(),
+            Some("reversals"),
+            now,
+            ClearPolicy::LeaveForCaller,
+        ));
+        assert_eq!(on.cancelled, vec!["order-redriven".to_string()]);
+
+        // OFF: pause cleared ⇒ the record's holder set empties and the order is
+        // re-driven through `run_enter`.
+        run(async {
+            store
+                .clear_pause("t", "cal-cpi-pause")
+                .await
+                .expect("clear pause");
+        });
+        // Nothing rests at the broker any more — it was cancelled.
+        broker.pendings.borrow_mut().clear();
+        let off = run(pending_order_lifecycle(
+            &broker,
+            &store,
+            &StubCfg,
+            &src(),
+            Some("reversals"),
+            now + chrono::Duration::minutes(5),
+            ClearPolicy::ClearRecord,
+        ));
+        assert_eq!(
+            off.restored,
+            vec![("t".to_string(), RestoreReason::Recovered)],
+            "the engine-placed order must be re-driven once the pause lifts",
+        );
+    }
 }
