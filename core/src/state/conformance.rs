@@ -638,6 +638,7 @@ fn sample_attempt(
         shell_time: now,
         expires_at: now + chrono::Duration::hours(24),
         stop_loss_price: None,
+        adverse_extreme: None,
         cancel_at: None,
         pip_size: None,
         blackout_close: BlackoutCloseAction::default(),
@@ -690,6 +691,38 @@ pub async fn entry_attempt(store: &impl StateStore, tag: &str) {
             .broker_trade_id
             .as_deref(),
         Some("trade-xyz")
+    );
+
+    // set adverse_extreme: the SL-breach sweep's running extreme. Held to the
+    // same contract on both backends because a silently-dropped or mistyped
+    // write on one of them turns that sweep back into an instantaneous-spot
+    // sampling lottery (see `EntryAttempt::adverse_extreme`) — and would do so
+    // only in production, where Pg is the store. Idempotent, no-op on a missing
+    // attempt_no, and the value must survive the round-trip as an f64.
+    store
+        .set_entry_attempt_adverse_extreme(None, &tid, 1, 1.0925)
+        .await
+        .unwrap();
+    store
+        .set_entry_attempt_adverse_extreme(None, &tid, 99, 9.9999)
+        .await
+        .unwrap();
+    let got = store.list_entry_attempts(None, &tid).await.unwrap();
+    assert_eq!(
+        got.iter()
+            .find(|a| a.attempt_no == 1)
+            .unwrap()
+            .adverse_extreme,
+        Some(1.0925),
+        "the running adverse extreme must round-trip through the store"
+    );
+    assert_eq!(
+        got.iter()
+            .find(|a| a.attempt_no == 2)
+            .unwrap()
+            .adverse_extreme,
+        None,
+        "a write must touch only its own attempt_no",
     );
 
     // Isolated per account; the global scope sees neither.

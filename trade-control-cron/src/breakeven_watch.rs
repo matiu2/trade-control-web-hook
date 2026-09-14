@@ -386,6 +386,7 @@ mod tests {
             shell_time: ts("2026-06-24T00:00:00Z"),
             expires_at: ts("2026-06-30T00:00:00Z"),
             stop_loss_price: Some(1.1040),
+            adverse_extreme: None,
             cancel_at: None,
             pip_size: Some(0.0001),
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
