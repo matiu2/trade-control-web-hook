@@ -113,14 +113,22 @@ pub struct App {
     /// the corpus is ~125 directories — a `read_dir` + 125 file reads per frame
     /// would make the TUI visibly stutter.
     pub fixtures: Vec<crate::fixtures::Cell>,
+    /// Which chart `l` drives — TradingView by default, local-chart under
+    /// `--new-tv`. Set once at startup (see `main.rs::Args::chart_backend`)
+    /// and never mutated at runtime — this is deliberately not a toggle key,
+    /// per `tv::ChartBackend`'s own doc comment on why a flag, not a runtime
+    /// branch, is the right shape here.
+    pub chart_backend: crate::tv::ChartBackend,
 }
 
 /// Braille spinner frames for the "loading…" indicator.
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 impl App {
-    /// Build the app, fetching the initial plan list.
-    pub fn new() -> Result<Self> {
+    /// Build the app, fetching the initial plan list. `chart_backend` is
+    /// resolved once from CLI args before this is called — see
+    /// `main.rs::Args::chart_backend`.
+    pub fn new(chart_backend: crate::tv::ChartBackend) -> Result<Self> {
         let plans = fetch_plans()?;
         let (job_tx, job_rx) = channel();
         Ok(Self {
@@ -143,6 +151,7 @@ impl App {
             tv_load_pending: false,
             save_fixture_pending: false,
             fixtures: crate::fixtures::scan(&crate::fixtures::default_dir()),
+            chart_backend,
         })
     }
 
@@ -626,13 +635,17 @@ impl App {
         if !self.mark_in_flight(trade_id, JobKind::LoadTv) {
             return;
         }
-        self.status = Status::info(format!("{trade_id}: loading TradingView…"));
+        self.status = Status::info(format!(
+            "{trade_id}: loading {}…",
+            self.chart_backend.label()
+        ));
         jobs::spawn_load_tv(
             self.job_tx.clone(),
             trade_id.to_string(),
             instrument,
             broker,
             granularity,
+            self.chart_backend.clone(),
         );
     }
 
@@ -901,6 +914,9 @@ impl App {
             // Render tests must not depend on whatever is on the developer's
             // disk; a test that wants a corpus sets `fixtures` explicitly.
             fixtures: Vec::new(),
+            // Default to TradingView — the byte-identical-by-default path. A
+            // test exercising `--new-tv` sets this explicitly.
+            chart_backend: crate::tv::ChartBackend::TradingView,
         }
     }
 
@@ -1444,7 +1460,8 @@ mod e2e {
     #[test]
     #[ignore]
     fn down_on_timeline_actually_loads_the_next_plan() {
-        let mut app = App::new().expect("fetch plan list from the live worker");
+        let mut app = App::new(crate::tv::ChartBackend::TradingView)
+            .expect("fetch plan list from the live worker");
         assert!(app.plans.len() > 1, "need 2+ plans to move between");
 
         app.push_deeper(); // List -> Timeline, fetches plan #1

@@ -31,6 +31,18 @@
 //! a redundant load costs a second, while a wrong skip leaves the operator on
 //! the wrong chart and — since tv-arm re-arms from whatever chart is up — yields
 //! a *wrong answer*, not a slow one.
+//!
+//! ## `--new-tv`: a second chart backend
+//!
+//! This module also hosts [`ChartBackend`] and [`load_chart_backend`], the
+//! dispatch `--new-tv` uses to point `l` at `local-chart` (`local_chart`
+//! submodule) instead of this file's TradingView path. The TradingView
+//! functions below (`load_chart` and everything it calls) are untouched by
+//! that addition — `--new-tv` absent is byte-identical to before it existed.
+
+mod local_chart;
+
+pub use local_chart::{DEFAULT_LOCAL_CHART_URL, load_chart_local};
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -46,6 +58,53 @@ const TV_MCP_ROOT: &str = "/home/matiu/Downloads/tradingview-mcp-jackson";
 
 /// Pause between tv-mcp commands so TradingView can catch up.
 const STEP_PAUSE: Duration = Duration::from_millis(1000);
+
+/// Which chart the `l` key drives. Default is TradingView (today's behaviour,
+/// unchanged); `--new-tv` at startup switches every plan to `LocalChart`.
+///
+/// An enum rather than a bare `bool`: adding a third backend later is then a
+/// compile error at every match site instead of a silently-wrong default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChartBackend {
+    /// The existing tv-mcp-driven path — [`load_chart`], byte-identical.
+    TradingView,
+    /// `--new-tv [URL]` — local-chart, at `base_url` (no trailing slash).
+    LocalChart { base_url: String },
+}
+
+impl ChartBackend {
+    /// A short label for the UI indicator (footer/header), so the active
+    /// backend is never a silent surprise when `l` is pressed.
+    pub fn label(&self) -> &str {
+        match self {
+            ChartBackend::TradingView => "TradingView",
+            ChartBackend::LocalChart { .. } => "local-chart",
+        }
+    }
+}
+
+/// Load a plan's chart on whichever backend is active. Same return contract as
+/// [`load_chart`] (`Ok(true)` = already there, nothing changed), dispatching to
+/// the TradingView path unchanged or the new local-chart path.
+///
+/// local-chart has no server-readable "what's on screen right now" (see
+/// `local_chart`'s module docs) — so its `Ok(true)` never fires; every call
+/// opens/navigates. That is the SAME fail-open direction the TradingView path
+/// documents ("answers false on any doubt"): the failure mode of always
+/// reloading is a wasted browser navigation, never a stranded operator.
+pub fn load_chart_backend(
+    backend: &ChartBackend,
+    instrument: &str,
+    broker: &str,
+    granularity: &str,
+) -> Result<bool> {
+    match backend {
+        ChartBackend::TradingView => load_chart(instrument, broker, granularity),
+        ChartBackend::LocalChart { base_url } => {
+            load_chart_local(base_url, instrument, granularity)
+        }
+    }
+}
 
 /// Load a plan onto the live chart: set the symbol and timeframe **only**. The
 /// operator scrolls/zooms to the setup manually — we deliberately do **not**
@@ -168,10 +227,14 @@ fn tv_symbol(instrument: &str, broker: &str) -> Result<String> {
     }
 }
 
-/// Turn a raw broker instrument id into a bare TradingView symbol by dropping
-/// the separators brokers use but TradingView doesn't: `AUD_SGD` (OANDA form)
-/// and `AUD/SGD` (TradeNation form) both → `AUDSGD`. Used as the last-resort
-/// fallback when instrument-lookup has no TradingView symbol for the asset.
+/// Turn a raw broker instrument id into a bare symbol by dropping the
+/// separators brokers use but TradingView/local-chart don't: `AUD_SGD`
+/// (OANDA form) and `AUD/SGD` (TradeNation form) both → `AUDSGD`. Used as
+/// the last-resort fallback when instrument-lookup has no symbol for the
+/// asset on the target — TradingView here, OANDA in `local_chart`. Plain
+/// private (no `pub`): a private item in a parent module is already visible
+/// to its own submodules in Rust, so `local_chart` reuses this directly via
+/// `super::strip_separators` rather than duplicating the same filter.
 fn strip_separators(instrument: &str) -> String {
     instrument
         .chars()

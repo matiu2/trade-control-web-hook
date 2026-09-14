@@ -66,18 +66,26 @@ fn render_body(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The one-line footer: context hints on the left, status on the right.
+///
+/// The `l` hint names the ACTIVE chart backend (`load-TV` / `load-chart`)
+/// rather than a fixed "load-TV" label — under `--new-tv`, `l` drives
+/// local-chart, and a stale hint would be exactly the "operator forgets and
+/// is surprised" case the flag's own doc comment calls out. See
+/// `App::chart_backend`.
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
+    let load_hint = load_hint(&app.chart_backend);
     let hints = match app.screen {
-        Screen::List => "↑↓ move  →/n open  / search  s fixtures  c copy  q quit",
+        Screen::List => "↑↓ move  →/n open  / search  s fixtures  c copy  q quit".to_string(),
         Screen::Replay => {
             "↑↓/jk scroll  ←/→ nav  r replay  c copy  o shot  ^L refresh  i detail  x delete  q quit"
+                .to_string()
         }
-        Screen::Compare => {
-            "← back  l load-TV  r replay  s fixtures  c copy  o shot  i detail  d/x delete  q quit"
-        }
-        _ => {
-            "← back  →/n deeper  l load-TV  r replay  s fixtures  c copy  o shot  i detail  d/x delete  q quit"
-        }
+        Screen::Compare => format!(
+            "← back  l {load_hint}  r replay  s fixtures  c copy  o shot  i detail  d/x delete  q quit"
+        ),
+        _ => format!(
+            "← back  →/n deeper  l {load_hint}  r replay  s fixtures  c copy  o shot  i detail  d/x delete  q quit"
+        ),
     };
     let status_style = if app.status.is_error {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
@@ -108,6 +116,18 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         None => Line::from(Span::styled(app.status.text.clone(), status_style)),
     };
     f.render_widget(Paragraph::new(status_line), chunks[1]);
+}
+
+/// The `l` footer hint's verb for the active backend — `load-TV` (default) or
+/// `load-chart` (`--new-tv`). Kept a plain function (not a method on
+/// `ChartBackend`) since it's a footer-hint wording choice, distinct from
+/// `ChartBackend::label`'s longer "TradingView"/"local-chart" used in the
+/// status line while a load is in flight.
+fn load_hint(backend: &crate::tv::ChartBackend) -> &'static str {
+    match backend {
+        crate::tv::ChartBackend::TradingView => "load-TV",
+        crate::tv::ChartBackend::LocalChart { .. } => "load-chart",
+    }
 }
 
 /// A small helper: a bordered block with a title, used by several screens.
@@ -232,6 +252,45 @@ mod tests {
         assert!(text.contains("normal"), "info bar should show entry mode");
         assert!(text.contains("oanda"), "info bar should show the broker");
         assert!(text.contains("Timeline"));
+    }
+
+    /// The footer's `l` hint names the ACTIVE backend, so `--new-tv` is never
+    /// a silent surprise. Proves both directions on the SAME screen/plan,
+    /// varying only `chart_backend` — the composite-key-test discipline: if
+    /// only the default were asserted, a mutation that always prints
+    /// "load-TV" regardless of the backend field would still pass.
+    #[test]
+    fn footer_hint_names_the_active_chart_backend() {
+        let rows = parse_plan_list(LIST).unwrap();
+        let mut app = App::from_rows(rows);
+        app.select_to("hs-aud-cad-a07622da");
+        app.seed_current(PlanData {
+            detail: parse_plan_export(EXPORT).ok(),
+            export_json: Some(EXPORT.to_string()),
+            timeline_json: Some(TIMELINE.to_string()),
+            replay_report: None,
+            tv_loaded: true,
+            max_depth: 1,
+            fixture_report: None,
+        });
+        app.set_screen(Screen::Timeline);
+
+        // Default: TradingView.
+        let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        term.draw(|f| super::render(f, &app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("load-TV"), "default hint:\n{text}");
+        assert!(!text.contains("load-chart"), "default hint:\n{text}");
+
+        // --new-tv: local-chart.
+        app.chart_backend = crate::tv::ChartBackend::LocalChart {
+            base_url: "http://127.0.0.1:8790".to_string(),
+        };
+        let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        term.draw(|f| super::render(f, &app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("load-chart"), "--new-tv hint:\n{text}");
+        assert!(!text.contains("load-TV"), "--new-tv hint:\n{text}");
     }
 
     /// Seed the AUD/CAD plan on a deep screen, with `fixtures` as the corpus.
