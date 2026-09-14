@@ -661,4 +661,147 @@ mod tests {
         let pos = position("EUR_NZD", Direction::Short, "POS-X");
         assert!(join_position_to_attempt(&pos, Some("reversals"), &attempts).is_none());
     }
+
+    // ---- Rule 2 on the LIVE path -------------------------------------------
+
+    /// A GBP/AUD short whose break-even snapshot arms at 1.0900.
+    ///
+    /// GBP/AUD carries a TN spread-hour mask of `[21]`, so a bar closing inside
+    /// the 21:00Z hour is one of the "rubbish candles" the engine already
+    /// suppresses entries and crosses on. The instrument choice is the whole
+    /// point: it must be one the *same* baked table flags, or the live gate and
+    /// the replay gate are answering different questions.
+    fn spread_hour_attempt() -> EntryAttempt {
+        let mut a = attempt_with_be(
+            "GBP/AUD",
+            Direction::Short,
+            None,
+            Some("POS-W"),
+            Some(BreakevenSnapshot {
+                rule: Breakeven::at_half(),
+                entry_price: 1.1000,
+                take_profit: 1.0800, // ⇒ arms at 1.0900
+                granularity: Granularity::H1,
+            }),
+        );
+        a.instrument = "GBP/AUD".into();
+        a
+    }
+
+    fn spread_hour_position() -> OpenPosition {
+        OpenPosition {
+            instrument: "GBP/AUD".into(),
+            direction: Direction::Short,
+            stop_loss: Some(1.1030),
+            take_profit: Some(1.0800),
+            position_id: "POS-W".into(),
+            order_id: "POS-W".into(),
+            stake: 10_000.0,
+            entry_price: Some(1.1000),
+            opened_at: Some(ts("2026-07-13T19:00:00Z")),
+        }
+    }
+
+    /// **RULE 2 on the live path.** The only bar that would arm break-even
+    /// closes inside the 21:00Z spread hour — a bar whose widen the cron's
+    /// System 2 is holding. The broker must receive **no amend**.
+    ///
+    /// Asserted at `watch_one` (the broker seam), not at `decide`: a gate that
+    /// the pure decision honours and the wiring ignores is exactly the mutation
+    /// that survived last time (`BUG-breakeven-arms-off-pre-fill-history.md`).
+    #[test]
+    fn the_live_path_does_not_arm_off_a_bar_inside_a_spread_hour() {
+        let attempts = vec![spread_hour_attempt()];
+        let pos = spread_hour_position();
+        // 20:00Z closes at 1.0990 — above the 1.0900 level, does not arm.
+        // 21:00Z closes at 1.0880 — past it, but INSIDE the spread hour.
+        let broker = SpyBroker::with(vec![
+            bar("2026-07-13T20:00:00Z", 1.0990),
+            bar("2026-07-13T21:00:00Z", 1.0880),
+        ]);
+        pollster::block_on(watch_one(
+            &broker,
+            None,
+            &attempts,
+            &pos,
+            ts("2026-07-13T23:00:00Z"),
+        ));
+        assert!(
+            broker.amends.borrow().is_empty(),
+            "Rule 2: a bar inside an active spread-hour widen must not arm \
+             break-even, but the live path amended to {:?}",
+            broker.amends.borrow(),
+        );
+    }
+
+    /// The mirror, and the premise guard: **the same close, one hour later**,
+    /// outside the spread hour, DOES arm and DOES reach the broker.
+    ///
+    /// Without this the test above would pass for any reason at all — a broken
+    /// join, a wrong snapshot, a gate that suppressed break-even everywhere. The
+    /// arming close (1.0880) is identical in both tests; only the bar's *hour*
+    /// differs, so the bar's spread-hour membership is the sole variable.
+    #[test]
+    fn the_live_path_does_arm_off_the_same_close_outside_a_spread_hour() {
+        let attempts = vec![spread_hour_attempt()];
+        let pos = spread_hour_position();
+        let broker = SpyBroker::with(vec![
+            bar("2026-07-13T20:00:00Z", 1.0990),
+            bar("2026-07-13T22:00:00Z", 1.0880), // same close, ordinary hour
+        ]);
+        pollster::block_on(watch_one(
+            &broker,
+            None,
+            &attempts,
+            &pos,
+            ts("2026-07-14T00:00:00Z"),
+        ));
+        let amends = broker.amends.borrow().clone();
+        assert_eq!(
+            amends.len(),
+            1,
+            "an ordinary post-fill bar must still arm break-even, got {amends:?}"
+        );
+        assert!(
+            (amends[0] - 1.1000).abs() < 1e-9,
+            "break-even targets the FILL 1.1000, got {}",
+            amends[0]
+        );
+    }
+
+    /// A mid-spread-hour crossing is **forgotten, not deferred**. The rejected
+    /// alternative was to remember it and apply break-even once the widen
+    /// restored; the distinguishing evidence is a later ordinary bar that does
+    /// **not** qualify on its own. Under the rejected design the remembered
+    /// crossing would still arm here.
+    ///
+    /// Note `decide` folds the *most-progressed* close since fill, so without an
+    /// explicit exclusion the 21:00Z bar would still win that fold on a later
+    /// tick — which is exactly why the gate has to drop the bar rather than
+    /// merely skip it on the tick it arrives.
+    #[test]
+    fn a_spread_hour_crossing_is_forgotten_not_deferred_on_the_live_path() {
+        let attempts = vec![spread_hour_attempt()];
+        let pos = spread_hour_position();
+        let broker = SpyBroker::with(vec![
+            // Deep crossing INSIDE the spread hour.
+            bar("2026-07-13T21:00:00Z", 1.0850),
+            // Later ordinary bars that do NOT qualify on their own (> 1.0900).
+            bar("2026-07-13T22:00:00Z", 1.0960),
+            bar("2026-07-13T23:00:00Z", 1.0975),
+        ]);
+        pollster::block_on(watch_one(
+            &broker,
+            None,
+            &attempts,
+            &pos,
+            ts("2026-07-14T01:00:00Z"),
+        ));
+        assert!(
+            broker.amends.borrow().is_empty(),
+            "the mid-widen crossing must be forgotten, not banked for after the \
+             restore; the live path amended to {:?}",
+            broker.amends.borrow(),
+        );
+    }
 }

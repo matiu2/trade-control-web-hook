@@ -35,6 +35,10 @@
 //! without a broker, and mutation-testable); the effectful ones carry only
 //! plumbing.
 //!
+//! - [`in_force_stop`] — **pure.** *"Which stop is the broker holding on this
+//!   bar?"* once break-even and the spread-hour widen are both in play. Owns the
+//!   two operator rules: a widen moves (and restores to) the **in-force** stop,
+//!   and break-even does not arm off a bar inside an active widen.
 //! - [`join`] — **pure.** Match a broker position back to the `EntryAttempt`
 //!   that opened it. De-duplicated from two byte-identical cron copies.
 //! - [`park`] — **effectful.** Persisting a Stored order on the trade's record:
@@ -73,6 +77,7 @@
 //!   spread sample, counted in **bars of market** rather than hours of
 //!   wall-clock, so a weekend can't silently shrink the sample.
 
+mod in_force_stop;
 mod join;
 mod park;
 mod pending;
@@ -87,6 +92,7 @@ mod tick;
 mod widen_episodes;
 mod widen_restore;
 
+pub use in_force_stop::*;
 pub use join::*;
 pub use park::*;
 pub use pending::*;

@@ -151,6 +151,25 @@ pub fn restore_decision(
         // Still at-or-wider than the original ⇒ this is our widen to give back.
         // Restore the remembered value VERBATIM — see the module docs on why
         // this must not be recomputed.
+        //
+        // Why `original_stop` cannot be a stale or arbitrary level: **the stop
+        // cannot be moved while the widen window is open.** The in-force stop is
+        // captured once, when the episode opens, and stays constant for the
+        // episode's whole duration — break-even, the only other system that
+        // would move it, is forbidden from arming off a bar inside an active
+        // widen (Rule 2 in `crate::order_control::in_force_stop`). So the level
+        // remembered at `effective_from` is still the right level at
+        // `restored_at`, and handing it back verbatim returns the stop the trade
+        // actually had rather than some other, unrelated level.
+        //
+        // That invariant is what makes this arm safe, and it is why the old
+        // `may_widen` refusal (see the tombstone at the foot of this file) could
+        // be deleted without losing the protection it was reaching for. If a
+        // future change ever lets another system tighten the stop mid-episode,
+        // this arm stops being correct: the remembered value would be a level
+        // the broker no longer holds, and restoring it would widen back past a
+        // stop something else had deliberately moved in. Re-derive a guard here
+        // if that day comes — do not weaken Rule 2 to get there.
         RestoreDecision::RestoreTo(original_stop)
     }
 }
@@ -311,98 +330,27 @@ mod tests {
     }
 }
 
-/// May System 2 widen this stop, or has break-even already made the trade free?
-///
-/// # The hazard
-///
-/// The widen captures `position.stop_loss` — the **live** stop — as the level it
-/// will later restore. If break-even (System F) has already moved that stop to
-/// entry, widening does two unwanted things at once:
-///
-/// 1. It pushes the stop **back past break-even**, re-exposing a trade whose
-///    risk had been eliminated. A spread hour is a reason to give a stop more
-///    room *against its original risk*, never a reason to re-introduce risk the
-///    operator had already banked.
-/// 2. It records break-even as the "original", so the later restore returns to
-///    break-even — silently redefining what the trade's original stop was.
-///
-/// [`restore_decision`] guards the *restore* side of the B↔F collision; this
-/// guards the *widen* side. Together they make the two systems commutative:
-/// whichever runs first, a locked-in break-even survives.
-///
-/// # The rule
-///
-/// A stop at or beyond break-even is **protected**: leave it exactly where it
-/// is. "Beyond" is direction-aware — for a long, at-or-above entry; for a short,
-/// at-or-below.
-///
-/// Returns `true` when the widen may proceed.
-pub fn may_widen(direction: Direction, current_stop: f64, entry_price: f64) -> bool {
-    if !current_stop.is_finite() || !entry_price.is_finite() {
-        // Unjudgeable — fall through to the caller's own guards rather than
-        // fabricating a block from a bad number.
-        return true;
-    }
-    if same_level(current_stop, entry_price) {
-        // Exactly at break-even: protected.
-        return false;
-    }
-    match direction {
-        Direction::Long => current_stop < entry_price,
-        Direction::Short => current_stop > entry_price,
-    }
-}
-
-#[cfg(test)]
-mod widen_guard_tests {
-    use super::*;
-
-    /// The core case: break-even has run, so a spread hour must NOT push the
-    /// stop back into risk.
-    ///
-    /// Mutation check: flip either comparison and this goes red.
-    #[test]
-    fn a_break_even_stop_is_not_widened() {
-        // Long, entry 1.1000. BE moved the stop to entry.
-        assert!(!may_widen(Direction::Long, 1.1000, 1.1000));
-        // ...and past entry (a trailing move) is likewise protected.
-        assert!(!may_widen(Direction::Long, 1.1020, 1.1000));
-        // Short mirrors.
-        assert!(!may_widen(Direction::Short, 1.1000, 1.1000));
-        assert!(!may_widen(Direction::Short, 1.0980, 1.1000));
-    }
-
-    /// A normal at-risk stop widens exactly as before — this guard must not
-    /// disable System 2 for the ordinary case.
-    #[test]
-    fn an_at_risk_stop_still_widens() {
-        // Long: stop below entry = still risking money → widen allowed.
-        assert!(may_widen(Direction::Long, 1.0950, 1.1000));
-        // Short: stop above entry.
-        assert!(may_widen(Direction::Short, 1.1050, 1.1000));
-    }
-
-    /// Degenerate inputs must not fabricate a block — the caller has its own
-    /// guards for a bad quote, and silently disabling the widen would leave a
-    /// stop sitting inside a spread spike.
-    #[test]
-    fn non_finite_falls_through_to_the_caller() {
-        assert!(may_widen(Direction::Long, f64::NAN, 1.1000));
-        assert!(may_widen(Direction::Long, 1.0950, f64::NAN));
-    }
-
-    /// Direction is load-bearing: the same pair of numbers must give opposite
-    /// answers for a long and a short.
-    #[test]
-    fn direction_inverts_the_guard() {
-        let (stop, entry) = (1.1050, 1.1000);
-        assert!(
-            may_widen(Direction::Short, stop, entry),
-            "for a SHORT a stop above entry is still at risk",
-        );
-        assert!(
-            !may_widen(Direction::Long, stop, entry),
-            "for a LONG the same stop is past break-even",
-        );
-    }
-}
+// # Where the break-even widen guard went (removed 2026-09-14)
+//
+// A `may_widen` function lived here from 2026-08-01: it answered *"may System 2
+// widen this stop, or has break-even already made the trade free?"* and
+// `blackout_apply::widen_one` refused the widen whenever the stop was at or
+// past break-even.
+//
+// **The operator rejected that rule** after inspecting a real trade. A spread
+// hour must now give the *in-force* stop more room whatever that stop is —
+// including a break-even one — and the restore puts it back to break-even. See
+// `crate::order_control::in_force_stop` for both operator rules, and
+// `trade-control-cron/src/blackout_apply.rs`'s module doc for why the trade-off
+// was reversed.
+//
+// It was **deleted rather than inverted**: an inverted-but-present guard is a
+// flag someone flips back, and a `may_widen` that always returns `true` is a
+// call site that reads as if a decision is being made when none is.
+//
+// [`restore_decision`] above is **unchanged** and still load-bearing — it is
+// what stops a restore reverting a stop some *other* system tightened
+// mid-episode. Break-even can no longer be that system, because
+// `in_force_stop`'s Rule 2 forbids it from arming off a bar inside an active
+// widen, which is what keeps the remembered level correct for the whole
+// episode.
