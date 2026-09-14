@@ -49,7 +49,7 @@ mod detect;
 mod metrics;
 mod state_machine;
 
-pub use atr::{atr_length_for, wilder_atr};
+pub use atr::{atr_length_for, atr_length_for_bar_minutes, wilder_atr};
 pub use band_anchor::band_anchor;
 pub use detect::{DetectFlags, Detected, SignalGeometry, detect_at};
 pub use metrics::CandleMetrics;
