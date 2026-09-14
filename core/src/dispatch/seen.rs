@@ -383,6 +383,16 @@ mod dispatcher_outcome_tests {
         ) -> Result<(), StateError> {
             Ok(())
         }
+
+        async fn set_entry_attempt_adverse_extreme(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _attempt_no: u32,
+            _adverse_extreme: f64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
         async fn is_retry_fire_seen(
             &self,
             _account: Option<&str>,

@@ -5,8 +5,11 @@
 //! * its `expires_at` has passed → cancel + delete (the alert window
 //!   itself is dead, so the still-pending order should be too); or
 //! * its `cancel_at` (bar-based expiry) has passed → cancel + delete; or
-//! * its `stop_loss_price` has been overtaken by current price → the
-//!   setup is invalidated before it ever filled, cancel + delete.
+//! * price has **traded past** its `stop_loss_price` at any point since
+//!   placement → the setup is invalidated before it ever filled, cancel +
+//!   delete. Note "since placement", not "right now": the row carries a running
+//!   adverse extreme so the decision is a property of the price path rather than
+//!   of where the cron tick happened to land on it. See [`maybe_breach_cancel`].
 //!
 //! Each of those is **terminal**: the setup is dead and the row goes with it.
 //!
@@ -48,7 +51,9 @@ use trade_control_core::state::{EntryAttempt, StateStore};
 
 // The pure sweep predicates live in `core` so the offline replay can share them
 // (the `[[strategy_changes_in_both_replayer_and_worker]]` rule).
-use trade_control_core::sweep_gate::{bar_expiry_due, breach_detected, market_blackout_due_symbol};
+use trade_control_core::sweep_gate::{
+    bar_expiry_due, breach_detected, market_blackout_due_symbol, update_adverse_extreme,
+};
 
 use crate::broker_handle::BrokerHandle;
 use crate::seam::CronEnv;
@@ -153,7 +158,45 @@ where
     }
 }
 
-/// Generic-over-broker helper so the OANDA / TN paths share one body.
+/// Generic-over-broker helper so the OANDA / TN / IBKR paths share one body.
+///
+/// # The question this answers: "has price TRADED past the stop since placement"
+///
+/// Not "is spot past the stop right now". Those are different questions and the
+/// difference is the whole point of this function's shape.
+///
+/// This used to read `get_current_price` — an **instantaneous spot quote** — and
+/// hand it straight to [`breach_detected`]. Sampled on the ~900s upkeep loop,
+/// that made the outcome depend on where the cron tick happened to land relative
+/// to the price path: two identical price paths gave different answers, and any
+/// excursion that opened and closed between two ticks was invisible. That is a
+/// sampling lottery, not a rule, and it governed whether a REAL resting order
+/// got cancelled.
+///
+/// So the tick now **folds** the quote into the row's persisted running adverse
+/// extreme ([`EntryAttempt::adverse_extreme`]) and evaluates the breach against
+/// **the extreme**. Once the extreme is past the stop it stays past, so the
+/// decision is monotonic in the price path rather than in tick alignment. The
+/// persistence is load-bearing — the excursion history cannot be recovered by
+/// re-reading the quote, which is why this is a stored field rather than a
+/// re-read.
+///
+/// A row with **no** extreme (legacy, or first observation) seeds from this
+/// tick's quote and is judged on that. A missing extreme is never read as
+/// "breached"; the seed value is a real observed price, so an order genuinely
+/// already past its stop when first observed still cancels on that same tick.
+///
+/// The offline replay's matching half reads each bar's **adverse extreme**
+/// (low for a Long, high for a Short) rather than its close — the bar-resolution
+/// analogue of the same question. Close-sampling there was explicitly
+/// **rejected**: it lets a bar trade clean through the stop and back inside with
+/// the order surviving, which is exactly the case the rule exists to catch.
+/// Both sides call the same shared [`breach_detected`] and now differ only in
+/// resolution (`[[strategy_changes_in_both_replayer_and_worker]]`).
+///
+/// See `core::sweep_gate::update_adverse_extreme` for why the fixture corpus
+/// **cannot** justify any of this — 854 orders truncated, zero outcomes changed
+/// — and therefore why a green corpus is not grounds to simplify it away.
 async fn maybe_breach_cancel<S: StateStore, B: Broker>(
     store: &S,
     attempt: &EntryAttempt,
@@ -165,13 +208,55 @@ async fn maybe_breach_cancel<S: StateStore, B: Broker>(
         .get_current_price(&attempt.instrument)
         .await
         .map_err(|err| format!("get_current_price: {err}"))?;
-    if breach_detected(attempt.direction, current, stop_loss) {
-        cancel_with_broker(broker, attempt, "sl-breached", current).await;
+
+    // Fold first, judge second. Judging the spot reading and *then* recording it
+    // would reintroduce the sampling lottery for exactly the tick that observes
+    // the excursion.
+    let extreme = update_adverse_extreme(attempt.direction, attempt.adverse_extreme, current);
+    persist_adverse_extreme(store, attempt, extreme).await;
+
+    if breach_detected(attempt.direction, extreme, stop_loss) {
+        cancel_with_broker(broker, attempt, "sl-breached", extreme).await;
         delete_row(store, attempt).await;
         Ok(())
     } else {
-        // Not breached — leave it alone for the next sweep.
+        // Not breached — leave it alone for the next sweep, which will fold its
+        // own quote into the extreme we just persisted.
         Ok(())
+    }
+}
+
+/// Write an advanced running adverse extreme back onto the row — the half of
+/// [`maybe_breach_cancel`] that makes the breach decision monotonic ACROSS ticks
+/// rather than only within one.
+///
+/// Skipped when the value is unchanged, so a quiet market costs no writes.
+///
+/// **Fail-soft, deliberately.** A failed write means the next tick re-derives
+/// from an older (or absent) extreme, which for that tick is exactly the
+/// pre-fix behaviour — never a fabricated breach. The caller keeps using the
+/// in-memory value, which is still the best reading available for THIS tick.
+/// The alternative — propagating the error — would abandon a breach we have
+/// already correctly detected because we could not write a note about it.
+async fn persist_adverse_extreme<S: StateStore>(store: &S, attempt: &EntryAttempt, extreme: f64) {
+    if attempt.adverse_extreme == Some(extreme) {
+        return;
+    }
+    if let Err(err) = store
+        .set_entry_attempt_adverse_extreme(
+            attempt.account.as_deref(),
+            &attempt.trade_id,
+            attempt.attempt_no,
+            extreme,
+        )
+        .await
+    {
+        tracing::error!(
+            "cron sweep set_entry_attempt_adverse_extreme({}/{}/#{}): {err}",
+            attempt.account.as_deref().unwrap_or("<global>"),
+            attempt.trade_id,
+            attempt.attempt_no,
+        );
     }
 }
 
@@ -337,6 +422,7 @@ mod tests {
             shell_time: ts("2026-07-10T20:00:00Z"),
             expires_at: ts("2026-07-20T00:00:00Z"),
             stop_loss_price: Some(0.5000),
+            adverse_extreme: None,
             cancel_at: None,
             pip_size: Some(0.0001),
             blackout_close,
@@ -413,6 +499,301 @@ mod tests {
         let store = MemStateStore::new();
         let a = attempt(BlackoutCloseAction::CancelAndClose);
         pollster::block_on(sweep_one(&store, &NoBrokerEnv, &a, ts(MARKET_CLOSED))).ok();
+    }
+
+    // --- the running adverse extreme (SL-breach sweep) ----------------------
+    //
+    // These drive `sweep_one` / `maybe_breach_cancel` — the REAL entry points —
+    // through a spy broker, not the pure predicate in `core::sweep_gate`. That
+    // is deliberate: a mutation that judges the spot reading instead of the
+    // extreme, or hardcodes a direction, leaves every pure-predicate test green.
+
+    use std::cell::RefCell;
+    use trade_control_core::broker::{
+        AttemptState, CancelError, Candle, CandleError, CloseOutcome, EntryError, EntryRequest,
+        Granularity, LookupError, OpenPosition, PendingOrder, Placement, Quote,
+    };
+
+    /// A broker that serves a SCRIPTED sequence of quotes — one per sweep tick —
+    /// and records every cancel. The script is what makes an *excursion* (a price
+    /// path, not a price) expressible, which is the whole subject here.
+    struct ScriptedBroker {
+        quotes: RefCell<std::collections::VecDeque<f64>>,
+        cancels: RefCell<Vec<String>>,
+    }
+
+    impl ScriptedBroker {
+        fn new(quotes: &[f64]) -> Self {
+            Self {
+                quotes: RefCell::new(quotes.iter().copied().collect()),
+                cancels: RefCell::new(Vec::new()),
+            }
+        }
+        fn cancelled(&self) -> usize {
+            self.cancels.borrow().len()
+        }
+    }
+
+    impl Broker for ScriptedBroker {
+        async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
+            let p = self
+                .quotes
+                .borrow_mut()
+                .pop_front()
+                .expect("the test scripted a quote for every tick it drives");
+            Ok(Quote { bid: p, ask: p })
+        }
+        async fn cancel_order(
+            &self,
+            _account_id: &str,
+            broker_order_id: &str,
+        ) -> Result<(), CancelError> {
+            self.cancels.borrow_mut().push(broker_order_id.to_string());
+            Ok(())
+        }
+        async fn place_entry(
+            &self,
+            _max_risk_pct: f64,
+            _max_open_positions: u32,
+            _req: &EntryRequest<'_>,
+        ) -> Result<Placement, EntryError> {
+            unreachable!("the sweep never places")
+        }
+        async fn close_positions(&self, _instrument: &str) -> CloseOutcome {
+            unreachable!("the SL-breach arm never closes a position")
+        }
+        async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
+            0
+        }
+        async fn lookup_attempt_state(
+            &self,
+            _instrument: &str,
+            _broker_order_id: &str,
+            _broker_trade_id: Option<&str>,
+        ) -> Result<AttemptState, LookupError> {
+            Ok(AttemptState::Unknown)
+        }
+        async fn list_open_positions(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<OpenPosition>, LookupError> {
+            Ok(vec![])
+        }
+        async fn amend_stop(
+            &self,
+            _account_id: &str,
+            _id: &str,
+            _new_stop: f64,
+        ) -> Result<(), trade_control_core::broker::AmendError> {
+            Ok(())
+        }
+        async fn list_pending_orders(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<PendingOrder>, LookupError> {
+            Ok(vec![])
+        }
+        async fn get_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<Candle>, CandleError> {
+            Ok(vec![])
+        }
+    }
+
+    /// A resting attempt on a 24h-open instrument (so the market-hours branch
+    /// cannot pre-empt the SL-breach one), with clocks far in the future.
+    fn resting(direction: Direction, stop_loss: f64) -> EntryAttempt {
+        EntryAttempt {
+            direction,
+            stop_loss_price: Some(stop_loss),
+            instrument: "EUR/USD".into(),
+            ..attempt(BlackoutCloseAction::CancelResting)
+        }
+    }
+
+    /// Drive N sweep ticks against one store row, re-reading the row each tick
+    /// exactly as the live loop does (it lists from the store every tick). This
+    /// is what makes the PERSISTENCE observable: a mutation that never writes
+    /// the extreme back is invisible to a single-tick test.
+    fn drive(store: &MemStateStore, broker: &ScriptedBroker, row: &EntryAttempt, ticks: usize) {
+        pollster::block_on(async {
+            store
+                .record_entry_attempt(row.clone())
+                .await
+                .expect("seed the attempt");
+            for _ in 0..ticks {
+                let Some(live) = store
+                    .list_all_entry_attempts()
+                    .await
+                    .expect("list attempts")
+                    .into_iter()
+                    .find(|a| a.trade_id == row.trade_id)
+                else {
+                    break; // swept and deleted — the loop is over
+                };
+                let sl = live.stop_loss_price.expect("seeded with an SL");
+                maybe_breach_cancel(store, &live, sl, broker, live.placed_at)
+                    .await
+                    .expect("the scripted broker never errors");
+            }
+        });
+    }
+
+    /// THE BUG, pinned from the entry point: a row that already carries an
+    /// extreme past its stop must cancel on a tick whose SPOT has recovered.
+    ///
+    /// # Why the excursion is pre-seeded rather than scripted as tick 2
+    ///
+    /// A three-tick script `[above, through, recovered]` does NOT distinguish the
+    /// two implementations, and a spot-reading mutation survives it: the tick that
+    /// *sees* the excursion breaches under either reading (spot is past the stop
+    /// right then) and the sweep is terminal, so tick 3 never runs. That version
+    /// was written first and the mutation lived through it.
+    ///
+    /// The divergence only appears when the tick that ACTS is not the tick that
+    /// OBSERVED — which is the live shape, not a contrivance: the extreme is
+    /// persisted precisely so it survives across ticks and across a worker
+    /// restart. Here the row arrives already carrying its excursion (as it would
+    /// after a restart, or from a peer process) and the only quote this tick sees
+    /// is a fully recovered one. Instantaneous spot says "leave it alone"; the
+    /// remembered path says the thesis is already falsified.
+    ///
+    /// Mutations this kills: judging `current` instead of `extreme`.
+    #[test]
+    fn a_recovered_spot_still_cancels_when_the_stored_extreme_breached() {
+        let store = MemStateStore::new();
+        // The only quote is 1.1050 — comfortably ABOVE the 1.0950 stop.
+        let broker = ScriptedBroker::new(&[1.1050]);
+        let mut row = resting(Direction::Long, 1.0950);
+        row.adverse_extreme = Some(1.0900); // the remembered excursion
+        drive(&store, &broker, &row, 1);
+        assert_eq!(
+            broker.cancelled(),
+            1,
+            "spot has recovered, but price already traded past the stop — cancel",
+        );
+    }
+
+    /// Direction mirror of the above: a Short's remembered spike ABOVE its stop,
+    /// judged on a tick whose spot has dropped back well below it.
+    ///
+    /// Both signs are pinned because a `Direction::Long` hardcode is the mutation
+    /// that survives a one-direction suite: a short's resting path sits below its
+    /// SL, so a wrong-direction predicate still yields "not breached" and the same
+    /// end state.
+    #[test]
+    fn a_recovered_short_still_cancels_when_the_stored_extreme_breached() {
+        let store = MemStateStore::new();
+        let broker = ScriptedBroker::new(&[1.0800]);
+        let mut row = resting(Direction::Short, 1.1050);
+        row.adverse_extreme = Some(1.1100); // spiked through, since recovered
+        drive(&store, &broker, &row, 1);
+        assert_eq!(broker.cancelled(), 1);
+    }
+
+    /// A multi-tick excursion, driven end to end: price dips through the stop and
+    /// recovers over three ticks. Complements the pre-seeded pair above by
+    /// exercising the FOLD as well as the read — the order must be gone, and gone
+    /// once, not once per tick.
+    ///
+    /// Kills a direction-swapped fold (a Long tracking the max never breaches).
+    #[test]
+    fn a_long_excursion_over_several_ticks_cancels_exactly_once() {
+        let store = MemStateStore::new();
+        let broker = ScriptedBroker::new(&[1.1000, 1.0900, 1.1050]);
+        let row = resting(Direction::Long, 1.0950);
+        drive(&store, &broker, &row, 3);
+        assert_eq!(broker.cancelled(), 1);
+        assert!(
+            pollster::block_on(store.list_all_entry_attempts())
+                .expect("list attempts")
+                .is_empty(),
+            "a breach is terminal — the row goes with the order",
+        );
+    }
+
+    /// Mirror of the multi-tick fold for a Short: the spike is the only adverse
+    /// move, so a Long-hardcoded fold tracks the low (1.0800), never breaches,
+    /// and this goes red.
+    #[test]
+    fn a_short_excursion_over_several_ticks_cancels_exactly_once() {
+        let store = MemStateStore::new();
+        let broker = ScriptedBroker::new(&[1.1000, 1.1100, 1.0800]);
+        let row = resting(Direction::Short, 1.1050);
+        drive(&store, &broker, &row, 3);
+        assert_eq!(broker.cancelled(), 1);
+    }
+
+    /// The extreme must be PERSISTED, not recomputed per tick. Observed directly
+    /// on the row rather than only through the cancel, so a mutation that drops
+    /// the store write is caught at the write, not two ticks downstream.
+    #[test]
+    fn the_extreme_is_persisted_and_never_retracts() {
+        let store = MemStateStore::new();
+        // No tick breaches 1.0500, so the row survives all three and can be read.
+        let broker = ScriptedBroker::new(&[1.1000, 1.0900, 1.1200]);
+        let row = resting(Direction::Long, 1.0500);
+        drive(&store, &broker, &row, 3);
+        let saved = pollster::block_on(store.list_all_entry_attempts())
+            .expect("list attempts")
+            .into_iter()
+            .find(|a| a.trade_id == row.trade_id)
+            .expect("the row survives — nothing breached");
+        assert_eq!(
+            saved.adverse_extreme,
+            Some(1.0900),
+            "the worst price seen must be stored, and a better price must not retract it",
+        );
+        assert_eq!(broker.cancelled(), 0, "nothing reached the stop");
+    }
+
+    /// A missing extreme must NEVER be read as a breach. A legacy row (written
+    /// before the field existed) seeds from its first observed quote and is judged
+    /// on that real price — so a benign first tick leaves the order alone.
+    #[test]
+    fn a_legacy_row_with_no_extreme_is_not_treated_as_breached() {
+        let store = MemStateStore::new();
+        let broker = ScriptedBroker::new(&[1.1000]);
+        let mut row = resting(Direction::Long, 1.0950);
+        row.adverse_extreme = None; // explicit: this is the legacy shape
+        drive(&store, &broker, &row, 1);
+        assert_eq!(
+            broker.cancelled(),
+            0,
+            "an absent extreme is 'not yet observed', never 'breached'",
+        );
+        let saved = pollster::block_on(store.list_all_entry_attempts())
+            .expect("list attempts")
+            .into_iter()
+            .find(|a| a.trade_id == row.trade_id)
+            .expect("the row survives");
+        assert_eq!(
+            saved.adverse_extreme,
+            Some(1.1000),
+            "the first observation seeds the extreme",
+        );
+    }
+
+    /// Guard against over-correction the other way: an order whose stop is already
+    /// blown on the very first tick that observes it must still cancel on that
+    /// tick. Seeding must not buy a free pass.
+    #[test]
+    fn a_first_tick_already_past_the_stop_cancels_immediately() {
+        let store = MemStateStore::new();
+        let broker = ScriptedBroker::new(&[1.0900]);
+        let row = resting(Direction::Long, 1.0950);
+        drive(&store, &broker, &row, 1);
+        assert_eq!(broker.cancelled(), 1);
+        assert!(
+            pollster::block_on(store.list_all_entry_attempts())
+                .expect("list attempts")
+                .is_empty(),
+            "a breach is terminal — the row is deleted with the order",
+        );
     }
 
     /// Guard against over-correction: the sweep's genuinely TERMINAL reasons

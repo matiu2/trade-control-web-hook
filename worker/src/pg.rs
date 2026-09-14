@@ -958,6 +958,36 @@ impl PgStateStore {
         .map_err(backend)?;
         Ok(())
     }
+
+    /// Advance a resting attempt's running adverse extreme (the worst price seen
+    /// against it since placement). Same jsonb read-modify-write shape as its
+    /// neighbours — the row is one body, so there is no column and no migration.
+    ///
+    /// The *decision* about whether this value moves lives in
+    /// `sweep_gate::update_adverse_extreme`, which the caller applies before
+    /// calling here; this is a plain write, so a shared-store race resolves on
+    /// the next tick's re-read rather than needing a SQL-side `LEAST`/`GREATEST`.
+    async fn set_entry_attempt_adverse_extreme_impl(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        attempt_no: u32,
+        adverse_extreme: f64,
+    ) -> Result<(), StateError> {
+        sqlx::query(
+            "UPDATE entry_attempt
+             SET body = jsonb_set(body, '{adverse_extreme}', to_jsonb($4::double precision), true)
+             WHERE account IS NOT DISTINCT FROM $1 AND trade_id = $2 AND attempt_no = $3",
+        )
+        .bind(account)
+        .bind(trade_id)
+        .bind(attempt_no as i32)
+        .bind(adverse_extreme)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
 }
 
 // ───────────── spread_blackout_window (singleton marker, TTL) ───────────────
@@ -1796,6 +1826,16 @@ impl StateStore for PgStateStore {
         attempt_no: u32,
     ) -> Result<(), StateError> {
         self.set_entry_attempt_superseded_impl(account, trade_id, attempt_no)
+            .await
+    }
+    async fn set_entry_attempt_adverse_extreme(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        attempt_no: u32,
+        adverse_extreme: f64,
+    ) -> Result<(), StateError> {
+        self.set_entry_attempt_adverse_extreme_impl(account, trade_id, attempt_no, adverse_extreme)
             .await
     }
     async fn is_retry_fire_seen(
