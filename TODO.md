@@ -193,3 +193,48 @@ guard), `:4885`; verify `:5648`, `:8694`. Multi-shot twins already assert
 - `cargo clippy` + `cargo fmt` before each commit.
 - Keep changes < ~600 lines each; commit + push as each lands.
 - Strategy changes must land in **both** replayer and worker.
+
+## Screenshot host widening (branch `feat/screenshot-image-host`)
+
+TradingView's camera button is gone with the subscription; `local-chart` now
+captures and uploads its own chart. Downstream, that needed exactly **one**
+change: `ScreenshotUrl::parse` learning the new host's shape.
+
+- [x] `core/src/screenshot.rs` — accept `https://files.catbox.moe/<stem>.<ext>`
+      as a **specific additional shape**, never "any URL". Split into two named
+      recognisers (`parse_tradingview`, `parse_catbox`), each a complete
+      host+path match, so neither can shadow the other. Requires an image
+      extension and exactly one path segment; no trailing-slash tolerance
+      (a real Catbox image URL never has one).
+- [x] **TradingView parsing is untouched and still tested** — old plans carry
+      those links. This is an addition, not a replacement.
+- [x] `core/src/trade_plan.rs` — no new field, no new top-level signed key.
+      Added `catbox_screenshot_url_round_trips_on_the_plan`; the pre-field
+      `plan_without_screenshot_url_still_parses` test stays green.
+- [x] `core/tests/real_upload_url.rs` — the two URLs from the real
+      upload-and-fetch-back proofs, pinned so a future narrowing that would
+      reject a genuine upload fails loudly.
+- [x] `journal` needed **zero changes**: `open_screenshot` just `xdg-open`s
+      whatever string the plan holds. 124 journal tests green.
+
+### Where the upload lives, and why not here
+
+In `local-chart`, server-side, handing the URL over via the **clipboard** —
+because `tv-arm register` already reads the clipboard at arm time. So the
+operator's workflow is unchanged (capture, then arm) and neither `tv-arm` nor
+`journal` needed touching. Server-side rather than in the browser keeps the
+Catbox `userhash` out of view-source.
+
+### Mutations run (each must go RED)
+
+- widen `parse` to accept any URL → **RED, 6 tests** — including the
+  pre-existing `rejects_non_snapshot_clipboard_contents`, which proves that
+  test was really testing rejection and not just passing.
+- drop the Catbox host check (take any last path segment) → **RED, 2 tests**
+- break normalisation (no extension-case folding) → **RED**
+- echo the input instead of canonicalising → **RED, 3 tests** (incl. the plan
+  round-trip)
+
+1219 core tests green. `cargo clippy` on the changed files is clean; the one
+workspace clippy error (`signals/state_machine.rs` "too many arguments") is
+**pre-existing** — verified by reproducing it with these changes stashed.

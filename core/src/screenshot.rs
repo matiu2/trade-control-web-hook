@@ -1,26 +1,36 @@
-//! Recognising a TradingView **snapshot** (screenshot) URL.
+//! Recognising a chart **snapshot** (screenshot) URL.
 //!
 //! `tv-arm register` reads the system clipboard at arm time and, if it holds a
-//! TradingView snapshot link, bakes it onto the plan so the journal can show
-//! the chart as the operator saw it when they armed. This module owns the one
-//! question that needs judgement — *is this string such a URL?* — so the
-//! clipboard plumbing (tv-arm) and the display (journal) share one answer.
+//! snapshot link, bakes it onto the plan so the journal can show the chart as
+//! the operator saw it when they armed. This module owns the one question that
+//! needs judgement — *is this string such a URL?* — so the clipboard plumbing
+//! (tv-arm) and the display (journal) share one answer.
 //!
-//! The shape TradingView mints from its camera button is:
+//! Two shapes are recognised, one per source of screenshots:
 //!
 //! ```text
-//! https://www.tradingview.com/x/pM2uDdC2/
+//! https://www.tradingview.com/x/pM2uDdC2/     TradingView's camera button
+//! https://files.catbox.moe/ogsh5n.png         local-chart's own capture
 //! ```
 //!
-//! We deliberately match **only** that snapshot shape, not any tradingview.com
-//! URL: the clipboard is a shared, incidental surface. Whatever the operator
-//! last copied — a chart link, a symbol page, an unrelated URL — must not be
-//! mistaken for a screenshot and journalled as one. Recognition is narrow so a
-//! non-match is the common, silent case rather than a false positive.
+//! The TradingView shape is **historical but still load-bearing**: plans armed
+//! before local-chart existed carry those links, and they must keep parsing.
+//! The Catbox shape is where new screenshots go now that the TradingView
+//! subscription is gone — local-chart captures its own chart, uploads it, and
+//! puts the URL on the clipboard, so this one module is the whole downstream
+//! change.
+//!
+//! **Each host is matched as a SPECIFIC shape — never "any URL".** The
+//! clipboard is a shared, incidental surface. Whatever the operator last
+//! copied — a chart link, a symbol page, a password, an unrelated URL — must
+//! not be mistaken for a screenshot and journalled as one. Recognition stays
+//! narrow so a non-match is the common, silent case rather than a false
+//! positive. Adding a host means adding another exact host+path+extension
+//! recogniser here, not loosening the existing ones.
 
 use serde::{Deserialize, Serialize};
 
-/// A validated TradingView snapshot URL, normalised to its canonical form.
+/// A validated chart snapshot URL, normalised to its canonical form.
 ///
 /// Constructing one is the only way to assert "this really is a screenshot
 /// link" — [`parse`](ScreenshotUrl::parse) is the sole constructor, so an
@@ -29,21 +39,31 @@ use serde::{Deserialize, Serialize};
 #[serde(transparent)]
 pub struct ScreenshotUrl(String);
 
-/// The snapshot id is TradingView's short base62 slug (`pM2uDdC2`). Bounds are
+/// The snapshot id is TradingView's short base62 slug (`pM2uDdC2`), or
+/// Catbox's short alphanumeric filename stem (`ogsh5n`). Bounds are
 /// deliberately loose — we're distinguishing a snapshot link from arbitrary
-/// clipboard junk, not validating TradingView's id scheme.
+/// clipboard junk, not validating either host's id scheme.
 const MIN_ID_LEN: usize = 4;
 const MAX_ID_LEN: usize = 32;
 
+/// Catbox serves uploads from this one host. A file lives at the root, so the
+/// path is exactly `/<stem>.<ext>` — no directories, no query.
+const CATBOX_HOST: &str = "files.catbox.moe";
+
+/// Image extensions local-chart can upload. Restricting these is part of
+/// keeping the match narrow: a `.zip` or `.txt` on Catbox is not a screenshot,
+/// so it must not be journalled as one.
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+
 impl ScreenshotUrl {
-    /// Recognise a TradingView snapshot URL in `raw`, returning `None` for
-    /// anything else. Surrounding whitespace is trimmed (a clipboard copy
-    /// commonly carries a trailing newline) and a missing trailing slash is
-    /// tolerated, but the host and `/x/` path are required.
+    /// Recognise a snapshot URL in `raw`, returning `None` for anything else.
+    /// Surrounding whitespace is trimmed (a clipboard copy commonly carries a
+    /// trailing newline).
     ///
-    /// The result is normalised to `https://www.tradingview.com/x/<id>/` so two
-    /// copies of the same snapshot that differ only in scheme, `www.`, or the
-    /// trailing slash compare equal.
+    /// Two host shapes are accepted, each matched exactly — see the module
+    /// docs. The result is normalised per host so two copies of the same
+    /// snapshot that differ only in scheme, `www.`, or the trailing slash
+    /// compare equal.
     pub fn parse(raw: &str) -> Option<Self> {
         let trimmed = raw.trim();
         // Reject anything with internal whitespace up front: a clipboard often
@@ -53,13 +73,11 @@ impl ScreenshotUrl {
             return None;
         }
         let rest = strip_scheme(trimmed)?;
-        let rest = rest.strip_prefix("www.").unwrap_or(rest);
-        let path = rest.strip_prefix("tradingview.com/x/")?;
-        let id = path.strip_suffix('/').unwrap_or(path);
-        if !is_snapshot_id(id) {
-            return None;
-        }
-        Some(Self(format!("https://www.tradingview.com/x/{id}/")))
+        // Ordered, and each arm is a complete host+path match, so the two
+        // recognisers cannot shadow one another the way an untagged serde
+        // superset can. A `None` from one is not a licence for the other to
+        // relax — it just tries its own exact shape.
+        parse_tradingview(rest).or_else(|| parse_catbox(rest))
     }
 
     /// The canonical URL, ready to print or open.
@@ -74,7 +92,8 @@ impl std::fmt::Display for ScreenshotUrl {
     }
 }
 
-/// Accept either scheme; a bare `www.tradingview.com/x/…` paste is also fine.
+/// Accept either scheme; a bare `www.tradingview.com/x/…` or
+/// `files.catbox.moe/…` paste is also fine.
 fn strip_scheme(s: &str) -> Option<&str> {
     if let Some(rest) = s.strip_prefix("https://") {
         return Some(rest);
@@ -82,12 +101,57 @@ fn strip_scheme(s: &str) -> Option<&str> {
     if let Some(rest) = s.strip_prefix("http://") {
         return Some(rest);
     }
-    // No scheme at all — only allow it when it still looks like the host, so a
-    // random word can't fall through to the path check.
-    if s.starts_with("www.tradingview.com/") || s.starts_with("tradingview.com/") {
+    // No scheme at all — only allow it when it still looks like one of the
+    // known hosts, so a random word can't fall through to the path checks.
+    const BARE_HOSTS: &[&str] = &["www.tradingview.com/", "tradingview.com/"];
+    if BARE_HOSTS.iter().any(|h| s.starts_with(h)) {
+        return Some(s);
+    }
+    if s.starts_with(&format!("{CATBOX_HOST}/")) {
         return Some(s);
     }
     None
+}
+
+/// The TradingView camera-button shape: `www.tradingview.com/x/<id>/`, with
+/// `www.` and the trailing slash both optional. Scheme already stripped.
+///
+/// Normalises to `https://www.tradingview.com/x/<id>/`.
+fn parse_tradingview(rest: &str) -> Option<ScreenshotUrl> {
+    let host_stripped = rest.strip_prefix("www.").unwrap_or(rest);
+    let path = host_stripped.strip_prefix("tradingview.com/x/")?;
+    let id = path.strip_suffix('/').unwrap_or(path);
+    if !is_snapshot_id(id) {
+        return None;
+    }
+    Some(ScreenshotUrl(format!(
+        "https://www.tradingview.com/x/{id}/"
+    )))
+}
+
+/// The Catbox shape local-chart uploads to: `files.catbox.moe/<stem>.<ext>`,
+/// where `ext` is an image extension. Scheme already stripped.
+///
+/// A file sits at the host root, so exactly one path segment is allowed —
+/// that, plus the extension check, is what keeps this from matching arbitrary
+/// Catbox links. There is deliberately **no** trailing-slash tolerance: a real
+/// Catbox image URL never has one, and accepting it would invent a second
+/// spelling of the same URL for no gain.
+///
+/// Normalises to `https://files.catbox.moe/<stem>.<ext>` with the extension
+/// lowercased, so `.PNG` and `.png` compare equal.
+fn parse_catbox(rest: &str) -> Option<ScreenshotUrl> {
+    let path = rest.strip_prefix(CATBOX_HOST)?.strip_prefix('/')?;
+    // One segment only: no directories, no query, no fragment.
+    if path.contains('/') || path.contains('?') || path.contains('#') {
+        return None;
+    }
+    let (stem, ext) = path.rsplit_once('.')?;
+    let ext = ext.to_ascii_lowercase();
+    if !IMAGE_EXTS.contains(&ext.as_str()) || !is_snapshot_id(stem) {
+        return None;
+    }
+    Some(ScreenshotUrl(format!("https://{CATBOX_HOST}/{stem}.{ext}")))
 }
 
 /// A snapshot id is a non-empty run of base62 characters of plausible length.
@@ -181,6 +245,105 @@ mod tests {
         assert!(ScreenshotUrl::parse("https://www.tradingview.com/x/ab/").is_none());
         let long = "a".repeat(MAX_ID_LEN + 1);
         assert!(ScreenshotUrl::parse(&format!("https://www.tradingview.com/x/{long}/")).is_none());
+    }
+
+    /// The exact shape local-chart's upload returns, as Catbox's API prints it.
+    /// This is the real URL from the upload-and-fetch-back proof.
+    #[test]
+    fn parses_the_canonical_catbox_url() {
+        let url = ScreenshotUrl::parse("https://files.catbox.moe/ogsh5n.png")
+            .expect("canonical catbox URL should parse");
+        assert_eq!(url.as_str(), "https://files.catbox.moe/ogsh5n.png");
+    }
+
+    /// Scheme and extension case are normalised away, so the same upload
+    /// copied from different places compares equal. Note there is no
+    /// trailing-slash variant: a Catbox image URL never carries one.
+    #[test]
+    fn normalises_catbox_scheme_and_extension_case() {
+        let canonical = "https://files.catbox.moe/ogsh5n.png";
+        for variant in [
+            "http://files.catbox.moe/ogsh5n.png",
+            "files.catbox.moe/ogsh5n.png",
+            "https://files.catbox.moe/ogsh5n.PNG",
+            "  https://files.catbox.moe/ogsh5n.png\n",
+        ] {
+            let url = ScreenshotUrl::parse(variant)
+                .unwrap_or_else(|| panic!("{variant} should parse as a snapshot URL"));
+            assert_eq!(url.as_str(), canonical, "variant {variant} normalised");
+        }
+    }
+
+    /// Every image extension local-chart might upload is recognised.
+    #[test]
+    fn parses_each_supported_image_extension() {
+        for ext in IMAGE_EXTS {
+            let raw = format!("https://files.catbox.moe/ogsh5n.{ext}");
+            assert!(
+                ScreenshotUrl::parse(&raw).is_some(),
+                "{raw} should parse as a snapshot URL"
+            );
+        }
+    }
+
+    /// The Catbox arm is a SPECIFIC shape, not "any catbox.moe URL" and
+    /// certainly not "any URL". Each case here is a real way the narrowness
+    /// could be lost — a wrong host, a non-image file, a nested path, a query.
+    #[test]
+    fn rejects_catbox_lookalikes_and_non_images() {
+        for raw in [
+            // Right path shape, wrong host — the litterbox sibling is the
+            // TEMPORARY one (files expire), so it must never be journalled.
+            "https://litter.catbox.moe/ogsh5n.png",
+            "https://litterbox.catbox.moe/ogsh5n.png",
+            // The site itself, not a file.
+            "https://catbox.moe/ogsh5n.png",
+            "https://catbox.moe/",
+            // Lookalike host must not pass the bare-host check.
+            "https://notfiles.catbox.moe/ogsh5n.png",
+            "https://files.catbox.moe.evil.com/ogsh5n.png",
+            // Not an image: a Catbox account can hold any file type.
+            "https://files.catbox.moe/ogsh5n.zip",
+            "https://files.catbox.moe/ogsh5n.txt",
+            "https://files.catbox.moe/ogsh5n.mp4",
+            // No extension at all.
+            "https://files.catbox.moe/ogsh5n",
+            // Nested path, query, fragment — not the flat file shape.
+            "https://files.catbox.moe/dir/ogsh5n.png",
+            "https://files.catbox.moe/ogsh5n.png?raw=1",
+            "https://files.catbox.moe/ogsh5n.png#frag",
+            // A trailing slash is not a real Catbox image URL.
+            "https://files.catbox.moe/ogsh5n.png/",
+            // Empty / implausible stems.
+            "https://files.catbox.moe/.png",
+            "https://files.catbox.moe/ab.png",
+        ] {
+            assert!(
+                ScreenshotUrl::parse(raw).is_none(),
+                "{raw:?} must not be taken for a snapshot URL"
+            );
+        }
+    }
+
+    /// The whole point of the narrowness, stated as one test: ordinary
+    /// clipboard contents must not parse under EITHER host arm. If a mutation
+    /// widens `parse` to accept any URL, this is what goes red.
+    #[test]
+    fn rejects_ordinary_clipboard_contents_under_both_hosts() {
+        for raw in [
+            "https://example.com/screenshot.png",
+            "https://imgur.com/a/abc123",
+            "https://github.com/matiu2/trading-libraries",
+            "https://files.catbox.example/ogsh5n.png",
+            "correct horse battery staple",
+            "/home/matiu/chart.png",
+            "EUR_USD h4 short",
+        ] {
+            assert!(
+                ScreenshotUrl::parse(raw).is_none(),
+                "{raw:?} must not be taken for a snapshot URL"
+            );
+        }
     }
 
     /// Serialises as a bare JSON string (`#[serde(transparent)]`), so the plan

@@ -805,4 +805,26 @@ bar: on_close
         let back: TradePlan = serde_json::from_str(&with).expect("re-parse");
         assert_eq!(back.screenshot_url, plan.screenshot_url);
     }
+
+    /// A local-chart (Catbox) screenshot URL round-trips on the plan exactly
+    /// like a TradingView one. This is the end of the chain the upload feeds:
+    /// local-chart captures, uploads, puts the URL on the clipboard, `tv-arm
+    /// register` parses it, and it lands here.
+    #[test]
+    fn catbox_screenshot_url_round_trips_on_the_plan() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[]}"#;
+        let mut plan: TradePlan = serde_json::from_str(json).expect("parse");
+
+        plan.screenshot_url = ScreenshotUrl::parse("https://files.catbox.moe/ogsh5n.png");
+        assert!(plan.screenshot_url.is_some(), "catbox URL should parse");
+
+        let with = serde_json::to_string(&plan).expect("serialise");
+        assert!(
+            with.contains(r#""screenshot_url":"https://files.catbox.moe/ogsh5n.png""#),
+            "URL must serialise as a bare string: {with}"
+        );
+        let back: TradePlan = serde_json::from_str(&with).expect("re-parse");
+        assert_eq!(back.screenshot_url, plan.screenshot_url);
+    }
 }
