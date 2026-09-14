@@ -32,38 +32,23 @@
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::{Candle, Granularity, OpenPosition};
 use trade_control_core::intent::Breakeven;
-use trade_control_core::signals::{atr_length_for, wilder_atr};
+use trade_control_core::order_control::{NoiseFloor, judge_breakeven_stop};
 use trade_control_core::state::BreakevenSnapshot;
 
 /// How close to current price a break-even stop may land before the amend is
 /// refused as noise, expressed as a fraction of the trade's own ATR.
 ///
-/// # Why a floor, and why this number
+/// **Re-exported, not defined here.** The floor moved to
+/// [`trade_control_core::order_control::breakeven_noise`] so the offline replay's
+/// fill simulator applies the *same* rule — it previously had none, so a
+/// mis-derived target was refused loudly on live and applied silently offline
+/// (`[[strategy_changes_in_both_replayer_and_worker]]`). The reasoning behind
+/// the number, the fail-open stance, and the warning that no fixture is evidence
+/// about it all live at the definition site; read there before changing it.
 ///
-/// The repo already holds the principle that a stop dominated by transaction
-/// cost is not a stop: `intent::sl_spread_floor` rejects an *entry* whose SL
-/// sits within `10 ×` the live spread, on the grounds that "the spread alone
-/// can stop the trade out before any real adverse move". A break-even amend is
-/// the same act — it replaces a stop — and had no such check, which is how the
-/// incident's stop landed **1.6% of ATR** from market and filled inside the
-/// same broker batch that created it.
-///
-/// This watcher sees only *mid* candles, so it cannot read a bid-ask spread to
-/// reuse that constant directly. ATR is the volatility unit it *can* compute
-/// from the candles it already fetched, so the floor is expressed in ATR.
-/// `0.1 × ATR` is the value the bug report proposed and is deliberately
-/// permissive: a legitimately-armed break-even sits ~50% of the way to TP from
-/// current price, which is many multiples of ATR — orders of magnitude clear of
-/// this line. It is a tripwire for absurdity, not a tuning knob, and it exists
-/// to make the *next* mis-derived target loud instead of silent.
-///
-/// **Fail-open, deliberately.** When the ATR cannot be computed (a window
-/// shorter than [`atr_length_for`]) the floor is not applied — the same
-/// discipline as `sl_spread_floor_violation`, which treats a degenerate spread
-/// as unjudgeable rather than fabricating a rejection. The floor is
-/// defence-in-depth behind the window bound and the fill-priced target; it must
-/// never become the thing that silently suppresses a correct break-even.
-pub const BREAKEVEN_MIN_ATR_FRACTION: f64 = 0.1;
+/// This alias is kept because the log line below prints it and because it is the
+/// name the incident report and the CLAUDE.md prose use.
+pub use trade_control_core::order_control::BREAKEVEN_MIN_ATR_FRACTION;
 
 /// Everything the break-even decision needs that isn't the candle window.
 ///
@@ -304,27 +289,33 @@ pub fn decide(
 /// `Some(block)` when `new_stop` sits within [`BREAKEVEN_MIN_ATR_FRACTION`] ×
 /// ATR of the latest close. `None` when it clears the floor **or** when the ATR
 /// is unjudgeable (fail-open — see [`BREAKEVEN_MIN_ATR_FRACTION`]).
+///
+/// A thin adapter over the shared
+/// [`trade_control_core::order_control::judge_breakeven_stop`], which the offline
+/// replay's fill simulator also calls. The comparison itself is deliberately NOT
+/// duplicated here — it used to live in this file alone, which is how replay came
+/// to have no floor at all. All this function does is translate the shared
+/// verdict into this module's `Option<BreakevenBlock>` shape, preserving
+/// [`BreakevenBlock::InsideNoise`]'s four reporting fields exactly so the
+/// operator-facing log line in `breakeven_watch` is unchanged.
 fn noise_violation(
     armable: &[Candle],
     new_stop: f64,
     granularity: Granularity,
 ) -> Option<BreakevenBlock> {
-    let latest = armable.last()?;
-    let atr = wilder_atr(armable, atr_length_for(granularity))?;
-    if !atr.is_finite() || atr <= 0.0 {
-        return None;
-    }
-    let floor = BREAKEVEN_MIN_ATR_FRACTION * atr;
-    let distance = (new_stop - latest.c).abs();
-    if distance < floor {
-        Some(BreakevenBlock::InsideNoise {
+    match judge_breakeven_stop(armable, new_stop, granularity) {
+        NoiseFloor::Clear => None,
+        NoiseFloor::Inside {
             new_stop,
-            reference_price: latest.c,
+            reference_price,
             distance,
             floor,
-        })
-    } else {
-        None
+        } => Some(BreakevenBlock::InsideNoise {
+            new_stop,
+            reference_price,
+            distance,
+            floor,
+        }),
     }
 }
 

@@ -39,6 +39,11 @@
 //!   bar?"* once break-even and the spread-hour widen are both in play. Owns the
 //!   two operator rules: a widen moves (and restores to) the **in-force** stop,
 //!   and break-even does not arm off a bar inside an active widen.
+//! - [`breakeven_noise`] — **pure.** *"Is this proposed break-even stop so close
+//!   to market that it cannot be a scratch?"* A tripwire for absurdity rather
+//!   than a tuning knob, fail-open by design, and shared by the live cron and
+//!   the offline replay so a mis-derived target cannot be refused loudly on one
+//!   and applied silently on the other.
 //! - [`join`] — **pure.** Match a broker position back to the `EntryAttempt`
 //!   that opened it. De-duplicated from two byte-identical cron copies.
 //! - [`park`] — **effectful.** Persisting a Stored order on the trade's record:
@@ -77,6 +82,7 @@
 //!   spread sample, counted in **bars of market** rather than hours of
 //!   wall-clock, so a weekend can't silently shrink the sample.
 
+mod breakeven_noise;
 mod in_force_stop;
 mod join;
 mod park;
@@ -92,6 +98,7 @@ mod tick;
 mod widen_episodes;
 mod widen_restore;
 
+pub use breakeven_noise::*;
 pub use in_force_stop::*;
 pub use join::*;
 pub use park::*;
