@@ -1,5 +1,73 @@
 # Changelog
 
+## v145 — 2026-09-15 — manual RESTING entries (`--stop-entry` / `--limit-entry`) are now cron-managed
+
+**Why.** A manual `--stop-entry` / `--limit-entry` order rested at the broker
+completely unmanaged. The consequential loss: an unfilled order has no working
+stop, so when price trades **through** the drawn stop before the order fills,
+the setup is dead but the order still rests and can fill later on the way back —
+a guaranteed loser that should never have been taken. The bug report's case is a
+sell-stop resting at 1.2640 with its stop at 1.2720; price rallies to 1.2735 and
+nothing cancels the order. The pre-fill SL-breach cancel is the only thing that
+kills it, and **it has no broker-side analogue** — the bracket cannot substitute
+for an order that has not filled.
+
+The root cause is one hop: all five attempt-keyed crons (pending-order sweep,
+break-even watch, both blackout passes, order-control re-price) enumerate
+`list_all_entry_attempts()` and **none of them joins via a plan**. So the only
+thing that turns them on is an `EntryAttempt` row, which `run_enter` writes only
+when the retry gate ran — and the gate runs only for `EntryDedup::GateOwned`.
+Manual entries carried the skeleton default (`entry_dedup` absent,
+`max_retries: Static(0)`), so no row was ever written.
+
+**What changed.** `build_position_enter` (`cli/src/trade_patterns.rs`) sets
+`entry_dedup: Some(GateOwned)` + `max_retries: Static(1)` for
+`PositionEntryKind::{Stop, Limit}` only. That is the whole production change.
+
+**Not changed: `PositionEntryKind::Market`.** It fills on receipt, so there is no
+resting order to sweep and no expiry to enforce, and its broker bracket covers it
+from the instant of the fill. Its documented fire-and-forget contract was written
+for an order that fills instantly and stands as-is. The cut is along the axis that
+matters — **does the order rest?** — not along the flag name.
+
+**Breaking.** None. No wire-format change (`entry_dedup` is an existing signed
+field), no migration, no change to any pattern trade. `Market` entries are
+byte-identical.
+
+**Config.** None.
+
+**Tests.** Six new tests in `cli/src/trade_patterns.rs`, driving the real chain
+end to end — `build_position_enter` → `parse_and_verify` → `run_enter` (spy
+broker) → the `EntryAttempt` row → the sweep's SL-breach decision. The
+headline one replays the GBP/USD story above and asserts the **cancel**, not the
+field values. Five mutations were run at the entry point and all confirmed red:
+dropping `entry_dedup`, reverting the cap to `0`, extending the change to
+`Market`, neutering `breach_detected`, and suppressing `record_placement`.
+
+The first of those **initially survived** — `effective_entry_dedup` heals an
+absent field by re-deriving from the cap, so at `max_retries: 1` the assignment
+is behaviourally invisible. The test was widened to assert the **raw** field
+rather than the healed reading: absent ≠ explicit, and inferring dedup from a cap
+is precisely the conflation that caused the v144 EUR/GBP 3× risk incident.
+
+Measured, not assumed: a **first** manual placement makes **zero** broker
+round-trips through the gate (the open-position backstop is skipped when there
+are no prior attempts), so nothing is added to placement latency. A re-fire that
+finds its order still resting takes the gate's `Pending` arm — cancel then
+re-place, a re-price, never a duplicate; once an entry has filled, the cap of 1
+makes a stop-out terminal.
+
+The replay corpus is **structurally blind** to this class (manual entries are a
+tv-arm → worker HTTP path, never a plan the replay drives). It was run to prove
+no movement: 2847 fixtures, 2847 ok, 0 failed, nothing re-blessed.
+
+**Follow-up (not in this change).** Break-even still cannot arm for a manual
+entry — it needs both a `breakeven` rule and a granularity, and the webhook path
+passes `enter_granularity: None`. The "management plan" (a plan with no enter
+rule, carrying `02-veto-trade-expiry`) remains deferred, as does persisting the
+signed body on the engine path so engine-placed orders keep their resting-order
+holds.
+
 ## v144 — 2026-09-10 — an M/W enter deduped nowhere: `entry_dedup` splits the cap from the gate
 
 **Why.** On 2026-08-20 an EUR/GBP H1 M-top (plan `m-eur-gbp-642f7851`) placed

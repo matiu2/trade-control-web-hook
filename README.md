@@ -342,11 +342,28 @@ reads that record and shows the `entered: order=<id>` outcome — that is
 the check that answers "did it actually fill?". With `--broker-dry-run`
 the line instead reads `DRY RUN — no order placed at the broker`.
 
-⚠️ Because this path is fire-and-forget it creates **no `EntryAttempt`
-row**, so the crons that manage a position (breakeven watch, blackout
-apply, order-control) do not track it. Once placed, the position is
-yours to manage — a reversal-close alert armed alongside it is the only
-automated touchpoint.
+⚠️ **`--market-entry` is fire-and-forget; the two resting kinds are
+managed.** The split is *does the order rest?*, not the flag name.
+
+- `--market-entry` creates **no `EntryAttempt` row**, so the crons that
+  manage a position (breakeven watch, blackout apply, order-control) do
+  not track it. It fills on receipt and its broker bracket covers it from
+  that instant, so once placed the position is yours to manage — a
+  reversal-close alert armed alongside it is the only automated
+  touchpoint.
+- `--stop-entry` / `--limit-entry` **do** write an `EntryAttempt` row
+  (v145), because they rest unfilled and a resting order needs looking
+  after. Most importantly they gain the **pre-fill SL-breach cancel**: if
+  price trades through the drawn stop *before* the order fills, the setup
+  is dead and the sweep pulls the order — otherwise it sits there and can
+  still fill on the way back, for a loss that should never have happened.
+  An unfilled order has no working stop at the broker, so nothing else can
+  provide this. They also get expiry cancel, the blackout stop
+  widen/restore, and order-control re-price. Break-even still does **not**
+  arm on this path (it needs a granularity the webhook does not carry).
+
+  Each such entry is capped at a single placement, so a stop-out is
+  terminal — it never re-enters.
 
 The resting price is baked onto the wire as an absolute trigger
 (`EntrySpec::{Stop,Limit}::at`) — the operator drew the exact level, so

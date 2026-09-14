@@ -4,8 +4,22 @@
 //! This is the *other* way to place a trade with tv-arm, and it shares almost
 //! nothing with the pattern-arming flow. There's no plan, no engine rules, no
 //! preps or vetos: the operator draws a long/short position tool, and its
-//! entry/SL/TP go straight to the worker as a single signed enter that's
-//! placed on receipt.
+//! entry/SL/TP go straight to the worker as a single signed enter, dispatched
+//! on receipt.
+//!
+//! # `Market` is fire-and-forget; `Stop`/`Limit` are cron-MANAGED
+//!
+//! `--market-entry` fills on receipt, so there is no resting order to look
+//! after and its broker bracket covers it from the fill. It stays entirely
+//! unmanaged, by design.
+//!
+//! `--stop-entry` / `--limit-entry` **rest unfilled**, which is a materially
+//! different situation: price can trade through the drawn stop *before* the
+//! order fills, killing the setup while the order sits there still able to fill
+//! later on the way back. So `build_position_enter` gives those two kinds
+//! `EntryDedup::GateOwned` + `max_retries: Static(1)`, which routes them
+//! through the retry gate and writes the `EntryAttempt` row that every
+//! attempt-keyed cron enumerates. See CLAUDE.md, "Manual entries".
 //!
 //! Because it reads a *drawing property* (the position tool's tick distances)
 //! rather than geometry a frozen spec could carry, this path is refused under
