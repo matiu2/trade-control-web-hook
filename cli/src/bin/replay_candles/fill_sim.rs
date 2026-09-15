@@ -228,9 +228,13 @@ fn resolve_effective_bracket(
     // stop closer than `10 × spread` to entry is widened to `10 × spread` and R
     // re-checked; the widen mutates `resolved.stop_loss` so every downstream
     // reader (fill, exit, break-even) sees the widened level.
-    if let EntryFloor::Rejected =
-        apply_entry_spread_floor(&mut resolved, pip_size, candles, entry_spread_price)
-    {
+    if let EntryFloor::Rejected = apply_entry_spread_floor(
+        &mut resolved,
+        pip_size,
+        replay_tick(intent, pip_size),
+        candles,
+        entry_spread_price,
+    ) {
         return Err(BracketReject::FloorRejected);
     }
 
@@ -1092,9 +1096,16 @@ pub enum EntryFloor {
 /// `hs-eur-aud-3d0b5dda`. Returns the spread used (for display) or a reject.
 ///
 /// No fire bar (empty path) ⇒ `Applied { spread_pips: 0.0 }` — nothing to floor.
+///
+/// `tick_size` is the instrument's tick grid — pass [`replay_tick`], the same
+/// value `Resolved::from_intent` snapped the drawn geometry with. The widen
+/// snaps its new stop onto that grid (away from entry) so the replay's placed
+/// stop is the same number the worker hands the broker; without it the replay
+/// would floor to an off-grid level the live worker cannot actually place.
 pub fn apply_entry_spread_floor(
     resolved: &mut Resolved,
     pip_size: f64,
+    tick_size: f64,
     candles: &[BidAskCandle],
     entry_spread_price: Option<f64>,
 ) -> EntryFloor {
@@ -1119,6 +1130,7 @@ pub fn apply_entry_spread_floor(
         resolved.take_profit,
         spread_price,
         resolved.min_r,
+        tick_size,
     ) {
         SlWiden::Unchanged => {}
         SlWiden::Widened { new_stop_loss, .. } => {
@@ -1234,9 +1246,13 @@ fn widened_stop_at(
     // signed SL. Uses the SAME trailing-window entry spread as the gate/sim
     // (via `entry_spread_price`) so all three floor to one number. A reject
     // means the live worker declined the entry, so there's no position to widen.
-    if let EntryFloor::Rejected =
-        apply_entry_spread_floor(&mut resolved, pip_size, candles, entry_spread_price)
-    {
+    if let EntryFloor::Rejected = apply_entry_spread_floor(
+        &mut resolved,
+        pip_size,
+        replay_tick(intent, pip_size),
+        candles,
+        entry_spread_price,
+    ) {
         return None;
     }
     widened_stop_at_resolved(
@@ -1772,7 +1788,7 @@ mod tests {
         // Fire-bar path (entry_spread_price = None) → floor off 0.0020 → widen to
         // 10× = 0.0200 above entry → SL 1.1200.
         let mut r_fire = Resolved::from_intent(&intent, &shell, 0.0001, 0.0).expect("resolves");
-        let out_fire = apply_entry_spread_floor(&mut r_fire, 0.0001, &fire, None);
+        let out_fire = apply_entry_spread_floor(&mut r_fire, 0.0001, 0.00001, &fire, None);
         assert!(
             matches!(out_fire, EntryFloor::Applied { .. }),
             "{out_fire:?}"
@@ -1787,7 +1803,7 @@ mod tests {
         // 10× = 0.0010 above entry → SL 1.1010, far tighter. The SAME fire slice,
         // only the supplied spread differs — proving the window wins.
         let mut r_win = Resolved::from_intent(&intent, &shell, 0.0001, 0.0).expect("resolves");
-        let out_win = apply_entry_spread_floor(&mut r_win, 0.0001, &fire, Some(0.0001));
+        let out_win = apply_entry_spread_floor(&mut r_win, 0.0001, 0.00001, &fire, Some(0.0001));
         assert!(matches!(out_win, EntryFloor::Applied { .. }), "{out_win:?}");
         assert!(
             (r_win.stop_loss - 1.1010).abs() < 1e-9,
@@ -2990,9 +3006,28 @@ mod tests {
         // Widen distance = baked p90 (~5p), NOT the 22p legacy floor. Long ⇒ SL
         // moves DOWN from the original stop by baked p90 pips.
         let expected = widen.original_stop - baked * 0.0001;
+        // Tolerance is ONE PIP, not 1e-9: `widened_stop` is snapped onto the
+        // pip grid (`blackout_widen::widened_stop`) so an over-precise level
+        // can't be rejected by the broker as PRICE_PRECISION_EXCEEDED, while
+        // `expected` here is the raw unsnapped product. What this test measures
+        // is WHICH widen size was used — the ~5p baked p90 rather than the 22p
+        // legacy floor, a 17p difference — so a sub-pip snap cannot mask it.
         assert!(
-            (widen.widened_stop - expected).abs() < 1e-9,
-            "widened by baked p90 {baked}p (expected SL {expected}), got {}",
+            (widen.widened_stop - expected).abs() < 0.0001,
+            "widened by baked p90 {baked}p (expected SL ~{expected}), got {}",
+            widen.widened_stop,
+        );
+        // And the snap itself: on the grid, and never TIGHTER than the raw
+        // widen (a long's stop moves DOWN, so "not tighter" means "not higher").
+        assert!(
+            widen.widened_stop <= expected + 1e-12,
+            "the snap tightened the widen: {} > {expected}",
+            widen.widened_stop,
+        );
+        let on_grid = (widen.widened_stop / 0.0001).round() * 0.0001;
+        assert!(
+            (widen.widened_stop - on_grid).abs() < 1e-9,
+            "widened stop is off the 0.0001 pip grid: {}",
             widen.widened_stop,
         );
         // Sanity: the baked p90 is much smaller than the legacy 22p floor, so

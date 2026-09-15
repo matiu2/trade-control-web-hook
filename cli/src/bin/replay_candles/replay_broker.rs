@@ -713,6 +713,10 @@ impl ReplayBroker {
                 super::fill_sim::apply_entry_spread_floor(
                     &mut resolved,
                     self.pip_size,
+                    // The same tick `Resolved::from_intent` snapped the drawn
+                    // geometry with above, so the floor's widened stop lands on
+                    // the same grid as the entry and TP beside it.
+                    tick,
                     forward,
                     None,
                 );
