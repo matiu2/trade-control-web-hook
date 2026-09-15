@@ -959,24 +959,36 @@ impl PgStateStore {
         Ok(())
     }
 
-    /// Re-point an attempt at the new order id it was re-placed under by a
-    /// `pending_lifecycle` restore. Same jsonb read-modify-write shape as its
-    /// neighbours (no column, no migration).
+    /// Re-point an attempt at the new order id it was re-placed under — and at
+    /// the stop that replacement actually carries — by a `pending_lifecycle`
+    /// restore or an `order_control::reprice`. Same jsonb read-modify-write
+    /// shape as its neighbours (no column, no migration).
     ///
     /// The WHERE clause matches on the body's **current** `broker_order_id`
     /// rather than `attempt_no` — the restore correlates by order id and never
     /// learns an attempt number — which also makes the statement idempotent: a
     /// repeat matches nothing, because the first run already moved the id.
-    async fn set_entry_attempt_broker_order_id_impl(
+    ///
+    /// Both keys are written by ONE `jsonb_set` chain, so a row can never be
+    /// left naming the new order while still carrying the old order's stop.
+    /// `stop_loss_price` is nullable on the row, and a `None` must land as a
+    /// JSON `null` rather than being skipped — leaving a stale number behind
+    /// would aim the sweep's breach gate at a stop the live order does not
+    /// carry — so the bind goes through `Option<f64>`, which encodes as SQL
+    /// NULL and thence `to_jsonb(NULL::float8)` = JSON `null`.
+    async fn set_entry_attempt_replacement_impl(
         &self,
         account: Option<&str>,
         trade_id: &str,
         old_broker_order_id: &str,
         new_broker_order_id: &str,
+        new_stop_loss: Option<f64>,
     ) -> Result<(), StateError> {
         sqlx::query(
             "UPDATE entry_attempt
-             SET body = jsonb_set(body, '{broker_order_id}', to_jsonb($4::text), true)
+             SET body = jsonb_set(
+                     jsonb_set(body, '{broker_order_id}', to_jsonb($4::text), true),
+                     '{stop_loss_price}', to_jsonb($5::float8), true)
              WHERE account IS NOT DISTINCT FROM $1 AND trade_id = $2
                AND body->>'broker_order_id' = $3",
         )
@@ -984,6 +996,7 @@ impl PgStateStore {
         .bind(trade_id)
         .bind(old_broker_order_id)
         .bind(new_broker_order_id)
+        .bind(new_stop_loss)
         .execute(&self.pool)
         .await
         .map_err(backend)?;
@@ -1859,18 +1872,20 @@ impl StateStore for PgStateStore {
         self.set_entry_attempt_superseded_impl(account, trade_id, attempt_no)
             .await
     }
-    async fn set_entry_attempt_broker_order_id(
+    async fn set_entry_attempt_replacement(
         &self,
         account: Option<&str>,
         trade_id: &str,
         old_broker_order_id: &str,
         new_broker_order_id: &str,
+        new_stop_loss: Option<f64>,
     ) -> Result<(), StateError> {
-        self.set_entry_attempt_broker_order_id_impl(
+        self.set_entry_attempt_replacement_impl(
             account,
             trade_id,
             old_broker_order_id,
             new_broker_order_id,
+            new_stop_loss,
         )
         .await
     }

@@ -1135,11 +1135,14 @@ mod tests {
                 .expect("seed the attempt");
             // What the restore does once the broker hands back the new id.
             store
-                .set_entry_attempt_broker_order_id(
+                .set_entry_attempt_replacement(
                     row.account.as_deref(),
                     &row.trade_id,
                     "order-cancelled-by-the-hold",
                     "order-restored",
+                    // Unchanged: this test's subject is the ORDER ID, so the
+                    // re-place is given the same stop the row already held.
+                    row.stop_loss_price,
                 )
                 .await
                 .expect("re-point the attempt");
