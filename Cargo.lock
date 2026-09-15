@@ -4680,6 +4680,7 @@ dependencies = [
  "broker-tradenation-adapter",
  "chrono",
  "pollster 1.0.1",
+ "serde_json",
  "tracing",
  "trade-control-core",
  "trade-control-engine",

@@ -28,6 +28,7 @@ pub mod plan_sentiment;
 pub mod plan_state;
 pub mod recording;
 pub mod recover_entry;
+pub mod resign;
 pub mod retry_gate;
 pub mod rounding;
 pub mod rules;

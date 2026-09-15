@@ -16,4 +16,5 @@ broker-ibkr = { version = "0.1.0", path = "../broker-ibkr" }
 
 [dev-dependencies]
 pollster = "1.0.1"
+serde_json = "1.0.151"
 trade-control-core = { path = "../core", features = ["test-support"] }
