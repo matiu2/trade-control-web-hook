@@ -176,3 +176,62 @@ pub fn hours_to_duration(hours: f64) -> Result<chrono::Duration> {
     chrono::Duration::try_seconds(secs)
         .ok_or_else(|| eyre!("news buffer {hours}h is out of representable range"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan_geometry::PlanGeometry;
+
+    /// A drawn trade-expiry is REQUIRED — `read_trade_expiry` must error, never
+    /// substitute a default, when the chart carries no expiry vertical.
+    ///
+    /// This is the shared predicate behind the requirement, and pinning it here
+    /// covers all four call sites at once: `hs_resolve`, `mw_resolve` and the
+    /// `pipeline` hint have always propagated this error with `?`, and
+    /// `position_entry` joined them in v146 (it previously swallowed it into
+    /// `now + --expiry-hours`).
+    ///
+    /// Why it matters enough to test: v145 made manual resting entries
+    /// cron-managed, so the order sweep **cancels the resting order** when this
+    /// timestamp passes. A silently-defaulted expiry cancels a live order at a
+    /// time the operator never chose. If this test ever goes green against a
+    /// fallback, that failure mode is back.
+    #[test]
+    fn a_missing_trade_expiry_is_an_error_not_a_default() {
+        let geom = PlanGeometry {
+            trade_expiry_epoch: None,
+            ..PlanGeometry::default()
+        };
+        let err = read_trade_expiry(&geom).expect_err("no drawn expiry must not resolve");
+        assert!(
+            err.to_string().contains("missing trade_expiry"),
+            "the error must name the missing expiry, got: {err}",
+        );
+    }
+
+    /// An out-of-range epoch is also an error rather than a silent default —
+    /// the old `Err(_)` fallback collapsed this case and the missing-line case
+    /// into the same 48h guess, so neither was distinguishable by the operator.
+    #[test]
+    fn an_unrepresentable_trade_expiry_is_an_error() {
+        let geom = PlanGeometry {
+            trade_expiry_epoch: Some(i64::MAX),
+            ..PlanGeometry::default()
+        };
+        assert!(
+            read_trade_expiry(&geom).is_err(),
+            "an out-of-range timestamp must not resolve to a default",
+        );
+    }
+
+    /// The happy path still works: a drawn line resolves to its instant.
+    #[test]
+    fn a_drawn_trade_expiry_resolves_to_that_instant() {
+        let geom = PlanGeometry {
+            trade_expiry_epoch: Some(1_800_000_000),
+            ..PlanGeometry::default()
+        };
+        let got = read_trade_expiry(&geom).expect("a drawn expiry resolves");
+        assert_eq!(got.timestamp(), 1_800_000_000);
+    }
+}

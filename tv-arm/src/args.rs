@@ -737,11 +737,20 @@ pub struct Args {
     #[arg(long)]
     pub tick_size: Option<f64>,
 
-    /// (Position-tool entry only) Trade-expiry window in hours from now,
-    /// used when the chart carries no `trade-expiry` vertical line. The
-    /// emitted enter self-cancels (if still resting) / the setup expires
-    /// at `now + this`. Ignored when a `trade-expiry` line is present
-    /// (the line wins). Default 48h.
+    /// **DEAD as of v146 — accepted but ignored.** Retained only so an
+    /// existing invocation carrying it still parses.
+    ///
+    /// This was the fallback trade-expiry window for a position-tool entry
+    /// when the chart carried no `trade-expiry` vertical. There is no
+    /// fallback any more: a manual entry **requires** a drawn trade-expiry
+    /// line, exactly as H&S / M&W arming always has.
+    ///
+    /// Why the default had to go: v145 made manual resting entries
+    /// cron-managed, so the order sweep now **cancels the resting order**
+    /// when its expiry passes. A defaulted expiry would therefore cancel a
+    /// live order at a time the operator never chose — and the old code
+    /// swallowed every failure mode (no line, malformed line, out-of-range
+    /// timestamp) into the same silent 48h. See `position_entry.rs`.
     #[arg(long, default_value_t = 48)]
     pub expiry_hours: u32,
 
