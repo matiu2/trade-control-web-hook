@@ -78,11 +78,37 @@ pub(crate) fn run_position_entry(
     // catalog value (NOT pip_size — see position_trade docs).
     let levels = resolve_levels(pos, resolved.precision.tick_size)?;
 
-    // Expiry: a drawn trade-expiry line wins; otherwise now + flag hours.
-    let trade_expiry = match read_trade_expiry(&PlanGeometry::from_roles(roles)) {
-        Ok(t) => t,
-        Err(_) => now + chrono::Duration::hours(i64::from(args.expiry_hours)),
-    };
+    // Expiry: the drawn trade-expiry line, REQUIRED — no fallback.
+    //
+    // # Why there is no default here (v146)
+    //
+    // This used to fall back to `now + args.expiry_hours` (default 48) on ANY
+    // read failure. That was safe only while the expiry was inert for a manual
+    // entry: it bounded the enter's `not_after` (how long the *alert* stays
+    // valid) and nothing swept the resting order.
+    //
+    // v145 made manual resting entries cron-managed, so the **sweep now
+    // enforces this timestamp** — it cancels the resting order when the expiry
+    // passes. A silently-defaulted expiry therefore silently cancels a live
+    // order, and the operator never chose the number that did it. Worse, the
+    // old `Err(_)` swallowed *every* failure mode identically: a chart with no
+    // expiry line, a malformed one, and an out-of-range timestamp all became
+    // "48 hours" with nothing logged.
+    //
+    // The three pattern call sites — `hs_resolve.rs`, `mw_resolve.rs` and the
+    // `pipeline.rs` hint — all use `read_trade_expiry(geom)?` and REFUSE TO ARM
+    // without a drawn line. This site was the only one that substituted a
+    // guess, so requiring it makes manual entries consistent with every other
+    // way of arming a trade rather than adding a new restriction.
+    //
+    // `--expiry-hours` is consequently dead for this path; it is retained on
+    // `Args` only so an existing invocation carrying it still parses.
+    let trade_expiry = read_trade_expiry(&PlanGeometry::from_roles(roles)).wrap_err(
+        "draw a trade-expiry vertical on the chart before arming a manual entry. It is not \
+         optional: the order sweep cancels this resting order when the expiry passes, so \
+         guessing a default would silently cancel a live order at a time you never chose. \
+         Pattern arming (H&S / M&W) already requires it.",
+    )?;
 
     let kind = match mode {
         PositionEntry::Market => cli::PositionEntryKind::Market,
