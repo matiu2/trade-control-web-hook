@@ -49,9 +49,18 @@
 //! past the trigger. That flip is rule 4, and it belongs to the shared re-place
 //! path rather than being copied here.
 //!
-//! `restore = true` for the same reason promotion uses it: a re-price is a
-//! replacement of an order we already placed, not a new attempt, so it must not
-//! burn a `max_retries` slot.
+//! It passes [`EntryOrigin::Replacing`](crate::dispatch::EntryOrigin) for the
+//! same reason promotion passes `Promotion`: a re-price is a replacement of an
+//! order we already placed, not a new attempt, so it must not burn a
+//! `max_retries` slot.
+//!
+//! The variant carries the cancelled order's id, and that is load-bearing.
+//! Because no new `EntryAttempt` row is written, nothing else would move the
+//! existing row off the id we just cancelled — leaving it naming an order the
+//! broker discarded while the re-placed one rests under a different id. The
+//! sweep's pre-fill SL-breach cancel dispatches **directly** on
+//! `attempt.broker_order_id`, with no lookup and no fallback, so a stale row
+//! aims it at a dead order.
 
 use chrono::{DateTime, Utc};
 
@@ -210,9 +219,14 @@ where
     }
 
     // --- Re-place through the full entry path (RAIL 7). ---------------------
-    // `restore = true`: a re-price replaces an order we already placed, so it
-    // must not burn a `max_retries` slot. The stop↔limit flip on "#19-10 too
-    // close to market" is inherited from this path, not re-implemented here.
+    // `EntryOrigin::Replacing`: a re-price replaces an order we already placed,
+    // so it must not burn a `max_retries` slot. The stop↔limit flip on "#19-10
+    // too close to market" is inherited from this path, not re-implemented here.
+    //
+    // It carries the cancelled order's id because it writes no new
+    // `EntryAttempt` row: the existing row must be re-pointed at whatever id the
+    // broker answers the re-place with, or it keeps naming the order we just
+    // cancelled three lines up.
     let cfg = cfg_provider.dispatch_config(&verified).await;
     let result = run_enter(
         broker,
@@ -222,7 +236,9 @@ where
         now,
         Some(&signed_intent),
         None,
-        true,
+        crate::dispatch::EntryOrigin::Replacing {
+            old_broker_order_id: order.order_id.clone(),
+        },
     )
     .await;
 
@@ -580,6 +596,61 @@ mod tests {
             broker.places.borrow().len(),
             0,
             "placing after a failed cancel would double the order",
+        );
+    }
+
+    /// A successful re-price must leave the `EntryAttempt` row naming the order
+    /// that is now resting, not the one it just cancelled.
+    ///
+    /// Same defect shape as the `pending_lifecycle` restore this was fixed
+    /// alongside, and for the same reason: a re-price is
+    /// `EntryOrigin::Replacing`, so `run_enter` writes NO new attempt row (it
+    /// must not burn a `max_retries` slot) — which means nothing updates the
+    /// existing row unless the re-point does. A stale row aims the sweep's
+    /// pre-fill SL-breach cancel (which dispatches directly on
+    /// `attempt.broker_order_id`, with no lookup) at a dead order.
+    #[test]
+    fn a_repriced_order_updates_the_entry_attempts_broker_order_id() {
+        let store = MemStateStore::default();
+        let broker = SpyBroker::default();
+        let now = at("2026-07-22T13:30:00Z");
+
+        // The row as `record_placement` left it when `ord-1` was first placed.
+        pollster::block_on(store.record_entry_attempt(crate::state::EntryAttempt {
+            trade_id: "t-1".into(),
+            account: None,
+            instrument: "EUR_USD".into(),
+            attempt_no: 1,
+            broker_order_id: "ord-1".into(),
+            broker_trade_id: None,
+            direction: Direction::Long,
+            placed_at: now,
+            shell_time: at("2026-07-22T12:00:00Z"),
+            expires_at: at("2026-07-24T00:00:00Z"),
+            stop_loss_price: Some(1.0980),
+            adverse_extreme: None,
+            cancel_at: None,
+            pip_size: Some(0.0001),
+            blackout_close: Default::default(),
+            breakeven: None,
+            order_control: None,
+            superseded: false,
+        }))
+        .expect("seed the attempt");
+
+        let out = run(&broker, &store, &TestSrc::Ok, adjust(), now).expect("re-price runs");
+        assert!(
+            matches!(out, RepriceOutcome::Repriced(_)),
+            "the re-place must succeed, got {out:?}",
+        );
+        assert_eq!(broker.cancels.borrow().as_slice(), ["ord-1"]);
+
+        let attempts =
+            pollster::block_on(store.list_entry_attempts(None, "t-1")).expect("list attempts");
+        assert_eq!(attempts.len(), 1, "a re-price must not write a second row");
+        assert_eq!(
+            attempts[0].broker_order_id, "ord-2",
+            "the attempt must name the re-placed order, not the cancelled one",
         );
     }
 

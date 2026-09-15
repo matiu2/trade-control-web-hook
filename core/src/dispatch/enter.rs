@@ -1,6 +1,7 @@
 //! The `Enter` dispatch path: gates → sizing → broker placement → recovery.
 
 use super::action_result::ActionResult;
+use super::entry_origin::EntryOrigin;
 use super::shared::record_control_event_for;
 use crate::allow_entry_gate;
 use crate::broker::{Broker, EntryError, EntryRequest};
@@ -59,20 +60,24 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // signed enter still carries its `breakeven` rule; only the cron snapshot
     // is skipped without a granularity to fetch on).
     enter_granularity: Option<crate::broker::Granularity>,
-    // `true` when this call is the spread-hour lifecycle **restoring** a resting
-    // order it earlier cancelled (RAIL 7), NOT a fresh alert fire or a multi-shot
-    // re-entry. A restore re-places the SAME order the lifecycle owns the
-    // cancel→restore correlation for, so it must bypass the retry gate entirely —
-    // exactly as a single-shot enter already does. Skipping the gate:
+    // What this call IS — a fresh fire, a re-placement of an order we cancelled,
+    // or a promotion of a parked setup. See [`EntryOrigin`].
+    //
+    // A replacement (RAIL 7) re-places an entry we already put through the
+    // gates, so it bypasses the retry gate entirely — exactly as a single-shot
+    // enter already does. Skipping the gate:
     //   * avoids the same-bar `is_retry_fire_seen` dedup that would otherwise
     //     `retry-fire-replay`-REJECT the re-drive (the original fire on this
     //     `shell.time` was already marked seen when it first placed), and
     //   * consumes NO `max_retries` slot / records no new `EntryAttempt` (the
     //     re-placement continues the original attempt, it is not a new re-entry).
-    // Every non-restore caller passes `false` and keeps the full gate. This is the
-    // `restoring` flag the blackout-restore docstring anticipated as the correct
-    // long-term answer to "a multi-shot re-drive shouldn't burn a slot".
-    restore: bool,
+    //
+    // Because no new row is written, a `Replacing` call must instead RE-POINT
+    // the existing row at the id the broker just answered with — the variant
+    // carries the old id for exactly that, so a caller cannot claim to replace
+    // an order without naming which. Every fresh-fire caller passes
+    // `EntryOrigin::Fresh` and keeps the full gate.
+    origin: EntryOrigin,
 ) -> ActionResult {
     // Blackout gate — if any pause for this trade_id is active, reject
     // before doing any other work. Pauses are intentionally cheap to
@@ -502,7 +507,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // Friday-night / mid-week-daily-close bar without touching a same-clock-time
     // mid-week bar. See the `market-hours-blackout-weekly-gap-bug` memory.
     //
-    // RESTORE BYPASS: a `restore` re-drive re-places an order the lifecycle
+    // RESTORE BYPASS: a replacement re-drive re-places an order the lifecycle
     // already cancelled for a spread hour — it is NOT a fresh entry, so it must
     // skip the two blackout REJECT gates (this market-hours one and the
     // spread-blackout one below), same discipline as the retry-gate bypass above.
@@ -512,7 +517,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // re-placed even on the next clean bar — a live-money bug for
     // blackout-cancelled resting orders. The lifecycle's own `is_spread_hour` /
     // `off_now` timing already governs WHEN a restore may run.
-    if !restore {
+    if !origin.is_replacement() {
         if crate::intent::market_hours_blocked(&resolved.instrument, now) {
             tracing::info!(
                 "entry rejected: market-blackout instrument={} now={now} (id={})",
@@ -889,7 +894,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // Adding a new reject-capable gate BELOW this point reopens the hole. Put it
     // above, with the others.
     //
-    // A restore re-places an order the lifecycle already cancelled — it is
+    // A replacement re-places an order the lifecycle already cancelled — it is
     // neither a fresh fire nor a new multi-shot re-entry, so it skips the retry
     // gate entirely (like single-shot). This is what un-blocks the cancel→restore
     // sequence: without it, the re-drive of a multi-shot resting order is
@@ -899,7 +904,8 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // `effective_entry_dedup`, NOT the raw field: an intent armed before
     // `entry_dedup` existed carries no value, and for a legacy MULTI-shot enter
     // serde's `EngineLatched` default would silently switch its dedup off.
-    let retry_attempt_no = if !restore && verified.intent.effective_entry_dedup().needs_retry_gate()
+    let retry_attempt_no = if !origin.is_replacement()
+        && verified.intent.effective_entry_dedup().needs_retry_gate()
     {
         match crate::retry_gate::evaluate(broker, store, &verified.intent, &verified.shell).await {
             crate::retry_gate::RetryGateOutcome::Proceed { next_attempt_no } => {
@@ -998,6 +1004,48 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                         order_control,
                     )
                     .await;
+                }
+                // A replacement writes NO new `EntryAttempt` row (that is the
+                // point — it continues the original attempt and must not burn a
+                // `max_retries` slot, RAIL 7). So the existing row is still
+                // naming the order we cancelled, while the live order now
+                // resting is the one we just placed under a DIFFERENT broker id.
+                // Re-point it here, where the new id is in hand.
+                //
+                // This must not be recovered by parsing the outcome string
+                // below: a log-line parse rots silently the first time someone
+                // rewords the message.
+                //
+                // The consumer that makes a stale id bite is the scheduled sweep
+                // (`trade-control-cron::sweep`), which calls
+                // `cancel_order(account, &attempt.broker_order_id)` DIRECTLY —
+                // no lookup, no fallback — so its pre-fill SL-breach cancel was
+                // aimed at an order the broker had discarded while the live one
+                // survived and could still fill. The retry gate reads the same
+                // field but goes through `lookup_attempt_state` first, where a
+                // dead id resolves `Unknown` and rejects, so that consumer
+                // forfeits a re-entry rather than stacking a duplicate.
+                //
+                // Fails SAFE, matching `set_entry_attempt_superseded`: log and
+                // carry on. The order IS placed and bracketed at the broker;
+                // abandoning the placement over a bookkeeping write would trade
+                // a stale row for a live unmanaged position, which is worse.
+                if let Some(old_order_id) = origin.replaced_order_id()
+                    && let Some(trade_id) = verified.intent.trade_id.as_deref()
+                    && let Err(err) = store
+                        .set_entry_attempt_broker_order_id(
+                            verified.intent.account.as_deref(),
+                            trade_id,
+                            old_order_id,
+                            &order_id,
+                        )
+                        .await
+                {
+                    tracing::error!(
+                        "entry-attempt re-point FAILED (trade={trade_id} {old_order_id} → \
+                         {order_id}): {err} — the attempt row still names the cancelled order, so \
+                         the sweep's SL-breach cancel is aimed at a dead id"
+                    );
                 }
                 // Spread-blackout System 3 (Sub-plan 5): persist the raw signed
                 // body keyed by the broker order id so the apply cron can
@@ -2003,8 +2051,17 @@ mod gate_order_tests {
                 )
                 .await
                 .expect("set prep");
-            let result =
-                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
             assert!(
                 matches!(&result, ActionResult::Rejected { outcome, .. }
                     if outcome.starts_with("rejected: missing-prep")),
@@ -2054,8 +2111,17 @@ mod gate_order_tests {
                 )
                 .await
                 .expect("set break-and-close");
-            let result =
-                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
             assert!(
                 matches!(&result, ActionResult::Rejected { outcome, .. }
                     if outcome == "rejected: prep-order-violated (retest)"),
@@ -2083,8 +2149,17 @@ mod gate_order_tests {
                 .set_veto(None, "t-1", "EUR_CAD", "too-low", TTL)
                 .await
                 .expect("set veto");
-            let result =
-                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
             assert!(
                 matches!(&result, ActionResult::Rejected { outcome, .. }
                     if outcome == "rejected: veto-active (too-low)"),
@@ -2111,8 +2186,17 @@ mod gate_order_tests {
                 .set_cooldown(None, "EUR_CAD", 24, now())
                 .await
                 .expect("set cooldown");
-            let result =
-                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
             assert!(
                 matches!(&result, ActionResult::Rejected { outcome, .. }
                     if outcome == "rejected: cooled-down"),
@@ -2138,8 +2222,17 @@ mod gate_order_tests {
         verified.intent.allow_entry = Some(crate::tunable::Tunable::Static(false));
         pollster::block_on(async {
             seed_prior_attempt(&store).await;
-            let result =
-                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
             assert!(
                 matches!(&result, ActionResult::Rejected { outcome, .. }
                     if outcome == "rejected: allow-entry-false"),
@@ -2170,8 +2263,17 @@ mod gate_order_tests {
         }];
         pollster::block_on(async {
             seed_prior_attempt(&store).await;
-            let result =
-                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
             assert!(
                 matches!(&result, ActionResult::Rejected { outcome, .. }
                     if outcome == "rejected: veto-active (too-high)"),
@@ -2220,8 +2322,17 @@ mod gate_order_tests {
                 )
                 .await
                 .expect("set retest");
-            let result =
-                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
             // `placed:`, not `entered:` — this enter is a STOP order, which
             // rests rather than filling (Stage 6). The assertion here is about
             // a placement having HAPPENED, so it tracks the resting verb.
@@ -2255,7 +2366,17 @@ mod gate_order_tests {
         let verified = enter_verified("[]", "[]");
         pollster::block_on(async {
             seed_prior_attempt(&store).await;
-            run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
             let attempts = store
                 .list_entry_attempts(None, "t-1")
                 .await
@@ -2297,8 +2418,17 @@ mod gate_order_tests {
                     crate::dispatch::handle_prep(&store, &prep_verified(step, bar), now()).await;
                 assert!(result.is_success(), "prep {step}: {}", result.body);
             }
-            let result =
-                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
             // Again `placed:` — a resting stop entry (Stage 6).
             assert!(
                 matches!(&result, ActionResult::Ok(o) if o.starts_with("placed: order=")),
@@ -2331,8 +2461,17 @@ mod gate_order_tests {
             ] {
                 crate::dispatch::handle_prep(&store, &prep_verified(step, bar), now()).await;
             }
-            let result =
-                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
             assert!(
                 matches!(&result, ActionResult::Rejected { outcome, .. }
                     if outcome == "rejected: prep-order-violated (retest)"),
@@ -2425,7 +2564,7 @@ mod placement_is_not_a_fill_tests {
             now(),
             None,
             None,
-            false,
+            EntryOrigin::Fresh,
         ));
         let outcome = match &result {
             ActionResult::Ok(o) => o.clone(),
@@ -2458,7 +2597,7 @@ mod placement_is_not_a_fill_tests {
             now(),
             None,
             None,
-            false,
+            EntryOrigin::Fresh,
         ));
         let outcome = match &result {
             ActionResult::Ok(o) => o.clone(),
@@ -2492,7 +2631,7 @@ mod placement_is_not_a_fill_tests {
             now(),
             None,
             None,
-            false,
+            EntryOrigin::Fresh,
         ));
         let outcome = match &result {
             ActionResult::Ok(o) => o.clone(),
@@ -2524,7 +2663,7 @@ mod placement_is_not_a_fill_tests {
                 now(),
                 None,
                 None,
-                false,
+                EntryOrigin::Fresh,
             ));
             let outcome = match &result {
                 ActionResult::Ok(o) => o.clone(),
@@ -2689,7 +2828,7 @@ mod units_below_minimum_tests {
             at("2026-07-22T13:00:30Z"),
             None,
             Some(Granularity::H1),
-            false,
+            EntryOrigin::Fresh,
         ))
     }
 
@@ -2810,7 +2949,7 @@ mod units_below_minimum_tests {
             at("2026-07-22T13:00:30Z"),
             None,
             Some(Granularity::H1),
-            false,
+            EntryOrigin::Fresh,
         ));
 
         let ActionResult::Failed(outcome) = &out else {
@@ -3063,8 +3202,17 @@ mod mw_everybar_dedup_tests {
                 .record_entry_attempt(prior_attempt("26936222", "2026-08-20T18:00:00Z"))
                 .await
                 .expect("seed the 18:00 attempt");
-            let result =
-                run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await;
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
             assert!(
                 matches!(&result, ActionResult::Ok(_)),
                 "the re-price fire should place, got {}",
@@ -3099,7 +3247,17 @@ mod mw_everybar_dedup_tests {
                 .record_entry_attempt(prior_attempt("26936222", "2026-08-20T18:00:00Z"))
                 .await
                 .expect("seed the filled attempt");
-            run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await
+            run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await
         });
         assert!(
             matches!(&result, ActionResult::Rejected { outcome, .. }
@@ -3132,7 +3290,17 @@ mod mw_everybar_dedup_tests {
                 .record_entry_attempt(prior_attempt("26936222", "2026-08-20T18:00:00Z"))
                 .await
                 .expect("seed the stopped-out attempt");
-            run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await
+            run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await
         });
         assert!(
             matches!(&result, ActionResult::Rejected { outcome, .. }
@@ -3159,13 +3327,33 @@ mod mw_everybar_dedup_tests {
         let mut second = mw_verified(MW_FIXED, "2026-08-20T19:00:00Z");
         second.intent.id = "m-1-enter-second-tick".into();
         let second_result = pollster::block_on(async {
-            let a = run_enter(&broker, &store, &first, &cfg(), now(), None, None, false).await;
+            let a = run_enter(
+                &broker,
+                &store,
+                &first,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
             assert!(
                 matches!(&a, ActionResult::Ok(_)),
                 "the first arrival on the bar should place, got {}",
                 describe(&a)
             );
-            run_enter(&broker, &store, &second, &cfg(), now(), None, None, false).await
+            run_enter(
+                &broker,
+                &store,
+                &second,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await
         });
         assert!(
             matches!(&second_result, ActionResult::Rejected { outcome, .. }
@@ -3226,7 +3414,7 @@ mod mw_everybar_dedup_tests {
                 now(),
                 None,
                 None,
-                false,
+                EntryOrigin::Fresh,
             )
             .await
         });
@@ -3248,7 +3436,7 @@ mod mw_everybar_dedup_tests {
                 now(),
                 None,
                 None,
-                false,
+                EntryOrigin::Fresh,
             )
             .await
         });
@@ -3285,7 +3473,17 @@ mod mw_everybar_dedup_tests {
                 .record_entry_attempt(prior_attempt("26936222", "2026-08-20T18:00:00Z"))
                 .await
                 .expect("seed a prior attempt the gate WOULD have found");
-            run_enter(&broker, &store, &verified, &cfg(), now(), None, None, false).await
+            run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await
         });
         assert!(
             matches!(&result, ActionResult::Ok(_)),

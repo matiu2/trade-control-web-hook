@@ -384,6 +384,16 @@ mod dispatcher_outcome_tests {
             Ok(())
         }
 
+        async fn set_entry_attempt_broker_order_id(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _old_broker_order_id: &str,
+            _new_broker_order_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+
         async fn set_entry_attempt_adverse_extreme(
             &self,
             _account: Option<&str>,

@@ -28,10 +28,16 @@
 //! vetos, cooldowns, sizing, the spread floor itself. A promotion that skipped
 //! them could place a trade the operator had since vetoed.
 //!
-//! It re-drives with `restore = true` because a promotion is **not a new
-//! attempt** — it is the placement of an order we already intended and merely
-//! deferred. Burning a `max_retries` slot would let a wide spread silently eat
-//! the operator's re-entry budget.
+//! It re-drives with [`EntryOrigin::Promotion`](crate::dispatch::EntryOrigin)
+//! because a promotion is **not a new attempt** — it is the placement of an
+//! order we already intended and merely deferred. Burning a `max_retries` slot
+//! would let a wide spread silently eat the operator's re-entry budget.
+//!
+//! `Promotion` rather than `Replacing`, because a parked order **has no broker
+//! id** (see below): the park happened *instead of* a placement, so there is no
+//! `EntryAttempt` row pointing at a now-cancelled order to re-point. A
+//! `Replacing` here would have to invent an id, and would move some other
+//! attempt's row.
 
 use chrono::{DateTime, Utc};
 
@@ -136,9 +142,14 @@ where
         .await
         .map_err(|e| format!("clear before promote: {e}"))?;
 
-    // Full entry path (RAIL 7), `restore = true`: a promotion places an order we
-    // already intended, so it must not burn a `max_retries` slot nor be
+    // Full entry path (RAIL 7), `EntryOrigin::Promotion`: a promotion places an
+    // order we already intended, so it must not burn a `max_retries` slot nor be
     // rejected as a replay of its own already-seen `shell.time`.
+    //
+    // `Promotion`, NOT `Replacing`: a parked setup never reached the broker (the
+    // park happened *instead of* a placement, see the module docs — "a Stored
+    // order has no broker id"), so there is no `EntryAttempt` row to re-point.
+    // Naming an id here would move some other attempt's row.
     let cfg = cfg_provider.dispatch_config(&verified).await;
     let result = run_enter(
         broker,
@@ -148,7 +159,7 @@ where
         now,
         Some(&order.signed_intent),
         None,
-        true,
+        crate::dispatch::EntryOrigin::Promotion,
     )
     .await;
     tracing::info!(

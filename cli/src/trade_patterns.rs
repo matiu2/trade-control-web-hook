@@ -3825,7 +3825,7 @@ mod tests {
             now,
             Some(&body),
             None,
-            false,
+            trade_control_core::dispatch::EntryOrigin::Fresh,
         )
         .await
     }
@@ -4017,7 +4017,7 @@ mod tests {
                 now,
                 Some(&body),
                 None,
-                false,
+                trade_control_core::dispatch::EntryOrigin::Fresh,
             )
             .await;
             assert!(matches!(
@@ -4038,7 +4038,7 @@ mod tests {
                 later,
                 Some(&body),
                 None,
-                false,
+                trade_control_core::dispatch::EntryOrigin::Fresh,
             )
             .await;
 
@@ -4091,7 +4091,7 @@ mod tests {
                 now,
                 Some(&body),
                 None,
-                false,
+                trade_control_core::dispatch::EntryOrigin::Fresh,
             )
             .await;
 
@@ -4109,7 +4109,7 @@ mod tests {
                 later,
                 Some(&body),
                 None,
-                false,
+                trade_control_core::dispatch::EntryOrigin::Fresh,
             )
             .await;
             assert!(
