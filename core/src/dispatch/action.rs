@@ -3,6 +3,7 @@
 use super::action_result::ActionResult;
 use super::close::run_close;
 use super::enter::run_enter;
+use super::entry_origin::EntryOrigin;
 use super::invalidate::run_invalidate;
 use super::veto::run_veto_with_broker;
 use crate::broker::Broker;
@@ -24,7 +25,7 @@ pub async fn run_action<B: Broker, S: StateStore>(
 ) -> ActionResult {
     match verified.intent.action {
         Action::Enter => {
-            run_enter(broker, store, verified, cfg, now, Some(raw_body), None, false).await
+            run_enter(broker, store, verified, cfg, now, Some(raw_body), None, EntryOrigin::Fresh).await
         }
         Action::Close => run_close(broker, store, verified, now).await,
         Action::Invalidate => run_invalidate(broker, store, verified, now).await,

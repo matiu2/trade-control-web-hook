@@ -1170,10 +1170,19 @@ async fn restore_one_order<B: Broker, S: StateStore, P: EnterConfigProvider, V: 
 
     // 3. Re-drive through run_enter. SAME intended entry — we do NOT mark_seen
     //    (off the HTTP is_seen path) and we pass the signed body so a re-placed
-    //    order re-stores its own order:{order_id} row. `restore = true` bypasses
-    //    the retry gate: this is a re-placement of the order we cancelled, not a
-    //    fresh fire, so it must not be `retry-fire-replay`-rejected on its own
-    //    already-seen `shell.time` nor burn a multi-shot slot (RAIL 7).
+    //    order re-stores its own order:{order_id} row. `EntryOrigin::Replacing`
+    //    bypasses the retry gate: this is a re-placement of the order we
+    //    cancelled, not a fresh fire, so it must not be
+    //    `retry-fire-replay`-rejected on its own already-seen `shell.time` nor
+    //    burn a multi-shot slot (RAIL 7).
+    //
+    //    It carries `cancelled.order_id` — the id the `EntryAttempt` row still
+    //    holds — because that bypass is exactly why no new row is written. The
+    //    broker answers the re-place with a DIFFERENT id, so without this the
+    //    row goes on naming an order the broker discarded, and the sweep's
+    //    pre-fill SL-breach cancel (which dispatches straight on
+    //    `attempt.broker_order_id`, with no lookup) is aimed at a dead order
+    //    while the live restored one rests on and can still fill.
     let cfg = cfg_provider.dispatch_config(&verified).await;
     let result = run_enter(
         broker,
@@ -1183,7 +1192,9 @@ async fn restore_one_order<B: Broker, S: StateStore, P: EnterConfigProvider, V: 
         now,
         Some(&cancelled.signed_intent),
         None,
-        true,
+        crate::dispatch::EntryOrigin::Replacing {
+            old_broker_order_id: cancelled.order_id.clone(),
+        },
     )
     .await;
     tracing::info!(
@@ -1409,6 +1420,15 @@ mod tests {
         cancel_fails: RefCell<bool>,
         /// What `lookup_attempt_state` answers. `None` ⇒ a lookup error.
         lookup: RefCell<Option<AttemptState>>,
+        /// Order ids `place_entry` hands out, popped front-to-back. Empty ⇒ the
+        /// historical fixed `"order-redriven"`, so every pre-existing test keeps
+        /// its exact behaviour.
+        ///
+        /// A real broker gives a **restored** order a DIFFERENT id from the
+        /// placement it replaces — that is the whole premise of the stale
+        /// `broker_order_id` bug — so a mock answering one fixed id cannot
+        /// express it.
+        place_ids: RefCell<std::collections::VecDeque<String>>,
     }
 
     impl MockBroker {
@@ -1419,6 +1439,11 @@ mod tests {
         }
         fn set_quote(&self, bid: f64, ask: f64) {
             *self.quote.borrow_mut() = Some(Quote { bid, ask });
+        }
+        /// Script the ids successive `place_entry` calls return.
+        fn with_place_ids(self, ids: &[&str]) -> Self {
+            *self.place_ids.borrow_mut() = ids.iter().map(|s| s.to_string()).collect();
+            self
         }
         /// Fail the cancel, and answer a follow-up lookup with `state`.
         fn failing_cancel(self, state: Option<AttemptState>) -> Self {
@@ -1435,7 +1460,12 @@ mod tests {
             _max_open_positions: u32,
             _req: &EntryRequest<'_>,
         ) -> Result<crate::broker::Placement, EntryError> {
-            Ok(crate::broker::Placement::id_only("order-redriven"))
+            let id = self
+                .place_ids
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_else(|| "order-redriven".to_string());
+            Ok(crate::broker::Placement::id_only(&id))
         }
         async fn close_positions(&self, _instrument: &str) -> crate::broker::CloseOutcome {
             crate::broker::CloseOutcome::NothingOpen
@@ -2815,7 +2845,7 @@ mod tests {
             now,
             Some(&body),
             Some(Granularity::H1),
-            false,
+            crate::dispatch::EntryOrigin::Fresh,
         ))
     }
 
@@ -2919,6 +2949,189 @@ mod tests {
             off.restored,
             vec![("t".to_string(), RestoreReason::Recovered)],
             "the engine-placed order must be re-driven once the pause lifts",
+        );
+    }
+
+    // --- the restored order's id must reach the EntryAttempt row ---
+    //
+    // A restore re-places the order at the broker, which answers with a NEW
+    // order id. The `EntryAttempt` row still names the OLD one, and nothing
+    // updated it — so every cron that dispatches on `attempt.broker_order_id`
+    // is aimed at an order the broker discarded.
+    //
+    // These drive the real `pending_order_lifecycle` entry point (cancel pass,
+    // then recover pass through `run_enter`) against a mem store, NOT the store
+    // setter in isolation: a test that only proved "the setter sets" would have
+    // survived this bug untouched, because the bug is that nobody calls it.
+
+    /// A `GateOwned` enter — the configuration that actually WRITES an
+    /// `EntryAttempt` row (see `record_placement`, reached only when the retry
+    /// gate ran). `armed_verified` is single-shot/`EngineLatched`, so it records
+    /// no row and cannot express this bug at all.
+    fn gate_owned_verified(order_instrument: &str) -> Verified {
+        use crate::broker::Candle;
+        use crate::intent::{Intent, Shell};
+        let intent: Intent = serde_json::from_str(&format!(
+            r#"{{
+                "v": 1,
+                "id": "t-enter",
+                "not_after": "2026-07-09T00:00:00Z",
+                "action": "enter",
+                "instrument": "{order_instrument}",
+                "direction": "short",
+                "entry": {{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 0.5598 }},
+                "stop_loss": {{ "absolute": 0.5607 }},
+                "take_profit": {{ "absolute": 0.5560 }},
+                "broker": "tradenation",
+                "trade_id": "t",
+                "pip_size": 0.0001,
+                "entry_dedup": "gate_owned",
+                "max_retries": 1
+            }}"#
+        ))
+        .expect("valid gate-owned enter intent");
+        let shell = Shell::from_candle(&Candle {
+            time: ts("2026-07-08T20:00:00Z"),
+            o: 0.5600,
+            h: 0.5605,
+            l: 0.5595,
+            c: 0.5600,
+        });
+        Verified { shell, intent }
+    }
+
+    /// Place a gate-owned enter through the real `run_enter`, exactly as the
+    /// cron's `dispatch_action` does (re-signed body as `raw_body`), so a real
+    /// `EntryAttempt` row lands in the store.
+    fn place_gate_owned(
+        broker: &MockBroker,
+        store: &MemStateStore,
+        now: DateTime<Utc>,
+    ) -> crate::dispatch::ActionResult {
+        let verified = gate_owned_verified("AUD/CHF");
+        let cfg = DispatchConfig {
+            worker_max_risk_pct: 1.0,
+            worker_max_open_positions: 3,
+            pip_size: 0.0001,
+            tick_size: None,
+            caps: AccountCaps::default(),
+        };
+        let body = crate::resign::resign(&verified, &KEY).expect("re-sign the fired enter");
+        run(crate::dispatch::run_enter(
+            broker,
+            store,
+            &verified,
+            &cfg,
+            now,
+            Some(&body),
+            Some(Granularity::H1),
+            crate::dispatch::EntryOrigin::Fresh,
+        ))
+    }
+
+    /// Drive one full hold episode — place, pause (cancel), unpause (restore) —
+    /// and hand back the `EntryAttempt` rows the store is left holding.
+    fn attempts_after_a_hold_episode(broker: &MockBroker) -> Vec<crate::state::EntryAttempt> {
+        let store = MemStateStore::new();
+        let now = ts("2026-07-08T12:00:00Z"); // clean bar — only the pause acts
+        store.set_clock(now);
+        broker.set_quote(0.5600, 0.5602);
+
+        let placed = place_gate_owned(broker, &store, now);
+        assert!(
+            matches!(placed, crate::dispatch::ActionResult::Ok(_)),
+            "the gate-owned enter must place: {}",
+            placed.describe()
+        );
+
+        // ON: pause armed ⇒ the resting order is cancelled and recorded.
+        run(pause_trade(&store, now));
+        let on = run(pending_order_lifecycle(
+            broker,
+            &store,
+            &StubCfg,
+            &src(),
+            Some("reversals"),
+            now,
+            ClearPolicy::LeaveForCaller,
+        ));
+        assert_eq!(
+            on.cancelled,
+            vec!["order-first".to_string()],
+            "the original order must be cancelled by the pause",
+        );
+
+        // OFF: pause cleared ⇒ the holder set empties and the order is
+        // re-placed, at a NEW broker id.
+        run(async {
+            store
+                .clear_pause("t", "cal-cpi-pause")
+                .await
+                .expect("clear pause");
+        });
+        broker.pendings.borrow_mut().clear();
+        let off = run(pending_order_lifecycle(
+            broker,
+            &store,
+            &StubCfg,
+            &src(),
+            Some("reversals"),
+            now + chrono::Duration::minutes(5),
+            ClearPolicy::ClearRecord,
+        ));
+        assert_eq!(
+            off.restored,
+            vec![("t".to_string(), RestoreReason::Recovered)],
+            "the order must be restored once the pause lifts",
+        );
+
+        // Scoped by the INTENT's account (`None` here), not the lifecycle's
+        // broker account — that is the key `record_placement` writes under.
+        run(store.list_entry_attempts(None, "t")).expect("list attempts")
+    }
+
+    /// THE BUG. After a cancel→restore episode the `EntryAttempt` row must name
+    /// the order that is actually resting at the broker, not the dead one.
+    ///
+    /// The exposure this closes is the sweep (`trade-control-cron::sweep`),
+    /// which calls `cancel_order(account, &attempt.broker_order_id)` DIRECTLY —
+    /// no lookup, no fallback — so a stale id means the pre-fill SL-breach
+    /// cancel is aimed at an order the broker already discarded while the live
+    /// restored order survives and can still fill. (The retry gate reads the
+    /// same field but goes through `lookup_attempt_state` first, so a dead id
+    /// resolves `Unknown` there and it fails safe.)
+    #[test]
+    fn a_restored_order_updates_the_entry_attempts_broker_order_id() {
+        let broker = MockBroker::with_pending(pending("order-first", "AUD/CHF"))
+            .with_place_ids(&["order-first", "order-restored"]);
+        let attempts = attempts_after_a_hold_episode(&broker);
+
+        assert_eq!(attempts.len(), 1, "a restore must not write a second row");
+        assert_eq!(
+            attempts[0].broker_order_id, "order-restored",
+            "the attempt must name the LIVE restored order, not the cancelled one",
+        );
+    }
+
+    /// A restore continues the original attempt — it must not burn a cap slot
+    /// (RAIL 7), so the row is UPDATED IN PLACE. `attempt_no` is row identity
+    /// (half the unique index `(account, trade_id, attempt_no)`), so it must
+    /// survive, and `superseded` must stay false: the order was not withdrawn
+    /// in favour of a re-priced replacement, it is the same entry put back.
+    #[test]
+    fn a_restore_updates_in_place_and_burns_no_cap_slot() {
+        let broker = MockBroker::with_pending(pending("order-first", "AUD/CHF"))
+            .with_place_ids(&["order-first", "order-restored"]);
+        let attempts = attempts_after_a_hold_episode(&broker);
+
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].attempt_no, 1,
+            "row identity must survive the restore",
+        );
+        assert!(
+            !attempts[0].superseded,
+            "a restore is not a supersede — it must not be marked as one",
         );
     }
 }

@@ -756,6 +756,50 @@ pub async fn entry_attempt(store: &impl StateStore, tag: &str) {
         "scoped attempts must not bleed into the global scope"
     );
 
+    // set_entry_attempt_broker_order_id: the `pending_lifecycle` restore's
+    // re-point. Held to the same contract on both backends because a write that
+    // silently dropped on Pg would leave the live worker's row naming an order
+    // the broker discarded, and the sweep cancels straight off that field.
+    //
+    // Matched on the id the row CURRENTLY holds (the restore correlates by order
+    // id and never learns an `attempt_no`), so it must still be scoped by
+    // account — `acct-a` and `acct-b` hold distinct ids under one trade_id here,
+    // which is what makes a missing account predicate visible.
+    store
+        .set_entry_attempt_broker_order_id(Some("acct-a"), &shared, "ord-a1", "ord-a1-restored")
+        .await
+        .unwrap();
+    // No row holds this id — a no-op, not an error.
+    store
+        .set_entry_attempt_broker_order_id(Some("acct-a"), &shared, "ord-nonexistent", "ord-zzz")
+        .await
+        .unwrap();
+    let a = store
+        .list_entry_attempts(Some("acct-a"), &shared)
+        .await
+        .unwrap();
+    let b = store
+        .list_entry_attempts(Some("acct-b"), &shared)
+        .await
+        .unwrap();
+    assert_eq!(
+        a.len(),
+        1,
+        "the re-point must UPDATE in place, never insert a second row",
+    );
+    assert_eq!(
+        a[0].broker_order_id, "ord-a1-restored",
+        "the restored order id must round-trip through the store",
+    );
+    assert_eq!(
+        a[0].attempt_no, 1,
+        "the re-point updates in place — row identity must survive",
+    );
+    assert_eq!(
+        b[0].broker_order_id, "ord-b1",
+        "a re-point must touch only its own account's row",
+    );
+
     // list_all includes every scope's attempts for this run's trade ids.
     let all = store.list_all_entry_attempts().await.unwrap();
     assert!(

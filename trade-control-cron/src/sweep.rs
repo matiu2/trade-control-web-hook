@@ -807,4 +807,65 @@ mod tests {
         a.expires_at = ts("2026-07-11T00:00:00Z"); // before MARKET_CLOSED
         pollster::block_on(sweep_one(&store, &NoBrokerEnv, &a, ts(MARKET_CLOSED))).ok();
     }
+
+    /// THE CONSEQUENCE of a stale `broker_order_id`, pinned at the sweep.
+    ///
+    /// When `pending_lifecycle` restores a resting order it earlier cancelled,
+    /// the broker answers with a NEW order id. If the `EntryAttempt` row is not
+    /// re-pointed, this sweep — which dispatches **straight** on
+    /// `attempt.broker_order_id`, with no `lookup_attempt_state` and no fallback
+    /// — cancels an id the broker already discarded, while the live restored
+    /// order rests on and can still fill through its breached stop.
+    ///
+    /// The restore itself lives in `core` and cannot be driven from here, so the
+    /// re-point is applied through the real store method (which is what that
+    /// restore calls) and the sweep is then driven end to end over the row the
+    /// store actually holds. `core`'s
+    /// `a_restored_order_updates_the_entry_attempts_broker_order_id` owns the
+    /// other half — that the restore performs this write at all.
+    ///
+    /// Asserting the cancelled ID, not the cancel COUNT, is the point: a stale
+    /// row still produces exactly one cancel, so a count-only assertion passes
+    /// under the bug.
+    #[test]
+    fn the_sweep_cancels_the_restored_order_not_the_dead_one() {
+        let store = MemStateStore::new();
+        let broker = ScriptedBroker::new(&[1.0900]); // straight through the stop
+        let mut row = resting(Direction::Long, 1.0950);
+        row.broker_order_id = "order-cancelled-by-the-hold".into();
+
+        pollster::block_on(async {
+            store
+                .record_entry_attempt(row.clone())
+                .await
+                .expect("seed the attempt");
+            // What the restore does once the broker hands back the new id.
+            store
+                .set_entry_attempt_broker_order_id(
+                    row.account.as_deref(),
+                    &row.trade_id,
+                    "order-cancelled-by-the-hold",
+                    "order-restored",
+                )
+                .await
+                .expect("re-point the attempt");
+            let live = store
+                .list_all_entry_attempts()
+                .await
+                .expect("list attempts")
+                .into_iter()
+                .find(|a| a.trade_id == row.trade_id)
+                .expect("the row is still there");
+            let sl = live.stop_loss_price.expect("seeded with an SL");
+            maybe_breach_cancel(&store, &live, sl, &broker, live.placed_at)
+                .await
+                .expect("the scripted broker never errors");
+        });
+
+        assert_eq!(
+            *broker.cancels.borrow(),
+            vec!["order-restored".to_string()],
+            "the sweep must cancel the order that is actually resting at the broker",
+        );
+    }
 }

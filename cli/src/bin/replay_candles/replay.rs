@@ -1074,7 +1074,7 @@ async fn dispatch_enter(
         now,
         None,
         Some(granularity),
-        false,
+        trade_control_core::dispatch::EntryOrigin::Fresh,
     )
     .await
     {
@@ -3526,7 +3526,7 @@ mod tests {
     /// This is the mechanism PR 4b-4 repaired. Two bugs had to be fixed for the
     /// restore to actually happen (both in the SHARED core path, so LIVE gets the
     /// same fix):
-    ///   1. **Retry-gate bypass on restore** (`run_enter(.., restore = true)`).
+    ///   1. **Retry-gate bypass on restore** (`run_enter(.., EntryOrigin::Replacing)`).
     ///      The RAIL-7 re-drive carries the ORIGINAL fire's `shell.time`, which the
     ///      retry gate had already marked seen — so a multi-shot order's restore was
     ///      `retry-fire-replay`-REJECTED and never re-placed. A restore is a

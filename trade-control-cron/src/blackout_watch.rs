@@ -18,7 +18,7 @@
 //!   `spread > 5×median` sample — the PR-2 trigger delta).
 //! - The OFF recovery decision + the safety force-restore ceiling + their pure
 //!   predicates and tests.
-//! - The System-3 re-drive via `run_enter` (RAIL 7, `restore = true`).
+//! - The System-3 re-drive via `run_enter` (RAIL 7, `EntryOrigin::Replacing`).
 //!
 //! ## What stays live-specific here
 //!
