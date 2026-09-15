@@ -950,13 +950,16 @@ where
             // Resolve the dispatch config at this edge (mirrors the webhook
             // fetch path) so `run_enter` is backend-free.
             let cfg = cron.dispatch_config(verified).await;
+            // Re-express this already-`Verified` intent as signed wire bytes so
+            // the placed order is RECOVERABLE — see `engine_order_body`.
+            let body = engine_order_body(cron, verified);
             run_enter(
                 broker,
                 store,
                 verified,
                 &cfg,
                 now,
-                None,
+                body.as_deref(),
                 Some(granularity),
                 false,
             )
@@ -1022,6 +1025,68 @@ fn control_result(
             status: code,
             body: format!("control dispatch returned status {code}"),
             outcome: format!("rejected: control-status-{code}"),
+        }
+    }
+}
+
+/// Re-express an engine-fired enter as signed wire bytes, so the order it places
+/// can be **cancelled and restored** by
+/// [`pending_lifecycle`](trade_control_core::pending_lifecycle).
+///
+/// # The gap this closes
+///
+/// `run_enter` stores the signed body under `order:{order_id}`; the lifecycle's
+/// live `SignedBodySource` recovers a resting order's intent by
+/// `parse_and_verify`-ing that row. The webhook path has the operator's bytes and
+/// stores them. The engine path had **none** — each fired intent is reconstructed
+/// from a registered plan, not re-received — so `get_order_body` answered `None`,
+/// the seam said `Unrecoverable`, and RAIL 2 ("never cancel what we can't
+/// restore") correctly left the order resting.
+///
+/// The cost was a **missing protection, not a lost order**: every engine-placed
+/// order — the bulk of automated pattern trading — sat through news pauses and
+/// market-closed windows it should have been pulled from. Nothing was ever
+/// cancelled and stranded off-broker.
+///
+/// # Why signing here mints no new authority
+///
+/// The input is a [`Verified`] — the type `parse_and_verify` *produces* — so this
+/// cannot launder untrusted bytes into trusted ones. And the authority it
+/// re-expresses is already trusted at rest *without* a signature:
+/// `StateStore::put_trade_plan` persists the `TradePlan` as plain JSONB with no
+/// `sig` field, the register envelope's signature having been verified once at
+/// the HTTP edge and discarded. The engine therefore already reads every rule it
+/// fires from an unauthenticated row; signing the re-serialisation of one placed
+/// order does not widen that boundary, it narrows it — the `order:{id}` row gains
+/// a tamper check it did not previously have.
+///
+/// # Confinement
+///
+/// These bytes go to exactly one place: `run_enter`'s `put_order_body` call, for
+/// an order the broker has already accepted. They are never returned to a caller
+/// and never reach the inbound webhook path, which reads the HTTP request body.
+/// `id` and `not_after` ride through unchanged, so a re-signed body inherits the
+/// original's replay identity and expiry — past the window a restore is
+/// `Recovered::Expired` and the order is dropped rather than re-placed.
+///
+/// # Failure is soft, and safe in the right direction
+///
+/// `None` (no signing key, or a serialisation fault) reproduces today's exact
+/// behaviour: the order is placed and simply remains unprotected. It can never
+/// cause a cancel-without-restore, because the lifecycle's only input is the
+/// stored body — an absent one leaves the order resting, which is RAIL 2 working
+/// as designed.
+fn engine_order_body<C: CronEnv>(cron: &C, verified: &Verified) -> Option<String> {
+    let key = cron.signing_key()?;
+    match trade_control_core::resign::resign(verified, &key) {
+        Ok(body) => Some(body),
+        Err(err) => {
+            tracing::error!(
+                "engine: re-signing the fired enter for trade_id={:?} failed ({err}) — placing \
+                 anyway, but this order can't be pause/market-hours cancelled+restored",
+                verified.intent.trade_id,
+            );
+            None
         }
     }
 }
@@ -1187,5 +1252,229 @@ mod tests {
             since <= ts("2026-06-16T20:00:00Z"),
             "H1 window {since} must reach ≥24h back to warm the ATR"
         );
+    }
+
+    // ===== engine-placed orders are recoverable (the order-body fix) =========
+
+    mod order_body {
+        use super::*;
+        use trade_control_core::account::AccountCaps;
+        use trade_control_core::broker::{
+            AmendError, AttemptState, CancelError, CloseOutcome, EntryError, EntryRequest,
+            LookupError, OpenPosition, PendingOrder, Placement, Quote,
+        };
+        use trade_control_core::dispatch_config::DispatchConfig;
+        use trade_control_core::intent::{Intent, Shell};
+        use trade_control_core::state::{MemStateStore, StateStore};
+        use trade_control_core::tick_bundle::TickBundle;
+
+        const KEY: [u8; 32] = [9u8; 32];
+        const ORDER_ID: &str = "ord-engine-1";
+
+        /// A `CronEnv` that hands out the signing key, the way the real worker
+        /// does once `SIGNING_KEY` is set.
+        struct KeyedEnv {
+            key: Option<Vec<u8>>,
+        }
+
+        impl CronEnv for KeyedEnv {
+            async fn acquire_broker(&self, _account: Option<&str>) -> Option<BrokerHandle> {
+                unreachable!("dispatch_action is called with a broker already in hand")
+            }
+            async fn dispatch_config(&self, _verified: &Verified) -> DispatchConfig {
+                DispatchConfig {
+                    worker_max_risk_pct: 1.0,
+                    worker_max_open_positions: 3,
+                    pip_size: 0.0001,
+                    tick_size: None,
+                    caps: AccountCaps::default(),
+                }
+            }
+            fn record_tick(&self, _bundle: TickBundle) {}
+            fn signing_key(&self) -> Option<Vec<u8>> {
+                self.key.clone()
+            }
+        }
+
+        /// Accepts any placement and reports the fixed [`ORDER_ID`], so the test
+        /// knows exactly which `order:{id}` row to look under.
+        struct PlacingBroker;
+
+        impl Broker for PlacingBroker {
+            async fn place_entry(
+                &self,
+                _max_risk_pct: f64,
+                _max_open_positions: u32,
+                _req: &EntryRequest<'_>,
+            ) -> Result<Placement, EntryError> {
+                Ok(Placement::id_only(ORDER_ID))
+            }
+            async fn close_positions(&self, _instrument: &str) -> CloseOutcome {
+                CloseOutcome::NothingOpen
+            }
+            async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
+                0
+            }
+            async fn lookup_attempt_state(
+                &self,
+                _instrument: &str,
+                _broker_order_id: &str,
+                _broker_trade_id: Option<&str>,
+            ) -> Result<AttemptState, LookupError> {
+                Ok(AttemptState::Pending)
+            }
+            async fn cancel_order(
+                &self,
+                _account_id: &str,
+                _broker_order_id: &str,
+            ) -> Result<(), CancelError> {
+                Ok(())
+            }
+            async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
+                Ok(Quote {
+                    bid: 0.5600,
+                    ask: 0.5602,
+                })
+            }
+            async fn list_open_positions(
+                &self,
+                _account_id: &str,
+            ) -> Result<Vec<OpenPosition>, LookupError> {
+                Ok(Vec::new())
+            }
+            async fn amend_stop(
+                &self,
+                _account_id: &str,
+                _position_or_order_id: &str,
+                _new_stop: f64,
+            ) -> Result<(), AmendError> {
+                Ok(())
+            }
+            async fn list_pending_orders(
+                &self,
+                _account_id: &str,
+            ) -> Result<Vec<PendingOrder>, LookupError> {
+                Ok(Vec::new())
+            }
+            async fn get_candles(
+                &self,
+                _instrument: &str,
+                _granularity: Granularity,
+                _since: DateTime<Utc>,
+                _now: DateTime<Utc>,
+            ) -> Result<Vec<Candle>, CandleError> {
+                Ok(Vec::new())
+            }
+        }
+
+        /// The `Verified` an engine tick synthesises for a fired enter rule.
+        fn fired_enter() -> Verified {
+            let intent: Intent = serde_json::from_str(
+                r#"{
+                    "v": 1,
+                    "id": "t-enter",
+                    "not_after": "2026-07-09T00:00:00Z",
+                    "action": "enter",
+                    "instrument": "AUD/CHF",
+                    "direction": "short",
+                    "entry": { "type": "stop", "from": "close", "offset_pips": 0.0, "at": 0.5598 },
+                    "stop_loss": { "absolute": 0.5607 },
+                    "take_profit": { "absolute": 0.5560 },
+                    "broker": "tradenation",
+                    "trade_id": "t",
+                    "pip_size": 0.0001
+                }"#,
+            )
+            .expect("valid enter intent");
+            let shell = Shell::from_candle(&Candle {
+                time: ts("2026-07-08T20:00:00Z"),
+                o: 0.5600,
+                h: 0.5605,
+                l: 0.5595,
+                c: 0.5600,
+            });
+            Verified { shell, intent }
+        }
+
+        fn dispatch(env: &KeyedEnv, store: &MemStateStore) -> Option<String> {
+            pollster::block_on(async {
+                let out = dispatch_action(
+                    &PlacingBroker,
+                    store,
+                    &fired_enter(),
+                    env,
+                    Granularity::H1,
+                    ts("2026-07-08T20:05:00Z"),
+                )
+                .await;
+                assert!(
+                    matches!(out, ActionResult::Ok(_)),
+                    "the enter must place: {}",
+                    out.describe()
+                );
+                store.get_order_body(ORDER_ID).await.expect("store read")
+            })
+        }
+
+        /// THE FIX, at its real entry point. An engine-fired enter must leave a
+        /// stored `order:{id}` body, and that body must VERIFY — otherwise the
+        /// lifecycle's seam answers `Unrecoverable` and the order silently gets
+        /// no news-pause / market-hours protection.
+        ///
+        /// Asserting only that a row exists would pass on garbage, so this
+        /// re-verifies it exactly as `SignedBodySource` does and checks the
+        /// intent that comes back is the one that was placed.
+        #[test]
+        fn an_engine_fired_enter_stores_a_recoverable_order_body() {
+            let store = MemStateStore::new();
+            let env = KeyedEnv {
+                key: Some(KEY.to_vec()),
+            };
+            let body = dispatch(&env, &store).expect("an order body must be stored");
+
+            let back = trade_control_core::incoming::parse_and_verify(
+                &body,
+                &KEY,
+                ts("2026-07-08T20:05:00Z"),
+            )
+            .expect("the stored body must verify under the worker's key");
+            assert_eq!(back.intent.trade_id.as_deref(), Some("t"));
+            assert_eq!(back.intent.instrument, "AUD/CHF");
+        }
+
+        /// A body stored under one key must not verify under another — proof the
+        /// stored bytes carry a real signature rather than a placeholder the
+        /// verify side happens to tolerate.
+        #[test]
+        fn the_stored_body_does_not_verify_under_a_foreign_key() {
+            let store = MemStateStore::new();
+            let env = KeyedEnv {
+                key: Some(KEY.to_vec()),
+            };
+            let body = dispatch(&env, &store).expect("an order body must be stored");
+            assert!(
+                trade_control_core::incoming::parse_and_verify(
+                    &body,
+                    &[1u8; 32],
+                    ts("2026-07-08T20:05:00Z")
+                )
+                .is_err(),
+                "a foreign key must not verify the stored body",
+            );
+        }
+
+        /// No signing key ⇒ no body, and the enter still PLACES. This is the
+        /// fail-soft direction: the order is merely unprotected, exactly as it
+        /// was before this change. It can never cause a cancel-without-restore,
+        /// because RAIL 2 leaves a body-less order resting.
+        #[test]
+        fn without_a_signing_key_the_enter_still_places_but_stores_no_body() {
+            let store = MemStateStore::new();
+            let env = KeyedEnv { key: None };
+            assert!(
+                dispatch(&env, &store).is_none(),
+                "no key ⇒ no stored body (and the placement must still succeed)",
+            );
+        }
     }
 }
