@@ -11,23 +11,39 @@
 //!
 //! # The two-stage match, and the hazard in stage 2
 //!
-//! 1. **Exact** — `attempt.broker_trade_id == position.position_id`. Only set
-//!    once the worker has observed the attempt fill, but unambiguous when
-//!    present.
-//! 2. **Coarse fallback** — `(instrument, direction, account)`. Needed because
-//!    stage 1 is blank until the fill is observed, and a cron may run first.
+//! 1. **Exact** — `attempt.broker_trade_id == position.position_id`. Written on
+//!    the first sweep tick that observes the attempt has filled, and
+//!    unambiguous from then on.
+//! 2. **Coarse fallback** — `(instrument, direction, account)`. Covers the
+//!    window between the fill and the sweep tick that observes it, plus rows
+//!    written before the snapshot existed.
 //!
 //! ⚠️ **Stage 2 can alias.** Two attempts on the same instrument, same
 //! direction, same account — a multi-shot re-entry, or two setups on one pair —
 //! are indistinguishable to it, and `find` returns whichever comes first. The
 //! consequence is a stop amended against the wrong attempt's geometry.
 //!
-//! This is inherited behaviour, preserved deliberately: changing the match
-//! semantics while merely de-duplicating them would mix a behaviour change into
-//! a refactor, on the live money path. It is documented here — rather than in
-//! two places, half-noticed — so the fix has one site when it comes. The real
-//! fix is to make stage 1 always available (snapshot `broker_trade_id` at
-//! placement), not to add tie-breakers to stage 2.
+//! # Stage 1 is now populated for every filled attempt
+//!
+//! It previously was not, and the shape of the hazard is different enough to be
+//! worth stating plainly. The only writer of `broker_trade_id` used to be
+//! [`retry_gate`](crate::retry_gate), on the branch where it looks up a prior
+//! attempt and **rejects** a re-entry — code an ordinary trade (fills once,
+//! never re-fired) never reaches. So the field stayed `None` for the position's
+//! whole life, and stage 2 was not the exception but **the only path taken in
+//! the common case**, correct purely by luck whenever exactly one position
+//! matched.
+//!
+//! `trade_control_cron::sweep::snapshot_broker_trade_id` now writes it on the
+//! first tick an attempt is seen to have filled, so stage 1 carries the ordinary
+//! case and stage 2 is the narrow fallback its name implies. Read that function
+//! for why the sweep is the seam and what the round-trip costs.
+//!
+//! **Do not "strengthen" stage 2 with tie-breakers.** It cannot be made correct:
+//! the information that separates two look-alike attempts is the broker's own
+//! id, and every proxy for it (most recent, nearest stop, first placed) is a
+//! guess that will eventually be wrong and silent. Narrowing the window in which
+//! stage 2 runs at all is the fix; a cleverer stage 2 is not.
 
 use crate::broker::OpenPosition;
 use crate::state::EntryAttempt;
@@ -168,9 +184,14 @@ mod tests {
 
     /// Pins the KNOWN aliasing hazard rather than asserting it is correct: two
     /// indistinguishable attempts resolve to the first, so a stop can be amended
-    /// against the wrong one's geometry. If a future fix makes this
-    /// deterministic by some better rule, this test should be *updated*, not
-    /// deleted — it is the record of what the coarse path can't tell apart.
+    /// against the wrong one's geometry.
+    ///
+    /// Still reachable, and deliberately so — it is what a position joined
+    /// between its fill and the sweep tick that observes the fill falls back to.
+    /// What changed is how *often*: with `broker_trade_id` now snapshotted, a
+    /// filled attempt leaves this path for good. Both rows here carry `None`,
+    /// which after the snapshot lands means neither has been observed to fill
+    /// yet.
     #[test]
     fn coarse_fallback_aliases_two_identical_attempts() {
         let attempts = vec![
