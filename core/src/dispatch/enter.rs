@@ -1183,12 +1183,29 @@ async fn park_stored_entry<S: StateStore>(
     now: chrono::DateTime<chrono::Utc>,
 ) -> String {
     // Prefer the exact signed bytes; fall back to re-serialising the verified
-    // intent. The engine path (and the offline replay) build `Verified` from a
-    // registered plan rather than from signed YAML, so they have no `raw_body` —
-    // but the intent in hand is the same one that was just verified, so
-    // re-serialising it loses nothing a promotion needs. Without this fallback
-    // the park would silently never happen on the plan-driven path, which is
-    // every trade the engine fires.
+    // intent.
+    //
+    // ⚠️ The fallback body is UNSIGNED (and shell-less), so it is promotable
+    // ONLY under a `VerifiedSource` that ignores the stored body. The live
+    // `SignedBodySource` `parse_and_verify`s it and answers
+    // `Recovered::Unrecoverable` on `MissingSig` — and `promote_stored_order`
+    // deliberately does not clear an unrecoverable park, so such a park would be
+    // refused every candle until its `drop_at`. An earlier version of this
+    // comment claimed re-serialising "loses nothing a promotion needs"; that was
+    // wrong, and it is recorded as finding #2 in
+    // `SECURITY-NOTES-for-remote-deployment.md`.
+    //
+    // It is nonetheless dead on every LIVE path: `park_stored_entry` does not
+    // choose the body, it forwards `run_enter`'s `raw_body`, and all five live
+    // callers now pass signed bytes — the webhook has the operator's, and the
+    // engine re-signs through `crate::resign` (`engine_order_body`). The one
+    // remaining `None` caller is the offline replay, whose `ReplayVerifiedSource`
+    // resolves from the fake broker's armed map and never reads these bytes.
+    //
+    // Kept rather than removed because it fails in the SAFE direction: an
+    // unverifiable park is refused, never acted on. Dropping the park entirely
+    // would turn that visible refusal into a silent loss of the setup. Anything
+    // that revives this for a live path must sign via `crate::resign`.
     let body = match raw_body {
         Some(b) => b.to_string(),
         None => match serde_yaml::to_string(&verified.intent) {
