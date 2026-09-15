@@ -6889,6 +6889,66 @@ mod tests {
         );
     }
 
+    /// The stamp, exercised as a real SEQUENCE rather than a seeded field: tick
+    /// the pinbar (a first entry — it fires), carry the resulting state forward,
+    /// then tick a SECOND pinbar's print bar. That second fire is now a
+    /// re-entry, so it must be deferred — even though nothing in this test ever
+    /// touches `plain_entered` by hand.
+    ///
+    /// This is the test that goes red if the stamp is deleted, and unlike
+    /// `a_plain_enter_fire_stamps_the_reentry_watermark` it does not assert the
+    /// field: it asserts the BEHAVIOUR the field exists to produce, so a stamp
+    /// written to the wrong key (or read from one) fails here too.
+    #[test]
+    fn a_second_pinbar_is_deferred_because_the_first_fire_stamped_the_watermark() {
+        let p = plan(vec![multi_shot_pine_enter_rule()]);
+        // Two pinbars: the one at index 3 of `bearish_pinbar_window`, then a
+        // second identical-geometry pinbar further along, so the latch is a
+        // fresh print on its own bar both times.
+        let mut window = bearish_pinbar_window();
+        // Flat context so nothing else prints between the two pinbars.
+        window.push(candle("2026-06-16T13:00:00Z", 1.12, 1.125, 1.11, 1.12));
+        window.push(candle("2026-06-16T14:00:00Z", 1.12, 1.13, 1.11, 1.115));
+        // The second bearish pinbar, identical geometry to the first (range
+        // 1.10..1.30, body 1.115..1.12 in the bottom quartile, high 1.30 above
+        // the prior bar's 1.13, bearish close).
+        window.push(candle("2026-06-16T15:00:00Z", 1.12, 1.30, 1.10, 1.115));
+
+        // Tick 1: the FIRST pinbar's own print bar → fires.
+        let first = run_window(
+            &p,
+            &seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z"),
+            &window[3..4],
+            &window,
+        );
+        assert_eq!(
+            first.fired.len(),
+            1,
+            "the first pinbar fires on its print bar (got {:?})",
+            first.fired
+        );
+
+        // Tick 2: the SECOND pinbar's own print bar, carrying tick 1's state.
+        // Prove the fixture really presents a fresh pinbar print here, or the
+        // assertion below could pass because no signal latched at all.
+        let cfg = trade_control_core::signals::default_config(Granularity::H1);
+        let latched = trade_control_core::signals::latched_signal_at(&window, 7, &cfg)
+            .expect("the second pinbar latches");
+        assert_eq!(latched.kind, SignalKind::Pinbar);
+        assert_eq!(
+            latched.signal_bar_time,
+            ts("2026-06-16T15:00:00Z"),
+            "the latch must be the SECOND pinbar's own bar, not the first's"
+        );
+
+        let again = run_window(&p, &first.new_state, &window[7..8], &window);
+        assert!(
+            again.fired.is_empty(),
+            "the second fire is a RE-entry and must wait for its pivot bar              (got {:?})",
+            again.fired
+        );
+    }
+
     /// **The variant's defining asymmetry, at the engine's own entry point.**
     /// The SAME plan, the SAME candles, the SAME pinbar — and the only
     /// difference is whether this enter has fired before. A first entry fires on
