@@ -1070,12 +1070,47 @@ pub trait StateStore {
     ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Re-point a previously-recorded attempt at the **new broker order id** it
-    /// was re-placed under, matching the row by the id it currently holds.
+    /// was re-placed under, and at the **stop that replacement actually
+    /// carries** — matching the row by the id it currently holds.
     ///
     /// Called when [`pending_lifecycle`](crate::pending_lifecycle) restores a
-    /// resting entry order it earlier cancelled: the re-drive places a fresh
-    /// order, and the broker answers with a **different** id. Without this write
+    /// resting entry order it earlier cancelled, and by
+    /// [`order_control::reprice`](crate::order_control::reprice). Both cancel a
+    /// real order and put an equivalent one back, so the re-drive places a fresh
+    /// order and the broker answers with a **different** id. Without this write
     /// the row keeps naming the order the broker discarded.
+    ///
+    /// # Why the stop moves with the id
+    ///
+    /// A replacement is re-driven through `run_enter`, which **re-resolves the
+    /// signed intent from scratch** — so the stop restarts at the operator's
+    /// DRAWN level — and only then re-runs the SL-vs-spread floor against
+    /// *today's* spread. The previous widen is not carried forward. A stop
+    /// widened by a spread spike at first placement therefore comes back at the
+    /// drawn level once the spread calms, which is **tighter** than the value
+    /// the row holds.
+    ///
+    /// That direction is what makes this more than bookkeeping. Two consumers
+    /// read [`EntryAttempt::stop_loss_price`]:
+    ///
+    /// - The sweep's **pre-fill SL-breach gate**, which cancels a resting order
+    ///   whose stop has already been traded through. A row holding the
+    ///   superseded *wider* stop makes that gate fire **late**, leaving an order
+    ///   resting after its real stop was blown — precisely the guaranteed loser
+    ///   the sweep exists to prevent.
+    /// - [`reprice_pass`](crate::order_control::reprice_pass)'s `geometry_of`,
+    ///   where it becomes `current_sl_distance` and hence the risk budget for
+    ///   the *next* re-price, so a stale value feeds forward into a mis-sized
+    ///   stake.
+    ///
+    /// Both fields move in **one** write because they record one event — the
+    /// replacement landing. Splitting them would admit a row naming the new
+    /// order while still carrying the old order's stop, which is the worst of
+    /// both readings.
+    ///
+    /// `new_stop_loss` is `Option` because [`EntryAttempt::stop_loss_price`] is:
+    /// an intent with no resolvable stop records `None`, and a replacement of
+    /// one must be able to say so rather than leave a stale number behind.
     ///
     /// # Why the match key is the OLD order id, not `attempt_no`
     ///
@@ -1090,15 +1125,20 @@ pub trait StateStore {
     /// (half the unique index `(account, trade_id, attempt_no)`), and a restore
     /// continues the original attempt rather than making a new entry, so it must
     /// not consume a `max_retries` slot (RAIL 7). Every other field on the row
-    /// is left exactly as it was.
+    /// is left exactly as it was — in particular
+    /// [`OrderControlSnapshot::original_stop_loss`], which is deliberately the
+    /// DRAWN level captured before any floor widened anything, and must NOT move
+    /// here: it is what a later shrink measures back toward, so re-pointing it
+    /// at a widened stop would let the stop ratchet outward and never return.
     ///
     /// No-op when no row matches `old_broker_order_id`.
-    fn set_entry_attempt_broker_order_id(
+    fn set_entry_attempt_replacement(
         &self,
         account: Option<&str>,
         trade_id: &str,
         old_broker_order_id: &str,
         new_broker_order_id: &str,
+        new_stop_loss: Option<f64>,
     ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Persist a resting attempt's advanced **running adverse extreme**. Called
@@ -2126,12 +2166,13 @@ mod memstore {
             Ok(())
         }
 
-        async fn set_entry_attempt_broker_order_id(
+        async fn set_entry_attempt_replacement(
             &self,
             account: Option<&str>,
             trade_id: &str,
             old_broker_order_id: &str,
             new_broker_order_id: &str,
+            new_stop_loss: Option<f64>,
         ) -> Result<(), StateError> {
             let scope = account_scope(account).to_string();
             let key = (scope, trade_id.to_string());
@@ -2142,6 +2183,7 @@ mod memstore {
                     .find(|a| a.broker_order_id == old_broker_order_id)
             {
                 row.broker_order_id = new_broker_order_id.to_string();
+                row.stop_loss_price = new_stop_loss;
             }
             Ok(())
         }
