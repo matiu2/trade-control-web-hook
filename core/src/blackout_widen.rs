@@ -99,7 +99,8 @@ pub fn spread_hour_widen_size(baked_p90_pips: f64, live_spread_pips: f64) -> f64
     baked_p90_pips.max(live_spread_pips).clamp(floor, ceil)
 }
 
-/// New stop-loss after widening `widen_pips` away from price.
+/// New stop-loss after widening `widen_pips` away from price, snapped onto the
+/// `pip_size` grid.
 ///
 /// SHORT → stop sits **above** entry → widening moves the SL **UP**
 /// (`original + widen`). LONG → stop sits **below** entry → widening moves
@@ -107,17 +108,102 @@ pub fn spread_hour_widen_size(baked_p90_pips: f64, live_spread_pips: f64) -> f64
 /// `breach_detected`. Widening the wrong way would *tighten* the stop into
 /// the spread and clip the position instantly; the direction matrix test is
 /// the sign-bug guard.
+///
+/// # Why it snaps
+///
+/// `widen_pips` is a float blend of a baked p90 and a live measured spread
+/// (see [`spread_hour_widen_size`] / [`clamp_widen`]), so the raw
+/// `original ± widen_pips × pip_size` lands on no price grid at all. OANDA
+/// rejects an over-precise price outright — `PRICE_PRECISION_EXCEEDED`, and the
+/// amend simply does not happen. That is strictly worse than the same fault on
+/// an entry: the position is already **open**, so a rejected amend leaves it
+/// running with its un-widened stop straight through the spread spike this
+/// widen exists to survive.
+///
+/// The snap is **away from price**, the same direction as the widen itself —
+/// `RoundDir::Up` for a short, `Down` for a long. Snapping the other way would
+/// walk part of the widen back, i.e. the sign bug above wearing a rounding hat.
+///
+/// # Why the grid is `pip_size` and not a tick
+///
+/// The caller (`blackout_apply`) reads `pip_size` off the originating
+/// `EntryAttempt`, which carries **no** `tick_size` — adding one is a persisted
+/// schema change, deliberately out of scope here. `pip_size` is a safe
+/// **coarser-or-equal** grid: gold's pip and tick are both `0.01`, while
+/// NAS100 pips at `1.0` against a `0.1` tick and FX pips at `0.0001` against
+/// `0.00001`. A value on the coarser grid is always also on the finer one, so
+/// the broker accepts it; the only cost is that an index widen is quantised to
+/// whole points. Combined with the away-from-price direction, over-coarseness
+/// can only ever widen *further* — never tighten. If `EntryAttempt` later
+/// carries a tick, pass that instead for a tighter grid; nothing else changes.
+///
+/// A non-positive / non-finite `pip_size` is identity — see [`crate::rounding`].
 pub fn widened_stop(direction: Direction, original_sl: f64, widen_pips: f64, pip_size: f64) -> f64 {
     let widen = widen_pips * pip_size;
-    match direction {
-        Direction::Short => original_sl + widen, // up, away from price
-        Direction::Long => original_sl - widen,  // down, away from price
-    }
+    let (raw, dir) = match direction {
+        // Up, away from price — and snap the same way.
+        Direction::Short => (original_sl + widen, crate::rounding::RoundDir::Up),
+        // Down, away from price — and snap the same way.
+        Direction::Long => (original_sl - widen, crate::rounding::RoundDir::Down),
+    };
+    crate::rounding::round_to_tick(raw, pip_size, dir)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE SECOND INSTANCE of the `PRICE_PRECISION_EXCEEDED` bug, on the AMEND
+    /// path. `widen_pips` is a float blend of a baked p90 and a live measured
+    /// spread (`spread_hour_widen_size` / `clamp_widen`), so `original ± pips ×
+    /// tick` lands on no grid at all. This one is WORSE than the entry case:
+    /// the position is already OPEN, so a rejected amend leaves it running with
+    /// the un-widened stop through the very spread spike the widen exists for.
+    #[test]
+    fn a_fractional_widen_lands_on_the_tick_grid() {
+        // Gold (tick 0.01) short, stop 4016.35, widen 34.7 "pips" of 0.01 =
+        // 0.347 → 4016.697 raw: three decimals on a two-decimal grid. Must snap
+        // UP (away from price for a short) to 4016.70, never the nearest.
+        let short = widened_stop(Direction::Short, 4016.35, 34.7, 0.01);
+        assert!(
+            (short - 4016.70).abs() < 1e-9,
+            "expected 4016.70 on gold's 0.01 grid, got {short}"
+        );
+        // Long, mirrored: 4016.35 − 0.347 = 4016.003 → snaps DOWN to 4016.00.
+        let long = widened_stop(Direction::Long, 4016.35, 34.7, 0.01);
+        assert!(
+            (long - 4016.00).abs() < 1e-9,
+            "expected 4016.00 on gold's 0.01 grid, got {long}"
+        );
+    }
+
+    /// The snap must never walk the widen back. A widen that rounds TOWARD
+    /// price is the sign bug wearing a rounding hat: it tightens the stop into
+    /// the very spread spike the widen was applied to survive.
+    ///
+    /// Swept over fractional widens that land all across a tick cell, so a
+    /// `Nearest` snap is caught (it tightens on roughly half of them) rather
+    /// than passing on a lucky value.
+    #[test]
+    fn the_snap_never_walks_the_widen_back() {
+        let (orig, tick) = (4016.35, 0.01);
+        for step in 0..20 {
+            let pips = 34.0 + f64::from(step) * 0.1; // 34.0 .. 35.9
+            let raw = pips * tick;
+            let short = widened_stop(Direction::Short, orig, pips, tick);
+            assert!(
+                short >= orig + raw - 1e-9,
+                "short widen {pips} tightened: {short} < {}",
+                orig + raw
+            );
+            let long = widened_stop(Direction::Long, orig, pips, tick);
+            assert!(
+                long <= orig - raw + 1e-9,
+                "long widen {pips} tightened: {long} > {}",
+                orig - raw
+            );
+        }
+    }
 
     #[test]
     fn short_widens_up_long_widens_down() {

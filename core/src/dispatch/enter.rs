@@ -700,12 +700,17 @@ pub async fn run_enter<B: Broker, S: StateStore>(
         // entry-level vetos abort the trade independently if price reaches
         // invalidation. Mutating `resolved.stop_loss` here flows into the
         // `EntryRequest` built just below.
+        // `tick_size` is the same resolved tick `Resolved::from_intent` snapped
+        // the drawn geometry with (baked `Intent::tick_size` → `cfg.tick_size`
+        // → `pip_size`), NOT a second derivation: the widened stop must land on
+        // the same grid as the entry and TP beside it.
         match crate::intent::widen_sl_to_spread_floor(
             entry_price,
             resolved.stop_loss,
             resolved.take_profit,
             spread_price,
             resolved.min_r,
+            tick_size,
         ) {
             crate::intent::SlWiden::Unchanged => {}
             crate::intent::SlWiden::Widened {
@@ -3524,6 +3529,442 @@ mod mw_everybar_dedup_tests {
         assert!(
             broker.cancelled().is_empty(),
             "the engine-latched path must make NO broker reconciliation calls"
+        );
+    }
+}
+
+/// The SL-spread-floor widen must leave the stop ON the instrument's tick grid.
+///
+/// # The bug these pin
+///
+/// `Resolved::finish_with_sizing` snaps every order price onto the tick grid
+/// (its own comment names the reason: OANDA rejects an unrounded price with
+/// `PRICE_PRECISION_EXCEEDED`). But the SL-vs-spread floor widen runs *later*,
+/// in `run_enter`, and assigns `resolved.stop_loss = new_stop_loss` — an
+/// arbitrary float (`entry ± 10 × live_spread`) that was never re-snapped. It
+/// flowed straight into the `EntryRequest` and on to the broker.
+///
+/// It is invisible on FX (5 dp, and OANDA's FX grid is 5 dp) and fires only
+/// when the spread is wide enough to trigger a widen — i.e. during news and
+/// session opens, exactly the conditions the floor exists for. On a coarse-tick
+/// instrument (gold ticks 0.01, an index 0.1) the widened stop carries real
+/// precision past the grid and the order is rejected outright: nothing reaches
+/// the book and the setup is lost.
+///
+/// # Why these drive `run_enter`
+///
+/// The defect is entirely in the CALLER. `widen_sl_to_spread_floor` is a pure
+/// function that correctly returns an unrounded price — that is its contract,
+/// it takes no tick. `round_stop_loss` is likewise correct in isolation. Only
+/// `run_enter` has both the widened stop and the resolved tick in hand, so only
+/// a test at `run_enter` can see the gap. These assert on the stop the BROKER
+/// WAS ASKED FOR, which is the number that cost the setup.
+#[cfg(test)]
+mod widen_rounding_tests {
+    use super::gate_order_tests::{describe, store_at_incident};
+    use super::*;
+    use crate::broker::{
+        AmendError, AttemptState, CancelError, Candle, CandleError, EntryError, EntryRequest,
+        Granularity, LookupError, OpenPosition, PendingOrder, Placement, Quote,
+    };
+    use crate::intent::{Intent, Shell};
+    use crate::state::MemStateStore;
+    use chrono::{DateTime, Utc};
+    use std::cell::RefCell;
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s)
+            .expect("valid test timestamp")
+            .with_timezone(&Utc)
+    }
+
+    fn now() -> DateTime<Utc> {
+        at("2026-08-07T17:00:01Z")
+    }
+
+    /// Records the **full geometry** of every placement, not just the
+    /// instrument: the stop-loss is the number under test, so a spy that only
+    /// remembers `req.instrument` (as the neighbouring modules' spies do) could
+    /// not fail on this bug at all.
+    ///
+    /// `get_candles` returns an empty window on purpose, so `run_enter`'s
+    /// windowed-mean spread source yields `None` and the floor falls through to
+    /// this spy's `get_quote` — the single, test-controlled spread.
+    struct SpyBroker {
+        places: RefCell<Vec<PlacedGeometry>>,
+        quote: Quote,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct PlacedGeometry {
+        stop_loss: f64,
+        take_profit: f64,
+    }
+
+    impl SpyBroker {
+        /// A broker quoting a spread of exactly `spread` around `mid`.
+        fn quoting(mid: f64, spread: f64) -> Self {
+            Self {
+                places: RefCell::new(Vec::new()),
+                quote: Quote {
+                    bid: mid - spread / 2.0,
+                    ask: mid + spread / 2.0,
+                },
+            }
+        }
+        /// The one placement this fire made. Panics if the count isn't exactly
+        /// one — a test that asserts on "the stop" must first know there IS one.
+        fn only_placement(&self) -> PlacedGeometry {
+            let p = self.places.borrow();
+            assert_eq!(p.len(), 1, "expected exactly one placement, got {p:?}");
+            p[0]
+        }
+    }
+
+    impl Broker for SpyBroker {
+        async fn place_entry(
+            &self,
+            _max_risk_pct: f64,
+            _max_open_positions: u32,
+            req: &EntryRequest<'_>,
+        ) -> Result<Placement, EntryError> {
+            self.places.borrow_mut().push(PlacedGeometry {
+                stop_loss: req.stop_loss,
+                take_profit: req.take_profit,
+            });
+            Ok(Placement::id_only("order-1"))
+        }
+        async fn close_positions(&self, _instrument: &str) -> crate::broker::CloseOutcome {
+            crate::broker::CloseOutcome::NothingOpen
+        }
+        async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
+            0
+        }
+        async fn lookup_attempt_state(
+            &self,
+            _instrument: &str,
+            _broker_order_id: &str,
+            _broker_trade_id: Option<&str>,
+        ) -> Result<AttemptState, LookupError> {
+            Ok(AttemptState::Cancelled)
+        }
+        async fn cancel_order(
+            &self,
+            _account_id: &str,
+            _broker_order_id: &str,
+        ) -> Result<(), CancelError> {
+            unimplemented!("cancel_order unused by these tests")
+        }
+        async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
+            Ok(self.quote)
+        }
+        async fn list_open_positions(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<OpenPosition>, LookupError> {
+            Ok(vec![])
+        }
+        async fn amend_stop(
+            &self,
+            _account_id: &str,
+            _position_or_order_id: &str,
+            _new_stop: f64,
+        ) -> Result<(), AmendError> {
+            unimplemented!("amend_stop unused by these tests")
+        }
+        async fn list_pending_orders(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<PendingOrder>, LookupError> {
+            Ok(vec![])
+        }
+        async fn get_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<Candle>, CandleError> {
+            Ok(vec![])
+        }
+    }
+
+    /// `DispatchConfig` with NO edge-resolved tick, so the tick under test is
+    /// the one BAKED on the intent — the production precedence
+    /// (`Intent::tick_size` → `cfg.tick_size` → `pip_size`).
+    fn cfg() -> DispatchConfig {
+        DispatchConfig {
+            worker_max_risk_pct: 1.0,
+            worker_max_open_positions: 3,
+            pip_size: 0.01,
+            tick_size: None,
+            caps: Default::default(),
+        }
+    }
+
+    /// A single-shot gold enter with a caller-chosen direction and geometry,
+    /// built by DESERIALISING wire JSON so the test can't diverge from what a
+    /// signed alert actually carries.
+    ///
+    /// `tick_size: 0.01` is gold's real tick from `instrument-lookup` (2 dp);
+    /// `pip_size` matches, so a fallback to pip would give the SAME grid — the
+    /// tick is asserted by the geometry, not by which field supplied it.
+    fn gold_enter(
+        direction: &str,
+        entry_at: f64,
+        stop_loss: f64,
+        take_profit: f64,
+        shell_close: f64,
+    ) -> crate::incoming::Verified {
+        let json = format!(
+            r#"{{
+                "v": 1,
+                "id": "gold-1-enter",
+                "not_after": "2026-08-09T00:00:00Z",
+                "action": "enter",
+                "instrument": "XAU_USD",
+                "direction": "{direction}",
+                "entry": {{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": {entry_at} }},
+                "stop_loss": {{ "absolute": {stop_loss} }},
+                "take_profit": {{ "absolute": {take_profit} }},
+                "broker": "oanda",
+                "trade_id": "gold-1",
+                "pip_size": 0.01,
+                "tick_size": 0.01,
+                "max_retries": 0,
+                "entry_dedup": "engine_latched"
+            }}"#
+        );
+        let intent: Intent = serde_json::from_str(&json).expect("valid gold enter intent");
+        let shell = Shell::from_candle(&Candle {
+            time: at("2026-08-07T17:00:00Z"),
+            o: shell_close,
+            h: shell_close + 1.0,
+            l: shell_close - 1.0,
+            c: shell_close,
+        });
+        crate::incoming::Verified { shell, intent }
+    }
+
+    fn store() -> MemStateStore {
+        let s = store_at_incident();
+        s.set_clock(now());
+        s
+    }
+
+    /// Is `price` exactly on the `tick` grid? Compares the price against its own
+    /// nearest-tick snap, with a tolerance far tighter than one tick but loose
+    /// enough for float dust (a 4016.00 computed as 4016.35 − 0.347 + rounding
+    /// is not bit-identical to the literal). A 3-dp value on a 2-dp grid misses
+    /// by >= 0.001, four orders of magnitude outside this.
+    fn on_grid(price: f64, tick: f64) -> bool {
+        (price - crate::rounding::round_price(price, tick)).abs() < 1e-9
+    }
+
+    /// THE DECISIVE TEST. Gold (tick 0.01) with a spread wide enough to force a
+    /// widen. The widened stop is `4016.35 − 10 × 0.0343 = 4016.007` — three
+    /// decimals on a two-decimal grid, the value OANDA rejects with
+    /// `PRICE_PRECISION_EXCEEDED`.
+    ///
+    /// Asserts the EXACT level the broker was asked for (4016.00), not merely
+    /// that a widen happened: "a widen occurred" is true in both the buggy and
+    /// the fixed world, so it would prove nothing.
+    ///
+    /// The `.007` fractional part is chosen deliberately: it sits in the UPPER
+    /// half of its tick cell, so a `Nearest` snap would give 4016.01 — a
+    /// *tighter* stop than the widen asked for. A test whose raw level landed
+    /// in the lower half (e.g. `.003`) would pass under nearest and directional
+    /// alike, and a nearest-snap mutation would survive it.
+    #[test]
+    fn a_widened_gold_stop_reaches_the_broker_on_the_tick_grid() {
+        // Long: entry trigger 4016.35, drawn stop 4016.10 (distance 0.25).
+        // Spread 0.0343 → floor 10 × 0.0343 = 0.343 > 0.25 → the floor is
+        // violated and the stop is widened to entry − 0.343 = 4016.007.
+        // TP 4026.35 is 10.00 away → R = 10.0 / 0.343 ≈ 29.2, far above min_r,
+        // so the widen is accepted rather than rejected.
+        let broker = SpyBroker::quoting(4016.35, 0.0343);
+        let store = store();
+        let verified = gold_enter("long", 4016.35, 4016.10, 4026.35, 4016.00);
+        pollster::block_on(async {
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
+            assert!(
+                matches!(result, ActionResult::Ok(_)),
+                "the widened entry must place, got {}",
+                describe(&result)
+            );
+        });
+        let placed = broker.only_placement();
+        assert!(
+            on_grid(placed.stop_loss, 0.01),
+            "the stop the broker was ASKED FOR is off gold's 0.01 grid: \
+             {} (OANDA rejects this as PRICE_PRECISION_EXCEEDED)",
+            placed.stop_loss
+        );
+        // The exact level, not just "on a grid": 4016.007 snapped AWAY from
+        // entry (down, for a long) is 4016.00 — NOT the nearest 4016.01.
+        assert!(
+            (placed.stop_loss - 4016.00).abs() < 1e-9,
+            "expected the widened stop snapped away from entry to 4016.00, got {}",
+            placed.stop_loss
+        );
+    }
+
+    /// The same defect on the SHORT side, where "away from entry" is UP. A
+    /// rounding fix that used `Nearest`, or that snapped toward entry, passes
+    /// the long case by luck and fails here.
+    #[test]
+    fn a_widened_gold_short_stop_reaches_the_broker_on_the_tick_grid() {
+        // Short: entry trigger 4016.35, drawn stop 4016.60 (distance 0.25).
+        // Same 0.0343 spread → widen to entry + 0.343 = 4016.693, which must
+        // snap UP (away from entry) to 4016.70 — NOT the nearest 4016.69.
+        let broker = SpyBroker::quoting(4016.35, 0.0343);
+        let store = store();
+        let verified = gold_enter("short", 4016.35, 4016.60, 4006.35, 4016.70);
+        pollster::block_on(async {
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
+            assert!(
+                matches!(result, ActionResult::Ok(_)),
+                "the widened short entry must place, got {}",
+                describe(&result)
+            );
+        });
+        let placed = broker.only_placement();
+        assert!(
+            on_grid(placed.stop_loss, 0.01),
+            "the short's widened stop is off gold's 0.01 grid: {}",
+            placed.stop_loss
+        );
+        assert!(
+            (placed.stop_loss - 4016.70).abs() < 1e-9,
+            "expected the widened short stop snapped away from entry to 4016.70, got {}",
+            placed.stop_loss
+        );
+    }
+
+    /// THE INVARIANT. Snapping must move the stop AWAY from entry, never
+    /// toward it: rounding a widened stop back toward entry would partially
+    /// undo the very floor just applied — the widen exists to put the stop
+    /// clear of spread noise, and a snap that tightens it re-enters that noise
+    /// AND silently inflates position size.
+    ///
+    /// Asserted for BOTH directions against the raw unrounded widen
+    /// (`entry ± 10 × spread`), which is the number the fix must never walk
+    /// back. A `Nearest` snap breaks this on exactly one side per geometry, so
+    /// one direction alone is not evidence.
+    #[test]
+    fn the_rounded_stop_is_never_tighter_than_the_unrounded_widen() {
+        let spread = 0.0343;
+        let entry = 4016.35;
+        let unrounded_long = entry - crate::intent::SL_WIDEN_SPREAD_MULTIPLE * spread;
+        let unrounded_short = entry + crate::intent::SL_WIDEN_SPREAD_MULTIPLE * spread;
+
+        // LONG — the stop sits BELOW entry, so "no tighter" means "no higher".
+        let long_broker = SpyBroker::quoting(entry, spread);
+        let long_store = store();
+        let verified = gold_enter("long", entry, 4016.10, 4026.35, 4016.00);
+        pollster::block_on(async {
+            let r = run_enter(
+                &long_broker,
+                &long_store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
+            assert!(matches!(r, ActionResult::Ok(_)), "{}", describe(&r));
+        });
+        let long_stop = long_broker.only_placement().stop_loss;
+        assert!(
+            long_stop <= unrounded_long + 1e-9,
+            "a long's snapped stop {long_stop} is TIGHTER (higher) than the \
+             unrounded widen {unrounded_long} — the snap undid part of the floor"
+        );
+
+        // SHORT — the stop sits ABOVE entry, so "no tighter" means "no lower".
+        let short_broker = SpyBroker::quoting(entry, spread);
+        let short_store = store();
+        let verified = gold_enter("short", entry, 4016.60, 4006.35, 4016.70);
+        pollster::block_on(async {
+            let r = run_enter(
+                &short_broker,
+                &short_store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
+            assert!(matches!(r, ActionResult::Ok(_)), "{}", describe(&r));
+        });
+        let short_stop = short_broker.only_placement().stop_loss;
+        assert!(
+            short_stop >= unrounded_short - 1e-9,
+            "a short's snapped stop {short_stop} is TIGHTER (lower) than the \
+             unrounded widen {unrounded_short} — the snap undid part of the floor"
+        );
+    }
+
+    /// A fire that does NOT trigger the floor must be byte-identical to before:
+    /// `finish_with_sizing` already snapped the drawn stop, so re-snapping an
+    /// unwidened stop is a no-op. Guards against a fix that quietly moves every
+    /// stop, widened or not.
+    #[test]
+    fn an_unwidened_stop_is_left_exactly_where_resolve_put_it() {
+        // Spread 0.001 → floor 0.01; the drawn 0.25 distance clears it easily,
+        // so `SlWiden::Unchanged` and nothing touches the stop.
+        let broker = SpyBroker::quoting(4016.35, 0.001);
+        let store = store();
+        let verified = gold_enter("long", 4016.35, 4016.10, 4026.35, 4016.00);
+        pollster::block_on(async {
+            let r = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                None,
+                EntryOrigin::Fresh,
+            )
+            .await;
+            assert!(matches!(r, ActionResult::Ok(_)), "{}", describe(&r));
+        });
+        let placed = broker.only_placement();
+        assert!(
+            (placed.stop_loss - 4016.10).abs() < 1e-9,
+            "an unwidened stop must reach the broker as drawn (4016.10), got {}",
+            placed.stop_loss
+        );
+        // And the TP is never touched by the widen path either way.
+        assert!(
+            (placed.take_profit - 4026.35).abs() < 1e-9,
+            "take-profit moved: {}",
+            placed.take_profit
         );
     }
 }
