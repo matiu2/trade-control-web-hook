@@ -591,6 +591,42 @@ fn update_tracked(
             }
         }
 
+        // A pinbar must be a PIVOT: its extreme has to clear the bar on BOTH
+        // sides. The left half (`low < low[1]`) is a print-time test inside the
+        // detector; the right half cannot be, because bar `N+1` has not closed
+        // when the signal prints — so it resolves here, on the bar after.
+        //
+        // Until then the signal is legitimately `Pending`, which is the
+        // operator's "if it is the last bar, it's considered pending still": no
+        // extra wait is introduced, because `confirm_bars` (2) already spans
+        // bar `N+1`, so the right-hand bar's close is folded into the
+        // confirmation window rather than added to it.
+        //
+        // Scope is pinbars only. Tweezers carry their own pivot test
+        // (`twin_pivot`, against the bar *before* the pattern) and engulfers
+        // have no pivot concept.
+        //
+        // ⚠️ This is a NARROW rule in practice, and that is worth knowing before
+        // "simplifying" it away. The breach test immediately below already
+        // invalidates any signal whose own extreme is taken out, and for a long
+        // pinbar "bar N+1 made a lower low" *is* a breach. Measured over the
+        // fixture corpus (86 distinct candle sets, 5141 pinbars): 1566 failed
+        // the right-hand pivot, and 1545 of those were already invalidated —
+        // 1521 by this very bar, 24 later in the window. The 21 that survived
+        // were **all exact ties**, where `c.l < t.low` is false but
+        // `c.l > t.low` is also false. The tie is the entire behavioural delta,
+        // which is why `long_pinbar_with_equal_right_low_is_not_a_pivot` is the
+        // test that carries the load and the strictly-lower case cannot.
+        if t.kind == SignalKind::Pinbar && bars_elapsed == 1 {
+            let right_pivot = match t.direction {
+                Direction::Long => c.l > t.low,
+                Direction::Short => c.h < t.high,
+            };
+            if !right_pivot {
+                new_state = SigState::Invalid;
+            }
+        }
+
         // Breach of the opposite extreme always invalidates (Pine `low < sig_low`
         // bullish / `high > sig_high` bearish).
         let breached = match t.direction {
@@ -1409,6 +1445,181 @@ mod tests {
         assert!(
             next.signal_bar_time > a_watermark,
             "next signal prints after A"
+        );
+    }
+
+    /// Bars for the right-hand-pivot tests: a long pinbar at index 4 whose low
+    /// (99.0) is below its left neighbour's (100.0), so the left half of the
+    /// pivot holds. The bar at index 5 is the one under test — the callers below
+    /// rewrite its low to be above / equal to / below the pinbar's.
+    ///
+    /// Bars 0-3 are flat filler so the pinbar is the first signal to print.
+    fn pivot_bars(n1_low: f64) -> Vec<Candle> {
+        vec![
+            k("2026-01-01T00:00:00Z", 105.0, 105.5, 104.5, 105.0),
+            k("2026-01-01T01:00:00Z", 105.0, 105.5, 104.5, 105.0),
+            k("2026-01-01T02:00:00Z", 105.0, 105.5, 104.5, 105.0),
+            // Left neighbour: low 100.0, so the pinbar's 99.0 clears it.
+            k("2026-01-01T03:00:00Z", 104.0, 104.5, 100.0, 104.0),
+            // The long pinbar: low 99.0, long lower wick, body in the top
+            // quartile. range 6, lower wick 5 (>= 3), body_top 105 >= top_25
+            // 103.5, body_bottom 104 >= midpoint 102.
+            k("2026-01-01T04:00:00Z", 104.0, 105.0, 99.0, 105.0),
+            // The right-hand bar under test. Its HIGH (106.0) wicks through the
+            // pinbar's high (105.0) so the signal CONFIRMS at the window end —
+            // the machine's push test reads `c.h > t.high`, a wick. Isolating
+            // the pivot as the only reason it could fail.
+            //
+            // Its CLOSE stays below the pinbar's high on purpose: a bar closing
+            // above it is a long floating engulfer (`close > prior high`), which
+            // would print its own signal, take over the latch, and leave the
+            // test measuring the wrong signal entirely.
+            k("2026-01-01T05:00:00Z", 104.7, 106.0, n1_low, 104.8),
+            k("2026-01-01T06:00:00Z", 104.8, 104.9, 104.6, 104.7),
+            k("2026-01-01T07:00:00Z", 104.7, 104.9, 104.6, 104.8),
+        ]
+    }
+
+    /// The pinbar's own print bar reports `Pending` with the right-hand bar not
+    /// yet closed — the operator's "if it is the last bar, it's considered
+    /// pending still".
+    #[test]
+    fn long_pinbar_is_pending_until_the_right_bar_closes() {
+        let bars = pivot_bars(100.0);
+        let l = latched_signal_at(&bars, 4, &cfg()).expect("pinbar prints");
+        assert_eq!(l.kind, SignalKind::Pinbar, "kind {:?}", l.kind);
+        assert_eq!(l.direction, Direction::Long);
+        assert_eq!(
+            l.state,
+            SigState::Pending,
+            "the right-hand pivot bar has not closed yet"
+        );
+        assert!(!l.signal_confirmed);
+    }
+
+    /// Right-hand pivot HOLDS (N+1 low 100.0 > the pinbar's 99.0): the signal
+    /// confirms at the end of the window, exactly as before this rule existed.
+    #[test]
+    fn long_pinbar_with_higher_right_low_confirms() {
+        let bars = pivot_bars(100.0);
+        let l = latched_signal_at(&bars, 6, &cfg()).expect("pinbar prints");
+        assert_eq!(l.kind, SignalKind::Pinbar);
+        assert_eq!(l.state, SigState::Valid, "state {:?}", l.state);
+        assert!(l.signal_confirmed, "a true pivot confirms");
+    }
+
+    /// Right-hand pivot FAILS on an EXACT TIE (N+1 low == the pinbar's low).
+    ///
+    /// This is the whole behavioural delta of the rule. A strictly-lower N+1 low
+    /// was already invalidated by the breach rule below (`c.l < t.low`), so a tie
+    /// is the only case that used to survive: measured over the fixture corpus,
+    /// **all 21** surviving pivot failures were exact ties.
+    #[test]
+    fn long_pinbar_with_equal_right_low_is_not_a_pivot() {
+        let bars = pivot_bars(99.0);
+        let l = latched_signal_at(&bars, 6, &cfg()).expect("pinbar prints");
+        assert_eq!(l.kind, SignalKind::Pinbar);
+        assert_eq!(
+            l.state,
+            SigState::Invalid,
+            "an equal low is not a lower low, so the pinbar is not a pivot"
+        );
+        assert!(
+            !l.signal_confirmed,
+            "a non-pivot must not reach the alert wire confirmed"
+        );
+    }
+
+    /// A strictly-lower N+1 low also fails, as it always did — this pins that
+    /// the new rule did not *replace* the breach rule, which covers the same
+    /// case by a different route. If the pivot check were deleted this stays
+    /// green, which is exactly why the equal-low test above carries the load.
+    ///
+    /// The N+1 low is dropped to 98.0 rather than reusing [`pivot_bars`]: a bar
+    /// that takes out the pinbar's low by enough to matter is usually a pinbar
+    /// itself, and it would take over the latch — leaving the assertion
+    /// measuring the *second* signal's lifecycle instead of the first's. So the
+    /// right-hand bar here keeps a short lower wick (not a pinbar) and simply
+    /// closes through the low.
+    #[test]
+    fn long_pinbar_with_lower_right_low_still_fails() {
+        let bars = vec![
+            k("2026-01-01T00:00:00Z", 105.0, 105.5, 104.5, 105.0),
+            k("2026-01-01T01:00:00Z", 105.0, 105.5, 104.5, 105.0),
+            k("2026-01-01T02:00:00Z", 105.0, 105.5, 104.5, 105.0),
+            k("2026-01-01T03:00:00Z", 104.0, 104.5, 100.0, 104.0),
+            // The long pinbar, as in `pivot_bars`: low 99.0.
+            k("2026-01-01T04:00:00Z", 104.0, 105.0, 99.0, 105.0),
+            // N+1 trades strictly below 99.0 — a plain bearish bar whose body
+            // dominates its range, so it is no pinbar and cannot steal the latch.
+            k("2026-01-01T05:00:00Z", 104.5, 104.6, 98.0, 98.2),
+            k("2026-01-01T06:00:00Z", 98.2, 98.4, 98.0, 98.1),
+            k("2026-01-01T07:00:00Z", 98.1, 98.3, 97.9, 98.0),
+        ];
+        let l = latched_signal_at(&bars, 5, &cfg()).expect("pinbar prints");
+        assert_eq!(l.kind, SignalKind::Pinbar, "kind {:?}", l.kind);
+        assert_eq!(
+            l.state,
+            SigState::Invalid,
+            "a lower low was already fatal via the breach rule"
+        );
+        assert!(!l.signal_confirmed);
+    }
+
+    /// The mirror for a short pinbar: an equal N+1 high is not a pivot.
+    #[test]
+    fn short_pinbar_with_equal_right_high_is_not_a_pivot() {
+        let bars = vec![
+            k("2026-01-01T00:00:00Z", 95.0, 95.5, 94.5, 95.0),
+            k("2026-01-01T01:00:00Z", 95.0, 95.5, 94.5, 95.0),
+            k("2026-01-01T02:00:00Z", 95.0, 95.5, 94.5, 95.0),
+            // Left neighbour: high 100.0, so the pinbar's 101.0 clears it.
+            k("2026-01-01T03:00:00Z", 96.0, 100.0, 95.5, 96.0),
+            // Short pinbar: high 101.0, long upper wick. range 6, upper wick 5,
+            // body_bottom 95 <= bottom_25 96.5, body_top 96 <= midpoint 98.
+            k("2026-01-01T04:00:00Z", 96.0, 101.0, 95.0, 95.0),
+            // N+1 ties the high at 101.0 → not a pivot. Its low (94.0) wicks
+            // below the pinbar's low so the window would otherwise confirm. Its
+            // close stays ABOVE the pinbar's low so it is not itself a short
+            // floating engulfer (which needs `close < prior low`).
+            k("2026-01-01T05:00:00Z", 95.3, 101.0, 94.0, 95.2),
+            k("2026-01-01T06:00:00Z", 95.2, 95.4, 95.1, 95.3),
+            k("2026-01-01T07:00:00Z", 95.3, 95.5, 95.2, 95.4),
+        ];
+        let l = latched_signal_at(&bars, 6, &cfg()).expect("pinbar prints");
+        assert_eq!(l.kind, SignalKind::Pinbar, "kind {:?}", l.kind);
+        assert_eq!(l.direction, Direction::Short);
+        assert_eq!(l.state, SigState::Invalid, "state {:?}", l.state);
+        assert!(!l.signal_confirmed);
+    }
+
+    /// The pivot rule is scoped to pinbars. Tweezers carry their own pivot test
+    /// (`twin_pivot`, on the pattern's shared extreme against the bar BEFORE the
+    /// pattern) and engulfers have no pivot concept at all — neither may be
+    /// silently retired by a bar that ties the extreme afterwards.
+    #[test]
+    fn the_right_pivot_does_not_apply_to_engulfers() {
+        let bars = vec![
+            k("2026-01-01T00:00:00Z", 105.0, 105.5, 104.5, 105.0),
+            k("2026-01-01T01:00:00Z", 105.0, 105.5, 104.5, 105.0),
+            k("2026-01-01T02:00:00Z", 105.0, 105.5, 104.5, 105.0),
+            // Bearish bar, then a bullish bar engulfing it → long engulfer.
+            k("2026-01-01T03:00:00Z", 104.0, 104.5, 100.0, 100.5),
+            k("2026-01-01T04:00:00Z", 100.0, 106.0, 99.0, 105.5),
+            // Ties the engulfer's low — irrelevant for an engulfer. Wicks above
+            // its high so the window confirms; closes below it so it prints no
+            // signal of its own.
+            k("2026-01-01T05:00:00Z", 105.4, 107.0, 99.0, 105.3),
+            k("2026-01-01T06:00:00Z", 105.3, 105.5, 105.2, 105.4),
+            k("2026-01-01T07:00:00Z", 105.4, 105.6, 105.3, 105.5),
+        ];
+        let l = latched_signal_at(&bars, 6, &cfg()).expect("a signal prints");
+        assert_ne!(l.kind, SignalKind::Pinbar, "fixture must not be a pinbar");
+        assert_eq!(
+            l.state,
+            SigState::Valid,
+            "a non-pinbar is untouched by the pinbar pivot rule (kind {:?})",
+            l.kind
         );
     }
 }
