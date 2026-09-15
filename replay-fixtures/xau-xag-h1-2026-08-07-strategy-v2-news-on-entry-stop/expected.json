@@ -394,7 +394,7 @@
     "trendline 04-prep-retest: anchor b (epoch 1784512800) is outside the 382-bar window; its bar-index was estimated from bar_seconds=3600 (wall-clock spacing across any gap in the un-fetched span). Widen the candle fetch so anchors are in-window."
   ],
   "outcome": {
-    "net_r": 1.1228571428572542,
+    "net_r": 1.1228571428571403,
     "tp_hits": 1,
     "sl_hits": 0,
     "reversal_closes": 0,
@@ -405,12 +405,12 @@
       {
         "entry_time": "2026-08-10T08:00:00Z",
         "entry_price": 67.633,
-        "stop_loss": 68.33299999999993,
+        "stop_loss": 68.333,
         "take_profit": 66.847,
         "exit_time": "2026-08-10T18:00:00Z",
         "exit_price": 66.847,
         "exit_reason": "took_profit",
-        "r": 1.1228571428572542
+        "r": 1.1228571428571403
       }
     ]
   }

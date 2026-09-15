@@ -98,10 +98,10 @@
       {
         "entry_time": "2026-08-06T16:00:00Z",
         "entry_price": 1.61624,
-        "stop_loss": 1.6178400000000015,
+        "stop_loss": 1.61784,
         "take_profit": 1.61219,
         "exit_time": "2026-08-07T12:00:00Z",
-        "exit_price": 1.6178400000000015,
+        "exit_price": 1.61784,
         "exit_reason": "stopped_out",
         "r": -1.0
       }

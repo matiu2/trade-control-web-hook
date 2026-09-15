@@ -41,7 +41,7 @@
   "final_phase": "done",
   "warnings": [],
   "outcome": {
-    "net_r": 1.0080048270310211,
+    "net_r": 1.0080048270312272,
     "tp_hits": 1,
     "sl_hits": 0,
     "reversal_closes": 1,
@@ -52,12 +52,12 @@
       {
         "entry_time": "2026-07-24T10:15:00Z",
         "entry_price": 94.751,
-        "stop_loss": 94.64100000000005,
+        "stop_loss": 94.641,
         "take_profit": 94.958,
         "exit_time": "2026-07-24T12:30:00Z",
         "exit_price": 94.6925,
         "exit_reason": "reversal",
-        "r": -0.5318181818184754
+        "r": -0.5318181818182693
       },
       {
         "entry_time": "2026-07-24T14:15:00Z",
