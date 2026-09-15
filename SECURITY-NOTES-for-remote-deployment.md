@@ -57,22 +57,53 @@ had to be withdrawn).
 
 ---
 
-## 2. `park_stored_entry` stores an UNSIGNED re-serialisation
+## 2. `park_stored_entry`'s unsigned fallback — RESOLVED by finding #3's fix
 
-**Found 2026-09-15, not fixed** (`core/src/dispatch/enter.rs:~1193`).
+**Found 2026-09-15. Re-investigated 2026-09-15: no longer reachable on any live
+path** (`core/src/dispatch/enter.rs:~1193`).
 
-On the engine path it stores `serde_yaml::to_string(&verified.intent)` — no
-signature. `SignedBodySource` rejects that with `MissingSig` → `Unrecoverable`.
+The original reading was correct. `park_stored_entry` falls back to
+`serde_yaml::to_string(&verified.intent)` — no `sig`, and no shell either —
+whenever its `raw_body` argument is `None`. `promote_stored_order` recovers a
+park by handing `StoredOrder.signed_intent` to `VerifiedSource::recover`, whose
+live impl `SignedBodySource` `parse_and_verify`s it; an unsigned body fails at
+`IncomingError::Sig(SigError::MissingSig)` → `Recovered::Unrecoverable`. That
+arm deliberately does **not** clear the record, so the park would have been
+retried and refused every candle until its `drop_at` — silently unpromotable.
 
-This is primarily a **correctness** bug, not a security one: engine-path parks
-are likely unpromotable, so `order_control::promote` / `reprice` are blocked
-there. Its comment claiming "re-serialising it loses nothing a promotion needs"
-looks wrong. **Deserves its own investigation** — see the TODO list.
+**What closed it.** `park_stored_entry` does not choose the body; it forwards
+the `raw_body` that `run_enter` was called with. The engine path was the only
+live caller passing `None`, and `deaf5ed9` (*fix(engine): store a recoverable
+order body for engine-placed entries*, merged to `main`) made
+`dispatch_action` re-sign via `engine_order_body` → `core::resign` and pass
+`body.as_deref()`. Every live `run_enter` caller now supplies a signed body:
+the webhook (`dispatch/action.rs:27`), the cron engine
+(`trade-control-cron/src/engine.rs:956`), promotion
+(`order_control/promote.rs:143`), re-price (`order_control/reprice.rs:217`) and
+the lifecycle re-drive (`pending_lifecycle.rs:1178`). So both park call sites
+(`enter.rs:763` `BelowMinR`, `enter.rs:1051` `BelowMinSize`) now park signed
+bytes.
 
-Recorded here because the *fix* has a security dimension: whatever makes that
-body recoverable should sign it, the same way
-`fix/engine-path-order-body` signs the `order:{id}` body, rather than adding a
-second unsigned-but-trusted path.
+**Verified empirically, not by reading.** Driving the real entry point
+(`dispatch_action`) with a broker that returns `EntryError::UnitsBelowMinimum`
+parks a body that `parse_and_verify`s under the worker key. Mutating the engine
+back to `raw_body: None` turns that same probe into `Sig(MissingSig)` — i.e.
+the probe reproduces the original bug exactly, and the shipped code does not
+have it.
+
+**The only remaining `None` caller is the offline replay**
+(`cli/src/bin/replay_candles/replay.rs:1069`), which supplies its own
+`ReplayVerifiedSource`. That impl ignores the stored body entirely and resolves
+from the fake broker's armed map by order id *or* trade id, so replay parks
+promote regardless of signature. Corollary for reviewers: **the fixture corpus
+is structurally blind to this class** and a green corpus is not evidence here.
+
+**Left in place deliberately:** the fallback is now dead code on every live
+path, but it is the replay's park path and it fails in the safe direction (an
+unverifiable park is refused, never acted on). Removing it would make a future
+`raw_body: None` caller park nothing at all rather than park something
+unpromotable — a silent loss instead of a visible refusal. If it is ever
+revived, it must sign through `core::resign`, not re-serialise raw.
 
 ---
 

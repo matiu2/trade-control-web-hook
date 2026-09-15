@@ -1296,6 +1296,15 @@ mod tests {
             }
         }
 
+        /// The promotion pass takes an [`EnterConfigProvider`] rather than a
+        /// `CronEnv`; give it the same config the engine dispatch uses so a
+        /// promoted order is sized exactly as the original fire would have been.
+        impl trade_control_core::pending_lifecycle::EnterConfigProvider for KeyedEnv {
+            async fn dispatch_config(&self, verified: &Verified) -> DispatchConfig {
+                CronEnv::dispatch_config(self, verified).await
+            }
+        }
+
         /// Accepts any placement and reports the fixed [`ORDER_ID`], so the test
         /// knows exactly which `order:{id}` row to look under.
         struct PlacingBroker;
@@ -1364,6 +1373,81 @@ mod tests {
                 _now: DateTime<Utc>,
             ) -> Result<Vec<Candle>, CandleError> {
                 Ok(Vec::new())
+            }
+        }
+
+        /// Refuses every placement as `UnitsBelowMinimum` — the broker verdict
+        /// that makes the entry path PARK rather than place. Everything else
+        /// delegates to [`PlacingBroker`], so the park is the only difference.
+        struct TooSmallBroker;
+
+        impl Broker for TooSmallBroker {
+            async fn place_entry(
+                &self,
+                _max_risk_pct: f64,
+                _max_open_positions: u32,
+                _req: &EntryRequest<'_>,
+            ) -> Result<Placement, EntryError> {
+                Err(EntryError::UnitsBelowMinimum)
+            }
+            async fn close_positions(&self, instrument: &str) -> CloseOutcome {
+                PlacingBroker.close_positions(instrument).await
+            }
+            async fn cancel_pending_for_instrument(&self, instrument: &str) -> usize {
+                PlacingBroker
+                    .cancel_pending_for_instrument(instrument)
+                    .await
+            }
+            async fn lookup_attempt_state(
+                &self,
+                instrument: &str,
+                order_id: &str,
+                trade_id: Option<&str>,
+            ) -> Result<AttemptState, LookupError> {
+                PlacingBroker
+                    .lookup_attempt_state(instrument, order_id, trade_id)
+                    .await
+            }
+            async fn cancel_order(
+                &self,
+                account_id: &str,
+                order_id: &str,
+            ) -> Result<(), CancelError> {
+                PlacingBroker.cancel_order(account_id, order_id).await
+            }
+            async fn get_quote(&self, instrument: &str) -> Result<Quote, LookupError> {
+                PlacingBroker.get_quote(instrument).await
+            }
+            async fn list_open_positions(
+                &self,
+                account_id: &str,
+            ) -> Result<Vec<OpenPosition>, LookupError> {
+                PlacingBroker.list_open_positions(account_id).await
+            }
+            async fn amend_stop(
+                &self,
+                account_id: &str,
+                id: &str,
+                new_stop: f64,
+            ) -> Result<(), AmendError> {
+                PlacingBroker.amend_stop(account_id, id, new_stop).await
+            }
+            async fn list_pending_orders(
+                &self,
+                account_id: &str,
+            ) -> Result<Vec<PendingOrder>, LookupError> {
+                PlacingBroker.list_pending_orders(account_id).await
+            }
+            async fn get_candles(
+                &self,
+                instrument: &str,
+                granularity: Granularity,
+                since: DateTime<Utc>,
+                now: DateTime<Utc>,
+            ) -> Result<Vec<Candle>, CandleError> {
+                PlacingBroker
+                    .get_candles(instrument, granularity, since, now)
+                    .await
             }
         }
 
@@ -1475,6 +1559,138 @@ mod tests {
                 dispatch(&env, &store).is_none(),
                 "no key ⇒ no stored body (and the placement must still succeed)",
             );
+        }
+
+        /// An engine-fired enter the broker rejects as `UnitsBelowMinimum` is
+        /// **parked**, and that park must be **promotable**.
+        ///
+        /// # The regression this pins
+        ///
+        /// `park_stored_entry` forwards `run_enter`'s `raw_body`; when that is
+        /// `None` it falls back to an UNSIGNED `serde_yaml::to_string` of the
+        /// intent. `promote_stored_order` recovers a park through
+        /// `SignedBodySource`, which `parse_and_verify`s those bytes and answers
+        /// `Recovered::Unrecoverable` on `MissingSig`. Because that arm
+        /// deliberately does not clear the record, such a park is refused every
+        /// candle until `drop_at` — the setup silently never enters.
+        ///
+        /// The engine is the path that would hit it (its intents are
+        /// reconstructed from a stored plan, never re-received), so this drives
+        /// `dispatch_action` — the real caller — rather than `park_stored_entry`
+        /// or `put_order_body` directly.
+        ///
+        /// # Why it asserts a PROMOTION, not a stored row
+        ///
+        /// Asserting "a body row exists" passes on an unsigned body, which is the
+        /// exact bug. Asserting "the body verifies" is closer but still tests the
+        /// layer below the one that matters. So this runs the real
+        /// `promote_stored_order` against the real `SignedBodySource` and requires
+        /// `PromoteOutcome::Promoted` — the operator-visible behaviour.
+        #[test]
+        fn an_engine_parked_entry_can_be_promoted() {
+            use trade_control_core::order_control::{
+                PromoteOutcome, StoredCheck, promote_stored_order, stored_order,
+            };
+            use trade_control_core::pending_lifecycle::SignedBodySource;
+
+            let store = MemStateStore::new();
+            let env = KeyedEnv {
+                key: Some(KEY.to_vec()),
+            };
+            let now = ts("2026-07-08T20:05:00Z");
+
+            // The shared `fired_enter` expires at 00:00Z, which puts `drop_at`
+            // (three H1 bars before expiry) at 21:00Z — the very next bar, so a
+            // park would be dropped before it could ever be re-checked. Widen the
+            // window so the promotion path is actually reachable; nothing else
+            // about the fired intent changes.
+            let mut fired = fired_enter();
+            fired.intent.not_after = ts("2026-07-10T00:00:00Z");
+
+            pollster::block_on(async {
+                // 1. Fire the enter. The broker refuses the size, so the entry
+                //    path parks instead of placing.
+                let out =
+                    dispatch_action(&TooSmallBroker, &store, &fired, &env, Granularity::H1, now)
+                        .await;
+                assert!(
+                    matches!(out, ActionResult::Rejected { .. }),
+                    "a below-minimum size is a rejection, not a placement: {}",
+                    out.describe(),
+                );
+                let parked = stored_order(&store, "t")
+                    .await
+                    .expect("store read")
+                    .expect("the setup must be PARKED, not discarded");
+
+                // 2. The parked bytes must describe THIS trade…
+                let back = trade_control_core::incoming::parse_and_verify(
+                    &parked.signed_intent,
+                    &KEY,
+                    now,
+                )
+                .expect("the parked body must verify under the worker's key");
+                assert_eq!(back.intent.trade_id.as_deref(), Some("t"));
+                assert_eq!(
+                    format!("{:?}", back.intent.entry),
+                    format!("{:?}", fired.intent.entry),
+                    "the parked body must round-trip the entry it was fired with",
+                );
+
+                // …and the nested `entry` must actually be COVERED by the
+                // signature, which round-tripping alone cannot show.
+                //
+                // The HMAC signs a line-scan over top-level `key: value` lines,
+                // while `parse_and_verify` deserialises with full YAML *after*
+                // checking it. So a nested value rendered in block style still
+                // parses back correctly — the trigger price is simply signed as
+                // the empty string, leaving it unauthenticated. Anyone who can
+                // write the record could then move the entry level and the body
+                // would still verify, and the promotion would place an order at
+                // a price the operator never authorised.
+                //
+                // Tampering is therefore the only assertion that can see this:
+                // move the trigger and require the promotion to REFUSE.
+                let tampered = parked.signed_intent.replace("0.5598", "0.5500");
+                assert_ne!(
+                    tampered, parked.signed_intent,
+                    "the trigger price must appear in the parked body for this to prove anything",
+                );
+                assert!(
+                    trade_control_core::incoming::parse_and_verify(&tampered, &KEY, now).is_err(),
+                    "moving the entry trigger must BREAK the signature — if it verifies, the \
+                     nested entry is outside the signed line-scan (a block-style render) and the \
+                     price the order would be placed at is unauthenticated",
+                );
+
+                // 3. Promote it through the LIVE seam. A `BelowMinSize` park is
+                //    re-checked once per new bar, so hand it a later bar.
+                let check = StoredCheck {
+                    clears_min_r: true,
+                    bar_time: Some(ts("2026-07-08T21:00:00Z")),
+                };
+                let outcome = promote_stored_order(
+                    &PlacingBroker,
+                    &store,
+                    &env,
+                    &SignedBodySource { key: &KEY },
+                    "t",
+                    check,
+                    ts("2026-07-08T21:05:00Z"),
+                )
+                .await;
+
+                // An unsigned park fails here as `Err("… will not verify")`.
+                match outcome {
+                    Ok(PromoteOutcome::Promoted(_)) => {}
+                    other => panic!(
+                        "the parked engine entry must PROMOTE — an unsigned park is refused every \
+                         candle until drop_at and the setup never enters. Got {other:?} (parked \
+                         body was {} bytes)",
+                        parked.signed_intent.len(),
+                    ),
+                }
+            });
         }
     }
 }
