@@ -2225,4 +2225,96 @@ mod tests {
             "…and so must the Resolved the fill sim walks"
         );
     }
+    /// #11 (audit): on an H4 bar spanning a spread hour the two spread-hour
+    /// gates give DIFFERENT answers, and that is CORRECT — they answer
+    /// different questions:
+    ///
+    /// * `suppress_on_spread_hour` — "is this candle's OHLC rubbish?" — is
+    ///   gated at `bar_seconds <= 3600`, so on H4 it is **false**. One bad hour
+    ///   inside a four-hour bar is diluted by three hours of genuine trading;
+    ///   discarding the bar would throw away real data.
+    /// * `is_spread_hour` — "should a resting order be pulled?" — is **not**
+    ///   bar-gated, so on H4 it is **true**. A four-hour bar does not protect
+    ///   an order from filling at 21:15, so it comes off the broker.
+    ///
+    /// Verified for the instant this test uses: at 2026-06-15T21:00Z on EUR/USD
+    /// with `bar_seconds = 14400`, `suppress_on_spread_hour_bar_seconds` is
+    /// `false` while `is_spread_hour` is `true` — asserted below so the test
+    /// fails loudly if a mask regen ever moves the hour out from under it,
+    /// rather than passing vacuously against a non-spread-hour bar.
+    ///
+    /// The audit read that pair as a RACE: "the lifecycle cancels while
+    /// `find_fill` would fill on the same bar, so the outcome depends on
+    /// interleave order." **This test is the refutation.** A cancelled order
+    /// fills nothing whatever the fill simulator thinks of the bar, because
+    /// `advance()` skips `cancelled` before ever consulting it. There is no
+    /// interleave that opens a position from an order the lifecycle pulled.
+    ///
+    /// The guard is a single `continue` in `advance()`. Remove it and an order
+    /// deliberately pulled would fill anyway — a position the live worker never
+    /// takes, booked into the corpus as real R. That is what this pins.
+    #[tokio::test]
+    async fn a_cancelled_order_never_fills_even_on_an_unsuppressed_h4_spread_hour_bar() {
+        // H4 spacing (14400s). The fire bar sits above the 1.1000 short-stop
+        // trigger so it cannot fill there; the next bar's bid reaches through it.
+        let fire = candle(1_781_542_800, 1.1010);
+        let fill = candle(1_781_557_200, 1.1000);
+
+        // The premise, asserted rather than assumed.
+        assert!(
+            !trade_control_core::spread_blackout::suppress_on_spread_hour_bar_seconds(
+                "EUR/USD", fill.time, 14_400,
+            ),
+            "premise: an H4 spread-hour bar is NOT suppressed (the simulator will fill on it)",
+        );
+        assert!(
+            trade_control_core::spread_blackout::is_spread_hour("EUR/USD", fill.time),
+            "premise: the same instant IS a spread hour (the lifecycle will pull the order)",
+        );
+
+        // Control: left alone, this order DOES fill on that bar. Without this
+        // the test could pass for the wrong reason — an order that never fills
+        // anyway proves nothing about the cancel.
+        let control = ReplayBroker::new(vec![fire, fill], 0.0001);
+        control.arm_placement(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&fire.mid()),
+        );
+        control
+            .place_entry(1.0, 5, &entry_req(RiskBudget::Percent(1.0)))
+            .await
+            .expect("the order is placed");
+        control.advance(fill.time);
+        assert_eq!(
+            control.list_open_positions("").await.unwrap().len(),
+            1,
+            "control: an uncancelled order fills on this H4 spread-hour bar",
+        );
+
+        // The real case: the lifecycle pulls the order before that bar.
+        let b = ReplayBroker::new(vec![fire, fill], 0.0001);
+        b.arm_placement(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&fire.mid()),
+        );
+        b.place_entry(1.0, 5, &entry_req(RiskBudget::Percent(1.0)))
+            .await
+            .expect("the order is placed");
+        b.cancel_order("", "o1")
+            .await
+            .expect("the lifecycle pulls it");
+
+        b.advance(fill.time);
+
+        assert!(
+            b.list_open_positions("").await.unwrap().is_empty(),
+            "a cancelled order must NOT fill, however tradeable the bar looks",
+        );
+        assert!(
+            b.held_realized_outcome("o1").is_none(),
+            "a cancelled order books no outcome at all",
+        );
+    }
 }
