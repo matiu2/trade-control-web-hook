@@ -1055,6 +1055,15 @@ async fn dispatch_enter(
     // (`MAX_RISK_PCT_PER_TRADE` / `MAX_OPEN_POSITIONS`). `pip_size` is the plan's
     // baked value (the intent's own `pip_size` still takes precedence inside
     // `run_enter`); `caps` default to no per-account narrowing.
+    //
+    // ⚠️ `caps` is the one KNOWN replay↔live gap here, and it is currently inert
+    // only because every account carries `caps: {}`. The live cron reads the
+    // per-account row (`accounts.caps`) and can NARROW these two numbers; replay
+    // always uses the defaults below. So the moment a per-account
+    // `max_open_positions` / `max_risk_pct` is set, the corpus silently keeps
+    // sizing and admitting entries against 3 / 1.0 and stops being evidence
+    // about that account. Audited 2026-09-15 (all four staging accounts `{}`) —
+    // re-check before trusting a fixture for an account that has caps set.
     let cfg = DispatchConfig {
         worker_max_risk_pct: 1.0,
         worker_max_open_positions: 3,
