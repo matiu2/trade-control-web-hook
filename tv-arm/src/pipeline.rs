@@ -908,8 +908,25 @@ fn resolve_control_windows(
     //   - right edge = the trade-expiry vertical, so only news the open trade
     //     could still run into is considered.
     // A missing/unparseable expiry collapses the range to empty (no windows)
-    // rather than fetching across all of time; check_required surfaces the
-    // absent expiry drawing as a hard error shortly anyway.
+    // rather than fetching across all of time.
+    //
+    // ⚠️ This `.ok()` is the ONE place a `read_trade_expiry` failure is
+    // tolerated, and it is deliberate: this is the right edge of a NEWS LOOKUP
+    // window, not a trade's expiry. Nothing here arms anything, and it fails
+    // SAFE (empty scope, no windows). Every caller that sets a TRADE's expiry
+    // uses `?` and refuses to arm — `hs_resolve.rs`, `mw_resolve.rs` and
+    // `position_entry.rs` (the last joined them in v146; it used to substitute
+    // `now + --expiry-hours`, which became dangerous once v145 made manual
+    // resting entries cron-managed and the sweep started CANCELLING the order
+    // at its expiry). Don't "tidy" this into a `?`, and don't copy the `.ok()`
+    // to a site that arms.
+    //
+    // The hard error arrives after this point on every arming path: the manual
+    // branch hits `run_position_entry`'s own required-expiry check, and the
+    // pattern branches hit theirs. (An earlier version of this comment credited
+    // `check_required` with covering that — it does not: it is called only from
+    // `hs_resolve.rs`, so it never sees a manual entry. The guarantee is per
+    // arming path, not one shared gate.)
     let expiry_hint = read_trade_expiry(geom).ok();
     let calendar_range = calendar_scope_range(cursor_unix, expiry_hint);
     match calendar_windows(
