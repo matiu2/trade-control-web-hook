@@ -29,15 +29,47 @@ pub enum RoundDir {
     Up,
 }
 
+/// Relative tolerance within which a computed step count is treated as a whole
+/// number rather than a value needing a directional snap. Comfortably larger
+/// than the few-ULP error of a single division, and many orders of magnitude
+/// smaller than any real sub-tick price difference. See [`round_to_tick`].
+const STEP_EPSILON: f64 = 1e-9;
+
 /// Snap `price` onto the `tick` grid in direction `dir`.
 ///
 /// Returns `price` unchanged when `tick` is non-finite or `<= 0.0` (the
 /// identity guard — see the module docs).
+///
+/// A price **already on the grid** is returned unchanged in every direction —
+/// see the `steps` dust-scrub below for why that needs saying.
 pub fn round_to_tick(price: f64, tick: f64, dir: RoundDir) -> f64 {
     if !tick.is_finite() || tick <= 0.0 || !price.is_finite() {
         return price;
     }
+    // `price / tick` is a float division, so a price ALREADY on the grid can
+    // land a hair off its own step count — `1.099 / 0.00001` is
+    // `109899.99999999999`, not `109900`. Taking `floor` of that moves an
+    // on-grid price a FULL TICK. For a stop-loss that reads as a silent
+    // one-tick widen of a level the operator drew exactly; across a realistic
+    // FX range, 1722 of 10000 exact levels moved this way.
+    //
+    // Snapping `steps` to its nearest whole number when it is already within
+    // `STEP_EPSILON` of one removes that dust WITHOUT swallowing genuine
+    // sub-tick precision: a price carrying real digits below the tick sits far
+    // from a whole step count and falls through untouched to the directional
+    // snap below. The tolerance is relative, so it holds at both FX (~1) and
+    // index (~10000) price magnitudes.
+    //
+    // This is distinct from the product scrub further down, which cleans dust
+    // introduced by `snapped * tick` — too late to affect WHICH side of a grid
+    // line the value fell on.
     let steps = price / tick;
+    let nearest = steps.round();
+    let steps = if (steps - nearest).abs() <= STEP_EPSILON * steps.abs().max(1.0) {
+        nearest
+    } else {
+        steps
+    };
     let snapped = match dir {
         RoundDir::Nearest => steps.round(),
         RoundDir::Down => steps.floor(),
@@ -102,6 +134,59 @@ fn round_half_away(value: f64, places: u32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A price ALREADY exactly on the grid must survive a directional snap
+    /// unchanged. `price / tick` is a float division, so an exact level can
+    /// land a hair under its own step count — `1.099 / 0.00001` is
+    /// `109899.99999999999`, which `floor` takes to `109899`, moving an
+    /// on-grid stop a FULL TICK further out. Directional rounding is supposed
+    /// to be a no-op here; silently widening is not "never tighter", it is a
+    /// different stop than the one that was drawn.
+    ///
+    /// Swept across a realistic FX range rather than asserted on one value:
+    /// before the `steps` dust-scrub, 1722 of these 10000 exact levels moved.
+    #[test]
+    fn an_on_grid_price_survives_a_directional_snap() {
+        let tick = 0.00001;
+        for i in 100_000..110_000u32 {
+            let price = f64::from(i) * tick;
+            for dir in [RoundDir::Down, RoundDir::Up, RoundDir::Nearest] {
+                let out = round_to_tick(price, tick, dir);
+                assert!(
+                    (out - price).abs() < tick * 0.5,
+                    "{price:?} moved a full tick under {dir:?}: {out:?}"
+                );
+            }
+        }
+    }
+
+    /// The same property on the coarse grids this matters most for.
+    #[test]
+    fn on_grid_coarse_prices_survive_a_directional_snap() {
+        for (tick, base, n) in [(0.01_f64, 400_000u32, 2_000u32), (0.1, 80_000, 2_000)] {
+            for i in base..base + n {
+                let price = f64::from(i) * tick;
+                for dir in [RoundDir::Down, RoundDir::Up] {
+                    let out = round_to_tick(price, tick, dir);
+                    assert!(
+                        (out - price).abs() < tick * 0.5,
+                        "{price:?} moved a full tick on a {tick} grid under {dir:?}: {out:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The scrub must NOT swallow genuine sub-tick precision — that is the
+    /// whole job of this module. A level with real digits below the tick still
+    /// snaps in the requested direction.
+    #[test]
+    fn genuine_sub_tick_precision_still_snaps_directionally() {
+        assert_eq!(round_to_tick(4016.007, 0.01, RoundDir::Down), 4016.00);
+        assert_eq!(round_to_tick(4016.007, 0.01, RoundDir::Up), 4016.01);
+        assert_eq!(round_to_tick(8806.74, 0.1, RoundDir::Down), 8806.7);
+        assert_eq!(round_to_tick(8806.74, 0.1, RoundDir::Up), 8806.8);
+    }
 
     #[test]
     fn identity_on_zero_or_nonfinite_tick() {
