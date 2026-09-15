@@ -319,14 +319,49 @@ regenerate.
 consumer 2 goes from never-rejecting to really-rejecting. That measurement is
 the missing evidence, and it is the reason this is accepted rather than fixed.
 
-### 11. Spread-hour gates disagree on H4+
+### 11. Spread-hour gates disagree on H4+ — **REFUTED (2026-09-15)**
 
-Fill suppression is bar-length gated (≤1 h,
-`spread_blackout.rs:465-468`); `is_spread_hour` with the 30-min lead
-(`:480-497`) — used by `cancel_pass`/`hold_reasons` and the widen — has no
-bar-length gate. On H4 the lifecycle holds/cancels a resting order for the
-lead window while `find_fill` would fill on the same bar; which wins depends
-on the dispatch/lifecycle interleave in `replay.rs`, not on a stated rule.
+**The premise is true; the conclusion is false. There is no bug.** Settled by
+a test, not by argument — `a_cancelled_order_never_fills_even_on_an_unsuppressed_h4_spread_hour_bar`
+(`cli/src/bin/replay_candles/replay_broker.rs`).
+
+**The premise, measured** at the exact instant the test uses (EUR/USD,
+2026-06-15T21:00Z, `bar_seconds = 14400`):
+
+| gate | value | question it answers |
+|---|---|---|
+| `suppress_on_spread_hour_bar_seconds` | **false** | "is this candle's OHLC rubbish?" |
+| `is_spread_hour` | **true** | "should a resting order be pulled?" |
+
+**Why that is CORRECT, not a disagreement.** They answer different questions
+and both answers are right:
+
+- Suppression **must** be bar-gated (`SPREAD_HOUR_SUPPRESSION_MAX_BAR_SECONDS
+  = 3600`): one bad hour inside a four-hour bar is diluted by three hours of
+  genuine trading, so discarding the bar would throw away real data.
+- The hold **must not** be bar-gated: a four-hour bar does not stop a fill at
+  21:15, so the order comes off the broker regardless of the chart timeframe.
+
+**Why there is no race.** The original finding said "which wins depends on the
+dispatch/lifecycle interleave". It does not: `ReplayBroker::advance` skips
+`order.cancelled` with a `continue` **before** it ever consults the fill logic,
+so a cancelled order fills nothing whatever the simulator thinks of the bar.
+No interleave opens a position from a pulled order. (The finding — and a later
+retelling of it — inferred a race from two functions returning different
+booleans. That is not the same as finding one.)
+
+⚠️ **Related question, already answered:** *"can we drop suppression for H4?"*
+— it is **already off there.** The constant's own doc says "suppress on 15m +
+1h, allow on 4h + D". On H4 the system does not discard the bar; **System 2
+widens the open position's stop** through the spike and restores it after.
+
+**What the test pins is one line.** Delete the `continue` in `advance()` and an
+order the lifecycle deliberately pulled fills anyway — a position the live
+worker never takes, booked into the corpus as real R. Mutation-verified RED,
+along with a premise assertion that fails loudly if a mask regen ever moves the
+spread hour out from under the test (rather than passing vacuously against an
+ordinary bar), and a control arm proving the *uncancelled* order does fill on
+that same bar.
 
 ---
 
