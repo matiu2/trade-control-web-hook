@@ -937,6 +937,12 @@ fn evaluate_one_entry(
                 // signal occurs, not on a later bar it retroactively confirms.
                 // A `needs_confirmed` enter opts INTO confirmation-firing.
                 !rule.intent.needs_confirmed,
+                // First entry or re-entry? Read off the engine's own persisted
+                // fire watermark (`PlanState::plain_entered`), which is the only
+                // seam where the question is answerable at all — see that
+                // field's docs for why neither the `EntryAttempt` rows nor
+                // `run_enter` can answer it here. Stamped below, on the fire.
+                plain_enter_shot(state, rule),
             ) {
                 Some(sig) => Some(sig),
                 None => return,
@@ -1045,6 +1051,20 @@ fn evaluate_one_entry(
     {
         state.last_confirmed_enter_at = Some(sig.signal_bar_time);
     }
+    // Advance the PLAIN enter's first-vs-re-entry watermark. Stamped on the
+    // fire, for every plain Pine enter (single- and multi-shot alike): a
+    // single-shot plain also latches in `state.fired` below and never
+    // re-evaluates, so its stamp is merely never read — recording it
+    // unconditionally keeps the watermark meaning "this enter has fired", with
+    // no shot-count condition that could drift from the one in
+    // `plain_enter_shot`.
+    //
+    // Scoped to `PinePattern` via `signal.is_some()` (⇔ a Pine fire) because the
+    // gate that reads it only exists on that path; the M/W heartbeat's dedup is
+    // the worker's retry gate.
+    if !rule.intent.needs_confirmed && signal.is_some() {
+        state.plain_entered.insert(rule.rule_id.clone());
+    }
     if matches!(
         rule.fire_mode,
         trade_control_core::trade_plan::FireMode::Once
@@ -1052,6 +1072,26 @@ fn evaluate_one_entry(
     {
         state.fired.insert(rule.rule_id.clone());
         state.phase = Phase::Done;
+    }
+}
+
+/// Is a plain (non-`needs_confirmed`) Pine enter'"'"'s next fire the trade'"'"'s **first**
+/// entry, or a **re-entry**?
+///
+/// Read off [`PlanState::plain_entered`], which the fire path stamps — see that
+/// field'"'"'s docs for why the engine keeps its own watermark instead of consulting
+/// the worker'"'"'s `EntryAttempt` rows (it is pure; and `run_enter`, which can read
+/// them, has no candle window and so cannot tell which bar of a pinbar'"'"'s pivot it
+/// is on).
+///
+/// Keyed per `rule_id`, not per plan: a strategy-v2 plan carries two enter legs
+/// and each owns its own shot count. The QM leg is `needs_confirmed` and never
+/// reads this.
+fn plain_enter_shot(state: &PlanState, rule: &ConditionRule) -> trade_control_core::signals::Shot {
+    if state.plain_entered.contains(&rule.rule_id) {
+        trade_control_core::signals::Shot::Reentry
+    } else {
+        trade_control_core::signals::Shot::First
     }
 }
 
@@ -1077,6 +1117,12 @@ fn eval_pine_entry(
     confirmed_floor: Option<chrono::DateTime<chrono::Utc>>,
     confirmed_after: Option<chrono::DateTime<chrono::Utc>>,
     print_only: bool,
+    // Would a fire here be the trade's FIRST entry or a RE-entry? Only the
+    // plain-pine path reads it (the pinbar pivot deferral is re-entry-scoped —
+    // see `trade_control_core::signals::print_gate`); the guard passes
+    // `Shot::First`, which is inert for it because `print_only: false` skips the
+    // gate entirely.
+    shot: trade_control_core::signals::Shot,
 ) -> Option<LatchedSignal> {
     let Some(idx) = detector_window.iter().position(|c| c.time == candle.time) else {
         tracing::debug!(
@@ -1151,13 +1197,18 @@ fn eval_pine_entry(
         "pine-enter: latched signal at this bar"
     );
     // `fires` means "the alert fired on this bar" — a fresh print, or an earlier
-    // pending signal retroactively validating. A plain PINBAR enter deliberately
-    // fires on a bar where NEITHER happened: bar `N+1`, one after the pinbar's
-    // print, where the pinbar is still `Pending` (its confirm window resolves at
-    // `N+2`, so nothing "just validated"). That bar is the operator's
-    // right-hand-pivot bar, so the `fires` gate must not pre-empt it — the
-    // print-only gate below owns the decision for this path and is strictly
-    // narrower (it pins the exact due bar, which `fires` never did).
+    // pending signal retroactively validating. A plain pinbar RE-entry
+    // deliberately fires on a bar where NEITHER happened: bar `N+1`, one after
+    // the pinbar's print, where the pinbar is still `Pending` (its confirm
+    // window resolves at `N+2`, so nothing "just validated"). That bar is the
+    // operator's right-hand-pivot bar, so the `fires` gate must not pre-empt it.
+    //
+    // Skipping `fires` for the whole plain path (not just the deferred case) is
+    // safe because the print-only gate below is strictly NARROWER than `fires`
+    // ever was: it pins one exact due bar per signal. For a FIRST entry that due
+    // bar is the print bar, where `fires` is true anyway, so widening the set of
+    // bars that reach the gate admits nothing the gate then lets through. The
+    // gate — not `fires` — is the decision on this path.
     //
     // Every other path keeps `fires` as its gate: a `needs_confirmed` enter
     // (`confirmed_first`) reads `first_confirmed_signal_at`, whose `fires` is
@@ -1211,10 +1262,18 @@ fn eval_pine_entry(
     // But "the occurrence bar" is NOT always the print bar. A **pinbar** is only
     // a signal if it is a PIVOT, and the right-hand half of that (`low` below
     // bar `N+1`'s low, for a long) cannot be known until `N+1` closes. So a
-    // plain pinbar enter is due one bar later, and only if the pivot held —
+    // plain pinbar RE-entry is due one bar later, and only if the pivot held —
     // the operator's "you'd need the left bar close, the pin bar close, and the
-    // 2nd bar close (confirming the pinbar)". Every other kind is due on its own
-    // print bar, exactly as before.
+    // 2nd bar close (confirming the pinbar)".
+    //
+    // **The deferral is RE-ENTRY-scoped.** Applying it to first entries too was
+    // measured over the whole fixture corpus and lost R (−46.03 overall, −9.47
+    // on the operator's live column, entirely out of winning R): delaying a
+    // trade's FIRST entry by a bar either filled worse or missed the setup, while
+    // the gain came from suppressing re-entries that fired on pinbars which were
+    // never pivots. So a first entry, and every non-pinbar kind on either shot,
+    // is due on its own print bar exactly as before. See
+    // `trade_control_core::signals::print_gate`'s module docs.
     //
     // Both halves of that live in ONE place,
     // `trade_control_core::signals::plain_enter_gate`: the due bar per kind, and
@@ -1241,7 +1300,7 @@ fn eval_pine_entry(
             );
             return None;
         };
-        let gate = trade_control_core::signals::plain_enter_gate(&sig, print_idx, idx);
+        let gate = trade_control_core::signals::plain_enter_gate(&sig, print_idx, idx, shot);
         if gate != trade_control_core::signals::PrintGate::Fire {
             tracing::debug!(
                 bar = %candle.time,
@@ -1330,6 +1389,11 @@ fn eval_pine_guard(
         // `print_only: false` — the reversal-close guard wants "a reversal
         // printed OR validated *now*", not print-only (see the doc above).
         false,
+        // Inert here: `print_only: false` skips the print-only gate, the only
+        // reader of `shot`. `First` is the no-deferral answer, so if a future
+        // change ever routed the guard through the gate it would keep today's
+        // print-or-validate behaviour rather than silently deferring a close.
+        trade_control_core::signals::Shot::First,
     )?;
 
     // Contextual window gate — the pure mirror of the worker's
@@ -3280,6 +3344,25 @@ mod tests {
         let mut s = PlanState::seed(phase, ts("2026-06-30T00:00:00Z"));
         s.watermark = Some(ts(watermark));
         s
+    }
+
+    /// Like [`seed_at`] but with the plain-enter re-entry watermark already set
+    /// for `05-enter`, so the next fire of that rule is a **re-entry** rather
+    /// than the trade's first entry. The pinbar pivot deferral is
+    /// re-entry-scoped, so this is what turns it on.
+    fn reentered_at(phase: Phase, watermark: &str) -> PlanState {
+        let mut s = seed_at(phase, watermark);
+        s.plain_entered.insert("05-enter".into());
+        s
+    }
+
+    /// [`pine_enter_rule`]'s short enter, opted into multi-shot
+    /// (`max_retries > 0`) — the shape a re-entry actually has, so a re-entry
+    /// test is not measuring a config the engine would have latched anyway.
+    fn multi_shot_pine_enter_rule() -> ConditionRule {
+        let mut r = pine_enter_rule(None, Direction::Short, false);
+        r.intent.max_retries = trade_control_core::tunable::Tunable::Static(5);
+        r
     }
 
     fn run(p: &TradePlan, prior: &PlanState, candles: &[Candle]) -> PlanEval {
@@ -6694,13 +6777,13 @@ mod tests {
     /// **right-hand pivot bar**. The earlier bars are flat context so no other
     /// signal prints.
     ///
-    /// Index 4 is the bar a plain pinbar enter is now DUE on: a short pinbar is
+    /// Index 3 (the pinbar) is the bar a **first** entry is due on, and index 4
+    /// (the pivot bar) is the bar a **re-entry** is due on: a short pinbar is
     /// only a pivot if the next bar's high stays below its own, and that cannot
-    /// be known on the pinbar's own bar (see
-    /// `trade_control_core::signals::plain_enter_gate`). So the tests below tick
-    /// `window[4..]`, not `window[3..]` — the pinbar's own bar is the *setup*
-    /// bar, and its geometry (high 1.30 / low 1.10) is what still rides onto the
-    /// dispatched shell.
+    /// be known on the pinbar's own bar — but the deferral is re-entry-scoped
+    /// (see `trade_control_core::signals::print_gate`). So a first-entry test
+    /// ticks `window[3..]` and a re-entry test ticks `window[4..]`, and both ride
+    /// the PINBAR's geometry (high 1.30 / low 1.10) onto the dispatched shell.
     fn bearish_pinbar_window() -> Vec<Candle> {
         vec![
             candle("2026-06-16T08:00:00Z", 1.10, 1.11, 1.09, 1.10),
@@ -6713,7 +6796,7 @@ mod tests {
             // high 1.30 > prior high 1.12. close 1.115 < open 1.12 → bearish.
             candle("2026-06-16T11:00:00Z", 1.12, 1.30, 1.10, 1.115),
             // The right-hand pivot bar. Its high (1.13) stays well below the
-            // pinbar's 1.30, so the short pivot HOLDS and the plain enter fires
+            // pinbar's 1.30, so the short pivot HOLDS and a plain RE-entry fires
             // here. It prints no signal of its own (no breakout of the pinbar's
             // 1.30 high, body dominates its small range) so it cannot steal the
             // latch, and its close (1.12) is above the sell-stop trigger
@@ -6729,16 +6812,16 @@ mod tests {
         // passes (a bare no-geometry enter would now decline at resolve).
         let p = plan(vec![pine_enter_rule(None, Direction::Short, false)]);
         let window = bearish_pinbar_window();
-        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
-        // The RIGHT-HAND PIVOT bar (index 4) is the new candle this tick — the
-        // bar a plain pinbar enter is due on. The whole window is the detector
-        // back-window, so the pinbar at index 3 is still the latched signal.
-        let new = &window[4..];
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        // The pinbar's OWN print bar (index 3). This is a FIRST entry (nothing in
+        // `plain_entered`), and the pivot deferral is re-entry-scoped, so it
+        // fires here exactly as it did before any pivot rule existed.
+        let new = &window[3..4];
         let eval = run_window(&p, &prior, new, &window);
         assert_eq!(
             eval.fired.len(),
             1,
-            "the pinbar fires the short enter on its pivot bar (got {:?})",
+            "a FIRST-entry pinbar fires on its own print bar (got {:?})",
             eval.fired
         );
         let f = &eval.fired[0];
@@ -6755,40 +6838,130 @@ mod tests {
         assert!(eval.done);
     }
 
-    /// The other half of the operator's pinbar rule: the pinbar's OWN print bar
-    /// must not fire. On that bar the right-hand pivot is unresolved — the
-    /// operator's "if it is the last bar, it's considered 'pending' still" — so
-    /// entering there would be entering off a pattern the next bar may refute.
+    /// A multi-shot plain enter whose FIRST fire already happened: its RE-entry
+    /// must not fire on the new pinbar's own print bar. On that bar the
+    /// right-hand pivot is unresolved — the operator's "if it is the last bar,
+    /// it's considered 'pending' still" — so entering there would be entering
+    /// off a pattern the next bar may refute.
     ///
-    /// This is the test that goes red if the one-bar deferral is removed, and it
-    /// is the behavioural change: before this rule, THIS bar was the entry.
+    /// This is the test that goes red if the one-bar deferral is removed. Its
+    /// twin below fires the same setup one bar later.
     #[test]
-    fn a_plain_pinbar_enter_does_not_fire_on_the_pinbar_bar() {
-        let p = plan(vec![pine_enter_rule(None, Direction::Short, false)]);
+    fn a_plain_pinbar_reentry_does_not_fire_on_the_pinbar_bar() {
+        let p = plan(vec![multi_shot_pine_enter_rule()]);
         let window = bearish_pinbar_window();
-        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let prior = reentered_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
         // Tick the pinbar's own bar (index 3) only.
         let eval = run_window(&p, &prior, &window[3..4], &window);
         assert!(
             eval.fired.is_empty(),
-            "the pinbar's own bar is pending, not an entry (got {:?})",
+            "a RE-entry on the pinbar's own bar is pending, not an entry (got {:?})",
             eval.fired
         );
         assert!(!eval.done, "the plan stays armed for the pivot bar");
         assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
     }
 
-    /// The pivot FAILS: the bar after the short pinbar ties its high, so the
-    /// pinbar is not a pivot and the plain enter never fires — not on the print
-    /// bar (deferred) and not on the pivot bar (refuted).
+    /// The twin: the same multi-shot re-entry, one bar later, with the pivot
+    /// held — it fires on the pivot bar. Without this, "deferred" would be
+    /// indistinguishable from "suppressed forever" and a mutation that simply
+    /// blocks every re-entry would survive.
+    #[test]
+    fn a_plain_pinbar_reentry_fires_on_the_pivot_bar() {
+        let p = plan(vec![multi_shot_pine_enter_rule()]);
+        let window = bearish_pinbar_window();
+        let prior = reentered_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        let eval = run_window(&p, &prior, &window[4..], &window);
+        assert_eq!(
+            eval.fired.len(),
+            1,
+            "a RE-entry fires on the pinbar's pivot bar (got {:?})",
+            eval.fired
+        );
+        let sig = eval.fired[0]
+            .signal
+            .expect("a PinePattern fire carries latched geometry");
+        assert_eq!(sig.kind, SignalKind::Pinbar);
+        assert_eq!(
+            sig.signal_bar_time,
+            ts("2026-06-16T11:00:00Z"),
+            "the geometry is the PINBAR's own bar, not the pivot bar"
+        );
+    }
+
+    /// **The variant's defining asymmetry, at the engine's own entry point.**
+    /// The SAME plan, the SAME candles, the SAME pinbar — and the only
+    /// difference is whether this enter has fired before. A first entry fires on
+    /// the print bar; a re-entry does not. If a mutation collapses the two
+    /// shots (either direction), this goes red.
+    #[test]
+    fn first_entry_and_reentry_differ_on_the_pinbar_print_bar() {
+        let p = plan(vec![multi_shot_pine_enter_rule()]);
+        let window = bearish_pinbar_window();
+        let first = run_window(
+            &p,
+            &seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z"),
+            &window[3..4],
+            &window,
+        );
+        let again = run_window(
+            &p,
+            &reentered_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z"),
+            &window[3..4],
+            &window,
+        );
+        assert_eq!(
+            first.fired.len(),
+            1,
+            "the FIRST entry fires on the print bar (got {:?})",
+            first.fired
+        );
+        assert!(
+            again.fired.is_empty(),
+            "the RE-entry is deferred off the print bar (got {:?})",
+            again.fired
+        );
+    }
+
+    /// The watermark the shot is read from is written by the engine itself, on
+    /// the fire — so a first entry's own fire is what makes the *next* one a
+    /// re-entry. Pinned at the entry point because a stamp that never lands
+    /// makes every fire a "first" forever, which is the full-rule-removed
+    /// behaviour wearing the variant's code.
+    #[test]
+    fn a_plain_enter_fire_stamps_the_reentry_watermark() {
+        let p = plan(vec![multi_shot_pine_enter_rule()]);
+        let window = bearish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        assert!(
+            prior.plain_entered.is_empty(),
+            "the fixture starts with no prior entry"
+        );
+        let eval = run_window(&p, &prior, &window[3..4], &window);
+        assert_eq!(eval.fired.len(), 1, "the first entry fires");
+        assert!(
+            eval.new_state.plain_entered.contains("05-enter"),
+            "the fire stamps this enter's re-entry watermark (got {:?})",
+            eval.new_state.plain_entered
+        );
+    }
+
+    /// The pivot FAILS on a RE-entry: the bar after the short pinbar ties its
+    /// high, so the pinbar is not a pivot and the re-entry never fires — not on
+    /// the print bar (deferred) and not on the pivot bar (refuted). This is the
+    /// suppression the variant's whole R gain comes from.
+    ///
+    /// ⚠️ It must be a **re-entry**. A first entry ticking the pivot bar is
+    /// declined as `WrongBar` regardless of the pivot, so the same fixture on a
+    /// first entry would pass with the `Refuted` arm deleted.
     ///
     /// An exact TIE is deliberately the fixture. A high strictly ABOVE the
     /// pinbar's was already fatal via the state machine's breach rule, so a tie
     /// is the only case the pivot rule alone decides — and measured over the
     /// fixture corpus, every surviving pivot failure was an exact tie.
     #[test]
-    fn a_plain_pinbar_enter_does_not_fire_when_the_right_pivot_fails() {
-        let p = plan(vec![pine_enter_rule(None, Direction::Short, false)]);
+    fn a_plain_pinbar_reentry_does_not_fire_when_the_right_pivot_fails() {
+        let p = plan(vec![multi_shot_pine_enter_rule()]);
         let mut window = bearish_pinbar_window();
         // Tie the pinbar's high (1.30) on the next bar → not a pivot.
         //
@@ -6824,15 +6997,66 @@ mod tests {
             "the state machine refuted the pinbar: its right-hand pivot failed"
         );
 
-        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        let prior = reentered_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
         let eval = run_window(&p, &prior, &window[4..], &window);
         assert!(
             eval.fired.is_empty(),
-            "a pinbar that is not a pivot must never enter (got {:?})",
+            "a pinbar that is not a pivot must never RE-enter (got {:?})",
             eval.fired
         );
         assert!(!eval.done, "a declined enter does not retire the plan");
         assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+    }
+
+    /// The control for the test above: the SAME re-entry on the SAME pivot bar,
+    /// with the pivot HELD, fires. Without this pair, "the pivot failed" and
+    /// "re-entries never fire" are indistinguishable.
+    #[test]
+    fn a_plain_pinbar_reentry_fires_when_the_right_pivot_holds() {
+        let p = plan(vec![multi_shot_pine_enter_rule()]);
+        let window = bearish_pinbar_window();
+        let cfg = trade_control_core::signals::default_config(Granularity::H1);
+        let latched = trade_control_core::signals::latched_signal_at(&window, 4, &cfg)
+            .expect("a signal is latched at the pivot bar");
+        assert_ne!(
+            latched.state,
+            trade_control_core::signals::SigState::Invalid,
+            "the unmodified fixture's pivot must HOLD for this control to mean anything"
+        );
+        let prior = reentered_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        let eval = run_window(&p, &prior, &window[4..], &window);
+        assert_eq!(
+            eval.fired.len(),
+            1,
+            "a held pivot lets the re-entry through (got {:?})",
+            eval.fired
+        );
+    }
+
+    /// A spread hour on a RE-entry's due bar still suppresses it. The
+    /// first-entry twin (`spread_hour_bar_suppresses_a_pine_entry_fire`) puts
+    /// the spread hour on the pinbar itself; this one puts it on the pivot bar,
+    /// so neither test can pass for the other's reason and the suppression
+    /// cannot be deleted on either shot unnoticed.
+    #[test]
+    fn spread_hour_on_a_reentrys_pivot_bar_suppresses_it() {
+        let p = plan(vec![multi_shot_pine_enter_rule()]);
+        // The pinbar prints on the clean 20:00Z bar; its pivot bar is the 21:00Z
+        // NY-close edge.
+        let window = pinbar_window_ending_at("2026-06-16T20:00:00Z");
+        let prior = reentered_at(Phase::AwaitEntry, "2026-06-16T20:00:00Z");
+        let due = &window[4..];
+        assert_eq!(
+            due[0].time,
+            ts("2026-06-16T21:00:00Z"),
+            "the re-entry's due bar must be the spread hour"
+        );
+        let eval = run_window(&p, &prior, due, &window);
+        assert!(
+            eval.fired.is_empty(),
+            "no re-entry may fire on a spread-hour bar (got {:?})",
+            eval.fired
+        );
     }
 
     // ---- spread-hour "rubbish candle" suppression ----------------------
@@ -6865,9 +7089,9 @@ mod tests {
             candle_at(end - h, 1.10, 1.12, 1.09, 1.105),
             // the bearish pinbar (identical geometry to bearish_pinbar_window).
             candle_at(end, 1.12, 1.30, 1.10, 1.115),
-            // the right-hand pivot bar (see `bearish_pinbar_window`). `end` is
-            // named for the PINBAR's hour, which is the bar under test for
-            // spread-hour suppression — the enter's due bar is one hour later.
+            // the right-hand pivot bar (see `bearish_pinbar_window`). Present so
+            // a RE-entry variant of these tests has a due bar; the first-entry
+            // tests below never tick it — their due bar is `end`, the pinbar.
             candle_at(end + h, 1.115, 1.13, 1.11, 1.12),
         ]
     }
@@ -6888,16 +7112,15 @@ mod tests {
         // but the bar the enter is DUE on lands on the 21:00Z NY-close edge →
         // `is_spread_hour` true → the enter must NOT fire on this rubbish bar.
         //
-        // ⚠️ The suppression is tested at the DUE bar, not the pinbar's bar. A
-        // plain pinbar enter is now due one bar after its print (the right-hand
-        // pivot bar), so putting the spread hour on the *pinbar* would leave
-        // this test passing for the wrong reason — the deferral alone would
-        // satisfy it and the suppression could be deleted unnoticed. So the
-        // pinbar prints on the clean 20:00Z bar and its pivot bar is 21:00Z.
+        // This is a FIRST entry, so the due bar IS the pinbar's own bar (the
+        // pivot deferral is re-entry-scoped) — hence the pinbar prints at 21:00Z
+        // and that is the bar ticked. The re-entry twin below moves the spread
+        // hour onto the *pivot* bar instead, so neither test can pass for the
+        // other's reason.
         let p = plan(vec![pine_enter_rule(None, Direction::Short, false)]);
-        let window = pinbar_window_ending_at("2026-06-16T20:00:00Z");
+        let window = pinbar_window_ending_at("2026-06-16T21:00:00Z");
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T20:00:00Z");
-        let due = &window[4..];
+        let due = &window[3..4];
         assert_eq!(
             due[0].time,
             ts("2026-06-16T21:00:00Z"),
@@ -6915,15 +7138,15 @@ mod tests {
 
     #[test]
     fn clean_hour_twin_of_the_spread_hour_entry_still_fires() {
-        // The identical pinbar whose DUE bar is a NON-edge hour (12:00Z) fires
+        // The identical pinbar whose DUE bar is a NON-edge hour (11:00Z) fires
         // exactly as today — the suppression is inert when the predicate is
         // false. Pairs with `spread_hour_bar_suppresses_a_pine_entry_fire`:
         // same geometry, same due-bar offset, only the absolute hour differs.
         let p = plan(vec![pine_enter_rule(None, Direction::Short, false)]);
         let window = pinbar_window_ending_at("2026-06-16T11:00:00Z");
-        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
-        let due = &window[4..];
-        assert_eq!(due[0].time, ts("2026-06-16T12:00:00Z"));
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let due = &window[3..4];
+        assert_eq!(due[0].time, ts("2026-06-16T11:00:00Z"));
         let eval = run_window(&p, &prior, due, &window);
         assert_eq!(eval.fired.len(), 1, "clean-hour pinbar fires the enter");
         assert_eq!(eval.fired[0].rule_id, "05-enter");
@@ -6932,7 +7155,7 @@ mod tests {
 
     #[test]
     fn spread_hour_does_not_suppress_an_h4_entry() {
-        // The SAME 21:00Z spread-hour due bar that an H1 plan suppresses (see
+        // The SAME 21:00Z spread-hour pinbar that an H1 plan suppresses (see
         // `spread_hour_bar_suppresses_a_pine_entry_fire`) MUST fire on an H4
         // plan: a 1h spread hour is only a quarter of the H4 bar, so the other
         // 3h of real trading dilute the rubbish. We only trade 15m/1h/4h/D, so
@@ -6940,9 +7163,9 @@ mod tests {
         // "don't suppress 7am entries on the 4h chart, only 15m and 1h."
         let mut p = plan(vec![pine_enter_rule(None, Direction::Short, false)]);
         p.granularity = Granularity::H4;
-        let window = pinbar_window_ending_at("2026-06-16T20:00:00Z");
+        let window = pinbar_window_ending_at("2026-06-16T21:00:00Z");
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T20:00:00Z");
-        let due = &window[4..];
+        let due = &window[3..4];
         assert_eq!(due[0].time, ts("2026-06-16T21:00:00Z"));
         let eval = run_window(&p, &prior, due, &window);
         assert_eq!(
@@ -7484,13 +7707,12 @@ mod tests {
         // (`max_retries > 0`). It must fire AND keep the plan in `AwaitEntry` so
         // a later signal bar can re-enter — if it went `Done`, the cron would
         // archive the plan and no re-entry could ever fire (the NZD/CHF bug).
-        let mut rule = pine_enter_rule(None, Direction::Short, false);
-        rule.intent.max_retries = trade_control_core::tunable::Tunable::Static(5);
-        let p = plan(vec![rule]);
+        let p = plan(vec![multi_shot_pine_enter_rule()]);
         let window = bearish_pinbar_window();
-        // The pinbar's due bar is its right-hand pivot bar (index 4).
-        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
-        let eval = run_window(&p, &prior, &window[4..], &window);
+        // Its FIRST fire, so the due bar is the pinbar's own print bar (index 3)
+        // — the deferral is re-entry-scoped.
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..4], &window);
         assert_eq!(eval.fired.len(), 1, "the pinbar still fires the enter");
         assert_eq!(eval.fired[0].rule_id, "05-enter");
         assert!(
@@ -7739,10 +7961,12 @@ mod tests {
         // valid pattern.
         let p = plan(vec![pine_enter_rule_unresolvable_tp()]);
         let window = bearish_pinbar_window();
-        // Tick the pinbar's due bar (its right-hand pivot bar), so the decline
-        // recorded is the RESOLVE failure's — not the print-only gate's.
-        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
-        let eval = run_window(&p, &prior, &window[4..], &window);
+        // Tick the pinbar's own bar — a FIRST entry's due bar (the pivot
+        // deferral is re-entry-scoped), so the decline recorded is the RESOLVE
+        // failure's and not the print-only gate's, which would silently hollow
+        // this test out.
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..4], &window);
         assert!(eval.fired.is_empty(), "an unresolvable enter must not fire");
         assert!(
             !eval.done,
@@ -7781,11 +8005,12 @@ mod tests {
         r.intent.needs_golden = true;
         let p = plan(vec![r]);
         let window = bearish_pinbar_window();
-        // Tick the pinbar's due bar (its right-hand pivot bar), so the decline
-        // that gets recorded is the GOLDEN gate's — not the print-only gate's,
-        // which would silently hollow this test out.
-        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
-        let eval = run_window(&p, &prior, &window[4..], &window);
+        // Tick the pinbar's own bar — a FIRST entry's due bar (the pivot
+        // deferral is re-entry-scoped), so the decline that gets recorded is the
+        // GOLDEN gate's and not the print-only gate's, which would silently
+        // hollow this test out.
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..4], &window);
         assert!(
             eval.fired.is_empty(),
             "needs_golden blocks the non-golden bar"

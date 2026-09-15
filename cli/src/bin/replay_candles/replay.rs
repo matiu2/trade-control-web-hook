@@ -3174,33 +3174,23 @@ mod tests {
             DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
         let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg, None).await;
 
-        // The declined bar is the bar the enter was DUE on — for a pinbar, the
-        // bar AFTER the golden mark (its right-hand pivot bar), not the marked
-        // bar itself. So find the decline rather than assuming it sits on the
-        // mark; the invariant under test is the per-bar exclusivity of the two
-        // surfaces, not which bar carries the decline.
-        let declined_bar = r
-            .traces
-            .iter()
-            .find(|t| !t.entry_declines.is_empty())
-            .expect("this golden fired and was declined (has an EntryDecline)");
-        assert!(
-            declined_bar.not_taken.is_none(),
-            "a declined bar must NOT also carry a not_taken: {:?}",
-            declined_bar.not_taken
-        );
-        // And the golden mark itself carries neither surface: nothing fired on
-        // it (the pinbar's own bar is pending), so there is nothing to decline
-        // and no unmet precondition to report either.
+        // This plan is single-shot, so its enter is a FIRST entry and its due
+        // bar is the pinbar's own bar — the marked bar. (The pivot deferral is
+        // re-entry-scoped; see `core::signals::print_gate`.) So the decline
+        // lands on the mark, exactly as it did before any pivot rule existed.
         let marked_bar = r
             .traces
             .iter()
             .find(|t| t.detected.is_some())
             .expect("golden marked");
         assert!(
-            marked_bar.entry_declines.is_empty(),
-            "the pinbar's own bar defers rather than declining: {:?}",
-            marked_bar.entry_declines
+            !marked_bar.entry_declines.is_empty(),
+            "this golden fired and was declined (has an EntryDecline)"
+        );
+        assert!(
+            marked_bar.not_taken.is_none(),
+            "a declined bar must NOT also carry a not_taken: {:?}",
+            marked_bar.not_taken
         );
     }
 

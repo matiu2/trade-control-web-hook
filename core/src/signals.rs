@@ -54,7 +54,7 @@ pub use atr::{atr_length_for, atr_length_for_bar_minutes, wilder_atr};
 pub use band_anchor::band_anchor;
 pub use detect::{DetectFlags, Detected, SignalGeometry, detect_at};
 pub use metrics::CandleMetrics;
-pub use print_gate::{PrintGate, plain_enter_gate};
+pub use print_gate::{PrintGate, Shot, plain_enter_gate};
 pub use state_machine::{
     DetectorConfig, LatchedSignal, SigState, SignalCriteria, first_confirmed_signal_at,
     latched_signal_at,

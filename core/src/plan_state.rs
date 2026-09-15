@@ -123,6 +123,37 @@ pub struct PlanState {
     /// until then, and always `None` for golden-only / single-shot plans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_confirmed_enter_at: Option<DateTime<Utc>>,
+    /// `rule_id`s of **plain** (non-`needs_confirmed`) Pine enters that have
+    /// already emitted at least one enter fire for this plan. Stamped on the
+    /// fire itself in the engine's `evaluate_one_entry`, never cleared, so on
+    /// every later bar it answers exactly one question: *"would a fire of this
+    /// rule be the trade's FIRST entry, or a RE-entry?"*
+    ///
+    /// # Why the engine needs its own answer
+    ///
+    /// The authoritative record of placements is the worker's `EntryAttempt`
+    /// rows, reconciled by [`crate::retry_gate`]. The engine cannot read them:
+    /// it is pure (`plan`, `prior: &PlanState`, candles — no broker, no store),
+    /// and `run_enter` — which *can* read them — has no candle window and so
+    /// cannot tell which bar of a pinbar's pivot it is on. The engine's own
+    /// persisted state is the only seam where both halves of the question are
+    /// answerable, so the answer is recorded here.
+    ///
+    /// # It is a FIRE watermark, not a PLACEMENT watermark
+    ///
+    /// An engine fire is necessary for a placement, never sufficient:
+    /// `run_enter` may still reject it (paused, vetoed, cooldown, market/spread
+    /// blackout, the retry gate's own cap). So this over-counts — a plan whose
+    /// first fire was rejected reads as "already entered" on the next bar. That
+    /// is the honest limit of what a pure engine can know, and the direction of
+    /// the error is the safe one for the rule that reads it: a rejected first
+    /// fire makes the *next* fire pivot-gated, i.e. stricter, never looser.
+    ///
+    /// Only **multi-shot** plain enters ever observe it — a single-shot plain
+    /// latches in [`Self::fired`] on its first fire and is never re-evaluated —
+    /// which is exactly the re-entry mechanism.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub plain_entered: BTreeSet<String>,
     /// Reserved for M/W neckline-evolution state. **Unused in Stage D** — the
     /// engine delegates all M/W geometry to the existing
     /// `run_enter → maybe_update_mw_state` path (one implementation), so this
@@ -199,6 +230,7 @@ impl PlanState {
             || self.break_close_at != prior.break_close_at
             || self.retest_seen_at != prior.retest_seen_at
             || self.last_confirmed_enter_at != prior.last_confirmed_enter_at
+            || self.plain_entered != prior.plain_entered
             || self.mw != prior.mw
             || self.open_news_windows != prior.open_news_windows
             || self.entries_blocked != prior.entries_blocked
@@ -218,6 +250,7 @@ impl PlanState {
             retest_seen_at: None,
             pullback_seen_at: None,
             last_confirmed_enter_at: None,
+            plain_entered: BTreeSet::new(),
             mw: None,
             open_news_windows: BTreeSet::new(),
             entries_blocked: false,
