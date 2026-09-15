@@ -654,6 +654,132 @@ mod tests {
         );
     }
 
+    /// A successful re-price must leave the `EntryAttempt` row holding the stop
+    /// the **live** order carries, not the one the cancelled order carried.
+    ///
+    /// The staleness is real because a re-place does NOT carry the previous
+    /// stop forward: `run_enter` re-resolves the signed intent from scratch (so
+    /// the stop restarts at the DRAWN level) and then re-runs the SL-vs-spread
+    /// floor against *today's* spread. A stop widened by a spike at placement
+    /// therefore comes back at the drawn level once the spread calms — a
+    /// **tighten** relative to the row.
+    ///
+    /// That direction is why this matters. The row is read by the sweep's
+    /// pre-fill SL-breach gate; holding the WIDER superseded stop makes that
+    /// gate fire LATE, leaving an order resting after its real stop was blown —
+    /// the "guaranteed loser" the sweep exists to prevent.
+    ///
+    /// The seeded row holds 1.0950 (as if widened by a spread spike at
+    /// placement) while the signed intent draws its stop at 1.0980, so the
+    /// re-place lands tighter and a row that failed to move is visible.
+    /// Asserted against what the BROKER was asked for, never a literal, so the
+    /// test cannot pass by coincidence.
+    #[test]
+    fn a_repriced_order_updates_the_entry_attempts_stop_loss() {
+        let store = MemStateStore::default();
+        let broker = SpyBroker::default();
+        let now = at("2026-07-22T13:30:00Z");
+
+        pollster::block_on(store.record_entry_attempt(widened_attempt(now)))
+            .expect("seed the attempt");
+
+        let out = run(&broker, &store, &TestSrc::Ok, adjust(), now).expect("re-price runs");
+        assert!(
+            matches!(out, RepriceOutcome::Repriced(_)),
+            "the re-place must succeed, got {out:?}",
+        );
+
+        let placed_stop = *broker
+            .placed_stops
+            .borrow()
+            .first()
+            .expect("the re-place reached the broker");
+        // This is a LONG with entry 1.1000, so its stop sits BELOW entry and
+        // "tighter" means a HIGHER price — closer to the entry.
+        assert!(
+            placed_stop > 1.0950,
+            "precondition: the re-place must land TIGHTER than the seeded row \
+             (row 1.0950, re-placed {placed_stop}) — otherwise this test cannot \
+             distinguish a stale row from a fresh one",
+        );
+
+        let attempts =
+            pollster::block_on(store.list_entry_attempts(None, "t-1")).expect("list attempts");
+        assert_eq!(attempts.len(), 1, "a re-price must not write a second row");
+        let row_stop = attempts[0]
+            .stop_loss_price
+            .expect("the row still carries a stop");
+        assert!(
+            (row_stop - placed_stop).abs() < 1e-12,
+            "the row must hold the stop the LIVE order carries ({placed_stop}), \
+             not the superseded one ({row_stop})",
+        );
+    }
+
+    /// The trader-facing consequence, driven through the real sweep gate: after
+    /// a re-price, the breach decision must be made against the stop the live
+    /// order carries.
+    ///
+    /// Price at 1.0965 sits between the two stops — past the freshly-placed
+    /// 1.0980 (a genuine breach for a long) but not past the superseded 1.0950.
+    /// So a row left holding the stale wider value answers "no breach" and the
+    /// order keeps resting with its stop already blown; the fixed row answers
+    /// "breach" and the sweep pulls it.
+    ///
+    /// This is deliberately the same `breach_detected` the cron's
+    /// `maybe_breach_cancel` calls, fed the row the re-price actually left
+    /// behind — not a hand-built row, which would prove nothing about the write.
+    #[test]
+    fn the_sweeps_breach_gate_reads_the_live_stop_after_a_reprice() {
+        let store = MemStateStore::default();
+        let broker = SpyBroker::default();
+        let now = at("2026-07-22T13:30:00Z");
+
+        pollster::block_on(store.record_entry_attempt(widened_attempt(now)))
+            .expect("seed the attempt");
+        run(&broker, &store, &TestSrc::Ok, adjust(), now).expect("re-price runs");
+
+        let attempts =
+            pollster::block_on(store.list_entry_attempts(None, "t-1")).expect("list attempts");
+        let row = &attempts[0];
+        let row_stop = row.stop_loss_price.expect("the row still carries a stop");
+
+        // Between the superseded stop (1.0950) and the live one (1.0980).
+        let observed = 1.0965;
+        assert!(
+            crate::sweep_gate::breach_detected(row.direction, observed, row_stop),
+            "a long whose live stop is {row_stop} has been breached at {observed}; \
+             a row still holding the superseded wider stop answers 'no breach' and \
+             leaves the order resting with its stop already blown",
+        );
+    }
+
+    /// The row as `record_placement` left it when `ord-1` was placed into a
+    /// spread spike: the floor widened the drawn 1.0980 out to 1.0950, and that
+    /// widened value is what the row recorded.
+    fn widened_attempt(now: DateTime<Utc>) -> crate::state::EntryAttempt {
+        crate::state::EntryAttempt {
+            trade_id: "t-1".into(),
+            account: None,
+            instrument: "EUR_USD".into(),
+            attempt_no: 1,
+            broker_order_id: "ord-1".into(),
+            broker_trade_id: None,
+            direction: Direction::Long,
+            placed_at: now,
+            shell_time: at("2026-07-22T12:00:00Z"),
+            expires_at: at("2026-07-24T00:00:00Z"),
+            stop_loss_price: Some(1.0950),
+            adverse_extreme: None,
+            cancel_at: None,
+            pip_size: Some(0.0001),
+            blackout_close: Default::default(),
+            breakeven: None,
+            order_control: None,
+            superseded: false,
+        }
+    }
+
     /// The park written by a demote records the SHELL time of the order it
     /// replaced, not `now` — so a promotion is judged against the signal that
     /// actually fired, and the drop clock is anchored to the real expiry.
@@ -684,6 +810,11 @@ mod tests {
     struct SpyBroker {
         cancels: RefCell<Vec<String>>,
         places: RefCell<Vec<String>>,
+        /// The stop price on every `EntryRequest` that reached the broker — the
+        /// stop the live order actually carries. The `EntryAttempt` row is
+        /// asserted against THIS, never against a hand-written constant, so a
+        /// row still holding a superseded stop is visible.
+        placed_stops: RefCell<Vec<f64>>,
         fail_cancel: bool,
         reject_entry: bool,
     }
@@ -696,6 +827,7 @@ mod tests {
             req: &EntryRequest<'_>,
         ) -> Result<crate::broker::Placement, EntryError> {
             self.places.borrow_mut().push(req.instrument.to_string());
+            self.placed_stops.borrow_mut().push(req.stop_loss);
             if self.reject_entry {
                 // The real rule-4 rejection: price drifted past the trigger
                 // between cancel and re-place.

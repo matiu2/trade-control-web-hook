@@ -384,12 +384,13 @@ mod dispatcher_outcome_tests {
             Ok(())
         }
 
-        async fn set_entry_attempt_broker_order_id(
+        async fn set_entry_attempt_replacement(
             &self,
             _account: Option<&str>,
             _trade_id: &str,
             _old_broker_order_id: &str,
             _new_broker_order_id: &str,
+            _new_stop_loss: Option<f64>,
         ) -> Result<(), StateError> {
             Ok(())
         }

@@ -45,26 +45,47 @@
 //! *before* ever reaching the broker, so it has no broker id and no row to
 //! re-point.
 //!
-//! ## Known-stale siblings, deliberately NOT re-pointed here
+//! ## What a replacement re-points, and what it deliberately does not
 //!
-//! Only `broker_order_id` is corrected. The other `EntryAttempt` fields are
-//! snapshots taken at the *original* placement, and a re-drive can legitimately
-//! produce different values — this is recorded so a later reader does not
-//! mistake the omission for a claim that they are fresh:
+//! `broker_order_id` **and** `stop_loss_price` are both corrected, in one write
+//! (`StateStore::set_entry_attempt_replacement`). They record the same event —
+//! this replacement landing — so splitting them would admit a row naming the new
+//! order while still carrying the old order's stop.
 //!
-//! - **`stop_loss_price`** — genuinely can go stale. A re-drive re-runs the
-//!   SL-vs-spread floor against the spread at the *restore* bar, and the widen
-//!   mutates `resolved.stop_loss` in place, so the order may now rest behind a
-//!   wider stop than the row records. Two consumers read this field: the sweep's
-//!   pre-fill breach gate and `order_control::reprice_pass`. Left alone here
-//!   because it is a separate decision with its own direction-of-safety
-//!   question (a row holding the *tighter* drawn stop makes the breach gate fire
-//!   *earlier*, which is the conservative side), and because fixing it belongs
-//!   with a measurement rather than bundled into an id correction.
+//! The stop was added after the direction question the earlier note left open
+//! was actually measured, and the answer was the **unsafe** one:
+//!
+//! - A re-drive does **not** carry the previous stop forward. `run_enter`
+//!   re-resolves the signed intent from scratch — the stop restarts at the
+//!   operator's DRAWN level — and only then re-runs the SL-vs-spread floor
+//!   against *today's* spread. So a stop widened by a spike at first placement
+//!   comes back at the drawn level once the spread calms: **tighter** than the
+//!   row, not wider. (`PriceRef::AbsoluteBuffered` gives a second, independent
+//!   tighten: its buffer is `offset_atr_pct × shell.atr` resolved at fire time,
+//!   and a falling ATR shrinks it. Nothing ratchets either against a prior fire.)
+//! - A row holding the superseded **wider** stop makes the sweep's pre-fill
+//!   breach gate fire **late**, leaving an order resting after its real stop was
+//!   already traded through — the guaranteed loser that gate exists to prevent.
+//!   The conservative-direction reasoning in the earlier note assumed the row
+//!   could only ever hold the tighter value, which is not what the code does.
+//! - The second consumer, `order_control::reprice_pass::geometry_of`, turns it
+//!   into `current_sl_distance` and hence the risk budget for the *next*
+//!   re-price, so a stale value feeds forward into a mis-sized stake.
+//!
+//! **`order_control.original_stop_loss` must NOT move.** It is deliberately the
+//! DRAWN level, captured in `run_enter` before any floor widened anything, and
+//! it is what a later shrink measures back toward (`sl_target` clamps
+//! `desired = spread_floor.max(original_sl_distance)`). Re-pointing it at a
+//! widened stop would let the stop ratchet outward and never return to the level
+//! the operator actually drew.
+//!
+//! The remaining fields are snapshots taken at the *original* placement, and a
+//! re-drive can legitimately produce different values — recorded so a later
+//! reader does not mistake the omission for a claim that they are fresh:
+//!
 //! - **`breakeven_snapshot`**, **`order_control`** — both snapshot geometry that
-//!   is re-derived from the same signed intent, so a restore reproduces them;
-//!   `order_control.original_stop_loss` is deliberately the DRAWN stop, which a
-//!   re-floor does not move.
+//!   is re-derived from the same signed intent, so a restore reproduces them
+//!   (see above for why `original_stop_loss` must stay put).
 //! - **`cancel_at`**, **`direction`**, **`attempt_no`**, **`shell_time`** —
 //!   properties of the original fire, and correctly unchanged by a re-placement
 //!   of that same entry.

@@ -756,7 +756,7 @@ pub async fn entry_attempt(store: &impl StateStore, tag: &str) {
         "scoped attempts must not bleed into the global scope"
     );
 
-    // set_entry_attempt_broker_order_id: the `pending_lifecycle` restore's
+    // set_entry_attempt_replacement: the `pending_lifecycle` restore's
     // re-point. Held to the same contract on both backends because a write that
     // silently dropped on Pg would leave the live worker's row naming an order
     // the broker discarded, and the sweep cancels straight off that field.
@@ -766,12 +766,24 @@ pub async fn entry_attempt(store: &impl StateStore, tag: &str) {
     // account — `acct-a` and `acct-b` hold distinct ids under one trade_id here,
     // which is what makes a missing account predicate visible.
     store
-        .set_entry_attempt_broker_order_id(Some("acct-a"), &shared, "ord-a1", "ord-a1-restored")
+        .set_entry_attempt_replacement(
+            Some("acct-a"),
+            &shared,
+            "ord-a1",
+            "ord-a1-restored",
+            Some(1.2345),
+        )
         .await
         .unwrap();
     // No row holds this id — a no-op, not an error.
     store
-        .set_entry_attempt_broker_order_id(Some("acct-a"), &shared, "ord-nonexistent", "ord-zzz")
+        .set_entry_attempt_replacement(
+            Some("acct-a"),
+            &shared,
+            "ord-nonexistent",
+            "ord-zzz",
+            Some(9.9999),
+        )
         .await
         .unwrap();
     let a = store
@@ -795,9 +807,22 @@ pub async fn entry_attempt(store: &impl StateStore, tag: &str) {
         a[0].attempt_no, 1,
         "the re-point updates in place — row identity must survive",
     );
+    // The stop travels with the id, on BOTH backends. A write that landed the
+    // id but silently dropped the stop would leave the live worker's sweep
+    // judging a breach against the stop the CANCELLED order carried.
+    assert_eq!(
+        a[0].stop_loss_price,
+        Some(1.2345),
+        "the replacement's stop must round-trip through the store alongside its id",
+    );
     assert_eq!(
         b[0].broker_order_id, "ord-b1",
         "a re-point must touch only its own account's row",
+    );
+    assert_ne!(
+        b[0].stop_loss_price,
+        Some(1.2345),
+        "a re-point must not move another account's stop",
     );
 
     // list_all includes every scope's attempts for this run's trade ids.

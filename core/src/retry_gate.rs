@@ -1012,12 +1012,13 @@ mod tests {
             }
             Ok(())
         }
-        async fn set_entry_attempt_broker_order_id(
+        async fn set_entry_attempt_replacement(
             &self,
             account: Option<&str>,
             trade_id: &str,
             old_broker_order_id: &str,
             new_broker_order_id: &str,
+            new_stop_loss: Option<f64>,
         ) -> Result<(), StateError> {
             let key = Self::attempt_key(account, trade_id);
             let mut map = self.attempts.borrow_mut();
@@ -1027,6 +1028,7 @@ mod tests {
                     .find(|a| a.broker_order_id == old_broker_order_id)
             {
                 row.broker_order_id = new_broker_order_id.to_string();
+                row.stop_loss_price = new_stop_loss;
             }
             Ok(())
         }

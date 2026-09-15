@@ -1009,8 +1009,34 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 // point — it continues the original attempt and must not burn a
                 // `max_retries` slot, RAIL 7). So the existing row is still
                 // naming the order we cancelled, while the live order now
-                // resting is the one we just placed under a DIFFERENT broker id.
-                // Re-point it here, where the new id is in hand.
+                // resting is the one we just placed under a DIFFERENT broker id
+                // AND a freshly re-resolved stop. Re-point both here, where the
+                // new id and the placed stop are in hand.
+                //
+                // The stop moves with the id because it is the same event — this
+                // replacement landing — and because it genuinely differs: a
+                // re-drive re-resolves the signed intent from scratch (the stop
+                // restarts at the operator's DRAWN level) and only then re-runs
+                // the SL-vs-spread floor against TODAY's spread. The previous
+                // widen is never carried forward. So a stop widened by a spike
+                // at first placement comes back at the drawn level once the
+                // spread calms — TIGHTER than the row.
+                //
+                // That direction is what makes it bite. The sweep's pre-fill
+                // SL-breach gate reads this field; a row holding the superseded
+                // WIDER stop makes the gate fire LATE, leaving an order resting
+                // after its real stop was already traded through — the
+                // guaranteed loser the sweep exists to prevent. The second
+                // reader, `order_control::reprice_pass::geometry_of`, turns it
+                // into `current_sl_distance` and hence the risk budget for the
+                // NEXT re-price, so a stale value feeds forward into a mis-sized
+                // stake.
+                //
+                // Deliberately NOT re-pointed: `order_control.original_stop_loss`,
+                // which is the DRAWN level captured before any floor widened
+                // anything. It is what a later shrink measures back toward, so
+                // moving it to a widened stop would let the stop ratchet outward
+                // and never return to the level the operator drew.
                 //
                 // This must not be recovered by parsing the outcome string
                 // below: a log-line parse rots silently the first time someone
@@ -1033,18 +1059,21 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 if let Some(old_order_id) = origin.replaced_order_id()
                     && let Some(trade_id) = verified.intent.trade_id.as_deref()
                     && let Err(err) = store
-                        .set_entry_attempt_broker_order_id(
+                        .set_entry_attempt_replacement(
                             verified.intent.account.as_deref(),
                             trade_id,
                             old_order_id,
                             &order_id,
+                            Some(resolved.stop_loss),
                         )
                         .await
                 {
                     tracing::error!(
                         "entry-attempt re-point FAILED (trade={trade_id} {old_order_id} → \
-                         {order_id}): {err} — the attempt row still names the cancelled order, so \
-                         the sweep's SL-breach cancel is aimed at a dead id"
+                         {order_id}, sl={sl}): {err} — the attempt row still names the cancelled \
+                         order and carries its superseded stop, so the sweep's SL-breach cancel is \
+                         aimed at a dead id and judged against the wrong level",
+                        sl = resolved.stop_loss,
                     );
                 }
                 // Spread-blackout System 3 (Sub-plan 5): persist the raw signed
