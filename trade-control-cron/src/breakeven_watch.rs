@@ -804,4 +804,135 @@ mod tests {
             broker.amends.borrow(),
         );
     }
+
+    // ---- The ALIASING case, on the live path -------------------------------
+    //
+    // Two attempts indistinguishable to the coarse `(instrument, direction,
+    // account)` key, different geometry, one of them filled. The join must reach
+    // the attempt that ACTUALLY opened the position.
+    //
+    // # What the mis-join corrupts here, and what it does not
+    //
+    // NOT the amend *price*: since v143 the break-even target is the position's
+    // own `entry_price` (the broker's fill), so the number amended to is read
+    // off the POSITION and is blind to which attempt won the join. A test
+    // asserting on that price passes under either join and proves nothing —
+    // that version was written first here, and a "nothing ever snapshots the
+    // id" mutation lived straight through it.
+    //
+    // What the join does decide is the `BreakevenSnapshot`, and through it
+    // **whether break-even arms at all**: `take_profit` sets the 50% arming
+    // level. So the observable that separates the two joins is the presence or
+    // absence of an amend, with the two rows given targets far enough apart
+    // that one arms on the given bars and the other cannot.
+
+    /// One of a pair of look-alike EUR/USD shorts. Both believe they entered at
+    /// 1.1000, so `take_profit` — and hence the arming level — is the sole
+    /// variable between them.
+    fn look_alike(trade_id: &str, broker_trade_id: Option<&str>, take_profit: f64) -> EntryAttempt {
+        let mut a = attempt_with_be(
+            "EUR_USD",
+            Direction::Short,
+            Some("reversals"),
+            broker_trade_id,
+            Some(BreakevenSnapshot {
+                rule: Breakeven::at_half(),
+                entry_price: 1.1000,
+                take_profit,
+                granularity: Granularity::H1,
+            }),
+        );
+        a.trade_id = trade_id.into();
+        a
+    }
+
+    /// The position the broker reports: filled at 1.1000, its id `POS-REAL`.
+    fn alias_position() -> OpenPosition {
+        OpenPosition {
+            instrument: "EUR_USD".into(),
+            direction: Direction::Short,
+            stop_loss: Some(1.1100),
+            take_profit: Some(1.0800),
+            position_id: "POS-REAL".into(),
+            order_id: "POS-REAL".into(),
+            stake: 10_000.0,
+            entry_price: Some(1.1000),
+            opened_at: Some(ts("2026-06-24T01:00:00Z")),
+        }
+    }
+
+    /// Bars running to 1.0950 — past a near TP's arming level (1.0975 for a TP
+    /// of 1.0950) but nowhere near a far one's (1.0500 for a TP of 1.0000).
+    fn alias_candles() -> Vec<Candle> {
+        vec![
+            bar("2026-06-24T02:00:00Z", 1.0990),
+            bar("2026-06-24T03:00:00Z", 1.0950),
+        ]
+    }
+
+    /// **THE ALIASING TEST.** The attempt that filled carries a FAR take-profit
+    /// (1.0000 ⇒ arms only at 1.0500), so on these bars it must not arm. The
+    /// look-alike decoy carries a NEAR one (1.0950 ⇒ arms at 1.0975), which
+    /// these bars clear easily.
+    ///
+    /// Joined correctly, the broker sees nothing. Joined by the coarse
+    /// `(instrument, direction, account)` key — which cannot tell the two rows
+    /// apart and returns whichever comes first — the decoy's geometry arms a
+    /// break-even on a position that has run nowhere near its own target.
+    #[test]
+    fn the_live_path_does_not_arm_off_a_look_alike_attempts_geometry() {
+        let attempts = vec![
+            look_alike("decoy", Some("POS-DECOY"), 1.0950),
+            look_alike("filled", Some("POS-REAL"), 1.0000),
+        ];
+        let broker = SpyBroker::with(alias_candles());
+        pollster::block_on(watch_one(
+            &broker,
+            Some("reversals"),
+            &attempts,
+            &alias_position(),
+            ts("2026-06-24T05:00:00Z"),
+        ));
+        assert!(
+            broker.amends.borrow().is_empty(),
+            "break-even armed off the OTHER attempt's take-profit: the position \
+             the broker reported is POS-REAL, whose own TP (1.0000) is nowhere \
+             near reached. The amend {:?} is reachable only by the coarse \
+             (instrument, direction, account) fallback aliasing the two rows.",
+            broker.amends.borrow(),
+        );
+    }
+
+    /// The premise guard, and the reason the test above cannot pass for a
+    /// trivial reason (a broken join, a snapshot that never loads, a watcher
+    /// that never amends). **Same bars, same pair of rows, same coarse key** —
+    /// only which row carries the reported `position_id` is swapped, so the
+    /// filled attempt is now the near-TP one and an amend MUST reach the broker.
+    #[test]
+    fn the_live_path_does_arm_when_the_filled_attempt_is_the_one_that_qualifies() {
+        let attempts = vec![
+            look_alike("decoy", Some("POS-DECOY"), 1.0000),
+            look_alike("filled", Some("POS-REAL"), 1.0950),
+        ];
+        let broker = SpyBroker::with(alias_candles());
+        pollster::block_on(watch_one(
+            &broker,
+            Some("reversals"),
+            &attempts,
+            &alias_position(),
+            ts("2026-06-24T05:00:00Z"),
+        ));
+        let amends = broker.amends.borrow().clone();
+        assert_eq!(
+            amends.len(),
+            1,
+            "the filled attempt's own geometry qualifies, so break-even must \
+             arm; got {amends:?}",
+        );
+        assert!(
+            (amends[0] - 1.1000).abs() < 1e-9,
+            "break-even targets the FILL 1.1000, got {}",
+            amends[0],
+        );
+    }
 }

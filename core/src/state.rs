@@ -1069,6 +1069,38 @@ pub trait StateStore {
         attempt_no: u32,
     ) -> impl Future<Output = Result<(), StateError>>;
 
+    /// Re-point a previously-recorded attempt at the **new broker order id** it
+    /// was re-placed under, matching the row by the id it currently holds.
+    ///
+    /// Called when [`pending_lifecycle`](crate::pending_lifecycle) restores a
+    /// resting entry order it earlier cancelled: the re-drive places a fresh
+    /// order, and the broker answers with a **different** id. Without this write
+    /// the row keeps naming the order the broker discarded.
+    ///
+    /// # Why the match key is the OLD order id, not `attempt_no`
+    ///
+    /// The restore correlates cancel→re-place by order id (that is what a
+    /// [`CancelledOrder`](crate::spread_blackout::CancelledOrder) carries); it
+    /// never learns an `attempt_no`. Matching on the id the row *currently*
+    /// holds also makes the write self-correlating and naturally idempotent — a
+    /// repeat call finds nothing to move, because the first one already moved
+    /// it.
+    ///
+    /// **Updates in place** rather than inserting: `attempt_no` is row identity
+    /// (half the unique index `(account, trade_id, attempt_no)`), and a restore
+    /// continues the original attempt rather than making a new entry, so it must
+    /// not consume a `max_retries` slot (RAIL 7). Every other field on the row
+    /// is left exactly as it was.
+    ///
+    /// No-op when no row matches `old_broker_order_id`.
+    fn set_entry_attempt_broker_order_id(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        old_broker_order_id: &str,
+        new_broker_order_id: &str,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
     /// Persist a resting attempt's advanced **running adverse extreme**. Called
     /// by the SL-breach sweep each tick after folding the observed price in with
     /// [`update_adverse_extreme`](crate::sweep_gate::update_adverse_extreme).
@@ -2090,6 +2122,26 @@ mod memstore {
                 && let Some(row) = list.iter_mut().find(|a| a.attempt_no == attempt_no)
             {
                 row.superseded = true;
+            }
+            Ok(())
+        }
+
+        async fn set_entry_attempt_broker_order_id(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            old_broker_order_id: &str,
+            new_broker_order_id: &str,
+        ) -> Result<(), StateError> {
+            let scope = account_scope(account).to_string();
+            let key = (scope, trade_id.to_string());
+            let mut attempts = self.attempts.borrow_mut();
+            if let Some(list) = attempts.get_mut(&key)
+                && let Some(row) = list
+                    .iter_mut()
+                    .find(|a| a.broker_order_id == old_broker_order_id)
+            {
+                row.broker_order_id = new_broker_order_id.to_string();
             }
             Ok(())
         }

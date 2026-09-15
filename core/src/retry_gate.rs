@@ -1012,6 +1012,24 @@ mod tests {
             }
             Ok(())
         }
+        async fn set_entry_attempt_broker_order_id(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            old_broker_order_id: &str,
+            new_broker_order_id: &str,
+        ) -> Result<(), StateError> {
+            let key = Self::attempt_key(account, trade_id);
+            let mut map = self.attempts.borrow_mut();
+            if let Some(list) = map.get_mut(&key)
+                && let Some(row) = list
+                    .iter_mut()
+                    .find(|a| a.broker_order_id == old_broker_order_id)
+            {
+                row.broker_order_id = new_broker_order_id.to_string();
+            }
+            Ok(())
+        }
         async fn set_entry_attempt_adverse_extreme(
             &self,
             account: Option<&str>,

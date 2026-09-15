@@ -961,7 +961,7 @@ where
                 now,
                 body.as_deref(),
                 Some(granularity),
-                false,
+                trade_control_core::dispatch::EntryOrigin::Fresh,
             )
             .await
         }

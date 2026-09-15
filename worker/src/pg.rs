@@ -959,6 +959,37 @@ impl PgStateStore {
         Ok(())
     }
 
+    /// Re-point an attempt at the new order id it was re-placed under by a
+    /// `pending_lifecycle` restore. Same jsonb read-modify-write shape as its
+    /// neighbours (no column, no migration).
+    ///
+    /// The WHERE clause matches on the body's **current** `broker_order_id`
+    /// rather than `attempt_no` — the restore correlates by order id and never
+    /// learns an attempt number — which also makes the statement idempotent: a
+    /// repeat matches nothing, because the first run already moved the id.
+    async fn set_entry_attempt_broker_order_id_impl(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        old_broker_order_id: &str,
+        new_broker_order_id: &str,
+    ) -> Result<(), StateError> {
+        sqlx::query(
+            "UPDATE entry_attempt
+             SET body = jsonb_set(body, '{broker_order_id}', to_jsonb($4::text), true)
+             WHERE account IS NOT DISTINCT FROM $1 AND trade_id = $2
+               AND body->>'broker_order_id' = $3",
+        )
+        .bind(account)
+        .bind(trade_id)
+        .bind(old_broker_order_id)
+        .bind(new_broker_order_id)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
     /// Advance a resting attempt's running adverse extreme (the worst price seen
     /// against it since placement). Same jsonb read-modify-write shape as its
     /// neighbours — the row is one body, so there is no column and no migration.
@@ -1827,6 +1858,21 @@ impl StateStore for PgStateStore {
     ) -> Result<(), StateError> {
         self.set_entry_attempt_superseded_impl(account, trade_id, attempt_no)
             .await
+    }
+    async fn set_entry_attempt_broker_order_id(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        old_broker_order_id: &str,
+        new_broker_order_id: &str,
+    ) -> Result<(), StateError> {
+        self.set_entry_attempt_broker_order_id_impl(
+            account,
+            trade_id,
+            old_broker_order_id,
+            new_broker_order_id,
+        )
+        .await
     }
     async fn set_entry_attempt_adverse_extreme(
         &self,
