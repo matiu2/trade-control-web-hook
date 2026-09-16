@@ -48,7 +48,7 @@ pub fn atr_length_for_bar_minutes(bar_minutes: i64) -> usize {
 
 /// True range of `cur` given the previous candle's close. The first bar (no
 /// prior close) uses `high - low`.
-fn true_range(cur: &Candle, prev_close: Option<f64>) -> f64 {
+pub(super) fn true_range(cur: &Candle, prev_close: Option<f64>) -> f64 {
     let hl = cur.h - cur.l;
     match prev_close {
         None => hl,
