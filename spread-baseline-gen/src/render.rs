@@ -103,7 +103,17 @@ pub fn render_table(rows: &[BaselineRow]) -> String {
     for r in &sorted {
         let sym = escape(&r.symbol);
         let sched = escape(&r.spread_schedule);
-        let reviewed = matches!(r.profile.review, crate::compute::ReviewStatus::Reviewed);
+        // `reviewed` answers "was this row analysed, so can its columns be
+        // trusted?" — which is true for a part-time market whose session was
+        // measured in full but was too short to RANK hours (`MaskNotComputable`).
+        // Its forecast and pips baseline are real; only the mask is absent.
+        // Rendering it as `false` would make `spread_blackout::coverage` refuse
+        // a row that carries a perfectly good forecast.
+        let reviewed = matches!(
+            r.profile.review,
+            crate::compute::ReviewStatus::Reviewed
+                | crate::compute::ReviewStatus::MaskNotComputable
+        );
         let widen = render_hours(&r.profile.hour_widen_frac);
         let forecast = render_hours(&r.profile.hour_p90_frac);
         let median_pips = r.profile.baseline_median_pips;
@@ -299,6 +309,48 @@ mod tests {
             out.matches("\"tradenation\", \"Spot Gold\"").count(),
             1,
             "duplicate (broker, symbol) key must collapse to one row"
+        );
+    }
+
+    /// A part-time market's row renders `reviewed = true`: it WAS analysed, and
+    /// its forecast/pips columns are trustworthy even though the mask is empty.
+    /// Rendering `false` would make `spread_blackout::coverage` classify it
+    /// `Unreviewed` and refuse an arm whose forecast is actually present.
+    #[test]
+    fn a_mask_not_computable_row_renders_as_reviewed() {
+        let mut profile = SpreadProfile::empty(11_281);
+        profile.review = ReviewStatus::MaskNotComputable;
+        profile.hour_p90_frac[9] = 0.000_152;
+        profile.baseline_median_pips = 3.0;
+        let table = render_table(&[BaselineRow {
+            broker: Broker::TradeNation,
+            symbol: "Spain 35".to_string(),
+            display_name: "Spain 35".to_string(),
+            spread_schedule: "frankfurt".to_string(),
+            profile,
+        }]);
+        assert!(
+            table.contains("\"frankfurt\", true,"),
+            "a measured part-time row must render reviewed = true:\n{table}",
+        );
+    }
+
+    /// …while genuinely thin data still renders `false`, so the two stay
+    /// distinguishable in the committed table.
+    #[test]
+    fn an_insufficient_data_row_still_renders_as_unreviewed() {
+        let mut profile = SpreadProfile::empty(40);
+        profile.review = ReviewStatus::InsufficientData;
+        let table = render_table(&[BaselineRow {
+            broker: Broker::TradeNation,
+            symbol: "Spain 35".to_string(),
+            display_name: "Spain 35".to_string(),
+            spread_schedule: "frankfurt".to_string(),
+            profile,
+        }]);
+        assert!(
+            table.contains("\"frankfurt\", false,"),
+            "thin data must stay reviewed = false:\n{table}",
         );
     }
 }
