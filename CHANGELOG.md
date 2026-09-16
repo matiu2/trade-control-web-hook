@@ -1,5 +1,51 @@
 # Changelog
 
+## v146 — 2026-09-17 — `--spec-url`: arm from a frozen setup fetched over HTTP
+
+**Why.** local-chart has replaced TradingView for drawing setups, and its
+`GET /arm-setup` already emits this crate's own `FrozenSetup` shape. Arming
+from it still meant clicking "Download spec" in the browser and handing the
+saved file to `--spec-in` — a file round trip between two programs that could
+just talk.
+
+**What changed.**
+
+- `--spec-url <URL>` arms from a frozen setup fetched over HTTP:
+
+      tv-arm --spec-url 'http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1'
+
+- `FrozenSetup::parse(text, source)` is new, and `load` now goes through it.
+  The version gate lives in one place, so it cannot be enforced on the file
+  path and forgotten on the HTTP one.
+- `pipeline::setup_from_frozen` is the shared core of a frozen arm. `--spec-in`
+  and `--spec-url` differ **only** in where the bytes come from; every
+  restriction holds identically for both.
+- `read_setup_from_spec`'s `path` became a `source` string, so errors and the
+  arm log line name whichever door was used.
+
+**Breaking.** None. `--spec-in`, `--spec-out` and the browser's "Download spec"
+button are untouched; `--spec-url` is purely additive.
+
+**Config.** None.
+
+**Tests.** 474 pass. New: `parse` accepts a current spec, rejects a future
+version naming the source, rejects a non-spec JSON body (local-chart's 422),
+and still rejects unknown fields; `--spec-url` conflicts with `--spec-in`,
+`--spec-out` and each position-entry flag; and the position-tool refusal is
+guarded at runtime through the `--spec-url` door too, not just at the clap
+layer (the `--spec-in` sibling of that test was originally found by mutation).
+
+Verified against the live local-chart server, not just in tests: fetched
+EUR_CAD h1 and armed an iH&S long through to a signed bundle with no
+TradingView. A 422 surfaces its missing-roles list in full rather than a bare
+status; a dead server names the URL it could not reach.
+
+**Follow-up.** Position write-back into local-chart (replay drawing positions
+onto the chart, as it did in TradingView) is still open, and is a design
+question rather than plumbing: `read_setup_from_spec` deliberately refuses the
+position-entry tools under a frozen setup, and `FrozenSetup` has no entry/SL/TP
+fields and is `deny_unknown_fields`.
+
 ## v145 — 2026-09-15 — manual RESTING entries (`--stop-entry` / `--limit-entry`) are now cron-managed
 
 **Why.** A manual `--stop-entry` / `--limit-entry` order rested at the broker
