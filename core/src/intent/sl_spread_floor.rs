@@ -556,9 +556,9 @@ mod tests {
             // Pre-decision behaviour: R computed on the raw 1.6 distance is
             // 2.25 >= 2.0, so the trade would be WIDENED and placed at an
             // effective R of 1.8 — below its own floor.
-            other => panic!(
-                "expected Reject on the snapped R; judging the raw stop gives {other:?}"
-            ),
+            other => {
+                panic!("expected Reject on the snapped R; judging the raw stop gives {other:?}")
+            }
         }
     }
 
