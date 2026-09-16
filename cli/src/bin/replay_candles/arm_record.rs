@@ -121,6 +121,19 @@ pub struct ArmRecord {
     /// `--skip-golden`: the golden-candle quality gate waived.
     #[serde(default)]
     pub skip_golden: bool,
+    /// `--skip-reversals`: both reversal-closes dropped. The grid's **exit**
+    /// axis, crossing every entry-rule × news cell.
+    ///
+    /// Load-bearing to record for the same reason as `skip_calendar_bars`, and
+    /// **not inferable from the plan**: a plan with no `07-close-on-sr-reversal`
+    /// rule could equally mean "reversals were skipped" or "the chart had no S/R
+    /// lines drawn and the TP resistance band was off".
+    ///
+    /// `#[serde(default)]` reads a pre-axis `meta.json` as reversals-**on**,
+    /// which is historically accurate: every capture before this field existed
+    /// had both closes armed.
+    #[serde(default)]
+    pub skip_reversals: bool,
     /// The `--start` cursor as the operator typed it, verbatim. Kept as a string
     /// (not parsed) so the exact spelling round-trips for a re-arm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,14 +170,23 @@ pub struct ArmRecord {
 
 impl ArmRecord {
     /// A stable grouping key for batch analysis: one grid **cell** is one
-    /// `(entry_rule, news-on/off)` pair. Two fixtures with the same key are the
-    /// same cell of the same grid and should be directly comparable.
+    /// `(entry_rule, news-on/off, reversals-on/off)` triple. Two fixtures with
+    /// the same key are the same cell of the same grid and should be directly
+    /// comparable.
     ///
     /// This is what lets `batch.rs` group fixtures by cell from **data** instead
     /// of parsing filenames — the whole point of recording the arm block.
+    ///
+    /// The reversal axis is **suffix-only**, matching
+    /// `save_matrix::Variant::fixture_suffix`: reversals-on keeps its historical
+    /// `<rule>/news-<on|off>` key so every fixture already on disk still groups
+    /// into the cell it always did, and only the off-twin gains `/rev-off`.
+    /// Suffixing both sides would re-key the entire corpus, so a blessed
+    /// baseline would read as a wholesale grid change rather than a new column.
     pub fn cell_key(&self) -> String {
         let news = if self.skip_calendar_bars { "off" } else { "on" };
-        format!("{}/news-{news}", self.entry_rule.label())
+        let rev = if self.skip_reversals { "/rev-off" } else { "" };
+        format!("{}/news-{news}{rev}", self.entry_rule.label())
     }
 }
 
@@ -255,6 +277,81 @@ mod tests {
         assert!(keys.contains(&"strategy-v2-qm-market/news-on".to_string()));
     }
 
+    /// The sixteen cells of one trade's grid must produce sixteen distinct keys.
+    ///
+    /// Without the reversal half of the key, a twin pair would group as ONE cell
+    /// and a batch tool would average the with-close and without-close runs
+    /// together — the exact comparison the axis exists to make, silently undone.
+    #[test]
+    fn the_sixteen_grid_cells_have_distinct_keys() {
+        let mut keys = Vec::new();
+        for rule in [
+            EntryRule::Normal,
+            EntryRule::SkipBcr,
+            EntryRule::StrategyV2,
+            EntryRule::StrategyV2QmMarket,
+        ] {
+            for skip_calendar_bars in [false, true] {
+                for skip_reversals in [false, true] {
+                    keys.push(
+                        ArmRecord {
+                            entry_rule: rule.clone(),
+                            skip_calendar_bars,
+                            skip_reversals,
+                            ..Default::default()
+                        }
+                        .cell_key(),
+                    );
+                }
+            }
+        }
+        let unique: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), 16, "sixteen cells, sixteen keys: {keys:?}");
+        assert!(keys.contains(&"normal/news-on/rev-off".to_string()));
+        assert!(
+            keys.contains(&"strategy-v2-qm-market/news-off/rev-off".to_string()),
+            "{keys:?}"
+        );
+    }
+
+    /// **The corpus-compatibility guarantee, key side.** A reversals-ON record
+    /// keys exactly as it did before the axis existed, so all 2847 fixtures
+    /// already on disk keep grouping into the cell they always did.
+    ///
+    /// Read alongside `a_pre_axis_record_reads_as_reversals_on`: together they
+    /// say an untouched `meta.json` both *parses* and *keys* unchanged.
+    #[test]
+    fn a_reversals_on_record_keys_exactly_as_before_the_axis() {
+        for rule in [EntryRule::Normal, EntryRule::StrategyV2QmMarket] {
+            for skip_calendar_bars in [false, true] {
+                let rec = ArmRecord {
+                    entry_rule: rule.clone(),
+                    skip_calendar_bars,
+                    skip_reversals: false,
+                    ..Default::default()
+                };
+                let news = if skip_calendar_bars { "off" } else { "on" };
+                assert_eq!(
+                    rec.cell_key(),
+                    format!("{}/news-{news}", rule.label()),
+                    "an on-cell's key must not mention the reversal axis"
+                );
+            }
+        }
+    }
+
+    /// A `meta.json` written before the axis existed has no `skip_reversals`
+    /// key. It must read back as reversals-**on**, which is what those captures
+    /// actually were — defaulting the other way would relabel the whole corpus
+    /// as the column it never measured.
+    #[test]
+    fn a_pre_axis_record_reads_as_reversals_on() {
+        let json = r#"{"entry_rule":"skip-bcr","skip_calendar_bars":true}"#;
+        let rec: ArmRecord = serde_json::from_str(json).expect("pre-axis record parses");
+        assert!(!rec.skip_reversals, "absent must mean reversals were ON");
+        assert_eq!(rec.cell_key(), "skip-bcr/news-off");
+    }
+
     /// Round-trips through JSON, and the labels are the stable kebab-case forms a
     /// batch tool groups on.
     #[test]
@@ -263,6 +360,7 @@ mod tests {
             entry_rule: EntryRule::SkipBcr,
             skip_calendar_bars: true,
             skip_golden: false,
+            skip_reversals: true,
             start: Some("2026-07-17T17:00:00+10:00".into()),
             candle_source: Some("tradenation".into()),
             chart_symbol: Some("TRADENATION:EURUSD".into()),
@@ -351,6 +449,7 @@ mod tests {
             entry_rule: EntryRule::Normal,
             skip_calendar_bars: false,
             skip_golden: false,
+            skip_reversals: false,
             start: Some("2026-07-17T17:00:00+10:00".into()),
             candle_source: Some("tradenation".into()),
             chart_symbol: Some("TRADENATION:EURUSD".into()),
@@ -367,7 +466,7 @@ mod tests {
             .filter(|k| {
                 !matches!(
                     k.as_str(),
-                    "entry_rule" | "skip_calendar_bars" | "skip_golden"
+                    "entry_rule" | "skip_calendar_bars" | "skip_golden" | "skip_reversals"
                 )
             })
             .cloned()
