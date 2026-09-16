@@ -74,9 +74,10 @@ pub fn run(args: Args) -> Result<i32> {
     // Source the setup: a frozen spec, or the live chart. `Roles` only exists on
     // the chart path — the position-entry tools need raw drawings, so a frozen
     // arm refuses them rather than silently arming something else.
-    let (setup, roles, from_chart) = match args.spec_in.as_deref() {
-        Some(path) => (read_setup_from_spec(&args, path)?, None, false),
-        None => {
+    let (setup, roles, from_chart) = match (args.spec_in.as_deref(), args.spec_url.as_deref()) {
+        (Some(path), _) => (read_setup_from_spec(&args, path)?, None, false),
+        (None, Some(url)) => (read_setup_from_url(&args, url)?, None, false),
+        (None, None) => {
             let (setup, roles) = read_setup_from_chart(&args)?;
             (setup, Some(roles), true)
         }
@@ -305,14 +306,68 @@ fn arm_the_matrix(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Res
 /// rows `[calendar]` rather than treating their movement as a regression.
 fn read_setup_from_spec(args: &Args, path: &Path) -> Result<SetupInputs> {
     let frozen = crate::frozen_setup::FrozenSetup::load(path)?;
+    setup_from_frozen(args, frozen, &path.display().to_string())
+}
+
+/// Fetch a frozen setup over HTTP and arm from it — `--spec-url`.
+///
+/// Points at local-chart's `GET /arm-setup`, which already emits this crate's
+/// own `FrozenSetup` shape, so the body is parsed as-is with no translation.
+///
+/// A non-2xx response is an error carrying the **body**, not just the status:
+/// local-chart answers an unarmable chart with a structured 422 naming what is
+/// missing (a required role, a stale or ambiguous invalidation line). That text
+/// is the whole diagnosis, and swallowing it would turn an actionable message
+/// into a bare "422".
+///
+/// Blocking call from a sync `main`, following this crate's existing pattern
+/// (`calendar.rs`, `broker_read.rs`, `register_post.rs`): a local runtime for
+/// the duration of the request.
+fn read_setup_from_url(args: &Args, url: &str) -> Result<SetupInputs> {
+    let runtime = tokio::runtime::Runtime::new()
+        .wrap_err("starting tokio runtime to fetch the frozen setup")?;
+    let body = runtime.block_on(async {
+        let response = reqwest::Client::new()
+            .get(url)
+            .send()
+            .await
+            .wrap_err_with(|| format!("fetch frozen setup from {url}"))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .wrap_err_with(|| format!("read frozen setup body from {url}"))?;
+        if !status.is_success() {
+            return Err(eyre!("{url} answered {status}: {}", text.trim()));
+        }
+        Ok(text)
+    })?;
+
+    let frozen = crate::frozen_setup::FrozenSetup::parse(&body, url)?;
+    setup_from_frozen(args, frozen, url)
+}
+
+/// The frozen-spec arm itself, independent of where the bytes came from — a
+/// file (`--spec-in`) or an HTTP fetch (`--spec-url`). `source` names the
+/// origin in errors and in the arm log line; nothing branches on it.
+///
+/// Sharing this is what keeps the two flags from drifting: every restriction a
+/// spec-in arm carries (the position-tool refusal below, the cursor
+/// requirement, catalog precision) applies identically to a spec-url arm,
+/// because it is the same code.
+fn setup_from_frozen(
+    args: &Args,
+    frozen: crate::frozen_setup::FrozenSetup,
+    source: &str,
+) -> Result<SetupInputs> {
     // The position tools need drawings this path doesn't have. Refuse up front,
     // with the reason — arming them off a frozen spec would silently place a
     // different trade.
     if args.position_entry_mode().is_some() {
         return Err(eyre!(
             "--market-entry / --stop-entry / --limit-entry read the drawn position \
-             tool's SL/TP from the chart, so they cannot be used with --spec-in \
-             (there are no drawings in a frozen setup)"
+             tool's SL/TP from the chart, so they cannot be used with a frozen setup \
+             (--spec-in / --spec-url): there are no drawings in one"
         ));
     }
 
@@ -329,9 +384,9 @@ fn read_setup_from_spec(args: &Args, path: &Path) -> Result<SetupInputs> {
     let start = parse_start(args)?.or(frozen.start);
     let cursor_unix = start.ok_or_else(|| {
         eyre!(
-            "frozen setup {} has no cursor and no --start was given; a spec-in arm \
+            "frozen setup {} has no cursor and no --start was given; a frozen arm \
              needs to know what instant counts as \"now\"",
-            path.display()
+            source
         )
     })?;
     let prune_as_of = pick_prune_as_of(args, Utc::now(), cursor_unix, start);
@@ -345,7 +400,7 @@ fn read_setup_from_spec(args: &Args, path: &Path) -> Result<SetupInputs> {
     );
 
     info!(
-        path = %path.display(),
+        source = %source,
         chart_symbol = %frozen.chart_symbol,
         resolution = %frozen.resolution,
         instrument = %instrument,
@@ -1780,6 +1835,35 @@ mod tests {
             "the error must say WHY, so the operator knows to arm off the chart: {err}"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The same guard, reached through the `--spec-url` door.
+    ///
+    /// `setup_from_frozen` is the shared core, so this is the invariant the
+    /// clap `conflicts_with` cannot enforce for a directly-built `Args`. Tested
+    /// against the core rather than `read_setup_from_url` so it needs no HTTP
+    /// server — the fetch is the only part that differs, and it happens before
+    /// this guard.
+    #[test]
+    fn spec_url_refuses_the_position_tools_even_when_clap_is_bypassed() {
+        let spec = crate::frozen_setup::FrozenSetup::capture(
+            PlanGeometry::default(),
+            "60".into(),
+            "OANDA:EUR_USD".into(),
+            Some(1_700_000_000),
+            None,
+        );
+        let mut args = mw_args(&[]);
+        args.market_entry = true;
+        args.spec_url = Some("http://127.0.0.1:8790/arm-setup".into());
+
+        let err = setup_from_frozen(&args, spec, "http://127.0.0.1:8790/arm-setup")
+            .expect_err("a frozen arm has no drawn position tool")
+            .to_string();
+        assert!(
+            err.contains("position") && err.contains("--spec-url"),
+            "the error must name the flag the operator actually used: {err}"
+        );
     }
 
     /// A spec with no cursor and no `--start` is refused rather than silently
