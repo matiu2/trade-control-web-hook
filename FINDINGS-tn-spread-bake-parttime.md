@@ -117,3 +117,121 @@ Two further wrinkles for whoever does the bake:
    destructures would do it.
 
 Neither should be decided by whoever is merely trying to arm one chart.
+
+## Postscript: two dead catalog entries (found during the bake)
+
+`NEO` and `DASHUSD` name TradeNation symbols (`"NEO"`, `"DASHCUSD"`) that do
+**not exist** in TradeNation's market list — not a fetch failure, not a rename:
+`tradenation instruments dump` has no market by either name, nor anything
+similar. TradeNation appears to have delisted both coins.
+
+Both are TN-only crypto ids (`oanda = ""`), so they are unreachable on either
+broker and cannot be armed or baked. They are skipped by the bake for that
+reason, which is why it covers 36 instruments rather than 38.
+
+Nothing here depends on fixing them — noting it so the next person doesn't
+re-diagnose it as a flaky fetch. The catalog entries should either be removed
+or have their `tradenation` field emptied.
+
+## Postscript 2: Germany 40 misses its spread hours by 0.6%
+
+Worth recording because the row will read "no spread hour" and that is NOT the
+same claim as "this market has a flat spread".
+
+Germany 40 has a clean, consistent **two-tier** spread — ~6x wider off-session
+than in the cash session:
+
+```
+--- tradenation Germany 40  vol=0.000680  med_ratio=0.114  threshold(3x)=0.342 ---
+  hours 0-7, 22   ratio 0.34    <- off-session, wide (0.000235)
+  hours 9-16      ratio 0.06    <- cash session, tight (0.000039)
+  hours 17-21, 8  ratio 0.11
+```
+
+Nine hours sit at **0.34** against a `MED_MULT x median` threshold of **0.342**.
+They miss by 0.6%, so the mask bakes empty. A slightly different 90-day window
+would flip all nine on. The verdict is a coin-flip, not a measurement.
+
+**This is not caused by the mask/forecast split.** Verified: Germany 40 baked
+`mask = 0` with the pre-split binary too. The split only adds an early return
+for sessions below `MIN_MASK_HOURS`; Germany 40 has 23 sampled hours and never
+takes that path. `a_full_day_market_still_flags_its_spike` covers the
+regression.
+
+**Why UK 100 flags and Germany 40 doesn't**, on near-identical 6x variation:
+UK 100 has a *third*, tighter tier (0.00007 at hours 11-14) that drags its
+median down to 0.000094, so its wide band clears 3x comfortably. Germany 40 is
+cleanly two-tier, so its median sits nearer the wide band and the ratio
+compresses. This is the three-tier dynamic `PEAK_FRAC` was introduced for, seen
+from the other side: there the concern was a low median letting a benign band
+through; here a high median keeps a real band out.
+
+**Consequence.** The forecast column still reports the true per-hour cost, so
+the forward-looking SL floor is correct either way. What is lost is the
+mask/widen: the System-2 stop-widen never fires on Germany 40's genuinely wide
+off-session hours, and `is_spread_hour` falls back to the NY-close-edge
+default.
+
+**Not changed here.** `MED_MULT` is load-bearing for all 160 rows and was
+calibrated against a full sampler + OANDA audit; retuning it for one instrument
+is its own change with its own evidence, not a side effect of a bake. Flagged
+for a decision.
+
+Of the 16 rows baked so far, Germany 40 is the ONLY marginal one — the other 15
+have peak/median ratios of 1.00-1.75 against a 3x threshold and are flat by a
+wide margin.
+
+## Postscript 3: the local overlay silently strips `spread_schedule` from 22 assets
+
+**This is a live config bug, not specific to this bake.** It is why Bitcoin,
+Stellar and TRON could not be baked, and it would quietly degrade three
+already-good committed rows on the next re-bake.
+
+`~/.config/instrument-lookup/mappings.toml` is merged over the baked-in
+catalog, and per the parent CLAUDE.md an overlay block with the same `id`
+**replaces** the baseline entry — *"The overlay block is the whole replacement —
+omitting a field is not inheritance."*
+
+22 of the overlay's 37 asset blocks omit `spread_schedule`. Those assets
+therefore resolve to `"none"` regardless of what `catalog.toml` says:
+
+```
+catalog.toml:  id=BITCOIN  tradenation="Bitcoin"  spread_schedule='ny'
+mappings.toml: id=BITCOIN  tradenation="Bitcoin"  (no spread_schedule)
+=> resolved:   spread_schedule = "none"
+```
+
+`spread-baseline-gen` skips a `none` schedule by design (it has no spread hour
+to bucket), so:
+
+```
+tradenation Bitcoin: schedule 'none' has no spread hour — skipped
+tradenation Stellar: schedule 'none' has no spread hour — skipped
+tradenation TRON:    schedule 'none' has no spread hour — skipped
+```
+
+Earlier in this investigation these three were recorded as transient fetch
+failures, on the evidence that the markets exist and their candle feeds are
+healthy (they do, and they are). That diagnosis was **wrong** — the generator
+never attempted a fetch. The distinguishing evidence is the log line above,
+which only appeared once they were run individually rather than inside a batch.
+
+**Blast radius beyond the three crypto.** Three rows already in the committed
+table would lose their schedule if re-baked today:
+
+| row | schedule now | after a re-bake |
+|---|---|---|
+| oanda `FR40_EUR` | `frankfurt` | `none` |
+| oanda `HK33_HKD` | `hongkong` | `none` |
+| tradenation `Spot Silver` | `ny` | `none` |
+
+A `none` schedule makes the row inert: `coverage()` returns `NoSchedule` and the
+mask cannot be indexed. None of the 33 rows baked in this run carry
+`schedule = "none"` — verified — because the affected instruments were skipped
+rather than baked badly. So this bake is safe to merge; the bug is a trap for
+the *next* one.
+
+**Fix:** add `spread_schedule` to the 22 overlay blocks that omit it, copying
+the baseline value (`instrument-lookup resolve <id>` prints it). Not done here —
+it is an edit to the operator's machine-local config, outside this repo, and
+should be a deliberate change rather than a side effect of a bake.
