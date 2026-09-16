@@ -56,6 +56,22 @@ pub enum Coverage {
     /// without computing the per-hour p90 the forecast is rendered from, so
     /// this means the row predates the forecast column or the bake dropped it.
     StaleForecast,
+    /// A row exists and resolves, but it was never successfully analysed
+    /// (`reviewed = false`) and carries no forecast at all.
+    ///
+    /// This is what the generator emits for a **part-time market**: a session
+    /// shorter than ~12 hours never populates the 12 local-hour buckets
+    /// `apply_gates` demands, so it returns an empty profile — `reviewed =
+    /// false`, every column zero. Spain 35 (08:00–16:30 London) is the
+    /// reported case; South Africa 40, Cocoa, Coffee, Orange Juice and Sugar
+    /// have the same shape.
+    ///
+    /// Distinct from [`StaleForecast`](Self::StaleForecast), whose populated
+    /// widen proves the bake *did* run, and from a `reviewed = true` flat row,
+    /// which is the legitimate verdict "analysed; no elevated hour". Here
+    /// nothing was ever measured, so arming would size stops off the last bar
+    /// alone with no forecast — the silent degrade this module exists to stop.
+    Unreviewed,
 }
 
 impl Coverage {
@@ -73,6 +89,11 @@ impl Coverage {
             Coverage::StaleForecast => {
                 "baked row has an all-zero spread forecast (stale — needs re-baking)"
             }
+            Coverage::Unreviewed => {
+                "baked row was never analysed (reviewed = false) and has no spread \
+                 forecast — typically a part-time market whose session is too \
+                 short for the generator's 12-hour minimum"
+            }
         }
     }
 }
@@ -88,7 +109,7 @@ pub fn coverage(instrument: &str) -> Coverage {
     else {
         return Coverage::Missing;
     };
-    let (_broker, _symbol, schedule, _reviewed, _mask, widen, _m, _l, _h, forecast) = row;
+    let (_broker, _symbol, schedule, reviewed, _mask, widen, _m, _l, _h, forecast) = row;
     if super::schedule_tz(schedule).is_none() {
         return Coverage::NoSchedule;
     }
@@ -97,6 +118,13 @@ pub fn coverage(instrument: &str) -> Coverage {
     // must not be flagged — that is what `reviewed` asserts.
     if forecast.iter().all(|f| *f <= 0.0) && widen.iter().any(|w| *w > 0.0) {
         return Coverage::StaleForecast;
+    }
+    // …and `reviewed` is what makes that claim checkable. Flat-on-both is only
+    // trustworthy when the row says it was actually analysed; an unreviewed row
+    // with no forecast was never measured at all, so it must refuse rather than
+    // arm with a zero forecast.
+    if !*reviewed && forecast.iter().all(|f| *f <= 0.0) {
+        return Coverage::Unreviewed;
     }
     Coverage::Covered
 }
@@ -149,12 +177,20 @@ mod tests {
     /// fixture. This mirrors its decision over an owned row instead; the
     /// `classify_agrees_with_coverage_on_the_real_table` test below pins the two
     /// together so this mirror cannot drift into testing only itself.
-    fn classify(schedule: &str, widen: &[f64; 24], forecast: &[f64; 24]) -> Coverage {
+    fn classify(
+        schedule: &str,
+        reviewed: bool,
+        widen: &[f64; 24],
+        forecast: &[f64; 24],
+    ) -> Coverage {
         if super::super::schedule_tz(schedule).is_none() {
             return Coverage::NoSchedule;
         }
         if forecast.iter().all(|f| *f <= 0.0) && widen.iter().any(|w| *w > 0.0) {
             return Coverage::StaleForecast;
+        }
+        if !reviewed && forecast.iter().all(|f| *f <= 0.0) {
+            return Coverage::Unreviewed;
         }
         Coverage::Covered
     }
@@ -175,7 +211,7 @@ mod tests {
         let forecast = [0.0_f64; 24]; // … with an empty forecast: the stale signature.
 
         assert_eq!(
-            classify("ny", &widen, &forecast),
+            classify("ny", true, &widen, &forecast),
             Coverage::StaleForecast,
             "a populated widen with a zero forecast must read as STALE, not as \
              missing and not as covered",
@@ -186,7 +222,7 @@ mod tests {
             "…while a row that does not exist reads as MISSING",
         );
         assert_ne!(
-            classify("ny", &widen, &forecast),
+            classify("ny", true, &widen, &forecast),
             Coverage::Missing,
             "the two defects must stay distinguishable — collapsing them is what \
              let 35 stale rows hide behind a green test",
@@ -200,9 +236,9 @@ mod tests {
     #[test]
     fn classify_agrees_with_coverage_on_the_real_table() {
         for row in super::super::baseline_candle::SPREAD_BASELINE_CANDLE.iter() {
-            let (_broker, symbol, schedule, _reviewed, _mask, widen, _m, _l, _h, forecast) = row;
+            let (_broker, symbol, schedule, reviewed, _mask, widen, _m, _l, _h, forecast) = row;
             assert_eq!(
-                classify(schedule, widen, forecast),
+                classify(schedule, *reviewed, widen, forecast),
                 coverage(symbol),
                 "mirror disagrees with the classifier for {symbol}",
             );
@@ -260,5 +296,111 @@ mod tests {
             "baked rows whose schedule FK resolves to no timezone (their mask \
              can never fire): {broken:?}",
         );
+    }
+
+    /// An **unreviewed** row whose forecast is entirely zero must NOT read as
+    /// `Covered`.
+    ///
+    /// This is the shape the generator emits for a part-time market: a session
+    /// shorter than ~12 hours never populates 12 local-hour buckets, so
+    /// `apply_gates` returns `SpreadProfile::empty()` — `reviewed = false`, widen
+    /// all-zero, forecast all-zero. Spain 35 (08:00–16:30 London) is exactly
+    /// this, and so are South Africa 40, Cocoa, Coffee, Orange Juice and Sugar.
+    ///
+    /// Flat-on-both was previously read as the legitimate "reviewed, genuinely
+    /// no spread hour" verdict, so such a row classified as `Covered` and the
+    /// arm gate let it through — sizing stops with **no spread forecast at all**,
+    /// the precise silent degrade `require_spread_coverage` exists to prevent.
+    /// The `reviewed` column is what tells the two apart, and `coverage`
+    /// destructured it without ever reading it.
+    #[test]
+    fn an_unreviewed_all_zero_row_is_not_covered() {
+        let widen = [0.0_f64; 24];
+        let forecast = [0.0_f64; 24];
+
+        assert_eq!(
+            classify("frankfurt", false, &widen, &forecast),
+            Coverage::Unreviewed,
+            "an unreviewed row with no forecast must refuse, not arm with zeros",
+        );
+        assert!(
+            !classify("frankfurt", false, &widen, &forecast).is_covered(),
+            "`is_covered` is what the arm gate branches on — it must say no",
+        );
+        // The mirror image: the SAME all-zero columns with `reviewed = true` are
+        // a real verdict ("analysed; this market has no elevated hour") and must
+        // still be covered, or the gate cries wolf on every calm instrument.
+        assert_eq!(
+            classify("frankfurt", true, &widen, &forecast),
+            Coverage::Covered,
+            "a reviewed flat row is a genuine verdict, not a defect",
+        );
+    }
+
+    /// `reviewed` alone must not veto a row that DID compute a forecast.
+    /// Only the combination "never analysed AND no forecast" is the defect;
+    /// a populated forecast is evidence the bake ran regardless of the flag.
+    #[test]
+    fn an_unreviewed_row_with_a_real_forecast_is_still_covered() {
+        let widen = [0.0_f64; 24];
+        let mut forecast = [0.0_f64; 24];
+        forecast[9] = 0.000_48;
+        assert_eq!(
+            classify("frankfurt", false, &widen, &forecast),
+            Coverage::Covered,
+        );
+    }
+
+    /// The committed table's unreviewed-and-forecastless rows, pinned by name.
+    ///
+    /// These five OANDA rows are **entirely empty** — `reviewed = false`, zero
+    /// mask, zero widen, zero forecast, and even `median_pips = 0.0`. They are
+    /// the "5 all-zero" OANDA rows tabulated in
+    /// `BUG-tradenation-forecast-all-zero.md` (oanda: 125 rows, 120 forecast
+    /// populated, 5 all-zero) and were never chased down at the time, because
+    /// that investigation was scoped to the TradeNation half.
+    ///
+    /// Before this variant existed they classified as `Covered`, so arming any
+    /// of them sized stops with no spread forecast at all. They now refuse
+    /// loudly, which is the correct behaviour and a change in blast radius
+    /// worth knowing about: `USD_TRY` and `EUR_TRY` in particular are tradable
+    /// pairs, not exotica nobody touches.
+    ///
+    /// This list is an inventory of known debt, not permission. Re-bake these
+    /// rows and shrink it; a NEW name appearing here is a regression.
+    const UNREVIEWED_ROWS: &[&str] = &["EUR_TRY", "SUGAR_USD", "TRY_JPY", "UK10YB_GBP", "USD_TRY"];
+
+    /// Whole-table invariant: the set of unreviewed-and-forecastless rows is
+    /// exactly [`UNREVIEWED_ROWS`] — no more, and no fewer.
+    ///
+    /// Asserting over EVERY row rather than a hand-picked symbol is the lesson
+    /// from the 35 stale TradeNation rows, which sailed past a guard that
+    /// checked only `EUR_USD`. Pinning the set in both directions means a newly
+    /// broken row fails here, and so does a stale entry left behind after a
+    /// re-bake fixes one.
+    #[test]
+    fn only_the_known_rows_are_unreviewed_with_no_forecast() {
+        let mut bad: Vec<&str> = super::super::baseline_candle::SPREAD_BASELINE_CANDLE
+            .iter()
+            .filter(|(_b, _s, _sch, reviewed, _m, _w, _me, _l, _h, forecast)| {
+                !*reviewed && forecast.iter().all(|f| *f <= 0.0)
+            })
+            .map(|(_b, symbol, ..)| *symbol)
+            .collect();
+        bad.sort_unstable();
+        assert_eq!(
+            bad, UNREVIEWED_ROWS,
+            "the set of rows that would arm with no spread forecast changed",
+        );
+    }
+
+    /// Those rows must actually REFUSE, not merely be listed. Ties the
+    /// inventory above to the predicate the arm gate branches on.
+    #[test]
+    fn the_unreviewed_rows_are_not_covered() {
+        for sym in UNREVIEWED_ROWS {
+            assert_eq!(coverage(sym), Coverage::Unreviewed, "{sym}");
+            assert!(!coverage(sym).is_covered(), "{sym} must refuse at arm time");
+        }
     }
 }
