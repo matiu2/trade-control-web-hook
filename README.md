@@ -3870,8 +3870,8 @@ human-paced part, and freezing it is what makes every later re-run free.
 
 ### The entry-sensitivity grid: `--save-matrix`
 
-The explicit form. Arms four entry rules × news calendar on/off — eight cells —
-from a **single** chart read:
+The explicit form. Arms four entry rules × news calendar on/off × reversal-closes
+on/off — sixteen cells — from a **single** chart read:
 
 | entry rule | what it arms |
 |---|---|
@@ -3884,7 +3884,36 @@ from a **single** chart read:
 tv-arm --spec-out setups/trade-124.json --save-matrix \
   replay --save trade-124 --simulate true
 # → trade-124-{normal,skip-bcr,strategy-v2,strategy-v2-qm-market}-{news-on,news-off}
+#   …and the same eight again with a `-rev-off` suffix
 ```
+
+#### The reversal-close axis: `--skip-reversals`
+
+`--skip-reversals` drops **both** reversal-closes: `06-close-on-reversal` (the
+news-window safety flatten) and `07-close-on-sr-reversal` (the S/R-band close).
+It suppresses them at the source in the trade-spec build — `close_on_news` forced
+false and `sr_reversal_ranges` left empty — so neither alert is emitted. That
+includes the **default-on take-profit resistance band**, which is an S/R band like
+any other and would otherwise keep the close armed on a cell whose name says
+reversals are off.
+
+Exits only. The `too-high`/`too-low` invalidation caps and the 80%-to-TP
+`pcl-exhausted` abort are **vetos**: they fire independently and never close an
+open position (see the CLOSE vs VETO/INVALIDATE vocabulary in `CLAUDE.md`), so
+they are untouched. M/W already hardcodes both fields off, so this is H&S-only.
+
+It is an **axis** rather than two more entry-rule columns because the
+reversal-close is orthogonal to the entry rule: it fires after the position is
+already open, so the same early exit can bank a partial win under one entry rule
+and cut a runner under another. Paired on/off twins make the R difference
+attributable to the close alone.
+
+Unlike `--sl-matrix` and `--entry-matrix` this axis is **always on** — it doubles
+rather than triples the cell count, and the question it answers ("does the exit
+earn its keep, or does it cut my runners?") had no other way to be asked. The
+naming is **suffix-only**: reversals-ON cells keep their exact historical
+directory names and `cell_key`s, so every fixture already on disk stays valid;
+only the off-twin gains `-rev-off`.
 
 The last two differ only in the QM leg's order type, and they answer different
 questions: the limit leg asks *"does waiting for the pullback pay for the fills
@@ -3895,7 +3924,7 @@ leaves `--qm-entry` unset rather than passing `limit` explicitly — limit is
 already the default, and the unset form keeps the cell byte-identical to the
 `strategy-v2` fixtures captured before `--qm-entry` existed.
 
-Reading once matters. Eight separate `tv-arm` invocations would each re-classify
+Reading once matters. Sixteen separate `tv-arm` invocations would each re-classify
 roles against a chart that may have scrolled and re-read a calendar that may
 have moved, so the cells could differ by more than the flag under test — and the
 grid would be comparing *setups* rather than gates. One read means every cell
@@ -3953,17 +3982,18 @@ is rejected, and a level that isn't drawn **rejects the arm** rather than
 silently falling back to `signal` (which would give a grid column secretly
 duplicating the control).
 
-`--sl-matrix` adds the axis to the grid — 8 cells become 24:
+`--sl-matrix` adds the axis to the grid — 16 cells become 48:
 
 ```sh
 tv-arm --spec-in setups/trade-124.json --save-matrix --sl-matrix \
   replay --instrument AUD_CAD --fixtures-dir replay-fixtures --save trade-124
 # → trade-124-normal-news-on                    (signal: name unchanged)
 #   trade-124-normal-news-on-sl-invalidation
-#   trade-124-normal-news-on-sl-fib-top          … ×8 base cells
+#   trade-124-normal-news-on-sl-fib-top          … ×16 base cells
+#   trade-124-normal-news-on-rev-off-sl-fib-top  (it crosses the reversal axis)
 ```
 
-Off by default: the loop is sequential, so 24 cells is 3× the wall-clock, and
+Off by default: the loop is sequential, so 48 cells is 3× the wall-clock, and
 the default cells keep their **original** fixture names so the existing corpus
 isn't orphaned by a rename.
 
@@ -3977,7 +4007,7 @@ The three pattern-path entry types answer *"is the break worth waiting for?"*:
 | `--entry-market` | market order on the signal bar | best fill price; always fills |
 | `--entry-limit` | pending limit at the anchor | fills on the pullback; recovers to a stop when wrong-side |
 
-`--entry-matrix` adds the axis to the grid — 8 cells become 24, or **72** when
+`--entry-matrix` adds the axis to the grid — 16 cells become 48, or **144** when
 combined with `--sl-matrix`:
 
 ```sh
@@ -3986,7 +4016,7 @@ tv-arm --spec-in setups/trade-124.json --save-matrix --entry-matrix \
 # → trade-124-normal-news-on                    (default: name unchanged)
 #   trade-124-normal-news-on-entry-stop         (explicit stop)
 #   trade-124-normal-news-on-entry-market
-#   trade-124-normal-news-on-entry-limit         … ×8 base cells
+#   trade-124-normal-news-on-entry-limit         … ×16 base cells
 ```
 
 Note `-entry-stop` is a **distinct cell** from the unsuffixed default even
@@ -4011,13 +4041,13 @@ armed with `--spec-out` can be re-armed chartlessly (currently ~26 of ~206
 fixture directories); the rest predate `--spec-out` and need one chart re-arm
 before they join the sweep.
 
-Each cell suffixes the replay's `--save` name, so eight cells land in eight
+Each cell suffixes the replay's `--save` name, so sixteen cells land in sixteen
 directories rather than overwriting each other, and records its own
-`arm.entry_rule` label so a batch tool groups columns from **data** rather than
-by parsing directory names. A cell that fails to arm is recorded and the run
-continues (a variant can legitimately be rejected); the summary names what's
-missing, and the exit code is non-zero unless all eight armed — a partial grid
-must not read as complete.
+`arm.entry_rule` / `arm.skip_calendar_bars` / `arm.skip_reversals` values so a
+batch tool groups columns from **data** rather than by parsing directory names.
+A cell that fails to arm is recorded and the run continues (a variant can
+legitimately be rejected); the summary names what's missing, and the exit code is
+non-zero unless all sixteen armed — a partial grid must not read as complete.
 
 ### Reading the corpus — entry-rule comparison and equity simulation
 

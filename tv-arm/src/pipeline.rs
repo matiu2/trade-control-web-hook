@@ -234,6 +234,7 @@ fn arm_context<'a>(args: &'a Args, chart_symbol: &'a str) -> crate::replay::ArmC
         qm_entry: args.qm_entry,
         skip_calendar_bars: args.skip_calendar_bars,
         skip_golden: args.skip_golden,
+        skip_reversals: args.skip_reversals,
         start: args.start.as_deref(),
         chart_symbol: Some(chart_symbol),
     }
@@ -2368,11 +2369,23 @@ mod tests {
     /// their own, but neither notices if `arm_context` stops forwarding a field:
     /// severing `qm_entry` here left all 359 tests green, and the only symptom
     /// would have been every QM-market fixture quietly filing itself in the
-    /// `strategy-v2` column.
+    /// `strategy-v2` column. Severing `skip_reversals` was the same survivor,
+    /// with the same shape of symptom — a `-rev-off` directory whose
+    /// `meta.json` claims the closes were armed.
+    ///
+    /// Walks the **whole** grid (`grid_for`), not the 8-cell `GRID` const: the
+    /// const is reversals-on throughout, so iterating it could never have
+    /// exercised the reversal wire in either direction.
     #[test]
     fn every_grid_cell_labels_itself_through_the_arm_context() {
         let base = sf_args(&[]);
-        for variant in crate::save_matrix::GRID.iter() {
+        let grid = crate::save_matrix::grid_for(false, false);
+        assert!(
+            grid.iter().any(|v| v.skip_reversals) && grid.iter().any(|v| !v.skip_reversals),
+            "the grid must contain BOTH halves of the reversal axis, or the \
+             assertion below is only ever checked one way"
+        );
+        for variant in &grid {
             let cell = variant.apply(&base);
             let arm = arm_context(&cell, "TRADENATION:EURUSD");
             assert_eq!(
@@ -2385,6 +2398,12 @@ mod tests {
                 arm.skip_calendar_bars,
                 variant.skip_calendar_bars,
                 "the news axis must reach the arm block for cell {}",
+                variant.fixture_suffix()
+            );
+            assert_eq!(
+                arm.skip_reversals,
+                variant.skip_reversals,
+                "the reversal axis must reach the arm block for cell {}",
                 variant.fixture_suffix()
             );
         }

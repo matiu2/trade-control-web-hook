@@ -358,7 +358,11 @@ pub fn build_trade_spec(
         },
         needs_golden: !args.skip_golden,
         needs_confirmed: args.require_confirmation,
-        close_on_news,
+        // `--skip-reversals` drops the news-window flatten. Forced false here
+        // rather than upstream so the calendar still runs: the news *pause*
+        // windows (which hold resting orders) are unaffected — only the
+        // reversal-close is dropped.
+        close_on_news: close_on_news && !args.skip_reversals,
         // Chart-drawn S/R bands, plus (default-on) the take-profit
         // resistance band so a reversal near TP flattens for a partial win
         // rather than round-tripping to the stop. `07-close-on-sr-reversal`
@@ -370,7 +374,16 @@ pub fn build_trade_spec(
         // the TP band spans TP → a fib level (`--tp-resistance-fib-level`).
         // They shared one percent until 2026-08, so two widenings meant for
         // drawn lines silently inflated the TP band — see `tp_resistance_band`.
-        sr_reversal_ranges: {
+        //
+        // `--skip-reversals` leaves this empty, which is what suppresses the
+        // alert: `build_trade_from_spec` emits `07-close-on-sr-reversal` only
+        // when the list is non-empty. Skipping the whole block (rather than
+        // filtering after) also drops the TP resistance band, which is
+        // deliberate — it is an S/R band like any other and would otherwise
+        // keep the reversal-close alive on a "reversals off" cell.
+        sr_reversal_ranges: if args.skip_reversals {
+            Vec::new()
+        } else {
             let mut bands = build_sr_ranges(geom, args.reversal_band_pct);
             // Needs the fib itself, not just the TP derived from it: the band's
             // far edge is a level *on* that fib. `check_required` has already
@@ -1024,6 +1037,138 @@ mod tests {
             spec.sr_reversal_ranges.len(),
             2,
             "drawn band + auto TP band"
+        );
+    }
+
+    // ---- `--skip-reversals` ---------------------------------------------
+    //
+    // The grid's reversal axis. Both tests arm the SAME chart twice — once
+    // bare, once with the flag — because a one-sided assertion ("the flag
+    // produces no bands") passes just as happily against a chart that had no
+    // bands to begin with.
+
+    /// Resolve the standard H&S short with a drawn S/R line, under `flags`.
+    fn resolve_with_sr(flags: &[&str]) -> cli::TradeSpec {
+        let mut roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        roles.sr_levels = vec![hline("sr", "support", 1.05)];
+        let (_dir, spec) = resolve_hs_trade(
+            &mw_args(flags),
+            &PlanGeometry::from_roles(&roles),
+            // `close_on_news: true` — the caller's news fact. The flag must
+            // override it, so passing false here would make the news half of
+            // this test vacuous.
+            true,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            test_precision(0.0001, 0.0001),
+        )
+        .expect("valid H&S resolves");
+        spec
+    }
+
+    /// `--skip-reversals` drops **every** S/R band — the drawn ones and the
+    /// default-on TP resistance band alike.
+    ///
+    /// The TP band is the one that would otherwise survive: it is appended
+    /// independently of the drawn lines, so a flag that only filtered
+    /// `build_sr_ranges` would leave a band behind and keep
+    /// `07-close-on-sr-reversal` armed on a cell whose name says reversals are
+    /// off. That is worse than not having the flag — the grid column would be
+    /// mislabelled rather than missing.
+    #[test]
+    fn skip_reversals_drops_drawn_and_tp_bands_alike() {
+        // Control: without the flag this same setup has both bands.
+        let with = resolve_with_sr(&[]);
+        assert_eq!(with.sr_reversal_ranges.len(), 2, "drawn + auto TP band");
+        assert!(with.close_on_news, "news fact carried through");
+
+        let without = resolve_with_sr(&["--skip-reversals"]);
+        assert!(
+            without.sr_reversal_ranges.is_empty(),
+            "both the drawn band and the TP band must go: {:?}",
+            without.sr_reversal_ranges
+        );
+        assert!(
+            !without.close_on_news,
+            "the news-window flatten must go too, even with news present"
+        );
+    }
+
+    /// The flag must not reach past the exits. The invalidation cap, the
+    /// pcl-exhausted abort and the enter are all independent of it — see
+    /// CLAUDE.md's CLOSE vs VETO/INVALIDATE section — so a flag that dropped
+    /// any of them would be silently changing what the "reversals off" column
+    /// measures.
+    #[test]
+    fn skip_reversals_leaves_the_entry_and_the_stop_untouched() {
+        let with = resolve_with_sr(&[]);
+        let without = resolve_with_sr(&["--skip-reversals"]);
+        assert_eq!(without.tp_price, with.tp_price);
+        assert_eq!(without.sl_price, with.sl_price);
+        assert_eq!(without.entry_mode, with.entry_mode);
+        assert_eq!(without.needs_golden, with.needs_golden);
+        assert_eq!(without.max_retries, with.max_retries);
+        assert_eq!(without.skip_preps, with.skip_preps);
+    }
+
+    /// End-to-end: the flag removes both reversal-close ALERTS from the bundle.
+    ///
+    /// The spec-level assertions above pin the inputs; this pins the output the
+    /// worker actually sees. `build_trade_from_spec` decides on
+    /// `!sr_reversal_ranges.is_empty()` and `close_on_news`, so this is the test
+    /// that would catch a future refactor keeping the fields but re-deriving the
+    /// alerts from somewhere else. Asserting on basenames is the real contract:
+    /// the Python role-mapper and the fixture corpus both key on them.
+    #[test]
+    fn skip_reversals_emits_neither_close_alert() {
+        let basenames = |flags: &[&str]| -> Vec<String> {
+            // Lenient: this test is about which alerts get emitted, not about
+            // the time-sensitive gates the live path adds.
+            cli::build_trade_from_spec(
+                resolve_with_sr(flags),
+                Utc::now(),
+                cli::BuildStrictness::Lenient,
+            )
+            .expect("bundle builds")
+            .alerts
+            .iter()
+            .map(|a| a.basename.clone())
+            .collect()
+        };
+
+        // Control: both closes present when the flag is off.
+        let with = basenames(&[]);
+        assert!(
+            with.iter().any(|b| b == "07-close-on-sr-reversal"),
+            "control must have the S/R close: {with:?}"
+        );
+        assert!(
+            with.iter().any(|b| b == "06-close-on-reversal"),
+            "control must have the news close: {with:?}"
+        );
+
+        let without = basenames(&["--skip-reversals"]);
+        assert!(
+            !without.iter().any(|b| b.contains("close-on")),
+            "no reversal-close alert may survive: {without:?}"
+        );
+        // The rest of the bundle is untouched — this drops exits, not entries
+        // and not vetos.
+        assert!(
+            without.iter().any(|b| b == "05-enter"),
+            "the enter must survive: {without:?}"
+        );
+        assert!(
+            without
+                .iter()
+                .any(|b| b.starts_with("02-veto-trade-expiry")),
+            "the expiry veto must survive: {without:?}"
+        );
+        assert!(
+            without.iter().any(|b| b.starts_with("01-veto-too-")),
+            "the invalidation cap must survive — it is a veto, not a close: \
+             {without:?}"
         );
     }
 
