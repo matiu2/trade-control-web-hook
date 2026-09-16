@@ -241,7 +241,7 @@ fn arm_context<'a>(args: &'a Args, chart_symbol: &'a str) -> crate::replay::ArmC
 }
 
 fn arm_the_matrix(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Result<i32> {
-    let grid = save_matrix::grid_for(args.sl_matrix, args.entry_matrix);
+    let grid = save_matrix::grid_for(args.sl_matrix, args.entry_matrix, args.reversal_matrix);
     info!(
         cells = grid.len(),
         sl_matrix = args.sl_matrix,
@@ -2379,7 +2379,7 @@ mod tests {
     #[test]
     fn every_grid_cell_labels_itself_through_the_arm_context() {
         let base = sf_args(&[]);
-        let grid = crate::save_matrix::grid_for(false, false);
+        let grid = crate::save_matrix::grid_for(false, false, true);
         assert!(
             grid.iter().any(|v| v.skip_reversals) && grid.iter().any(|v| !v.skip_reversals),
             "the grid must contain BOTH halves of the reversal axis, or the \

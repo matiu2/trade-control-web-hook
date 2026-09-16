@@ -486,13 +486,33 @@ pub const ENTRY_AXIS: [crate::args::PatternEntry; 3] = [
 /// filtered out (83 filled legs vs 72; SL hits 25 → 38), for a net −10 to −12R.
 /// That is one entry rule; the axis exists so the same question can be asked of
 /// all four without hand-rolling a loop.
-pub fn grid_for(sl_matrix: bool, entry_matrix: bool) -> Vec<Variant> {
-    // The reversal axis is applied FIRST, so the opt-in axes multiply all
-    // sixteen cells rather than only the reversals-on eight. Both questions
-    // ("does a tighter stop pay?" and "does the exit earn its keep?") are about
-    // the trade *after* it opens, and asking one only under the other's default
-    // would leave their interaction unmeasured.
-    let base = mirror_reversals();
+pub fn grid_for(sl_matrix: bool, entry_matrix: bool, reversal_matrix: bool) -> Vec<Variant> {
+    // The reversal axis is OPT-IN (`--reversal-matrix`), like the other two, and
+    // is applied FIRST so that when it IS on the other axes multiply all sixteen
+    // cells rather than only the reversals-on eight. Both questions ("does a
+    // tighter stop pay?" and "does the exit earn its keep?") are about the trade
+    // *after* it opens, so asking one only under the other's default would leave
+    // their interaction unmeasured.
+    //
+    // # Why opt-in rather than always-on (operator, 2026-09-16)
+    //
+    // It shipped always-on, doubling the standard matrix 8 → 16. That makes every
+    // future corpus regeneration pay 2× for a question that is only asked
+    // occasionally. The flag `--skip-reversals` stays available for one-off
+    // replays, which is how the question gets asked in practice until there is
+    // enough data to justify the standing cost.
+    //
+    // The 8-setup pilot (2026-09-16) is why it is not yet worth it: mean effect of
+    // turning reversals OFF was −0.109R per setup, but it moved only 4 of 8
+    // setups and those four had a stdev of 0.823 — two dominating cases in
+    // opposite directions that nearly cancel (AUD/CAD 2026-07-22 +0.955, AUD/JPY
+    // 2026-09-01 −0.962). Underpowered, and not a random sample (first 8
+    // alphabetically, 5 of them AUD/CAD). See PARKED-reversal-axis-measurement.md.
+    let base = if reversal_matrix {
+        mirror_reversals()
+    } else {
+        GRID.to_vec()
+    };
     let with_sl: Vec<Variant> = if sl_matrix {
         SL_AXIS
             .iter()
@@ -689,7 +709,7 @@ mod tests {
     /// only be caught by someone re-reading this file.
     #[test]
     fn every_grid_cell_matches_its_news_label() {
-        for v in grid_for(true, false) {
+        for v in grid_for(true, false, false) {
             let out = v.apply_to_setup(setup_with_news());
             let suffix = v.fixture_suffix();
             if suffix.contains("news-off") {
@@ -1047,8 +1067,8 @@ mod tests {
     /// on the default anchor. The SL axis must cost nothing when unused.
     #[test]
     fn the_sl_axis_is_off_by_default() {
-        let grid = grid_for(false, false);
-        assert_eq!(grid.len(), 16, "8 base cells × reversals on/off");
+        let grid = grid_for(false, false, false);
+        assert_eq!(grid.len(), 8, "the base grid, both opt-in axes off");
         assert!(grid.iter().all(|v| v.sl_anchor == SlAnchor::Signal));
     }
 
@@ -1063,7 +1083,7 @@ mod tests {
     /// pass — which changes which cell `GRID[i]`-indexed callers get.
     #[test]
     fn default_cells_keep_their_original_fixture_names() {
-        let grid = grid_for(false, false);
+        let grid = grid_for(false, false, false);
         let names: Vec<String> = grid.iter().take(8).map(|v| v.fixture_suffix()).collect();
         assert!(
             grid.iter().take(8).all(|v| !v.skip_reversals),
@@ -1106,7 +1126,7 @@ mod tests {
     /// eight plus one `-rev-off` twin each.
     #[test]
     fn the_reversal_axis_doubles_the_grid_into_sixteen_distinct_cells() {
-        let grid = grid_for(false, false);
+        let grid = grid_for(false, false, true);
         assert_eq!(grid.len(), 16, "8 base × reversals on/off");
         let names: std::collections::HashSet<String> =
             grid.iter().map(|v| v.fixture_suffix()).collect();
@@ -1132,7 +1152,7 @@ mod tests {
     /// wholesale grid change rather than a new column.
     #[test]
     fn each_reversals_on_cell_gains_a_suffix_only_twin() {
-        let grid = grid_for(false, false);
+        let grid = grid_for(false, false, true);
         let on: Vec<String> = grid
             .iter()
             .filter(|v| !v.skip_reversals)
@@ -1160,7 +1180,7 @@ mod tests {
     /// exists to measure.
     #[test]
     fn a_twin_differs_from_its_base_by_only_the_reversal_flag() {
-        let grid = grid_for(false, false);
+        let grid = grid_for(false, false, true);
         assert_eq!(grid.len(), GRID.len() * 2);
         // Pair each cell with its base POSITIONALLY, against the `GRID` const —
         // the fixed, unmutated source of truth — rather than against the grid
@@ -1204,7 +1224,7 @@ mod tests {
     #[test]
     fn apply_sets_the_reversal_flag_on_the_args() {
         let b = base();
-        for v in grid_for(false, false) {
+        for v in grid_for(false, false, false) {
             assert_eq!(
                 v.apply(&b).skip_reversals,
                 v.skip_reversals,
@@ -1247,11 +1267,11 @@ mod tests {
     /// cell still has a distinct directory name.
     #[test]
     fn the_sl_matrix_is_the_full_product_with_distinct_names() {
-        let grid = grid_for(true, false);
-        assert_eq!(grid.len(), 48, "3 anchors × 16 base×reversal cells");
+        let grid = grid_for(true, false, false);
+        assert_eq!(grid.len(), 24, "3 anchors × 8 base cells");
         let names: std::collections::HashSet<String> =
             grid.iter().map(|v| v.fixture_suffix()).collect();
-        assert_eq!(names.len(), 48, "colliding fixture names");
+        assert_eq!(names.len(), 24, "colliding fixture names");
         // The base 8 keep their bare names; the structural cells are suffixed.
         assert!(names.contains("normal-news-on"), "{names:?}");
         assert!(
@@ -1259,11 +1279,16 @@ mod tests {
             "{names:?}"
         );
         assert!(names.contains("normal-news-on-sl-fib-top"), "{names:?}");
-        // …and the SL axis crosses the reversal axis, rather than only the
-        // reversals-on half.
+        // …and when the reversal axis IS requested, the SL axis crosses it
+        // rather than covering only the reversals-on half.
+        let crossed: std::collections::HashSet<String> = grid_for(true, false, true)
+            .iter()
+            .map(|v| v.fixture_suffix())
+            .collect();
+        assert_eq!(crossed.len(), 48, "3 anchors × 16 base×reversal cells");
         assert!(
-            names.contains("normal-news-on-rev-off-sl-fib-top"),
-            "the SL axis must cover the reversals-off twins too: {names:?}"
+            crossed.contains("normal-news-on-rev-off-sl-fib-top"),
+            "the SL axis must cover the reversals-off twins too: {crossed:?}"
         );
     }
 
@@ -1271,17 +1296,22 @@ mod tests {
     /// cell still has a distinct directory name.
     #[test]
     fn the_entry_matrix_is_the_full_product_with_distinct_names() {
-        let grid = grid_for(false, true);
-        assert_eq!(grid.len(), 48, "3 entry types × 16 base×reversal cells");
+        let grid = grid_for(false, true, false);
+        assert_eq!(grid.len(), 24, "3 entry types × 8 base cells");
         let names: std::collections::HashSet<String> =
             grid.iter().map(|v| v.fixture_suffix()).collect();
-        assert_eq!(names.len(), 48, "colliding fixture names");
+        assert_eq!(names.len(), 24, "colliding fixture names");
         assert!(names.contains("normal-news-on-entry-stop"), "{names:?}");
         assert!(names.contains("normal-news-on-entry-market"), "{names:?}");
         assert!(names.contains("normal-news-on-entry-limit"), "{names:?}");
+        let crossed: std::collections::HashSet<String> = grid_for(false, true, true)
+            .iter()
+            .map(|v| v.fixture_suffix())
+            .collect();
+        assert_eq!(crossed.len(), 48, "3 entry types × 16 base×reversal cells");
         assert!(
-            names.contains("normal-news-on-rev-off-entry-market"),
-            "the entry axis must cover the reversals-off twins too: {names:?}"
+            crossed.contains("normal-news-on-rev-off-entry-market"),
+            "the entry axis must cover the reversals-off twins too: {crossed:?}"
         );
     }
 
@@ -1289,23 +1319,34 @@ mod tests {
     /// collisions. All three suffixes must compose in a fixed order, or the same
     /// cell gets two names across runs and the corpus grows duplicates.
     #[test]
-    fn both_axes_compose_into_144_distinct_cells() {
-        let grid = grid_for(true, true);
+    fn both_axes_compose_into_72_distinct_cells() {
+        let grid = grid_for(true, true, false);
         assert_eq!(
             grid.len(),
-            144,
-            "3 anchors × 3 entry types × 16 base×reversal cells"
+            72,
+            "3 anchors × 3 entry types × 8 base cells (reversal axis off)"
         );
         let names: std::collections::HashSet<String> =
             grid.iter().map(|v| v.fixture_suffix()).collect();
-        assert_eq!(names.len(), 144, "colliding fixture names");
+        assert_eq!(names.len(), 72, "colliding fixture names");
         assert!(
             names.contains("skip-bcr-news-off-sl-fib-top-entry-market"),
             "sl suffix must precede the entry suffix: {names:?}"
         );
+        // Suffix ORDER is a corpus-stability property, so check it with the
+        // reversal axis explicitly on — off by default, it contributes no name.
+        let with_rev: std::collections::HashSet<String> = grid_for(true, true, true)
+            .iter()
+            .map(|v| v.fixture_suffix())
+            .collect();
+        assert_eq!(
+            with_rev.len(),
+            144,
+            "3 anchors × 3 entry × 16 base×reversal"
+        );
         assert!(
-            names.contains("skip-bcr-news-off-rev-off-sl-fib-top-entry-market"),
-            "the rev suffix must precede both the sl and entry suffixes: {names:?}"
+            with_rev.contains("skip-bcr-news-off-rev-off-sl-fib-top-entry-market"),
+            "the rev suffix must precede both the sl and entry suffixes: {with_rev:?}"
         );
     }
 
@@ -1315,7 +1356,7 @@ mod tests {
     /// orphan every one of them.
     #[test]
     fn the_default_grid_keeps_bare_names() {
-        for v in grid_for(false, false) {
+        for v in grid_for(false, false, false) {
             assert_eq!(v.entry_mode, None, "base grid must not set an entry mode");
             assert!(
                 !v.fixture_suffix().contains("-entry-"),
@@ -1397,13 +1438,13 @@ mod tests {
     /// The entry axis varies ONLY the order type: entry rule, news, reversals
     /// and SL of each base cell survive untouched.
     ///
-    /// Indexes into the 16-cell `grid_for(false, false)`, not `GRID[i % 8]` — a
+    /// Indexes into the 16-cell `grid_for(false, false, false)`, not `GRID[i % 8]` — a
     /// modulo over the 8-cell const would line a `-rev-off` cell up against a
     /// reversals-on base and never notice the axis had been dropped.
     #[test]
     fn the_entry_axis_varies_only_the_order_type() {
-        let cells = grid_for(false, false);
-        for (i, v) in grid_for(false, true).iter().enumerate() {
+        let cells = grid_for(false, false, false);
+        for (i, v) in grid_for(false, true, false).iter().enumerate() {
             let base = &cells[i % cells.len()];
             assert_eq!(v.entry_rule, base.entry_rule);
             assert_eq!(v.skip_bcr, base.skip_bcr);
@@ -1420,12 +1461,12 @@ mod tests {
     /// reversals-off twins.
     #[test]
     fn every_anchor_covers_every_base_cell() {
-        let grid = grid_for(true, false);
+        let grid = grid_for(true, false, false);
         for anchor in SL_AXIS {
             assert_eq!(
                 grid.iter().filter(|v| v.sl_anchor == anchor).count(),
-                16,
-                "{anchor:?} must cover all 16 base cells"
+                8,
+                "{anchor:?} must cover all 8 base cells"
             );
         }
     }
@@ -1434,7 +1475,7 @@ mod tests {
     /// true product rather than the SL axis only reaching the on-cells.
     #[test]
     fn every_anchor_covers_both_reversal_settings() {
-        let grid = grid_for(true, false);
+        let grid = grid_for(true, false, true);
         for anchor in SL_AXIS {
             for rev in [false, true] {
                 assert_eq!(
@@ -1453,8 +1494,8 @@ mod tests {
     /// its entry rule would be attributing an entry difference to the stop.
     #[test]
     fn the_sl_axis_varies_only_the_stop() {
-        let cells = grid_for(false, false);
-        for (i, v) in grid_for(true, false).iter().enumerate() {
+        let cells = grid_for(false, false, false);
+        for (i, v) in grid_for(true, false, false).iter().enumerate() {
             let base = &cells[i % cells.len()];
             assert_eq!(v.entry_rule, base.entry_rule);
             assert_eq!(v.skip_bcr, base.skip_bcr);

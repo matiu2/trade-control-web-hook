@@ -391,6 +391,25 @@ pub struct Args {
     #[arg(long)]
     pub entry_matrix: bool,
 
+    /// Sweep the reversal-close on/off as an extra `--save-matrix` axis,
+    /// **doubling** the cell count (8 → 16, and multiplying through
+    /// `--sl-matrix` / `--entry-matrix` on top).
+    ///
+    /// Each reversals-on cell gains a `-rev-off` twin armed with
+    /// [`Args::skip_reversals`]. Because the close fires *after* the position is
+    /// open it is orthogonal to the entry rule, so paired twins make any R
+    /// difference attributable to the close alone.
+    ///
+    /// Off by default. The standing cost is real — it doubles every corpus
+    /// regeneration — and an 8-setup pilot (2026-09-16) was too underpowered to
+    /// justify paying it: mean −0.109R per setup, but only 4 of 8 setups moved
+    /// and those had a stdev of 0.823, two dominating cases nearly cancelling.
+    /// Use `--skip-reversals` for a one-off replay instead; turn this on when
+    /// you want the question asked across a whole corpus run. See
+    /// `PARKED-reversal-axis-measurement.md`.
+    #[arg(long)]
+    pub reversal_matrix: bool,
+
     /// Require the break-and-close (`03`) and retest (`04`) candles to be
     /// **golden** — the crossing bar's full range (`high − low`) must be at
     /// least the Wilder ATR at that bar. A weak, indecisive bar that merely
