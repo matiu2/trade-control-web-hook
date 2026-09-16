@@ -73,6 +73,29 @@ pub const MIN_HOUR_BARS: usize = 3;
 /// baseline are too thin to trust. Low-confidence ⇒ mask 0 (fallback).
 pub const MIN_INSTRUMENT_BARS: usize = 48;
 
+/// How many populated local-hour buckets the **mask** needs before we rank
+/// hours against each other. Half the clock.
+///
+/// This gates the mask ONLY — not the forecast, and not the pips baseline.
+/// The distinction matters because the two need different things:
+///
+/// - The **mask** asks "is hour `h` elevated *relative to this instrument's
+///   other hours*", and its yardstick is `median-over-hours(ratio)`. That
+///   median is computed from the very hours being judged, so a short list is
+///   both unstable and self-defeating: if a third of the hours are elevated
+///   the median sits *inside* the spike, and the spike stops clearing
+///   `MED_MULT × median`. The guard exists so the typical hour outnumbers the
+///   spiky one.
+/// - The **forecast** (`hour_p90_frac`) and the **pips baseline** ask "what
+///   spread does hour `h` actually cost", which is a plain per-hour percentile.
+///   No cross-hour comparison, so no minimum hour count applies.
+///
+/// A part-time market can never satisfy this: a cash index trading 08:00–16:30
+/// has ~9 local hours no matter how much history is fetched. That is not thin
+/// data — it is a complete picture of a shorter day — so it yields no mask but
+/// a perfectly good forecast. See [`ReviewStatus::MaskNotComputable`].
+pub const MIN_MASK_HOURS: usize = 12;
+
 /// The per-hour spread we bake as the System-2 stop-widen amount when that
 /// hour is elevated: the hour's p90 spread *fraction* (robust to a lone freak
 /// print, which `max` would chase).
@@ -105,6 +128,14 @@ pub enum ReviewStatus {
     /// Too few usable bars / hours to compute a trustworthy verdict. The mask
     /// is 0 and the gate should fall back to its NY-close-edge default.
     InsufficientData,
+    /// Measured in full, but the session is too short to rank hours against
+    /// each other ([`MIN_MASK_HOURS`]) — a part-time market such as a cash
+    /// index. The mask is 0 and means "not computable", NOT "genuinely flat";
+    /// the forecast and pips baseline ARE populated and can be trusted.
+    ///
+    /// Distinct from [`InsufficientData`](Self::InsufficientData), where we
+    /// learned nothing at all and every column is empty.
+    MaskNotComputable,
 }
 
 /// The computed spread profile for one (broker, instrument).
@@ -426,13 +457,31 @@ fn apply_gates(
     baseline_median_pips: f64,
     baseline_high_pips: f64,
 ) -> SpreadProfile {
+    // The mask needs to rank hours against each other; the forecast and pips
+    // baseline do not. When the ranking is impossible, keep everything that was
+    // genuinely measured and emit an empty mask with an explicit verdict —
+    // rather than discarding the lot via `SpreadProfile::empty`.
+    let mask_less = |vol: f64| SpreadProfile {
+        elevated_hours: 0,
+        hour_widen_frac: [0.0; 24],
+        vol,
+        median_ratio: 0.0,
+        hour_p90_frac: hour_p90,
+        hour_ratio: std::array::from_fn(|h| flag_ratio[h].unwrap_or(0.0)),
+        review: ReviewStatus::MaskNotComputable,
+        n_bars,
+        baseline_low_pips,
+        baseline_high_pips,
+        baseline_median_pips,
+    };
+
     let ratios: Vec<f64> = flag_ratio.iter().filter_map(|r| *r).collect();
-    if ratios.len() < 12 {
-        return SpreadProfile::empty(n_bars);
+    if ratios.len() < MIN_MASK_HOURS {
+        return mask_less(vol);
     }
     let median_ratio = median(&ratios);
     if !(median_ratio.is_finite() && median_ratio > 0.0) {
-        return SpreadProfile::empty(n_bars);
+        return mask_less(vol);
     }
     let peak_ratio = ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let med_threshold = MED_MULT * median_ratio;
@@ -819,5 +868,141 @@ mod tests {
         assert_eq!(p.baseline_low_pips, 0.0);
         assert_eq!(p.baseline_median_pips, 0.0);
         assert_eq!(p.baseline_high_pips, 0.0);
+    }
+
+    /// Build a **part-time** market: minutes only inside `hours`, nothing
+    /// outside. Models a cash index (Spain 35 = 09:00–17:00 local) rather than
+    /// a 24h FX pair, so fewer than `MIN_MASK_HOURS` buckets ever populate.
+    fn session_days(
+        days: usize,
+        hours: std::ops::RangeInclusive<u8>,
+        normal: f64,
+        elevated: impl Fn(u8, u8) -> Option<f64>,
+    ) -> Vec<MinuteBar> {
+        let mut bars = Vec::new();
+        let mut mid = 1.0000_f64;
+        for _ in 0..days {
+            for h in hours.clone() {
+                mid += if h % 2 == 0 { 0.0002 } else { -0.0002 };
+                for m in 0..60u8 {
+                    let frac = elevated(h, m).unwrap_or(normal);
+                    bars.push(min_bar(h, m, frac, mid));
+                }
+            }
+        }
+        bars
+    }
+
+    /// A part-time market must still get a **forecast** and a **pips baseline**,
+    /// even though its session is too short to rank hours against each other.
+    ///
+    /// This is the Spain 35 case (08:00–16:30 London → 9 local hours). Before
+    /// the split, `apply_gates` bailed on `< MIN_MASK_HOURS` and returned
+    /// `SpreadProfile::empty()`, which zeroed the forecast and the pips
+    /// baseline along with the mask — so the SL floor lost its forward-looking
+    /// term entirely and the arm gate had nothing to read.
+    ///
+    /// The mask legitimately stays empty (nothing to rank), but the per-hour
+    /// p90 and the whole-window pips percentiles need no cross-hour median and
+    /// must survive.
+    #[test]
+    fn a_part_time_session_still_gets_a_forecast_and_pips_baseline() {
+        let bars = session_days(40, 9..=17, 0.0002, |_h, _m| None);
+        let p = profile_from_minutes(&bars, 0.01);
+
+        assert_eq!(
+            p.elevated_hours, 0,
+            "a flat short session has no spike to flag",
+        );
+        let populated = p.hour_p90_frac.iter().filter(|f| **f > 0.0).count();
+        assert_eq!(
+            populated, 9,
+            "every traded hour must carry a forecast; got {populated}",
+        );
+        for h in 9..=17usize {
+            assert!(
+                p.hour_p90_frac[h] > 0.0,
+                "hour {h} is in session and must have a forecast",
+            );
+        }
+        for h in [0usize, 8, 18, 23] {
+            assert_eq!(
+                p.hour_p90_frac[h], 0.0,
+                "hour {h} is outside the session and must stay zero",
+            );
+        }
+        assert!(
+            p.baseline_median_pips > 0.0,
+            "the pips baseline is a whole-window percentile and must survive",
+        );
+        assert!(
+            p.vol > 0.0,
+            "the volatility series is healthy and must survive"
+        );
+    }
+
+    /// The verdict for that row must be **explicit**, not "never looked".
+    /// A short session that was fully measured is analysed — the mask is simply
+    /// not computable. Conflating it with `InsufficientData` is what let an
+    /// all-zero row read as covered downstream.
+    #[test]
+    fn a_measured_part_time_session_is_not_insufficient_data() {
+        let bars = session_days(40, 9..=17, 0.0002, |_h, _m| None);
+        let p = profile_from_minutes(&bars, 0.01);
+        assert_eq!(p.review, ReviewStatus::MaskNotComputable);
+        assert_ne!(
+            p.review,
+            ReviewStatus::InsufficientData,
+            "the data was ample — only the cross-hour ranking was impossible",
+        );
+    }
+
+    /// Genuinely thin data must STILL be `InsufficientData`. The split must not
+    /// turn the real guard into a rubber stamp: too few bars means we learned
+    /// nothing, and the forecast must stay empty.
+    #[test]
+    fn genuinely_thin_data_is_still_insufficient() {
+        // 2 hours of one day — far below MIN_INSTRUMENT_BARS * MIN_HOUR_MINUTES.
+        let bars = session_days(1, 9..=10, 0.0002, |_h, _m| None);
+        let p = profile_from_minutes(&bars, 0.01);
+        assert_eq!(p.review, ReviewStatus::InsufficientData);
+        assert_eq!(p.elevated_hours, 0);
+        assert!(
+            p.hour_p90_frac.iter().all(|f| *f == 0.0),
+            "thin data must not emit a forecast",
+        );
+    }
+
+    /// A 24h market is unaffected: it still ranks hours and still flags its
+    /// spike. The split must change nothing for the instruments the mask was
+    /// designed for.
+    #[test]
+    fn a_full_day_market_still_flags_its_spike() {
+        let bars = minute_days(5, 0.0001, |h, _m| (h == 21).then_some(0.0020));
+        let p = profile_from_minutes(&bars, 0.01);
+        assert_eq!(p.review, ReviewStatus::Reviewed);
+        assert_eq!(p.elevated_vec(), vec![21]);
+    }
+
+    /// The mask floor still bites where it matters: a SHORT session whose hours
+    /// do vary must not have a spike flagged off a median taken over too few
+    /// hours (the median can sit inside the spike and defeat the test). We
+    /// emit the forecast but refuse to rank.
+    #[test]
+    fn a_short_session_never_flags_a_mask_even_when_hours_vary() {
+        // 3 of 9 hours elevated — enough to drag a 9-hour median into the spike.
+        let bars = session_days(40, 9..=17, 0.0002, |h, _m| {
+            (15..=17).contains(&h).then_some(0.0020)
+        });
+        let p = profile_from_minutes(&bars, 0.01);
+        assert_eq!(
+            p.elevated_hours, 0,
+            "a short session must not rank hours against an unreliable median",
+        );
+        assert_eq!(p.review, ReviewStatus::MaskNotComputable);
+        assert!(
+            p.hour_p90_frac[16] > 0.0,
+            "…but the forecast still reports what each hour actually costs",
+        );
     }
 }
