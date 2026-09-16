@@ -212,19 +212,19 @@ pub struct Args {
     /// entry / SL / TP. Mutually exclusive with `--stop-entry` /
     /// `--limit-entry`. No pattern, preps, or geometry needed — just the
     /// drawn position + a trade-expiry.
-    #[arg(long, conflicts_with = "spec_in")]
+    #[arg(long, conflicts_with_all = ["spec_in", "spec_url"])]
     pub market_entry: bool,
 
     /// **Position-tool direct entry.** Rest a **stop** order at the
     /// drawn position's entry price. Mutually exclusive with
     /// `--market-entry` / `--limit-entry`.
-    #[arg(long, conflicts_with = "spec_in")]
+    #[arg(long, conflicts_with_all = ["spec_in", "spec_url"])]
     pub stop_entry: bool,
 
     /// **Position-tool direct entry.** Rest a **limit** order at the
     /// drawn position's entry price. Mutually exclusive with
     /// `--market-entry` / `--stop-entry`.
-    #[arg(long, conflicts_with = "spec_in")]
+    #[arg(long, conflicts_with_all = ["spec_in", "spec_url"])]
     pub limit_entry: bool,
 
     /// Anchor SL to Pine's `recent_high` (shorts) / `recent_low`
@@ -612,7 +612,7 @@ pub struct Args {
     /// deliberately **not** frozen: they're re-read on every arm, because a
     /// frozen spread mis-sizes an entry and frozen news answers a question about
     /// a stale calendar.
-    #[arg(long, value_name = "FILE", conflicts_with = "spec_in")]
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["spec_in", "spec_url"])]
     pub spec_out: Option<PathBuf>,
 
     /// Arm from a frozen setup written by `--spec-out`, with **no TradingView**.
@@ -626,6 +626,22 @@ pub struct Args {
     /// properties with no frozen equivalent.
     #[arg(long, value_name = "FILE")]
     pub spec_in: Option<PathBuf>,
+
+    /// Arm from a frozen setup fetched over HTTP, with **no TradingView** —
+    /// the same bytes `--spec-in` reads, without the download-then-pass step.
+    ///
+    /// Points at local-chart's `GET /arm-setup`, e.g.
+    /// `--spec-url 'http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1'`.
+    /// That endpoint already emits exactly this crate's `FrozenSetup` shape,
+    /// so nothing is translated on the way in; the browser's "Download spec"
+    /// button remains the offline path and is unaffected.
+    ///
+    /// Carries every restriction `--spec-in` does — it is the same frozen-spec
+    /// arm, differing only in where the bytes come from. In particular the
+    /// position-entry tools are refused: their SL/TP are live-chart drawing
+    /// properties with no frozen equivalent.
+    #[arg(long, value_name = "URL", conflicts_with = "spec_in")]
+    pub spec_url: Option<String>,
 
     /// Arm the **entry-sensitivity grid** from a single chart read: four entry
     /// rules (normal / skip-bcr / strategy-v2 / strategy-v2-qm-market) × news
@@ -1136,7 +1152,50 @@ mod tests {
                 Args::try_parse_from(["tv-arm", flag, "--spec-in", "/tmp/s.json"]).is_err(),
                 "{flag} must conflict with --spec-in"
             );
+            // … nor with --spec-url, which is the same frozen arm over HTTP.
+            // Without this the position tools would slip through the one door
+            // that isn't a file path.
+            assert!(
+                Args::try_parse_from([
+                    "tv-arm",
+                    flag,
+                    "--spec-url",
+                    "http://127.0.0.1:8790/arm-setup"
+                ])
+                .is_err(),
+                "{flag} must conflict with --spec-url"
+            );
         }
+    }
+
+    /// `--spec-url` is `--spec-in` over HTTP: the same frozen arm, so it keeps
+    /// the same company — never both at once, and never alongside `--spec-out`.
+    #[test]
+    fn spec_url_is_exclusive_with_the_other_spec_flags() {
+        Args::try_parse_from(["tv-arm", "--spec-url", "http://127.0.0.1:8790/arm-setup"])
+            .expect("--spec-url alone is the intended use");
+        assert!(
+            Args::try_parse_from([
+                "tv-arm",
+                "--spec-url",
+                "http://127.0.0.1:8790/arm-setup",
+                "--spec-in",
+                "/tmp/s.json"
+            ])
+            .is_err(),
+            "two sources for one frozen setup is incoherent"
+        );
+        assert!(
+            Args::try_parse_from([
+                "tv-arm",
+                "--spec-url",
+                "http://127.0.0.1:8790/arm-setup",
+                "--spec-out",
+                "/tmp/s.json"
+            ])
+            .is_err(),
+            "reading a spec over HTTP and writing one in the same run is incoherent"
+        );
     }
 
     /// `--spec-in` and `--spec-out` are opposite directions of the same file and

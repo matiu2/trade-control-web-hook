@@ -1,9 +1,19 @@
-//! `--spec-out` / `--spec-in`: arm a setup again without TradingView.
+//! `--spec-out` / `--spec-in` / `--spec-url`: arm a setup again without
+//! TradingView.
 //!
 //! The operator confirms a pattern on the chart **once**, writes a frozen setup,
 //! and every later arm of that setup reads the file. No tv-mcp, no chart, no
 //! risk that a rewound chart or a stale drawing hands back a different pattern
 //! than the one that was confirmed.
+//!
+//! ## Two doors, one arm
+//!
+//! `--spec-in` reads the bytes from a file; `--spec-url` fetches them over
+//! HTTP, pointed at local-chart's `GET /arm-setup`, which emits exactly this
+//! struct. Both funnel through [`FrozenSetup::parse`] and then the same
+//! `setup_from_frozen` in `pipeline`, so every restriction below holds
+//! identically for either — a spec-url arm is a spec-in arm that skipped the
+//! download step, not a second code path with its own rules.
 //!
 //! ## What is frozen, and what is deliberately re-read
 //!
@@ -143,13 +153,24 @@ impl FrozenSetup {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .wrap_err_with(|| format!("read frozen setup {}", path.display()))?;
-        let setup: Self = serde_json::from_str(&text)
-            .wrap_err_with(|| format!("parse frozen setup {}", path.display()))?;
+        Self::parse(&text, &path.display().to_string())
+    }
+
+    /// Parse a spec from its text, whatever produced it — a file on disk
+    /// (`load`) or an HTTP body (`--spec-url`).
+    ///
+    /// Both paths go through here so the version gate cannot be enforced on one
+    /// and forgotten on the other. `source` names where the bytes came from and
+    /// appears in every error: a path for a file, a URL for a fetch. It is
+    /// purely for the operator's benefit — nothing branches on it.
+    pub fn parse(text: &str, source: &str) -> Result<Self> {
+        let setup: Self =
+            serde_json::from_str(text).wrap_err_with(|| format!("parse frozen setup {source}"))?;
         if setup.version > SPEC_VERSION {
             return Err(eyre!(
                 "frozen setup {} is version {} but this tv-arm understands up to {}; \
                  upgrade tv-arm rather than arming from a spec it can't read",
-                path.display(),
+                source,
                 setup.version,
                 SPEC_VERSION,
             ));
@@ -338,5 +359,57 @@ mod tests {
             .expect_err("must fail")
             .to_string();
         assert!(err.contains("read frozen setup"), "err = {err}");
+    }
+
+    // ------------------------------------------------ parsing, source-agnostic
+
+    /// `parse` is the single seam both `load` (a file) and `--spec-url` (an
+    /// HTTP body) go through, so the version gate cannot be enforced on one
+    /// path and forgotten on the other.
+    #[test]
+    fn parse_accepts_a_current_version_spec() {
+        let json = serde_json::to_string(&setup()).expect("serialize");
+        let back = FrozenSetup::parse(&json, "test source").expect("parses");
+        assert_eq!(back, setup());
+    }
+
+    #[test]
+    fn parse_rejects_a_future_version_naming_the_source() {
+        let mut s = setup();
+        s.version = SPEC_VERSION + 1;
+        let json = serde_json::to_string(&s).expect("serialize");
+        let err = FrozenSetup::parse(&json, "http://127.0.0.1:8790/arm-setup")
+            .expect_err("must refuse a spec it cannot read")
+            .to_string();
+        assert!(
+            err.contains("http://127.0.0.1:8790/arm-setup"),
+            "err = {err}"
+        );
+        assert!(err.contains("upgrade tv-arm"), "err = {err}");
+    }
+
+    /// local-chart answers a chart that is missing a required role with a
+    /// structured 422 body. That is JSON, but it is not a `FrozenSetup` — the
+    /// parse error must name the source so the operator knows what to fix.
+    #[test]
+    fn parse_rejects_a_non_spec_json_body() {
+        let body = r#"{"error":"missing required roles","missing":["neckline"]}"#;
+        let err = FrozenSetup::parse(body, "http://127.0.0.1:8790/arm-setup")
+            .expect_err("must fail")
+            .to_string();
+        assert!(err.contains("parse frozen setup"), "err = {err}");
+        assert!(err.contains("127.0.0.1:8790"), "err = {err}");
+    }
+
+    /// `deny_unknown_fields` is what catches a stray or misspelled key coming
+    /// from another producer; prove it still fires through `parse`.
+    #[test]
+    fn parse_rejects_an_unknown_field() {
+        let mut v: serde_json::Value = serde_json::to_value(setup()).expect("to value");
+        v["surprise"] = serde_json::json!("extra");
+        let err = FrozenSetup::parse(&v.to_string(), "test source")
+            .expect_err("unknown fields must be refused")
+            .to_string();
+        assert!(err.contains("parse frozen setup"), "err = {err}");
     }
 }
