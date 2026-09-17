@@ -114,16 +114,56 @@ pub fn plan_delete(trade_id: &str) -> Result<String> {
     run_trade_control(&["plan", "delete", trade_id])
 }
 
-/// Replay the setup by re-arming it from the **live TradingView chart** and
-/// chaining into `replay-candles`, via `tv-arm-<env> --start <armed_at> replay`.
+/// Build the argv for a replay: `tv-arm [--spec-url <URL>] --start <armed_at>
+/// [skip flags] replay`.
 ///
-/// The journal has already loaded the plan's chart (symbol + timeframe, right
-/// broker), so tv-arm reads the instrument, timeframe, and **broker from the
-/// chart's own exchange** — no `--instrument`/`--source` to pass, and no
-/// instrument-resolution failure for OANDA-only assets (e.g. the XAU/XAG ratio
-/// that isn't listed on TradeNation). `--start <armed_at>` is the "live now"
-/// cursor: tv-arm walks the whole chart to find the pattern's roles
-/// (neckline / invalidation / expiry) relative to it.
+/// Split out from [`replay_via_tv_arm`] so the flags — and critically the
+/// PRESENCE of `--spec-url` — are testable without launching anything, the same
+/// way [`save_fixture_args`] already is. Order is load-bearing for the same
+/// reason: every one of these is a **tv-arm** flag, so all must precede the
+/// `replay` subcommand or clap rejects them.
+fn replay_args<'a>(
+    armed_at: &'a str,
+    skip_flags: &[&'a str],
+    spec_url: Option<&'a str>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(url) = spec_url {
+        args.push("--spec-url".to_string());
+        args.push(url.to_string());
+    }
+    args.push("--start".to_string());
+    args.push(armed_at.to_string());
+    args.extend(skip_flags.iter().map(|s| s.to_string()));
+    args.push("replay".to_string());
+    args
+}
+
+/// Replay the setup by re-arming it from the active chart backend and chaining
+/// into `replay-candles`, via `tv-arm-<env> [--spec-url …] --start <armed_at>
+/// replay`.
+///
+/// `spec_url` selects WHICH chart is re-armed, and is the whole point of the
+/// parameter (see [`crate::tv::ChartBackend::spec_url`] for the incident that
+/// motivated it):
+///
+/// * `None` (TradingView, the default) — tv-arm reads the **live chart** it has
+///   already loaded, taking the instrument, timeframe, and **broker from the
+///   chart's own exchange**. No `--instrument`/`--source` to pass, and no
+///   instrument-resolution failure for OANDA-only assets (e.g. the XAU/XAG
+///   ratio that isn't listed on TradeNation). Byte-identical to before this
+///   parameter existed.
+/// * `Some(url)` (`--new-tv`) — tv-arm fetches a frozen setup from
+///   local-chart's `GET /arm-setup` and never touches TradingView at all.
+///   Without this the two backends fall out of step: `l` navigates
+///   local-chart while the replay silently arms off a stale TradingView tab.
+///
+/// `--start <armed_at>` is the "live now" cursor in both cases: on the chart
+/// path tv-arm walks the chart to find the pattern's roles (neckline /
+/// invalidation / expiry) relative to it, and on the spec path it **overrides
+/// the frozen cursor** (`tv-arm/src/pipeline.rs`: `parse_start(args)?.or(
+/// frozen.start)`), so the journal's `armed_at` still means exactly what it
+/// meant before.
 ///
 /// `armed_at` is the plan's RFC3339 UTC arm time. The `replay` subcommand
 /// defaults to `--verbose --annotate true --source <chart-broker>`; we take
@@ -141,14 +181,15 @@ pub fn plan_delete(trade_id: &str) -> Result<String> {
 /// stall in `AwaitBreakAndClose` — a replay↔original divergence. The journal
 /// reads the stored plan's preps and forwards the matching skips. These are
 /// tv-arm flags, so they go **before** the `replay` subcommand.
-pub fn replay_via_tv_arm(armed_at: &str, skip_flags: &[&str]) -> Result<String> {
+pub fn replay_via_tv_arm(
+    armed_at: &str,
+    skip_flags: &[&str],
+    spec_url: Option<&str>,
+) -> Result<String> {
     let program = bin("tv-arm");
+    let args = replay_args(armed_at, skip_flags, spec_url);
     let mut cmd = Command::new(&program);
-    cmd.arg("--start").arg(armed_at);
-    for flag in skip_flags {
-        cmd.arg(flag);
-    }
-    cmd.arg("replay");
+    cmd.args(&args);
     // tv-arm logs its pipeline at INFO on **stdout** (mixed into the report we
     // capture); quiet it to warn so the report body dominates. Honour an
     // operator's own RUST_LOG if they set one. (ANSI is stripped regardless.)
@@ -160,7 +201,8 @@ pub fn replay_via_tv_arm(armed_at: &str, skip_flags: &[&str]) -> Result<String> 
     if !out.status.success() {
         let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
         return Err(eyre!(
-            "`{program} --start {armed_at} replay` failed ({}): {}\n{stdout}",
+            "`{program} {}` failed ({}): {}\n{stdout}",
+            args.join(" "),
             out.status,
             stderr.trim()
         ));
@@ -180,8 +222,15 @@ fn save_fixture_args<'a>(
     skip_flags: &[&'a str],
     fixture_name: &'a str,
     message: Option<&'a str>,
+    spec_url: Option<&'a str>,
 ) -> Vec<String> {
-    let mut args = vec!["--start".to_string(), armed_at.to_string()];
+    let mut args = Vec::new();
+    if let Some(url) = spec_url {
+        args.push("--spec-url".to_string());
+        args.push(url.to_string());
+    }
+    args.push("--start".to_string());
+    args.push(armed_at.to_string());
     args.extend(skip_flags.iter().map(|s| s.to_string()));
     args.push("--save-fixture".to_string());
     args.push("--fixture-name".to_string());
@@ -195,7 +244,7 @@ fn save_fixture_args<'a>(
 }
 
 /// Capture the six-cell fixture corpus for this setup by re-arming it from the
-/// **live TradingView chart**, via `tv-arm --save-fixture … replay`.
+/// active chart backend, via `tv-arm --save-fixture … replay`.
 ///
 /// `--save-fixture` is tv-arm's one-flag corpus capture: it freezes the setup to
 /// a `.spec.json`, arms all six grid cells (normal / skip-bcr / strategy-v2
@@ -203,6 +252,12 @@ fn save_fixture_args<'a>(
 /// `replay-fixtures/`. So this shares the replay's hard precondition — the
 /// plan's chart must already be loaded, with its drawings intact — because
 /// tv-arm reads whatever chart is up.
+///
+/// `spec_url` carries the replay's meaning verbatim (`None` = live TradingView,
+/// `Some` = local-chart's `/arm-setup`), and matters MORE here: a replay off
+/// the wrong chart is a wrong answer the operator reads once, but a fixture off
+/// the wrong chart is a wrong expectation **committed to the corpus**, where it
+/// then pins the wrong gates for every future run.
 ///
 /// `fixture_name` is passed explicitly (the journal uses the plan's `trade_id`)
 /// so a captured fixture traces back to the journal page it came from, rather
@@ -217,9 +272,10 @@ pub fn save_fixture_via_tv_arm(
     skip_flags: &[&str],
     fixture_name: &str,
     message: Option<&str>,
+    spec_url: Option<&str>,
 ) -> Result<String> {
     let program = bin("tv-arm");
-    let args = save_fixture_args(armed_at, skip_flags, fixture_name, message);
+    let args = save_fixture_args(armed_at, skip_flags, fixture_name, message, spec_url);
     let mut cmd = Command::new(&program);
     cmd.args(&args);
     if std::env::var_os("RUST_LOG").is_none() {
@@ -314,7 +370,7 @@ mod tests {
     /// the same ordering trap the skip flags have.
     #[test]
     fn save_fixture_flags_precede_the_replay_subcommand() {
-        let args = save_fixture_args("2026-07-22T20:58:53Z", &[], "trade-1", None);
+        let args = save_fixture_args("2026-07-22T20:58:53Z", &[], "trade-1", None, None);
         let replay_at = args.iter().position(|a| a == "replay");
         let save_at = args.iter().position(|a| a == "--save-fixture");
         let name_at = args.iter().position(|a| a == "--fixture-name");
@@ -335,7 +391,13 @@ mod tests {
     /// journal page rather than colliding on tv-arm's derived date-based name.
     #[test]
     fn save_fixture_names_the_fixture_after_the_trade() {
-        let args = save_fixture_args("2026-07-22T20:58:53Z", &[], "ihs-eur-usd-584d3770", None);
+        let args = save_fixture_args(
+            "2026-07-22T20:58:53Z",
+            &[],
+            "ihs-eur-usd-584d3770",
+            None,
+            None,
+        );
         let i = args
             .iter()
             .position(|a| a == "--fixture-name")
@@ -355,6 +417,7 @@ mod tests {
             &["--skip-break-and-close", "--skip-retest"],
             "trade-1",
             None,
+            None,
         );
         let replay_at = args.iter().position(|a| a == "replay");
         for flag in ["--skip-break-and-close", "--skip-retest"] {
@@ -368,14 +431,101 @@ mod tests {
     /// which clap would reject as a missing value).
     #[test]
     fn save_fixture_omits_message_when_none() {
-        let without = save_fixture_args("2026-07-22T20:58:53Z", &[], "t", None);
+        let without = save_fixture_args("2026-07-22T20:58:53Z", &[], "t", None, None);
         assert!(!without.iter().any(|a| a == "--message"), "{without:?}");
-        let with = save_fixture_args("2026-07-22T20:58:53Z", &[], "t", Some("why it exists"));
+        let with = save_fixture_args(
+            "2026-07-22T20:58:53Z",
+            &[],
+            "t",
+            Some("why it exists"),
+            None,
+        );
         let i = with
             .iter()
             .position(|a| a == "--message")
             .unwrap_or_default();
         assert_eq!(with.get(i + 1).map(String::as_str), Some("why it exists"));
+    }
+
+    /// Default (TradingView): NO `--spec-url`, so tv-arm reads the live chart.
+    /// Byte-identical to the argv this built before the parameter existed —
+    /// the whole point of `None` being the TradingView answer.
+    #[test]
+    fn replay_without_a_spec_url_is_the_original_argv() {
+        let args = replay_args("2026-07-22T20:58:53Z", &["--skip-retest"], None);
+        assert_eq!(
+            args,
+            vec!["--start", "2026-07-22T20:58:53Z", "--skip-retest", "replay"]
+        );
+    }
+
+    /// `--new-tv`: the replay must arm from local-chart's `/arm-setup`, not the
+    /// live TradingView chart. Without this the two chart seams diverge — `l`
+    /// navigates local-chart while the replay silently arms off whatever
+    /// TradingView is showing (the `ihs-eur-cad` incident: an invalidation line
+    /// at 1.61982 against a plan whose `too-low` was 1.60942).
+    #[test]
+    fn replay_passes_the_spec_url_before_the_replay_subcommand() {
+        let url = "http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1";
+        let args = replay_args("2026-07-22T20:58:53Z", &[], Some(url));
+        let at = args.iter().position(|a| a == "--spec-url");
+        assert!(at.is_some(), "--spec-url forwarded: {args:?}");
+        let at = at.unwrap_or_default();
+        assert_eq!(args.get(at + 1).map(String::as_str), Some(url));
+        // A tv-arm flag, so it must precede the subcommand or clap rejects it.
+        assert!(
+            Some(at) < args.iter().position(|a| a == "replay"),
+            "--spec-url before replay: {args:?}"
+        );
+        // `--start` still overrides the frozen cursor, so armed_at keeps meaning.
+        assert!(args.iter().any(|a| a == "--start"), "{args:?}");
+    }
+
+    /// The skip flags still reach a spec-url arm. `--spec-url` changes only
+    /// WHERE the geometry comes from; the prep set still has to reproduce the
+    /// original plan's or the replay diverges for the other reason.
+    #[test]
+    fn replay_keeps_the_skip_flags_alongside_a_spec_url() {
+        let args = replay_args(
+            "2026-07-22T20:58:53Z",
+            &["--skip-break-and-close", "--skip-retest"],
+            Some("http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1"),
+        );
+        let replay_at = args.iter().position(|a| a == "replay");
+        for flag in ["--skip-break-and-close", "--skip-retest"] {
+            let at = args.iter().position(|a| a == flag);
+            assert!(at.is_some(), "{flag} forwarded: {args:?}");
+            assert!(at < replay_at, "{flag} before replay: {args:?}");
+        }
+    }
+
+    /// The capture path has the SAME defect and the same fix — and higher
+    /// stakes, since a fixture armed off the wrong chart is committed to the
+    /// corpus as a wrong expectation.
+    #[test]
+    fn save_fixture_passes_the_spec_url_before_the_replay_subcommand() {
+        let url = "http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1";
+        let args = save_fixture_args("2026-07-22T20:58:53Z", &[], "trade-1", None, Some(url));
+        let at = args.iter().position(|a| a == "--spec-url");
+        assert!(at.is_some(), "--spec-url forwarded: {args:?}");
+        assert_eq!(
+            args.get(at.unwrap_or_default() + 1).map(String::as_str),
+            Some(url)
+        );
+        assert!(at < args.iter().position(|a| a == "replay"), "{args:?}");
+        // The capture's own flags are untouched by the addition.
+        assert!(args.iter().any(|a| a == "--save-fixture"), "{args:?}");
+        assert_eq!(args.last().map(String::as_str), Some("replay"), "{args:?}");
+    }
+
+    /// Absent spec-url must emit NO flag at all — not an empty one, which clap
+    /// would reject as a missing value (the same trap `--message` documents).
+    #[test]
+    fn no_spec_url_emits_no_flag_on_either_path() {
+        let replay = replay_args("2026-07-22T20:58:53Z", &[], None);
+        assert!(!replay.iter().any(|a| a == "--spec-url"), "{replay:?}");
+        let fixture = save_fixture_args("2026-07-22T20:58:53Z", &[], "t", None, None);
+        assert!(!fixture.iter().any(|a| a == "--spec-url"), "{fixture:?}");
     }
 
     #[test]
