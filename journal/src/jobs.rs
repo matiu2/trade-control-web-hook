@@ -143,6 +143,9 @@ pub fn spawn_save_fixture(
 /// exchange prefix; unused by the local-chart backend, which is single-broker).
 /// `backend` is `App::chart_backend` — TradingView by default, local-chart
 /// under `--new-tv` — cloned in at spawn time since the job runs off-thread.
+/// `goto` is the plan's `armed_at`, so a local-chart load also CENTRES on the
+/// arm bar rather than leaving the operator to hunt for the setup; the
+/// TradingView path ignores it (setting a date there was never built).
 ///
 /// Cheap when the chart is already right ON THE TRADINGVIEW PATH: `load_chart`
 /// reads the chart first and no-ops if it matches (see `tv`'s module doc). The
@@ -156,10 +159,16 @@ pub fn spawn_load_tv(
     broker: String,
     granularity: String,
     backend: crate::tv::ChartBackend,
+    goto: Option<String>,
 ) {
     spawn(tx, trade_id, JobKind::LoadTv, move || {
-        let already_there =
-            crate::tv::load_chart_backend(&backend, &instrument, &broker, &granularity)?;
+        let already_there = crate::tv::load_chart_backend(
+            &backend,
+            &instrument,
+            &broker,
+            &granularity,
+            goto.as_deref(),
+        )?;
         Ok(JobOutcome::LoadTv { already_there })
     });
 }
