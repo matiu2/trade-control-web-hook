@@ -46,6 +46,7 @@ mod precision;
 mod register;
 mod register_post;
 mod replay;
+mod replay_positions;
 mod resolve_error;
 mod roles;
 mod save_fixture;

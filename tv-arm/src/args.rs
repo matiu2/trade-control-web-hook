@@ -821,6 +821,30 @@ pub struct Args {
     /// `~/Downloads/tradingview-mcp-jackson` path.
     #[arg(long)]
     pub tv_mcp_root: Option<PathBuf>,
+
+    /// Draw a chained replay's positions on **local-chart** instead of
+    /// TradingView. Optional URL; bare `--new-tv` uses
+    /// `http://127.0.0.1:8790`.
+    ///
+    /// Today this is opt-in, for testing the new chart against the old one.
+    /// It is expected to become the default, after which the TradingView
+    /// annotation path is deleted outright rather than kept as a second
+    /// backend — which is why this is a plain `Option<String>` and not a
+    /// backend enum: the end state has one chart, so dispatch machinery would
+    /// only have to be unpicked again.
+    ///
+    /// The two paths are independent and compose: `--new-tv` draws on
+    /// local-chart via `replay-candles --positions`, while `--annotate` (on by
+    /// default for a chained replay) still draws on TradingView. Both can run
+    /// on a single replay, which is how the new path gets compared against the
+    /// old one.
+    ///
+    /// A top-level flag, not a `replay` subcommand one: `replay` is
+    /// `trailing_var_arg`, so everything after it is collected verbatim for
+    /// `replay-candles` and a flag placed there would be passed through rather
+    /// than read by tv-arm.
+    #[arg(long, value_name = "URL", num_args = 0..=1, default_missing_value = local_chart_client::DEFAULT_LOCAL_CHART_URL)]
+    pub new_tv: Option<String>,
 }
 
 /// The terminal action a `tv-arm` invocation performs on the plan it builds.

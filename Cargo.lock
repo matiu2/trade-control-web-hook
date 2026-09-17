@@ -2208,6 +2208,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
+name = "local-chart-client"
+version = "0.1.0"
+dependencies = [
+ "color-eyre",
+ "instrument-lookup",
+ "reqwest 0.12.23",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4820,6 +4832,7 @@ dependencies = [
  "color-eyre",
  "hex",
  "instrument-lookup",
+ "local-chart-client",
  "news-sentiment-tv",
  "oanda-client",
  "reqwest 0.12.23",

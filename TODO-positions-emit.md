@@ -33,20 +33,43 @@ emit site — a flag that appears to work and silently produces nothing is worse
 than one that says no. Pinned by
 `replay_args::tests::positions_is_refused_with_test_mode_rather_than_silently_ignored`.
 
-## Stage 2 — `tv-arm --new-tv [URL]` draws them (NEXT)
+## Stage 2 — `tv-arm --new-tv [URL]` draws them ✅
 
-- [ ] add the `local-chart-client` submodule as a dependency of `tv-arm`
-- [ ] `--new-tv [URL]` on `tv-arm`, defaulting to
+- [x] `local-chart-client` as a dependency of `tv-arm`
+- [x] `--new-tv [URL]` on `tv-arm`, bare form defaulting to
       `local_chart_client::DEFAULT_LOCAL_CHART_URL`
-- [ ] `tv-arm replay --new-tv` spawns `replay-candles --positions <tmp>`, reads
-      the file back, draws via `DrawingsClient`
-- [ ] the colour/label rules (`box_style`, `outcome_label`) move to `tv-arm` —
+- [x] `tv-arm replay --new-tv` injects `--positions <tmp>`, reads the file back
+      and draws via `DrawingsClient`
+- [x] the colour rules moved to `tv-arm/src/replay_positions.rs` —
       presentation belongs to the chart layer, not the simulator
-- [ ] **stable drawing ids** so a redraw is idempotent
-      (`replay-<instrument>-<tf>-<fill_epoch>`?). The TradingView path needs its
-      sidecar manifest only because TV's position tool has no writable id;
-      local-chart upserts by the caller's own id, so the manifest is not needed
-- [ ] clear a prior run's drawings by id prefix
+- [x] **stable drawing ids** (`replay-pos-<direction>-<fill_epoch>`), so a
+      redraw upserts in place and this path needs NO sidecar manifest
+- [x] prior drawings cleared by id prefix, never by wiping the chart
+- [x] 9 unit tests + 5 argv tests + 2 live tests against a real server
+
+### Deliberate choices
+
+- **A plain `Option<String>`, not a backend enum.** `journal` uses a
+  `ChartBackend` enum, which is right for permanent dispatch — but here TV is
+  being deprecated, so the flag goes opt-in → default → gone. An enum would be
+  added now and unpicked later.
+- **Fail-soft drawing.** The plan is armed and the replay has already printed
+  by the time drawing runs. A chart that cannot be drawn on is a missing
+  picture, not a wrong answer — so it warns and returns `Ok` rather than
+  turning a successful arm into a non-zero exit.
+- **`--new-tv` does not disturb `--annotate`.** Both run, so one replay paints
+  both charts while the new path is compared against the old. Pinned by
+  `new_tv_does_not_disturb_the_tradingview_annotate_default`.
+- **An unknown direction is refused, not guessed.** Defaulting to long would
+  draw a coherent bracket for the opposite trade.
+
+### Mutation-verified
+
+Removing the `ID_PREFIX` filter from `clear_prior` — so cleanup wipes every
+drawing on the chart — turns
+`positions_land_a_rerun_replaces_them_and_the_operator_is_untouched` red with
+"the operator's own drawing survived both runs". That is the guarantee that
+makes running a replay on a working chart safe.
 
 ## Stage 3 — the deprecation (weeks away)
 

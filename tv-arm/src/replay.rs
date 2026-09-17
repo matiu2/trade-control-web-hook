@@ -209,6 +209,10 @@ fn build_argv(
     source: CandleSource,
     passthrough: &[String],
     arm: ArmContext<'_>,
+    // Where `replay-candles` should write its positions file, when `--new-tv`
+    // asked for one. `None` leaves the flag off entirely, so an invocation
+    // without `--new-tv` is byte-identical to before this existed.
+    positions_out: Option<&Path>,
 ) -> Vec<String> {
     let mut argv = vec![
         bin.to_string(),
@@ -217,6 +221,14 @@ fn build_argv(
     ];
     if !sets_flag(passthrough, "--verbose") {
         argv.push("--verbose".to_string());
+    }
+    // Guarded like every other default: an operator's explicit `--positions`
+    // must win rather than collide with ours.
+    if let Some(path) = positions_out
+        && !sets_flag(passthrough, "--positions")
+    {
+        argv.push("--positions".to_string());
+        argv.push(path.display().to_string());
     }
     if !sets_flag(passthrough, "--annotate") {
         argv.push("--annotate".to_string());
@@ -261,6 +273,10 @@ pub fn run_replay(
     broker: Broker,
     passthrough: &[String],
     arm: ArmContext<'_>,
+    // `--new-tv [URL]`: also draw the replayed positions on local-chart. The
+    // TradingView `--annotate` path is untouched and still runs, so a single
+    // replay can paint both charts while the new one is compared to the old.
+    new_tv: Option<&str>,
 ) -> Result<()> {
     let bin = replay_binary();
     let plan = plan_path(plan_out, trade_id);
@@ -278,7 +294,20 @@ pub fn run_replay(
             broker.as_str()
         )
     })?;
-    let argv = build_argv(&bin, &plan, source, passthrough, arm);
+    // Under `--new-tv`, ask the replay to also write its positions somewhere we
+    // can read them back. A temp file keyed on the trade id: it is an
+    // intermediate between two processes in one run, not an artefact the
+    // operator keeps.
+    let positions_path =
+        new_tv.map(|_| std::env::temp_dir().join(format!("tv-arm-positions-{trade_id}.json")));
+    let argv = build_argv(
+        &bin,
+        &plan,
+        source,
+        passthrough,
+        arm,
+        positions_path.as_deref(),
+    );
 
     // Validate the full invocation against the shared clap definition before
     // shelling out, so a bad passthrough flag fails with replay-candles' own
@@ -311,6 +340,44 @@ pub fn run_replay(
                 .unwrap_or_else(|| "signal".to_string())
         ));
     }
+
+    // The replay succeeded; draw what it recorded. Only under `--new-tv` —
+    // without it, nothing above wrote a positions file and this is skipped
+    // entirely.
+    if let (Some(url), Some(path)) = (new_tv, positions_path.as_deref()) {
+        draw_positions_on_local_chart(url, path)?;
+    }
+    Ok(())
+}
+
+/// Read the positions `replay-candles` just wrote and draw them on
+/// local-chart.
+///
+/// **Fail-soft**, deliberately: the plan is already armed and the replay has
+/// already printed its report by the time this runs. A chart that could not be
+/// drawn on is a missing picture, not a wrong answer — so it warns and returns
+/// `Ok`, rather than turning a successful arm-and-replay into a non-zero exit.
+/// The one thing it must not do is fail *silently*, hence the warning naming
+/// the cause.
+fn draw_positions_on_local_chart(url: &str, path: &Path) -> Result<()> {
+    let doc = match crate::replay_positions::read(path) {
+        Ok(doc) => doc,
+        Err(err) => {
+            warn!(%err, path = %path.display(), "could not read the replay's positions");
+            return Ok(());
+        }
+    };
+    // Draw the not-taken brackets too: on local-chart they are cheap (muted
+    // grey) and the operator asked for a replay precisely to see what the plan
+    // would have done, including the entries it never got.
+    match crate::replay_positions::draw(&doc, url, true) {
+        Ok(drawn) => {
+            info!(drawn, url, "drew replay positions on local-chart");
+            println!("drew {drawn} position(s) on local-chart");
+        }
+        Err(err) => warn!(%err, url, "could not draw positions on local-chart"),
+    }
+    std::fs::remove_file(path).ok();
     Ok(())
 }
 
@@ -373,6 +440,7 @@ mod tests {
             CandleSource::TradeNation,
             &[],
             ArmContext::default(),
+            None,
         );
         assert_eq!(argv[0], "replay-candles");
         assert!(argv.contains(&"--verbose".to_string()));
@@ -400,6 +468,7 @@ mod tests {
             CandleSource::TradeNation,
             &["--annotate".to_string(), "false".to_string()],
             ArmContext::default(),
+            None,
         );
         assert_eq!(
             argv.iter().filter(|a| *a == "--annotate").count(),
@@ -421,6 +490,7 @@ mod tests {
             CandleSource::TradeNation,
             &["--annotate=false".to_string()],
             ArmContext::default(),
+            None,
         );
         let parsed = ReplayArgs::try_parse_from(&argv).expect("=-form must parse");
         assert!(!parsed.annotate);
@@ -436,7 +506,14 @@ mod tests {
             skip_calendar_bars: true,
             ..Default::default()
         };
-        let argv = build_argv("replay-candles", &plan, CandleSource::TradeNation, &[], arm);
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &[],
+            arm,
+            None,
+        );
         assert!(
             !argv.iter().any(|a| a.starts_with("--arm-")),
             "no --arm-* without --save: {argv:?}"
@@ -463,6 +540,7 @@ mod tests {
             CandleSource::TradeNation,
             &["--save".to_string(), "trade-124".to_string()],
             arm,
+            None,
         );
         assert!(
             !argv.iter().any(|a| a == "--arm-skip-reversals"),
@@ -491,6 +569,7 @@ mod tests {
             CandleSource::TradeNation,
             &["--save".to_string(), "trade-124".to_string()],
             arm,
+            None,
         );
         let parsed = ReplayArgs::try_parse_from(&argv).expect("arm tokens must parse with --save");
         assert_eq!(parsed.arm_entry_rule.as_deref(), Some("skip-bcr"));
@@ -528,6 +607,7 @@ mod tests {
             CandleSource::TradeNation,
             &["--save".to_string(), "t".to_string()],
             arm,
+            None,
         );
         let parsed = ReplayArgs::try_parse_from(&argv).unwrap();
         assert_eq!(parsed.arm_entry_rule.as_deref(), Some("strategy-v2"));
@@ -552,6 +632,7 @@ mod tests {
             CandleSource::TradeNation,
             &["--save".to_string(), "t".to_string()],
             arm,
+            None,
         );
         let parsed = ReplayArgs::try_parse_from(&argv).unwrap();
         assert_eq!(
@@ -618,6 +699,7 @@ mod tests {
                 "custom-thing".to_string(),
             ],
             arm,
+            None,
         );
         assert_eq!(
             argv.iter().filter(|a| *a == "--arm-entry-rule").count(),
@@ -639,6 +721,7 @@ mod tests {
             CandleSource::TradeNation,
             &["--source".to_string(), "oanda".to_string()],
             ArmContext::default(),
+            None,
         );
         assert_eq!(argv.iter().filter(|a| *a == "--source").count(), 1);
         let parsed = ReplayArgs::try_parse_from(&argv).expect("source override must parse");
@@ -654,6 +737,7 @@ mod tests {
             CandleSource::Oanda,
             &[],
             ArmContext::default(),
+            None,
         );
         assert!(
             ReplayArgs::try_parse_from(&argv).is_ok(),
@@ -670,6 +754,7 @@ mod tests {
             CandleSource::Oanda,
             &["--no-such-flag".to_string()],
             ArmContext::default(),
+            None,
         );
         assert!(
             ReplayArgs::try_parse_from(&argv).is_err(),
@@ -697,7 +782,14 @@ mod tests {
             instrument: Some("AUD/NZD"),
             ..Default::default()
         };
-        let argv = build_argv("replay-candles", &plan, CandleSource::TradeNation, &[], arm);
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &[],
+            arm,
+            None,
+        );
         let parsed = ReplayArgs::try_parse_from(&argv).expect("must parse");
         assert_eq!(
             parsed.instrument.as_deref(),
@@ -723,6 +815,7 @@ mod tests {
             CandleSource::TradeNation,
             &["--instrument".to_string(), "EUR/USD".to_string()],
             arm,
+            None,
         );
         assert_eq!(
             argv.iter().filter(|a| *a == "--instrument").count(),
@@ -748,6 +841,7 @@ mod tests {
             CandleSource::TradeNation,
             &["--instrument=EUR/USD".to_string()],
             arm,
+            None,
         );
         let parsed = ReplayArgs::try_parse_from(&argv).expect("=-form must parse");
         assert_eq!(parsed.instrument.as_deref(), Some("EUR/USD"));
@@ -764,7 +858,14 @@ mod tests {
             instrument: Some("AUD/NZD"),
             ..Default::default()
         };
-        let argv = build_argv("replay-candles", &plan, CandleSource::TradeNation, &[], arm);
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &[],
+            arm,
+            None,
+        );
         assert!(
             !argv.iter().any(|a| a.starts_with("--arm-")),
             "still no --arm-* without --save: {argv:?}"
@@ -788,6 +889,7 @@ mod tests {
             CandleSource::TradeNation,
             &[],
             ArmContext::default(),
+            None,
         );
         assert!(
             !argv.contains(&"--instrument".to_string()),
@@ -795,5 +897,129 @@ mod tests {
         );
         let parsed = ReplayArgs::try_parse_from(&argv).expect("must parse");
         assert_eq!(parsed.instrument, None);
+    }
+
+    /// `--new-tv` makes the chained replay WRITE a positions file — that file
+    /// is the only way the drawing step gets its data, so the flag reaching
+    /// `replay-candles` is the whole mechanism.
+    ///
+    /// Parsed, not pattern-matched on tokens. This module's own history is the
+    /// reason: a prior version asserted flag ordering by token position
+    /// without ever parsing the result, so the test passed while every real
+    /// invocation failed with "cannot be used multiple times".
+    #[test]
+    fn new_tv_asks_the_replay_for_a_positions_file() {
+        let plan = PathBuf::from("/tmp/p.json");
+        let out = PathBuf::from("/tmp/positions.json");
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &[],
+            ArmContext::default(),
+            Some(&out),
+        );
+        let parsed = ReplayArgs::try_parse_from(&argv).expect("must parse");
+        assert_eq!(
+            parsed.positions.as_deref(),
+            Some(out.as_path()),
+            "the replay must be told where to write its positions: {argv:?}"
+        );
+    }
+
+    /// Without `--new-tv` the flag must be ABSENT, not empty-valued: an
+    /// invocation that never asked for local-chart has to stay byte-identical
+    /// to before this feature existed.
+    #[test]
+    fn without_new_tv_no_positions_flag_is_injected() {
+        let plan = PathBuf::from("/tmp/p.json");
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &[],
+            ArmContext::default(),
+            None,
+        );
+        assert!(
+            !argv.contains(&"--positions".to_string()),
+            "no --new-tv ⇒ no --positions: {argv:?}"
+        );
+        let parsed = ReplayArgs::try_parse_from(&argv).expect("must parse");
+        assert_eq!(parsed.positions, None);
+    }
+
+    /// `--positions` takes a value, and a repeated flag is a hard clap error
+    /// rather than "last wins" — so an operator's explicit `--positions` must
+    /// SUPPRESS ours, exactly as `--instrument` and `--annotate` do. Without
+    /// this guard, `--new-tv` plus a hand-passed `--positions` would refuse to
+    /// run at all.
+    #[test]
+    fn an_operator_positions_flag_suppresses_the_injected_one() {
+        let plan = PathBuf::from("/tmp/p.json");
+        let ours = PathBuf::from("/tmp/ours.json");
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &["--positions".to_string(), "/tmp/theirs.json".to_string()],
+            ArmContext::default(),
+            Some(&ours),
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--positions").count(),
+            1,
+            "exactly one --positions survives: {argv:?}"
+        );
+        let parsed = ReplayArgs::try_parse_from(&argv).expect("must parse");
+        assert_eq!(
+            parsed.positions.as_deref(),
+            Some(Path::new("/tmp/theirs.json")),
+            "the operator's path wins"
+        );
+    }
+
+    /// The `=` form of the operator's flag has to suppress ours too —
+    /// `sets_flag` handles both spellings, and missing one would resurrect the
+    /// "cannot be used multiple times" failure for `--positions=<path>`.
+    #[test]
+    fn the_equals_form_of_an_operator_positions_flag_also_suppresses_ours() {
+        let plan = PathBuf::from("/tmp/p.json");
+        let ours = PathBuf::from("/tmp/ours.json");
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &["--positions=/tmp/theirs.json".to_string()],
+            ArmContext::default(),
+            Some(&ours),
+        );
+        let parsed = ReplayArgs::try_parse_from(&argv).expect("=-form must parse");
+        assert_eq!(
+            parsed.positions.as_deref(),
+            Some(Path::new("/tmp/theirs.json"))
+        );
+    }
+
+    /// `--new-tv` and `--annotate` are INDEPENDENT: the TradingView default
+    /// must survive, so one replay can paint both charts while the new path is
+    /// compared against the old. If enabling local-chart silently turned off
+    /// the TradingView drawing, the comparison this flag exists for would be
+    /// impossible.
+    #[test]
+    fn new_tv_does_not_disturb_the_tradingview_annotate_default() {
+        let plan = PathBuf::from("/tmp/p.json");
+        let out = PathBuf::from("/tmp/positions.json");
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &[],
+            ArmContext::default(),
+            Some(&out),
+        );
+        let parsed = ReplayArgs::try_parse_from(&argv).expect("must parse");
+        assert!(parsed.annotate, "--annotate true still injected");
+        assert!(parsed.positions.is_some(), "and --positions alongside it");
     }
 }

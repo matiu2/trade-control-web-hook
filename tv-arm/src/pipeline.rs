@@ -941,6 +941,7 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
             broker,
             args.replay_args(),
             arm,
+            args.new_tv.as_deref(),
         )
         .wrap_err("replay after arm (--replay)")?;
     }
