@@ -382,13 +382,33 @@ fn setup_from_frozen(
     // spec can be re-armed at several cursors (which is what the entry-rule grid
     // does). Absent, the frozen cursor stands.
     let start = parse_start(args)?.or(frozen.start);
-    let cursor_unix = start.ok_or_else(|| {
-        eyre!(
-            "frozen setup {} has no cursor and no --start was given; a frozen arm \
-             needs to know what instant counts as \"now\"",
-            source
-        )
-    })?;
+    // With no cursor from either source, only `register` can supply one: it
+    // means "arm this now", so wall-clock IS the instant that counts. This is
+    // the live-capture case — a spec exported off the chart carries no
+    // journaling cursor, and demanding `--start` would ask the operator to name
+    // an instant they can only call "now". `register` already prunes against
+    // wall-clock in `pick_prune_as_of`, so the cursor it was missing only ever
+    // reached the calendar scope.
+    //
+    // The replay subcommands keep failing: there the cursor is the yardstick
+    // the whole replay is scored against, and defaulting it to today would
+    // prune a historical setup's news as elapsed and quietly score it against
+    // the wrong calendar. Silence is the danger, so it stays an error.
+    //
+    // `start` is deliberately left `None` rather than back-filled — nothing was
+    // pinned, and a later re-arm should still be free to be given a real cursor.
+    let cursor_unix = match start {
+        Some(s) => s,
+        None if args.register_plan() => Utc::now().timestamp(),
+        None => {
+            return Err(eyre!(
+                "frozen setup {} has no cursor and no --start was given; a replay \
+                 of a frozen setup needs to know what instant counts as \"now\" \
+                 (the `register` subcommand arms at wall-clock now instead)",
+                source
+            ));
+        }
+    };
     let prune_as_of = pick_prune_as_of(args, Utc::now(), cursor_unix, start);
     let control = resolve_control_windows(
         args,
@@ -1866,12 +1886,16 @@ mod tests {
         );
     }
 
-    /// A spec with no cursor and no `--start` is refused rather than silently
-    /// defaulting to wall-clock "now".
+    /// A **replay** spec with no cursor and no `--start` is refused rather than
+    /// silently defaulting to wall-clock "now".
     ///
     /// Defaulting would be wrong in the one case that matters: re-arming a
     /// historical setup for the corpus. It'd prune every news window as elapsed
     /// and score the trade against today's calendar instead of its own.
+    ///
+    /// Scoped to the replay subcommands on purpose — `register` means "arm this
+    /// now", so there wall-clock *is* the answer. See
+    /// [`a_cursorless_spec_registers_at_wall_clock_now`].
     #[test]
     fn a_cursorless_spec_without_start_is_refused() {
         let spec = crate::frozen_setup::FrozenSetup::capture(
@@ -1895,6 +1919,104 @@ mod tests {
             read_setup_from_spec(&args, &path).is_ok(),
             "--start must supply the missing cursor"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `register` on a cursorless spec arms at wall-clock now instead of
+    /// failing.
+    ///
+    /// This is the bug an operator hits exporting a setup from the chart and
+    /// arming it straight away: a live capture has no journaling cursor, so the
+    /// spec carries no `start`, and the arm demanded one for an instant the
+    /// operator has no way to name other than "now".
+    ///
+    /// `register` is precisely the mode where `pick_prune_as_of` already
+    /// discards the cursor and prunes against wall-clock, so requiring it was
+    /// asking for a value that only reached the calendar scope.
+    #[test]
+    fn a_cursorless_spec_registers_at_wall_clock_now() {
+        let spec = crate::frozen_setup::FrozenSetup::capture(
+            PlanGeometry::default(),
+            "60".into(),
+            "OANDA:EUR_USD".into(),
+            None, // live capture — no journaling cursor
+            None,
+        );
+        let path = std::env::temp_dir().join(format!("spec-reg-now-{}.json", std::process::id()));
+        spec.write(&path).expect("write spec");
+
+        let before = Utc::now().timestamp();
+        let setup = read_setup_from_spec(&mw_args(&["register"]), &path)
+            .expect("register supplies its own cursor");
+        let after = Utc::now().timestamp();
+
+        // `start` stays None: nothing was pinned, so a later re-arm is still
+        // free to be given a real cursor. The defaulting lives in the cursor,
+        // not in the recorded provenance.
+        assert!(
+            setup.start.is_none(),
+            "defaulting must not forge a cursor into the setup"
+        );
+        // The substantive claim: the yardstick actually *is* now. Without this
+        // the test would pass on any default at all, including epoch 0.
+        let as_of = setup.prune_as_of.at.timestamp();
+        assert!(
+            (before..=after).contains(&as_of),
+            "prune as-of {as_of} must be wall-clock now ({before}..={after})"
+        );
+        assert_eq!(setup.prune_as_of.source, "wallclock");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An explicit `--start` still wins over the wall-clock default, so a
+    /// deliberate re-arm of a historical setup through `register` is still
+    /// pinned to the instant the operator named.
+    #[test]
+    fn register_still_honours_an_explicit_start() {
+        let spec = crate::frozen_setup::FrozenSetup::capture(
+            PlanGeometry::default(),
+            "60".into(),
+            "OANDA:EUR_USD".into(),
+            None,
+            None,
+        );
+        let path = std::env::temp_dir().join(format!("spec-reg-start-{}.json", std::process::id()));
+        spec.write(&path).expect("write spec");
+
+        let want = "2026-06-20T07:00:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("fixed instant");
+        let setup = read_setup_from_spec(
+            &mw_args(&["--start", "2026-06-20T17:00", "register"]),
+            &path,
+        )
+        .expect("explicit cursor");
+
+        assert_eq!(setup.start, Some(want.timestamp()));
+        assert_eq!(setup.prune_as_of.at, want, "--start outranks the default");
+        assert_eq!(setup.prune_as_of.source, "start-flag");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The frozen cursor still wins when the spec carries one, even under
+    /// `register` — a spec captured at a cursor re-arms at that cursor.
+    #[test]
+    fn register_prefers_a_frozen_cursor_over_the_wall_clock_default() {
+        let frozen_at = 1_750_000_000;
+        let spec = crate::frozen_setup::FrozenSetup::capture(
+            PlanGeometry::default(),
+            "60".into(),
+            "OANDA:EUR_USD".into(),
+            Some(frozen_at),
+            None,
+        );
+        let path = std::env::temp_dir().join(format!("spec-reg-froz-{}.json", std::process::id()));
+        spec.write(&path).expect("write spec");
+
+        let setup =
+            read_setup_from_spec(&mw_args(&["register"]), &path).expect("frozen cursor stands");
+
+        assert_eq!(setup.start, Some(frozen_at));
         std::fs::remove_file(&path).ok();
     }
 
