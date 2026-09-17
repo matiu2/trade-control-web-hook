@@ -35,16 +35,27 @@ use instrument_lookup::{Broker, by_broker_symbol};
 pub const DEFAULT_LOCAL_CHART_URL: &str = "http://127.0.0.1:8790";
 
 /// Open local-chart at `base_url`, navigated to `instrument`'s OANDA-style id
-/// and `granularity`. `base_url` has no trailing slash. Always returns
-/// `Ok(false)` — see the module doc for why there is no already-there
-/// short-circuit here. Only a failure to **launch the opener itself** is an
-/// `Err`; an unresolvable instrument or unrecognised granularity still opens
-/// the chart (falling back to the bare instrument / no `tf` param) rather
-/// than refusing outright — the fail-open direction from `tv.rs`, applied
-/// here too: doubt about the mapping is not a reason to leave the operator
-/// with no action at all.
-pub fn load_chart_local(base_url: &str, instrument: &str, granularity: &str) -> Result<bool> {
-    load_chart_local_with(base_url, instrument, granularity, crate::opener::open)
+/// and `granularity`, optionally centred on `goto`. `base_url` has no trailing
+/// slash. Always returns `Ok(false)` — see the module doc for why there is no
+/// already-there short-circuit here. Only a failure to **launch the opener
+/// itself** is an `Err`; an unresolvable instrument or unrecognised
+/// granularity still opens the chart (falling back to the bare instrument / no
+/// `tf` param) rather than refusing outright — the fail-open direction from
+/// `tv.rs`, applied here too: doubt about the mapping is not a reason to leave
+/// the operator with no action at all.
+///
+/// `goto` is an RFC3339 **UTC** instant — in practice a plan's `armed_at`, so
+/// the chart lands on the arm bar instead of the operator hunting for the
+/// setup. It is passed through verbatim; local-chart's own bootstrap parses
+/// it and ignores anything it cannot read as a UTC instant. Same fail-open
+/// direction: a bad timestamp costs the centring, never the navigation.
+pub fn load_chart_local(
+    base_url: &str,
+    instrument: &str,
+    granularity: &str,
+    goto: Option<&str>,
+) -> Result<bool> {
+    load_chart_local_with(base_url, instrument, granularity, goto, crate::opener::open)
 }
 
 /// [`load_chart_local`] with the actual browser-open call injected, so a test
@@ -57,10 +68,11 @@ fn load_chart_local_with(
     base_url: &str,
     instrument: &str,
     granularity: &str,
+    goto: Option<&str>,
     opener: impl FnOnce(&str) -> Result<&'static str>,
 ) -> Result<bool> {
     let symbol = local_chart_symbol(instrument);
-    let url = build_url(base_url, &symbol, granularity);
+    let url = build_url(base_url, &symbol, granularity, goto);
     opener(&url)?;
     Ok(false)
 }
@@ -107,15 +119,21 @@ fn local_chart_tf(granularity: &str) -> Option<String> {
     LOCAL_CHART_TIMEFRAMES.contains(&g.as_str()).then_some(g)
 }
 
-/// Build `<base_url>/?instrument=<symbol>[&tf=<granularity>]`. The `tf` param
-/// is DROPPED (not defaulted to something) when `granularity` doesn't map —
-/// dropping only its own param rather than refusing the whole navigation:
-/// the operator still lands on the right instrument, just not the right
-/// timeframe, and the gap is visible (the chart shows its own last/default
-/// timeframe, not a fabricated match).
-fn build_url(base_url: &str, symbol: &str, granularity: &str) -> String {
+/// Build `<base_url>/?instrument=<symbol>[&tf=<granularity>][&goto=<instant>]`.
+/// The `tf` param is DROPPED (not defaulted to something) when `granularity`
+/// doesn't map — dropping only its own param rather than refusing the whole
+/// navigation: the operator still lands on the right instrument, just not the
+/// right timeframe, and the gap is visible (the chart shows its own
+/// last/default timeframe, not a fabricated match).
+///
+/// `goto` is appended only when present, so every existing link is
+/// byte-identical to before it existed. It is percent-encoded: an RFC3339
+/// instant carries `:` throughout and may carry `+` in its offset, and a raw
+/// `+` in a query string decodes to a SPACE — which would silently corrupt
+/// the timestamp rather than fail.
+fn build_url(base_url: &str, symbol: &str, granularity: &str, goto: Option<&str>) -> String {
     let base = base_url.trim_end_matches('/');
-    match local_chart_tf(granularity) {
+    let mut url = match local_chart_tf(granularity) {
         Some(tf) => format!("{base}/?instrument={symbol}&tf={tf}"),
         None => {
             warn!(
@@ -124,7 +142,35 @@ fn build_url(base_url: &str, symbol: &str, granularity: &str) -> String {
             );
             format!("{base}/?instrument={symbol}")
         }
+    };
+    if let Some(instant) = goto {
+        url.push_str("&goto=");
+        url.push_str(&percent_encode_query(instant));
     }
+    url
+}
+
+/// Percent-encode a query-parameter VALUE, keeping only the unreserved set
+/// (`A-Z a-z 0-9 - . _ ~`) literal.
+///
+/// Hand-rolled rather than pulling a dependency in for one call: `journal` is
+/// a small TUI whose only other URL construction is the two params above,
+/// both of which are already restricted alphabets. The one input that is not
+/// is this timestamp.
+///
+/// Encoding every reserved character rather than an allow-list of "the ones a
+/// timestamp has" means a future caller passing something less tame cannot
+/// produce a malformed URL.
+fn percent_encode_query(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// Build the `--spec-url` for this plan: local-chart's `GET /arm-setup`, which
@@ -179,7 +225,8 @@ mod tests {
             build_url(
                 "http://127.0.0.1:8790",
                 &local_chart_symbol("EUR/CAD"),
-                "h1"
+                "h1",
+                None
             )
             .contains("instrument=EUR_CAD")
         );
@@ -218,7 +265,7 @@ mod tests {
         );
         // Contrast: the navigation URL still opens, minus the tf param.
         assert_eq!(
-            build_url("http://127.0.0.1:8790", "EUR_USD", "not-a-tf"),
+            build_url("http://127.0.0.1:8790", "EUR_USD", "not-a-tf", None),
             "http://127.0.0.1:8790/?instrument=EUR_USD"
         );
     }
@@ -259,7 +306,7 @@ mod tests {
 
     #[test]
     fn builds_url_with_both_params_when_granularity_is_known() {
-        let url = build_url("http://127.0.0.1:8790", "EURUSD", "h4");
+        let url = build_url("http://127.0.0.1:8790", "EURUSD", "h4", None);
         assert_eq!(url, "http://127.0.0.1:8790/?instrument=EURUSD&tf=h4");
     }
 
@@ -270,8 +317,8 @@ mod tests {
     /// varies the granularity, so BOTH halves are independently exercised.
     #[test]
     fn url_varies_with_instrument_granularity_fixed() {
-        let eur = build_url("http://127.0.0.1:8790", "EURUSD", "h4");
-        let gbp = build_url("http://127.0.0.1:8790", "GBPUSD", "h4");
+        let eur = build_url("http://127.0.0.1:8790", "EURUSD", "h4", None);
+        let gbp = build_url("http://127.0.0.1:8790", "GBPUSD", "h4", None);
         assert_ne!(
             eur, gbp,
             "different instrument must produce a different URL"
@@ -288,9 +335,9 @@ mod tests {
     /// `composite_key_tests_must_vary_each_half`.
     #[test]
     fn url_varies_with_granularity_instrument_fixed() {
-        let h4 = build_url("http://127.0.0.1:8790", "EURUSD", "h4");
-        let m15 = build_url("http://127.0.0.1:8790", "EURUSD", "m15");
-        let d = build_url("http://127.0.0.1:8790", "EURUSD", "d");
+        let h4 = build_url("http://127.0.0.1:8790", "EURUSD", "h4", None);
+        let m15 = build_url("http://127.0.0.1:8790", "EURUSD", "m15", None);
+        let d = build_url("http://127.0.0.1:8790", "EURUSD", "d", None);
         assert_ne!(
             h4, m15,
             "different granularity must produce a different URL"
@@ -302,7 +349,7 @@ mod tests {
 
     #[test]
     fn drops_only_the_tf_param_on_an_unknown_granularity() {
-        let url = build_url("http://127.0.0.1:8790", "EURUSD", "not-a-real-tf");
+        let url = build_url("http://127.0.0.1:8790", "EURUSD", "not-a-real-tf", None);
         assert_eq!(url, "http://127.0.0.1:8790/?instrument=EURUSD");
         assert!(
             !url.contains("tf="),
@@ -312,7 +359,7 @@ mod tests {
 
     #[test]
     fn strips_a_trailing_slash_from_the_base_url() {
-        let url = build_url("http://127.0.0.1:8790/", "EURUSD", "h4");
+        let url = build_url("http://127.0.0.1:8790/", "EURUSD", "h4", None);
         assert_eq!(url, "http://127.0.0.1:8790/?instrument=EURUSD&tf=h4");
     }
 
@@ -325,7 +372,7 @@ mod tests {
     #[test]
     fn a_successful_open_is_always_ok_false_never_already_there() {
         let opened = std::cell::RefCell::new(None);
-        let result = load_chart_local_with("http://127.0.0.1:8790", "EUR_USD", "h4", |url| {
+        let result = load_chart_local_with("http://127.0.0.1:8790", "EUR_USD", "h4", None, |url| {
             *opened.borrow_mut() = Some(url.to_string());
             Ok("xdg-open")
         });
@@ -361,7 +408,7 @@ mod tests {
             .expect("set LOCAL_CHART_E2E_URL to a throwaway local-chart instance, e.g. :8824");
 
         let mut captured_url = None;
-        let result = load_chart_local_with(&base_url, "AUD/CHF", "h4", |url| {
+        let result = load_chart_local_with(&base_url, "AUD/CHF", "h4", None, |url| {
             captured_url = Some(url.to_string());
             Ok("test-capture")
         });
@@ -408,9 +455,10 @@ mod tests {
     /// above) — only a total inability to launch anything is an error.
     #[test]
     fn only_a_launch_failure_is_an_error() {
-        let result = load_chart_local_with("http://127.0.0.1:8790", "EUR_USD", "h4", |_url| {
-            Err(color_eyre::eyre::eyre!("no opener on this system"))
-        });
+        let result =
+            load_chart_local_with("http://127.0.0.1:8790", "EUR_USD", "h4", None, |_url| {
+                Err(color_eyre::eyre::eyre!("no opener on this system"))
+            });
         assert!(result.is_err());
     }
 
@@ -419,6 +467,102 @@ mod tests {
     /// silently change what callers see.
     #[test]
     fn public_wrapper_has_the_documented_signature() {
-        let _: fn(&str, &str, &str) -> Result<bool> = load_chart_local;
+        let _: fn(&str, &str, &str, Option<&str>) -> Result<bool> = load_chart_local;
+    }
+
+    /// A plan's `armed_at` rides along as `&goto=`, so the chart CENTRES on
+    /// the arm bar rather than opening at its right edge.
+    #[test]
+    fn a_goto_instant_is_appended_to_the_url() {
+        let url = build_url(
+            "http://127.0.0.1:8790",
+            "EUR_CAD",
+            "h1",
+            Some("2026-09-02T11:19:54Z"),
+        );
+        assert!(url.contains("goto="), "goto forwarded: {url}");
+        // The instrument/tf half is untouched by the addition.
+        assert!(
+            url.contains("instrument=EUR_CAD") && url.contains("tf=h1"),
+            "{url}"
+        );
+    }
+
+    /// The colon is percent-encoded. A raw RFC3339 instant in a query string
+    /// is not merely ugly — `+` in an offset decodes to a SPACE, which
+    /// corrupts the timestamp silently instead of failing.
+    #[test]
+    fn a_goto_instant_is_percent_encoded() {
+        let url = build_url(
+            "http://127.0.0.1:8790",
+            "EUR_CAD",
+            "h1",
+            Some("2026-09-02T11:19:54Z"),
+        );
+        assert!(
+            url.ends_with("&goto=2026-09-02T11%3A19%3A54Z"),
+            "colons must be encoded: {url}"
+        );
+        assert!(!url.contains("11:19:54"), "a raw colon leaked: {url}");
+        // The nanosecond form a real plan carries round-trips too.
+        let nanos = build_url(
+            "http://127.0.0.1:8790",
+            "EUR_CAD",
+            "h1",
+            Some("2026-09-02T11:19:54.201124894Z"),
+        );
+        assert!(nanos.contains("54.201124894Z"), "{nanos}");
+    }
+
+    /// `+` is the one that MUST encode: raw, a query parser reads it as a
+    /// space, so an offset-bearing instant would arrive mangled rather than
+    /// rejected. Pinned separately because the common case (a `Z` instant)
+    /// contains no `+` at all and so cannot catch it.
+    #[test]
+    fn a_plus_in_an_offset_is_encoded_not_left_to_become_a_space() {
+        let url = build_url(
+            "http://127.0.0.1:8790",
+            "EUR_CAD",
+            "h1",
+            Some("2026-09-02T21:19:54+10:00"),
+        );
+        assert!(url.contains("%2B"), "the + must be encoded: {url}");
+        assert!(!url.contains('+'), "a raw + leaked: {url}");
+    }
+
+    /// No `armed_at` (or the TradingView backend) means no param at all —
+    /// every pre-existing link is byte-identical to before goto existed.
+    #[test]
+    fn no_goto_leaves_the_url_exactly_as_it_was() {
+        let url = build_url("http://127.0.0.1:8790", "EUR_CAD", "h1", None);
+        assert_eq!(url, "http://127.0.0.1:8790/?instrument=EUR_CAD&tf=h1");
+        assert!(!url.contains("goto"), "{url}");
+    }
+
+    /// The goto rides on the degraded URL too. An unrecognised granularity
+    /// drops only `tf` (see [`build_url`]), and the centring is independent of
+    /// that — dropping both would lose the operator's position for an
+    /// unrelated reason.
+    #[test]
+    fn a_goto_survives_an_unknown_granularity() {
+        let url = build_url(
+            "http://127.0.0.1:8790",
+            "EUR_CAD",
+            "not-a-tf",
+            Some("2026-09-02T11:19:54Z"),
+        );
+        assert!(!url.contains("tf="), "{url}");
+        assert!(url.contains("goto=2026-09-02T11%3A19%3A54Z"), "{url}");
+    }
+
+    /// The encoder keeps the unreserved set literal and encodes everything
+    /// else, so a future caller passing something less tame than a timestamp
+    /// still produces a well-formed URL.
+    #[test]
+    fn percent_encoding_keeps_unreserved_characters_literal() {
+        assert_eq!(percent_encode_query("aZ09-._~"), "aZ09-._~");
+        assert_eq!(percent_encode_query("a b&c=d"), "a%20b%26c%3Dd");
+        // Non-ASCII encodes per UTF-8 byte, not per char.
+        assert_eq!(percent_encode_query("é"), "%C3%A9");
     }
 }

@@ -657,6 +657,7 @@ impl App {
             return;
         };
         let broker = detail.broker.clone();
+        let goto = chart_goto_for(detail);
         if !self.mark_in_flight(trade_id, JobKind::LoadTv) {
             return;
         }
@@ -671,6 +672,7 @@ impl App {
             broker,
             granularity,
             self.chart_backend.clone(),
+            goto,
         );
     }
 
@@ -907,6 +909,26 @@ impl App {
     }
 }
 
+/// Which instant a chart load should centre on for this plan: its **arm bar**.
+///
+/// The plan's `armed_at` is the only timestamp `plan export` carries — there
+/// is no right-shoulder TIME anywhere in a signed plan (tv-arm's
+/// `right_shoulder` is a PRICE, and lives in pre-signing geometry). The arm
+/// bar sits just past the setup, so centring on it puts the pattern on screen.
+///
+/// A free function, and a NAMED one, rather than an inline `detail.armed_at
+/// .clone()` at the call site: the call site hands its result straight to a
+/// spawned thread, so there is nothing observable to assert there. Replacing
+/// the body with `None` — the exact "the feature silently does nothing"
+/// regression — survived the whole suite when this was inline. See the repo
+/// memory `mutation_test_the_entry_point_not_just_the_layer_below`.
+///
+/// `None` means "load without centring", which is what every plan predating
+/// `armed_at` gets, and is byte-identical to the pre-goto behaviour.
+fn chart_goto_for(detail: &PlanDetail) -> Option<String> {
+    detail.armed_at.clone()
+}
+
 /// Fetch + parse the plan list.
 fn fetch_plans() -> Result<Vec<PlanRow>> {
     let yaml = cli::plan_list_yaml()?;
@@ -1055,6 +1077,38 @@ mod tests {
             base_url: "http://127.0.0.1:8790".to_string(),
         };
         assert_eq!(app.spec_url_for_test("no-such-plan"), None);
+    }
+
+    /// ENTRY-POINT test: a chart load centres on the plan's ARM BAR.
+    ///
+    /// Built by parsing a real `plan export` fixture rather than a hand-made
+    /// struct, so the field this depends on is the one the real parser
+    /// produces — including its nanosecond precision, which must survive
+    /// verbatim into the URL for local-chart to parse.
+    ///
+    /// Asserted at `chart_goto_for` because the `start_load_tv` call site
+    /// hands its value straight to a spawned thread, leaving nothing
+    /// observable there: replacing this with `None` passed all 163 tests when
+    /// the expression was inline at that call site.
+    #[test]
+    fn a_chart_load_centres_on_the_plans_arm_bar() {
+        let detail = parse_plan_export(include_str!("../tests/fixtures/plan_export.json"))
+            .expect("the fixture parses");
+        assert_eq!(
+            chart_goto_for(&detail).as_deref(),
+            Some("2026-07-22T09:12:10.392142272Z"),
+            "the load must centre on armed_at, verbatim"
+        );
+    }
+
+    /// A plan with no `armed_at` loads WITHOUT centring rather than guessing
+    /// an instant — byte-identical to the pre-goto behaviour.
+    #[test]
+    fn a_plan_without_an_arm_time_loads_without_centring() {
+        let mut detail = parse_plan_export(include_str!("../tests/fixtures/plan_export.json"))
+            .expect("the fixture parses");
+        detail.armed_at = None;
+        assert_eq!(chart_goto_for(&detail), None);
     }
 
     fn row(trade_id: &str) -> PlanRow {
