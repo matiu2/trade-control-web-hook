@@ -939,9 +939,11 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
             effective_plan_out.as_deref(),
             &trade_id,
             broker,
-            args.replay_args(),
+            &args.replay_args(),
             arm,
-            args.new_tv.as_deref(),
+            // `new_tv_url()`, not the raw field: `--new-tv` typed after the
+            // `replay` subcommand lands in the passthrough, not the field.
+            args.new_tv_url(),
         )
         .wrap_err("replay after arm (--replay)")?;
     }

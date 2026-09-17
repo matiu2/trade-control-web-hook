@@ -1021,11 +1021,41 @@ impl Args {
     /// Passthrough tokens for `replay-candles`, collected after the `replay`
     /// subcommand. Empty (and irrelevant) for any other subcommand. Was the old
     /// trailing `--replay [REPLAY_ARGS…]`.
-    pub fn replay_args(&self) -> &[String] {
-        match &self.command {
-            Some(Command::Replay { args }) => args,
+    /// ⚠️ `--new-tv` is **stripped** here. `replay` is `trailing_var_arg`, so a
+    /// `--new-tv` typed after it (the natural place — `tv-arm … replay
+    /// --new-tv`) lands in this vector rather than binding to the field. It is
+    /// tv-arm's own flag and `replay-candles` has no such argument, so leaving
+    /// it in makes the shell-out fail:
+    ///
+    /// ```text
+    /// error: unexpected argument '--new-tv' found
+    /// ```
+    ///
+    /// Read it with [`Self::new_tv_url`], which understands both positions.
+    pub fn replay_args(&self) -> Vec<String> {
+        let raw = match &self.command {
+            Some(Command::Replay { args }) => args.as_slice(),
             _ => &[],
+        };
+        strip_new_tv(raw)
+    }
+
+    /// The local-chart URL to draw on, from `--new-tv` in **either** position:
+    /// before the subcommand (where clap binds it to the field) or after it
+    /// (where `trailing_var_arg` collects it into the passthrough).
+    ///
+    /// An operator types it wherever it reads naturally, and both must work —
+    /// a flag that silently does nothing depending on where it sits is worse
+    /// than one that is rejected.
+    pub fn new_tv_url(&self) -> Option<&str> {
+        if let Some(url) = self.new_tv.as_deref() {
+            return Some(url);
         }
+        let raw = match &self.command {
+            Some(Command::Replay { args }) => args.as_slice(),
+            _ => return None,
+        };
+        new_tv_in_passthrough(raw)
     }
 
     /// The `register --replace [<id>]` target when arming with a re-arm, else
@@ -1148,6 +1178,59 @@ pub enum PatternEntry {
     /// a stop when wrong-side — the mirror of [`PatternEntry::Stop`], decided
     /// in `hs_resolve`).
     Limit,
+}
+
+/// tv-arm's own flag, which `trailing_var_arg` may have collected into the
+/// `replay` passthrough. Named once so the strip and the read cannot drift.
+const NEW_TV_FLAG: &str = "--new-tv";
+
+/// Drop `--new-tv` (and its value, when it has one) from a `replay`
+/// passthrough.
+///
+/// The value form is the fiddly part: `--new-tv <url>` puts the URL in the
+/// NEXT token, so both must go — but `--new-tv --warmup-bars 400` has no value
+/// at all, and eating `--warmup-bars` would silently drop a real
+/// `replay-candles` flag. A following token counts as the URL only when it
+/// does not itself start with `-`.
+fn strip_new_tv(raw: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut skip_next = false;
+    for (i, token) in raw.iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if token == NEW_TV_FLAG {
+            // Only swallow the next token when it looks like a value, not a flag.
+            skip_next = raw.get(i + 1).is_some_and(|next| !next.starts_with('-'));
+            continue;
+        }
+        if token.starts_with(&format!("{NEW_TV_FLAG}=")) {
+            continue;
+        }
+        out.push(token.clone());
+    }
+    out
+}
+
+/// Find `--new-tv`'s URL in a `replay` passthrough, or the default when the
+/// flag is present but bare. `None` when the flag is absent entirely.
+fn new_tv_in_passthrough(raw: &[String]) -> Option<&str> {
+    let eq_prefix = format!("{NEW_TV_FLAG}=");
+    for (i, token) in raw.iter().enumerate() {
+        if let Some(url) = token.strip_prefix(&eq_prefix) {
+            return Some(url);
+        }
+        if token == NEW_TV_FLAG {
+            return match raw.get(i + 1) {
+                Some(next) if !next.starts_with('-') => Some(next.as_str()),
+                // Bare `--new-tv`, exactly as the clap `default_missing_value`
+                // would have produced had the token reached the field.
+                _ => Some(local_chart_client::DEFAULT_LOCAL_CHART_URL),
+            };
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1351,6 +1434,141 @@ mod tests {
             args.replay_args(),
             ["--annotate", "false", "--warmup-bars", "400"]
         );
+    }
+
+    /// REGRESSION: `tv-arm ... replay --new-tv` — the way an operator actually
+    /// types it — must enable local-chart drawing, not be forwarded to
+    /// `replay-candles`.
+    ///
+    /// `replay` is `trailing_var_arg`, so every token after it is collected
+    /// verbatim. `--new-tv` typed there was swallowed into the passthrough and
+    /// shelled out, and `replay-candles` has no such flag:
+    ///
+    ///   Error: --replay: invalid replay-candles arguments:
+    ///          error: unexpected argument '--new-tv' found
+    ///
+    /// The unit tests could not catch this: they called `build_argv` directly
+    /// with an explicit `Some(path)`, which skips the clap layer where the
+    /// token actually goes astray. Only parsing a whole command line shows it.
+    #[test]
+    fn new_tv_after_the_replay_subcommand_binds_to_tv_arm_not_the_passthrough() {
+        let args = Args::try_parse_from(["tv-arm", "replay", "--new-tv"])
+            .expect("`replay --new-tv` must parse");
+        assert!(args.replay());
+        assert_eq!(
+            args.new_tv_url(),
+            Some(local_chart_client::DEFAULT_LOCAL_CHART_URL),
+            "bare --new-tv after `replay` enables local-chart at the default URL"
+        );
+        assert!(
+            args.replay_args().is_empty(),
+            "and it must NOT be forwarded to replay-candles, which has no such \
+             flag: {:?}",
+            args.replay_args()
+        );
+    }
+
+    /// The URL form, likewise, and still not forwarded.
+    #[test]
+    fn new_tv_with_a_url_after_replay_also_binds_to_tv_arm() {
+        let args = Args::try_parse_from(["tv-arm", "replay", "--new-tv", "http://127.0.0.1:9999"])
+            .expect("`replay --new-tv <url>` must parse");
+        assert_eq!(args.new_tv_url(), Some("http://127.0.0.1:9999"));
+        assert!(args.replay_args().is_empty(), "not forwarded");
+    }
+
+    /// A real passthrough flag still reaches `replay-candles` when it shares
+    /// the line with `--new-tv` — the fix must not swallow everything.
+    #[test]
+    fn new_tv_coexists_with_real_passthrough_tokens() {
+        let args = Args::try_parse_from(["tv-arm", "replay", "--new-tv", "--warmup-bars", "400"])
+            .expect("must parse");
+        assert_eq!(
+            args.new_tv_url(),
+            Some(local_chart_client::DEFAULT_LOCAL_CHART_URL)
+        );
+        assert_eq!(
+            args.replay_args(),
+            ["--warmup-bars", "400"],
+            "genuine replay-candles flags still pass through"
+        );
+    }
+
+    /// `--new-tv <url>` in the passthrough must take the NEXT token as its
+    /// URL — and `--new-tv --warmup-bars 400` must NOT, or a real
+    /// `replay-candles` flag disappears silently and the replay runs with the
+    /// wrong warmup.
+    #[test]
+    fn stripping_new_tv_eats_its_url_but_never_a_following_flag() {
+        let with_url: Vec<String> = ["--new-tv", "http://x", "--warmup-bars", "400"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            strip_new_tv(&with_url),
+            ["--warmup-bars", "400"],
+            "the URL goes with the flag"
+        );
+
+        let bare: Vec<String> = ["--new-tv", "--warmup-bars", "400"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            strip_new_tv(&bare),
+            ["--warmup-bars", "400"],
+            "a following FLAG is not the URL — it must survive"
+        );
+
+        let eq_form: Vec<String> = ["--new-tv=http://x", "--warmup-bars", "400"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(strip_new_tv(&eq_form), ["--warmup-bars", "400"]);
+    }
+
+    /// Reading the URL back out of the passthrough, in all three spellings.
+    #[test]
+    fn reading_new_tv_from_the_passthrough_handles_every_spelling() {
+        let url: Vec<String> = ["--new-tv", "http://x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(new_tv_in_passthrough(&url), Some("http://x"));
+
+        let eq: Vec<String> = ["--new-tv=http://y"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(new_tv_in_passthrough(&eq), Some("http://y"));
+
+        let bare: Vec<String> = ["--new-tv", "--warmup-bars"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            new_tv_in_passthrough(&bare),
+            Some(local_chart_client::DEFAULT_LOCAL_CHART_URL),
+            "bare form falls back to the default, as clap would have"
+        );
+
+        let absent: Vec<String> = ["--warmup-bars", "400"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(new_tv_in_passthrough(&absent), None);
+    }
+
+    /// A passthrough with no `--new-tv` must come through completely
+    /// untouched — the overwhelmingly common case, and the one where a bug
+    /// here would quietly change every existing replay.
+    #[test]
+    fn a_passthrough_without_new_tv_is_unchanged() {
+        let raw: Vec<String> = ["--annotate", "false", "--warmup-bars", "400", "--save", "t"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(strip_new_tv(&raw), raw, "nothing to strip ⇒ identity");
     }
 
     #[test]
