@@ -57,6 +57,7 @@ mod replay_candles {
     pub mod lazy_zoom;
     pub mod lifecycle;
     pub mod outcome;
+    pub mod positions_out;
     pub mod replay;
     pub mod replay_broker;
     pub mod report;
@@ -86,7 +87,7 @@ use replay_candles::futures_caveats;
 use replay_candles::tv::TvDefaults;
 use replay_candles::{
     annotate, brisbane, candles, economics, golden_eq, granularity, instrument, lazy_zoom, outcome,
-    replay, report, sentiment, tv,
+    positions_out, replay, report, sentiment, tv,
 };
 use trade_control_cli::replay_args::{CandleSource, DetectorMarkConfig, ReplayArgs as Args};
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan, Trigger};
@@ -417,6 +418,31 @@ async fn run() -> Result<()> {
         tracing::info!(root = %mcp.root().display(), "annotating {scope} on the chart");
         let drawn = annotate::annotate(&mcp, &plan, &replay, args.annotate_unfilled)?;
         println!("annotated {drawn} position(s) on the chart");
+    }
+
+    // Emit the same resolved positions as data, for a chart layer to draw.
+    // Independent of `--annotate` above: this talks to no chart. Both may be
+    // on at once, so the TradingView path and its replacement can be compared
+    // on a single run. Resolved with `resolve_fire_any` — the *consumer*
+    // decides whether to draw the not-taken ones, since the file carries a
+    // `taken` flag per position.
+    if let Some(path) = &args.positions {
+        let fires: Vec<_> = replay
+            .fires
+            .iter()
+            .filter_map(|f| report::resolve_fire_any(&plan, f))
+            .collect();
+        let doc = positions_out::PositionsFile::new(
+            raw_instrument,
+            granularity::engine_label(gran.engine()),
+            &fires,
+        );
+        doc.write(path)?;
+        println!(
+            "wrote {} position(s) to {}",
+            doc.positions.len(),
+            path.display()
+        );
     }
 
     if let Some(name) = &args.save {
@@ -1791,6 +1817,7 @@ mod tests {
             candle_detector_golden: GoldenFilter::Golden,
             annotate: false,
             annotate_unfilled: false,
+            positions: None,
             arm_entry_rule: None,
             arm_skip_calendar_bars: false,
             arm_skip_golden: false,
@@ -1954,5 +1981,93 @@ mod tests {
             next <= pull_from - Duration::seconds(M15),
             "advances ≥ 1 bar"
         );
+    }
+
+    /// END-TO-END: replay a real fixture offline and emit its positions.
+    ///
+    /// The `positions_out` unit tests project a hand-built `FireResult`; this
+    /// drives the REAL pipeline — `fixture::load` → `run_frozen` →
+    /// `resolve_fire_any` → `PositionsFile` — over a fixture whose saved
+    /// outcome is 2 stop-outs and 1 reversal close.
+    ///
+    /// It exists because the unit tests were green while the flag did nothing:
+    /// the emit sits on the live replay path, and `--test-mode` goes through
+    /// `replay_one_fixture` instead, so `--test-mode --positions <path>` ran a
+    /// full replay, printed a report, exited 0 and wrote no file. That
+    /// combination is now refused at parse time
+    /// (`replay_args::tests::positions_is_refused_with_test_mode_...`), and
+    /// this test covers the projection the live path actually runs.
+    #[tokio::test]
+    async fn a_real_replay_emits_its_positions_as_absolute_price_levels() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("cli/ has a parent")
+            .join("replay-fixtures")
+            .join("au200-aud-h1-2026-08-10-skip-bcr-news-off-entry-market");
+        let inputs = fixture::load(&dir).expect("the fixture loads");
+
+        let mark_cfg = DetectorMarkConfig::new(
+            DirectionFilter::Both,
+            GoldenFilter::Both,
+            inputs.plan.direction,
+        );
+        let replay = run_frozen(
+            &inputs.plan,
+            &inputs.candles,
+            inputs.meta.granularity,
+            inputs.meta.start,
+            mark_cfg,
+            &inputs.sub_bars,
+            // Fully offline: no broker, no candle-cache.
+            None,
+            CronCadence::PER_BAR,
+        )
+        .await;
+
+        let fires: Vec<_> = replay
+            .fires
+            .iter()
+            .filter_map(|f| report::resolve_fire_any(&inputs.plan, f))
+            .collect();
+        let doc = positions_out::PositionsFile::new(
+            &inputs.meta.instrument,
+            granularity::engine_label(inputs.meta.granularity),
+            &fires,
+        );
+
+        assert!(
+            !doc.positions.is_empty(),
+            "this fixture books 3 trades — an empty emit means the projection \
+             silently dropped them"
+        );
+        assert!(
+            doc.positions.iter().any(|p| p.taken),
+            "at least one position was actually filled"
+        );
+
+        for p in &doc.positions {
+            // The levels are what a chart draws. A zero or NaN here would
+            // render as a degenerate bracket rather than failing loudly.
+            assert!(
+                p.entry_price.is_finite() && p.entry_price != 0.0,
+                "entry price is a real level: {p:?}"
+            );
+            assert!(p.stop_loss.is_finite(), "stop is a real level: {p:?}");
+            assert!(p.take_profit.is_finite(), "target is a real level: {p:?}");
+            assert!(
+                p.until >= p.fill_at,
+                "a bracket cannot end before it starts: {p:?}"
+            );
+            assert!(
+                p.direction == "long" || p.direction == "short",
+                "direction is one of the two words a chart understands: {p:?}"
+            );
+        }
+
+        // And it survives the trip a consumer actually makes.
+        let json = serde_json::to_string(&doc).expect("serialises");
+        let back: positions_out::PositionsFile =
+            serde_json::from_str(&json).expect("a consumer can parse it");
+        assert_eq!(back, doc);
     }
 }

@@ -269,6 +269,31 @@ pub struct ReplayArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, overrides_with = "annotate_unfilled")]
     pub annotate_unfilled: bool,
 
+    /// Write the replayed positions to `<path>` as JSON, for a chart layer to
+    /// draw. Independent of `--annotate`: this emits **what happened**, it
+    /// draws nothing and talks to no chart.
+    ///
+    /// That separation is the point. `--annotate` reaches out to a TradingView
+    /// bridge from inside the simulator, which is why the drawing code is
+    /// shaped around TradingView's position tool and why a second chart backend
+    /// would mean teaching this binary about a second chart. `--positions`
+    /// hands the same resolved positions to whoever wants them; `tv-arm` reads
+    /// the file and draws. Composes with `--annotate` (both may be on) so the
+    /// old and new paths can be compared on one run.
+    ///
+    /// The instrument and granularity are written **unresolved**, exactly as
+    /// this replay received them: resolving to a broker's convention is the
+    /// consumer's job, and baking one in here would make the file
+    /// backend-specific.
+    /// `conflicts_with = "test_mode"` because a fixture replay takes a
+    /// different code path entirely ([`replay_one_fixture`]), which never
+    /// reaches the emit. Refusing the combination is the honest outcome: the
+    /// alternative — accepting it and writing nothing — is a flag that appears
+    /// to work and silently produces no file, which is exactly the failure
+    /// mode the `--json`/`--test-mode` pairing above documents.
+    #[arg(long, value_name = "PATH", conflicts_with = "test_mode")]
+    pub positions: Option<PathBuf>,
+
     /// Number of **real** candles to pull *before* the window start as a silent
     /// warm-up prefix. These bars seed the detector (so ATR is warm and the
     /// candle patterns have context) and prime the FSM, but fire nothing — the
@@ -599,5 +624,66 @@ mod tests {
         );
         assert!(!cfg(DirectionFilter::With, GoldenFilter::Both).suppresses_not_golden_decline());
         assert!(!cfg(DirectionFilter::With, GoldenFilter::None).suppresses_not_golden_decline());
+    }
+
+    #[test]
+    fn positions_takes_a_path() {
+        let args = ReplayArgs::try_parse_from([
+            "replay-candles",
+            "--plan",
+            "p.json",
+            "--positions",
+            "/tmp/out.json",
+        ])
+        .expect("must parse");
+        assert_eq!(
+            args.positions.as_deref(),
+            Some(std::path::Path::new("/tmp/out.json"))
+        );
+    }
+
+    /// The emit lives on the LIVE replay path only; a fixture replay goes
+    /// through `replay_one_fixture`, which never reaches it. Accepting the
+    /// combination would give an operator a flag that runs cleanly and writes
+    /// no file — so it must be refused at parse time instead.
+    ///
+    /// Found by running it: `--test-mode --fixture <name> --positions <path>`
+    /// replayed three trades, printed a full report, exited 0, and produced
+    /// nothing at the path.
+    #[test]
+    fn positions_is_refused_with_test_mode_rather_than_silently_ignored() {
+        let err = ReplayArgs::try_parse_from([
+            "replay-candles",
+            "--test-mode",
+            "--fixture",
+            "some-fixture",
+            "--positions",
+            "/tmp/out.json",
+        ])
+        .expect_err("--positions cannot work under --test-mode, so it must not parse");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "refused as a conflict, not some incidental parse failure"
+        );
+    }
+
+    /// `--positions` and `--annotate` are independent: one emits data, the
+    /// other draws on TradingView. Both on at once is how the old and new
+    /// paths get compared on a single run, so this must keep parsing.
+    #[test]
+    fn positions_composes_with_annotate() {
+        let args = ReplayArgs::try_parse_from([
+            "replay-candles",
+            "--plan",
+            "p.json",
+            "--annotate",
+            "true",
+            "--positions",
+            "/tmp/out.json",
+        ])
+        .expect("both flags together must parse");
+        assert!(args.annotate);
+        assert!(args.positions.is_some());
     }
 }
