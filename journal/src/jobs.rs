@@ -81,42 +81,57 @@ pub fn spawn_timeline(tx: Sender<JobResult>, trade_id: String) {
     });
 }
 
-/// Spawn the replay job. Re-arms the setup from the **live TradingView chart**
-/// (already loaded by the TV-load job) via `tv-arm --start <armed_at> replay`,
-/// so the instrument + broker come from the chart — no plan file, no `--source`,
-/// and no resolution failure for OANDA-only assets. `armed_at` is the plan's
+/// Spawn the replay job. Re-arms the setup from the chart the load job just
+/// loaded, via `tv-arm [--spec-url …] --start <armed_at> replay`, so the
+/// instrument + broker come from that chart — no plan file, no `--source`, and
+/// no resolution failure for OANDA-only assets. `armed_at` is the plan's
 /// RFC3339 UTC arm time, used as the `--start` cursor. `skip_flags` are the
 /// tv-arm prep-skip flags that reproduce the ORIGINAL plan's prep set (so a
 /// skip-BCR plan doesn't re-arm with the full break-and-close-then-retest).
+///
+/// `spec_url` comes from [`crate::tv::ChartBackend::spec_url`] and must name
+/// the SAME backend the load job used — it is what keeps `l` and `r` pointed at
+/// one chart. See that method for the divergence it closes.
 pub fn spawn_replay(
     tx: Sender<JobResult>,
     trade_id: String,
     armed_at: String,
     skip_flags: Vec<String>,
+    spec_url: Option<String>,
 ) {
     spawn(tx, trade_id, JobKind::Replay, move || {
         let flags: Vec<&str> = skip_flags.iter().map(String::as_str).collect();
-        let report = cli::replay_via_tv_arm(&armed_at, &flags)?;
+        let report = cli::replay_via_tv_arm(&armed_at, &flags, spec_url.as_deref())?;
         Ok(JobOutcome::Replay(report))
     });
 }
 
 /// Spawn the fixture-capture job — `tv-arm --save-fixture … replay`, which
-/// re-arms from the **live chart** (already loaded) and writes the six-cell
-/// corpus. Same chart precondition and same `skip_flags` caveat as the replay:
-/// the capture must reproduce the ORIGINAL plan's prep set or it pins the wrong
-/// gates. `fixture_name` is the plan's `trade_id`, so a fixture traces back to
-/// its journal page.
+/// re-arms from the chart just loaded and writes the six-cell corpus. Same
+/// chart precondition and same `skip_flags` caveat as the replay: the capture
+/// must reproduce the ORIGINAL plan's prep set or it pins the wrong gates.
+/// `fixture_name` is the plan's `trade_id`, so a fixture traces back to its
+/// journal page.
+///
+/// `spec_url` is the replay's, with higher stakes: a capture off the wrong
+/// backend writes a wrong expectation into the committed corpus.
 pub fn spawn_save_fixture(
     tx: Sender<JobResult>,
     trade_id: String,
     armed_at: String,
     skip_flags: Vec<String>,
     fixture_name: String,
+    spec_url: Option<String>,
 ) {
     spawn(tx, trade_id, JobKind::SaveFixture, move || {
         let flags: Vec<&str> = skip_flags.iter().map(String::as_str).collect();
-        let report = cli::save_fixture_via_tv_arm(&armed_at, &flags, &fixture_name, None)?;
+        let report = cli::save_fixture_via_tv_arm(
+            &armed_at,
+            &flags,
+            &fixture_name,
+            None,
+            spec_url.as_deref(),
+        )?;
         Ok(JobOutcome::SaveFixture(report))
     });
 }

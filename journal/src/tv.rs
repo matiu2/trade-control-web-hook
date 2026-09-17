@@ -42,7 +42,7 @@
 
 mod local_chart;
 
-pub use local_chart::{DEFAULT_LOCAL_CHART_URL, load_chart_local};
+pub use local_chart::{DEFAULT_LOCAL_CHART_URL, arm_setup_url, load_chart_local};
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -79,6 +79,34 @@ impl ChartBackend {
         match self {
             ChartBackend::TradingView => "TradingView",
             ChartBackend::LocalChart { .. } => "local-chart",
+        }
+    }
+
+    /// The `--spec-url` tv-arm should arm from for a plan on this backend, or
+    /// `None` when it must read the live TradingView chart instead.
+    ///
+    /// **This is what makes `--new-tv` a whole backend rather than half of
+    /// one.** `l` (load-chart) and `r`/`s` (replay / fixture-capture) are two
+    /// independent chart seams: the load job dispatches on the backend, but
+    /// tv-arm defaults to reading TradingView via tv-mcp. So before this
+    /// existed, `--new-tv` loaded local-chart and then armed off whatever
+    /// symbol and leftover drawings the TradingView tab was sitting on —
+    /// silently, since a stale chart still arms *something*. The observed
+    /// failure was an `ihs-eur-cad` replay rejected for an invalidation line at
+    /// 1.61982 when the plan's own `too-low` was 1.60942: a different setup's
+    /// drawing entirely, caught only because `tv-arm/src/hs_resolve.rs`'s
+    /// fib-range guard happened to reject it. A stale line that fell *inside*
+    /// the range would have replayed a wrong setup with no error at all.
+    ///
+    /// `None` for TradingView is not a gap — tv-arm reading the live chart IS
+    /// that backend's arm path, and passing no `--spec-url` is exactly today's
+    /// behaviour, byte-identical.
+    pub fn spec_url(&self, instrument: &str, granularity: &str) -> Option<String> {
+        match self {
+            ChartBackend::TradingView => None,
+            ChartBackend::LocalChart { base_url } => {
+                arm_setup_url(base_url, instrument, granularity)
+            }
         }
     }
 }
@@ -453,5 +481,44 @@ mod tests {
     fn comparison_ignores_case() {
         let json = r#"{"success": true, "symbol": "oanda:gbpusd", "resolution": "1d"}"#;
         assert!(state_matches(&state(json), "OANDA:GBPUSD", "1D"));
+    }
+
+    /// TradingView arms from the LIVE chart, so it has no spec-url — passing
+    /// none is exactly the pre-existing behaviour, unchanged.
+    #[test]
+    fn tradingview_backend_has_no_spec_url() {
+        assert_eq!(
+            ChartBackend::TradingView.spec_url("EUR/CAD", "h1"),
+            None,
+            "TradingView must keep reading the live chart"
+        );
+    }
+
+    /// local-chart arms from its own `/arm-setup`. THE regression test for the
+    /// `--new-tv` split-brain: before this, `l` navigated local-chart and the
+    /// replay armed off a stale TradingView tab.
+    #[test]
+    fn local_chart_backend_arms_from_its_own_endpoint() {
+        let backend = ChartBackend::LocalChart {
+            base_url: "http://127.0.0.1:8790".to_string(),
+        };
+        assert_eq!(
+            backend.spec_url("EUR/CAD", "h1").as_deref(),
+            Some("http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1")
+        );
+    }
+
+    /// The two backends must not agree: a mutation collapsing the match arms
+    /// (either direction) is what this catches — the exact shape of the bug.
+    #[test]
+    fn the_two_backends_do_not_resolve_to_the_same_arm_source() {
+        let local = ChartBackend::LocalChart {
+            base_url: "http://127.0.0.1:8790".to_string(),
+        };
+        assert_ne!(
+            ChartBackend::TradingView.spec_url("EUR/CAD", "h1"),
+            local.spec_url("EUR/CAD", "h1"),
+            "the backends must arm from different chart sources"
+        );
     }
 }

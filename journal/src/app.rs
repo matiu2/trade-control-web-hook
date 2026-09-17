@@ -457,13 +457,38 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+        let spec_url = self.spec_url_for(trade_id);
         self.status = Status::info(format!("{trade_id}: running replay…"));
         jobs::spawn_replay(
             self.job_tx.clone(),
             trade_id.to_string(),
             armed_at,
             skip_flags,
+            spec_url,
         );
+    }
+
+    /// The `--spec-url` tv-arm should arm this plan from, for the active chart
+    /// backend — `None` on TradingView (read the live chart, today's behaviour).
+    ///
+    /// Both arm-from-chart jobs (replay and fixture-capture) go through here, so
+    /// the backend choice is made in ONE place and they cannot drift apart —
+    /// which is the bug this closes: `l` dispatched on the backend while `r` and
+    /// `s` always read TradingView. Derived from the same `PlanRow` fields
+    /// [`Self::start_load_tv`] navigates with, so the arm reads the very chart
+    /// that was loaded.
+    ///
+    /// An unknown plan id, or a granularity local-chart doesn't have, yields
+    /// `None` — which falls back to the live-chart arm rather than refusing. On
+    /// TradingView that is simply correct. On local-chart it is the same
+    /// fail-open direction `tv.rs` documents throughout, and it is *loud*:
+    /// `arm_setup_url` warns, and a fallback arm against a TradingView tab that
+    /// is on the wrong chart fails visibly at tv-arm's own geometry guards
+    /// rather than quietly arming something plausible.
+    fn spec_url_for(&self, trade_id: &str) -> Option<String> {
+        let row = self.plans.iter().find(|p| p.trade_id == trade_id)?;
+        self.chart_backend
+            .spec_url(&row.instrument, &row.granularity)
     }
 
     /// Add a job to the in-flight set. Returns `false` if it was already there
@@ -713,6 +738,7 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+        let spec_url = self.spec_url_for(trade_id);
         self.status = Status::info(format!("{trade_id}: saving fixtures…"));
         jobs::spawn_save_fixture(
             self.job_tx.clone(),
@@ -720,6 +746,7 @@ impl App {
             armed_at,
             skip_flags,
             trade_id.to_string(),
+            spec_url,
         );
     }
 
@@ -969,6 +996,17 @@ impl App {
     pub fn in_flight_test(&self, trade_id: &str, kind: JobKind) -> bool {
         self.in_flight.contains(&(trade_id.to_string(), kind))
     }
+
+    /// The `--spec-url` this app would hand the replay / capture jobs for a
+    /// plan (test helper). Exposes [`Self::spec_url_for`] — the ACTUAL caller —
+    /// rather than re-deriving it, so a test observes the same value the spawn
+    /// sites pass. `tv.rs`'s own tests cover `ChartBackend::spec_url` one layer
+    /// down; a mutation that made this method return `None` unconditionally
+    /// survived all of them, because nothing exercised the caller. See the repo
+    /// memory `mutation_test_the_entry_point_not_just_the_layer_below`.
+    pub fn spec_url_for_test(&self, trade_id: &str) -> Option<String> {
+        self.spec_url_for(trade_id)
+    }
 }
 
 #[cfg(test)]
@@ -976,6 +1014,48 @@ mod tests {
     use super::*;
     use crate::jobs::JobOutcome;
     use crate::plan::PlanRow;
+
+    /// ENTRY-POINT test for the `--new-tv` fix: the app must hand the replay /
+    /// capture jobs a local-chart `--spec-url`, built from THIS PLAN's own
+    /// instrument + granularity.
+    ///
+    /// This asserts at [`App::spec_url_for`] — the real caller — not at
+    /// `ChartBackend::spec_url` below it. That distinction is not academic: a
+    /// mutation making `spec_url_for` return `None` unconditionally (exactly
+    /// the bug being fixed) passed all 153 tests when only the lower layer was
+    /// covered.
+    #[test]
+    fn new_tv_hands_the_jobs_a_local_chart_spec_url_for_this_plan() {
+        let mut app = App::from_rows(vec![row("ihs-eur-cad-636ca2ba")]);
+        app.chart_backend = crate::tv::ChartBackend::LocalChart {
+            base_url: "http://127.0.0.1:8790".to_string(),
+        };
+        // `row()` is AUD_CAD/h1 — the URL must carry the plan's own values.
+        assert_eq!(
+            app.spec_url_for_test("ihs-eur-cad-636ca2ba").as_deref(),
+            Some("http://127.0.0.1:8790/arm-setup?instrument=AUD_CAD&tf=h1"),
+            "the replay must arm from local-chart, not a stale TradingView tab"
+        );
+    }
+
+    /// The default path is untouched: on TradingView there is no spec-url, so
+    /// tv-arm reads the live chart exactly as it did before the fix.
+    #[test]
+    fn tradingview_hands_the_jobs_no_spec_url() {
+        let app = App::from_rows(vec![row("ihs-eur-cad-636ca2ba")]);
+        assert_eq!(app.spec_url_for_test("ihs-eur-cad-636ca2ba"), None);
+    }
+
+    /// An unknown plan id yields `None` rather than panicking or fabricating a
+    /// URL — the fail-open direction, falling back to the live-chart arm.
+    #[test]
+    fn an_unknown_plan_has_no_spec_url() {
+        let mut app = App::from_rows(vec![row("ihs-eur-cad-636ca2ba")]);
+        app.chart_backend = crate::tv::ChartBackend::LocalChart {
+            base_url: "http://127.0.0.1:8790".to_string(),
+        };
+        assert_eq!(app.spec_url_for_test("no-such-plan"), None);
+    }
 
     fn row(trade_id: &str) -> PlanRow {
         PlanRow {
