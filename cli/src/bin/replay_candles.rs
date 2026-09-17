@@ -83,7 +83,6 @@ use replay_candles::batch;
 use replay_candles::cadence::CronCadence;
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::futures_caveats;
-use replay_candles::tv::TvDefaults;
 use replay_candles::{
     annotate, brisbane, candles, economics, golden_eq, granularity, instrument, lazy_zoom, outcome,
     replay, report, sentiment, tv,
@@ -185,6 +184,19 @@ async fn run() -> Result<()> {
     let gran_label = granularity::engine_label(plan.granularity);
 
     let window = resolve_window(&args, &plan)?;
+
+    // An instrument from a flag or the chart must name the SAME asset the plan
+    // was built for. Without this, a chart left on another pair (which outranks
+    // the plan in the precedence above) silently replays the plan against a
+    // different asset's candles — see `instrument_mismatch_error`.
+    if let Some(raw) = window.instrument.as_deref()
+        && let Some(m) = instrument_mismatch(raw, &plan.instrument)
+    {
+        let source = window
+            .instrument_source
+            .unwrap_or(WindowSource::Flag("--instrument"));
+        return Err(instrument_mismatch_error(&m, source));
+    }
 
     let raw_instrument = window.instrument.as_deref().unwrap_or(&plan.instrument);
     let symbol = instrument::resolve_for(raw_instrument, args.source)?;
@@ -1274,10 +1286,98 @@ impl WindowSource {
 /// [`resolve_granularity`]).
 struct ResolvedWindow {
     instrument: Option<String>,
+    /// Where `instrument` came from — `None` when nothing supplied one and the
+    /// caller falls back to the plan (which can never mismatch itself).
+    /// Carried so a mismatch can name the culprit: "the chart did this" and
+    /// "you passed this" need different fixes.
+    instrument_source: Option<WindowSource>,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     start_source: WindowSource,
     end_source: WindowSource,
+}
+
+/// Two instruments that disagree: the one the replay would pull candles for,
+/// and the one the plan was built against. Both `*_id`s are catalog-canonical
+/// ([`instrument_lookup::resolve`]); the `*_raw`s are what the operator and the
+/// plan actually spelled, for the message.
+#[derive(Debug, PartialEq, Eq)]
+struct InstrumentMismatch {
+    flag_raw: String,
+    flag_id: String,
+    plan_raw: String,
+    plan_id: String,
+}
+
+/// Does the resolved instrument name a **different asset** than the plan?
+///
+/// Comparison is on the catalog's canonical id, never the raw string: the same
+/// asset is legitimately spelled `AUD/NZD` (TradeNation), `AUD_NZD` (OANDA) and
+/// `AUDNZD` (canonical), and a string compare would reject all three against
+/// each other. `instrument-lookup` is already the single source of truth for
+/// this collapse, so we reuse it rather than normalising by hand.
+///
+/// A symbol that **doesn't resolve** falls back to a normalised literal compare
+/// rather than being waved through. Silently accepting an unresolvable symbol
+/// would leave the hole open for precisely the instruments least likely to be
+/// in the catalog; equal-but-unknown is still "not a mismatch", so the
+/// downstream `instrument::resolve_for` raises the catalog's own actionable
+/// "add an `[[asset]]` entry" error instead of this one.
+fn instrument_mismatch(resolved: &str, plan: &str) -> Option<InstrumentMismatch> {
+    /// Canonical id if the catalog knows it; otherwise a normalised literal.
+    fn canonical(s: &str) -> String {
+        instrument_lookup::resolve(s)
+            .ok()
+            .flatten()
+            .map(|a| a.id.to_uppercase())
+            .unwrap_or_else(|| {
+                s.to_uppercase()
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .collect()
+            })
+    }
+    let (flag_id, plan_id) = (canonical(resolved), canonical(plan));
+    (flag_id != plan_id).then(|| InstrumentMismatch {
+        flag_raw: resolved.to_string(),
+        flag_id,
+        plan_raw: plan.to_string(),
+        plan_id,
+    })
+}
+
+/// Explain a wrong-feed replay, in terms of where the wrong instrument came
+/// from and what it does to the report.
+///
+/// This failure is dangerous precisely because it is *quiet*: the banner keeps
+/// printing the plan's instrument, so the header looks right while the candles
+/// are another asset's. The levels then sit nowhere near the prices, every
+/// entry is declined `entry ... is outside the SL..TP range`, and the run
+/// reports a plausible `fires: 1, Net R +0.00` — which reads as a geometry or
+/// fib-direction bug and sends the reader to the wrong place entirely.
+/// Measured twice: Coffee replayed as EUR/GBP (2026-07-27) and an AUD/NZD plan
+/// replayed at ~0.99 instead of ~1.22 (2026-09-17), the latter hiding a real
+/// −1.00R stop-out behind a reported 0R.
+fn instrument_mismatch_error(
+    m: &InstrumentMismatch,
+    source: WindowSource,
+) -> color_eyre::eyre::Report {
+    outcome::bad_input(eyre!(
+        "instrument mismatch: this replay would pull {flag_raw} ({flag_id}) candles, but the \
+         plan was built for {plan_raw} ({plan_id}).\n\n\
+         The instrument came from {src}.\n\n\
+         Replaying a plan against another asset's candles does not fail loudly — the plan's \
+         levels simply sit nowhere near the prices, so every entry is declined \
+         `entry ... is outside the SL..TP range` and the run reports a plausible 0R. The \
+         banner still names the plan's instrument, so the report looks right.\n\n\
+         Fix: drop --instrument to use the plan's own instrument, or pass \
+         --instrument {plan_raw} if you really mean to replay against {plan_raw}.",
+        flag_raw = m.flag_raw,
+        flag_id = m.flag_id,
+        plan_raw = m.plan_raw,
+        plan_id = m.plan_id,
+        src = source.describe(),
+    ))
 }
 
 /// Explain an inverted (or empty) replay window in terms of the two knobs that
@@ -1401,10 +1501,14 @@ fn resolve_window(args: &Args, plan: &TradePlan) -> Result<ResolvedWindow> {
         None
     };
 
-    let instrument = args
-        .instrument
-        .clone()
-        .or_else(|| tv.as_ref().map(|d: &TvDefaults| d.instrument.clone()));
+    let (instrument, instrument_source) = match (&args.instrument, &tv) {
+        (Some(flag), _) => (Some(flag.clone()), Some(WindowSource::Flag("--instrument"))),
+        (None, Some(d)) => (
+            Some(d.instrument.clone()),
+            Some(WindowSource::Chart("instrument")),
+        ),
+        (None, None) => (None, None),
+    };
 
     let (start, start_source) = match (&args.start, plan_start, &tv) {
         (Some(s), _, _) => (
@@ -1434,6 +1538,7 @@ fn resolve_window(args: &Args, plan: &TradePlan) -> Result<ResolvedWindow> {
 
     Ok(ResolvedWindow {
         instrument,
+        instrument_source,
         start,
         end,
         start_source,
@@ -1555,6 +1660,7 @@ mod tests {
     ) -> ResolvedWindow {
         ResolvedWindow {
             instrument: None,
+            instrument_source: None,
             start,
             end,
             start_source,
@@ -1954,5 +2060,88 @@ mod tests {
             next <= pull_from - Duration::seconds(M15),
             "advances ≥ 1 bar"
         );
+    }
+
+    /// The guard for a wrong-feed replay. Both sides are compared as
+    /// **catalog-resolved canonical ids**, never raw strings, so the spelling
+    /// differences that are merely cosmetic (`AUD/NZD` vs `AUD_NZD` vs
+    /// `audnzd`) agree instead of firing a false alarm.
+    #[test]
+    fn spelling_variants_of_the_same_asset_agree() {
+        for raw in ["AUD/NZD", "AUD_NZD", "audnzd", "AUDNZD"] {
+            assert_eq!(
+                instrument_mismatch(raw, "AUD/NZD"),
+                None,
+                "{raw} is the same asset as the plan's AUD/NZD"
+            );
+        }
+    }
+
+    /// The real incident, inverted into a guard: a plan for one pair replayed
+    /// against another's candles. AUD/CHF plan levels sit at ~0.58 while
+    /// EUR/CAD candles arrive at ~1.61, so every entry is declined as
+    /// "outside the SL..TP range" and the run reports a plausible 0R.
+    #[test]
+    fn a_different_asset_is_a_mismatch() {
+        let m = instrument_mismatch("EUR/CAD", "AUD/CHF").expect("must be caught");
+        assert_eq!(m.flag_id, "EURCAD");
+        assert_eq!(m.plan_id, "AUDCHF");
+    }
+
+    /// The message has to carry the operator to the fix. The failure it
+    /// prevents is silent and *looks like a geometry bug* (entries declined
+    /// against their own SL..TP range), so naming the real cause is the whole
+    /// value — same reasoning as `inverted_window_names_both_sources_and_the_fix`.
+    #[test]
+    fn mismatch_error_names_both_sides_and_the_fix() {
+        let msg = instrument_mismatch_error(
+            &instrument_mismatch("EUR/CAD", "AUD/CHF").expect("mismatch"),
+            WindowSource::Flag("--instrument"),
+        )
+        .to_string();
+        // Both instruments, as the operator spelled/stored them.
+        assert!(msg.contains("EUR/CAD"), "got: {msg}");
+        assert!(msg.contains("AUD/CHF"), "got: {msg}");
+        // Where the wrong value came from, and how to override it.
+        assert!(msg.contains("--instrument"), "got: {msg}");
+        // WHY it matters — the symptom that misdirects the reader.
+        assert!(msg.contains("SL..TP"), "got: {msg}");
+        // The fix.
+        assert!(msg.contains("drop --instrument"), "got: {msg}");
+    }
+
+    /// The chart is the dangerous source: it outranks the plan and nobody
+    /// passed a flag, so the error must say *the chart* did this and that the
+    /// fix is to pass `--instrument` (or move the chart).
+    #[test]
+    fn a_chart_sourced_mismatch_blames_the_chart() {
+        let msg = instrument_mismatch_error(
+            &instrument_mismatch("EUR/CAD", "AUD/CHF").expect("mismatch"),
+            WindowSource::Chart("instrument"),
+        )
+        .to_string();
+        assert!(msg.contains("TradingView chart"), "got: {msg}");
+        assert!(msg.contains("--instrument"), "got: {msg}");
+    }
+
+    /// An instrument outside the catalog must not be *silently* treated as
+    /// agreeing — that would reopen the hole for exactly the symbols least
+    /// likely to resolve. It reports a mismatch, and the downstream
+    /// `resolve_for` then produces the catalog's own "add an [[asset]] entry"
+    /// error.
+    #[test]
+    fn an_unresolvable_instrument_is_not_silently_accepted() {
+        assert!(
+            instrument_mismatch("NOT_A_REAL_PAIR", "AUD/CHF").is_some(),
+            "an unresolvable symbol must not pass the guard"
+        );
+    }
+
+    /// The identity case for an unresolvable symbol: if both sides are the
+    /// same unknown string, there is no *mismatch* — the catalog error is the
+    /// right one to surface, not a confusing "these differ" when they don't.
+    #[test]
+    fn an_unresolvable_instrument_matching_the_plan_is_not_a_mismatch() {
+        assert_eq!(instrument_mismatch("WEIRDSYM", "WEIRDSYM"), None);
     }
 }
