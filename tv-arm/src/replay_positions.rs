@@ -27,7 +27,9 @@
 //! them (or vice versa) would be a no-op at best.
 
 use color_eyre::eyre::{Result, WrapErr};
-use local_chart_client::{ChartKey, DrawingsClient, Position, Side, local_chart_symbol};
+use local_chart_client::{
+    ChartKey, DrawingsClient, Position, Side, local_chart_symbol, local_chart_tf,
+};
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -161,7 +163,21 @@ pub fn read(path: &std::path::Path) -> Result<PositionsFile> {
 /// Returns how many positions were drawn.
 pub fn draw(doc: &PositionsFile, base_url: &str, include_unfilled: bool) -> Result<usize> {
     let client = DrawingsClient::new(base_url)?;
-    let key = ChartKey::new(local_chart_symbol(&doc.instrument), &doc.granularity);
+    let key = ChartKey::new(
+        local_chart_symbol(&doc.instrument),
+        // CANONICALISE, never forward the replay's own label. The engine says
+        // `1d` where local-chart files under `d`, and local-chart's parser
+        // ACCEPTS `1d` — so the write succeeds with a 201 and lands in
+        // `AUD_NZD-1d.json`, a file no chart reads. Observed live: three
+        // positions "drawn", server happy, chart empty.
+        local_chart_tf(&doc.granularity).ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "local-chart has no timeframe matching '{}' — refusing to write \
+                 to a chart that cannot be displayed",
+                doc.granularity
+            )
+        })?,
+    );
 
     let cleared = clear_prior(&client, &key)?;
     if cleared > 0 {
@@ -309,6 +325,23 @@ mod tests {
         assert_eq!(pos.time2, 1_700_086_400);
     }
 
+    /// A granularity local-chart has no timeframe for must be REFUSED, not
+    /// written to a phantom file. `draw` cannot be unit-tested without a
+    /// server, so this asserts the decision it makes.
+    #[test]
+    fn a_granularity_local_chart_lacks_has_no_chart_to_draw_on() {
+        assert_eq!(
+            local_chart_tf("1m"),
+            None,
+            "no one-minute chart exists, so there is nothing to write to"
+        );
+        assert_eq!(
+            local_chart_tf("1d").as_deref(),
+            Some("d"),
+            "but a daily replay resolves to the daily chart"
+        );
+    }
+
     /// A version this code does not understand must be refused. The fields it
     /// would misread are price levels, and a bracket at the wrong levels looks
     /// entirely plausible on a chart.
@@ -421,7 +454,12 @@ mod tests {
         };
         let doc = live_doc();
         let client = DrawingsClient::new(&url).expect("client builds");
-        let key = ChartKey::new(local_chart_symbol(&doc.instrument), &doc.granularity);
+        // Built the same way `draw` builds it — canonicalised — so these
+        // tests read the file production actually writes.
+        let key = ChartKey::new(
+            local_chart_symbol(&doc.instrument),
+            local_chart_tf(&doc.granularity).expect("h1 is a local-chart timeframe"),
+        );
 
         // A drawing the OPERATOR made, which must survive everything below.
         let theirs = serde_json::json!({
@@ -462,6 +500,47 @@ mod tests {
         client.remove(&key, "operator-neckline").ok();
     }
 
+    /// REGRESSION, live: a replay's own granularity label must canonicalise
+    /// before it becomes part of a filename.
+    ///
+    /// `replay-candles` emits `1d`; local-chart files under `d`. Its parser
+    /// ACCEPTS `1d`, so every write returned 201 and the run reported "drew 3
+    /// position(s) on local-chart" — while the drawings sat in
+    /// `AUD_NZD-1d.json` and the chart read `AUD_NZD-d.json`. Nothing errored
+    /// anywhere.
+    ///
+    /// This draws with `1d` and then reads back through `d`: the two must be
+    /// the same chart.
+    #[test]
+    #[ignore = "needs a running local-chart; see the notes above"]
+    fn a_replays_1d_granularity_lands_on_the_chart_the_operator_reads_as_d() {
+        let Some(url) = test_url() else {
+            eprintln!("skipped: set LOCAL_CHART_TEST_URL");
+            return;
+        };
+        let mut doc = live_doc();
+        // Exactly what replay-candles writes for a daily replay.
+        doc.granularity = "1d".to_string();
+
+        let drawn = draw(&doc, &url, true).expect("draws");
+        assert_eq!(drawn, 2);
+
+        let client = DrawingsClient::new(&url).expect("client builds");
+        // Read back through the token the CHART uses, not the one we wrote.
+        let chart_key = ChartKey::new("EUR_USD", "d");
+        let ids = our_ids(&client, &chart_key);
+        assert_eq!(
+            ids.len(),
+            2,
+            "a `1d` replay must land on the `d` chart the operator is looking \
+             at, not in a parallel `EUR_USD-1d.json`: {ids:?}"
+        );
+
+        for id in ids {
+            client.remove(&chart_key, &id).ok();
+        }
+    }
+
     /// Without `include_unfilled`, only the taken positions are drawn — the
     /// not-taken ones are an *intended* bracket the operator may not want.
     #[test]
@@ -473,7 +552,12 @@ mod tests {
         };
         let doc = live_doc();
         let client = DrawingsClient::new(&url).expect("client builds");
-        let key = ChartKey::new(local_chart_symbol(&doc.instrument), &doc.granularity);
+        // Built the same way `draw` builds it — canonicalised — so these
+        // tests read the file production actually writes.
+        let key = ChartKey::new(
+            local_chart_symbol(&doc.instrument),
+            local_chart_tf(&doc.granularity).expect("h1 is a local-chart timeframe"),
+        );
 
         let drawn = draw(&doc, &url, false).expect("draws");
         assert_eq!(drawn, 1, "only the taken position");
