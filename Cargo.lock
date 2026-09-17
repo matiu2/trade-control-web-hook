@@ -368,8 +368,8 @@ dependencies = [
 
 [[package]]
 name = "broker-tradenation"
-version = "0.11.0"
-source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.17.0#b03d76181fbb035096724b87bfb12ac03913270e"
+version = "0.12.0"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.18.1#fcdfb633d3bc59e6ce8db0f0a75b2cfeda5f57f8"
 dependencies = [
  "color-eyre",
  "reqwest 0.12.23",
@@ -4760,8 +4760,8 @@ dependencies = [
 
 [[package]]
 name = "tradenation-api"
-version = "0.5.0"
-source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.17.0#b03d76181fbb035096724b87bfb12ac03913270e"
+version = "0.6.0"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.18.1#fcdfb633d3bc59e6ce8db0f0a75b2cfeda5f57f8"
 dependencies = [
  "aes-gcm",
  "candle-model",
@@ -4786,7 +4786,7 @@ dependencies = [
 [[package]]
 name = "tradenation-instrument-cache"
 version = "0.2.0"
-source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.17.0#b03d76181fbb035096724b87bfb12ac03913270e"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.18.1#fcdfb633d3bc59e6ce8db0f0a75b2cfeda5f57f8"
 dependencies = [
  "chrono",
  "dirs",
