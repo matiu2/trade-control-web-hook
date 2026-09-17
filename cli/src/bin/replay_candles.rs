@@ -64,6 +64,7 @@ mod replay_candles {
     pub mod sentiment;
     pub mod spread_breakdown;
     pub mod tv;
+    pub mod upkeep;
     pub mod verbose;
 }
 
@@ -86,7 +87,7 @@ use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::futures_caveats;
 use replay_candles::{
     annotate, brisbane, candles, economics, golden_eq, granularity, instrument, lazy_zoom, outcome,
-    positions_out, replay, report, sentiment, tv,
+    positions_out, replay, report, sentiment, tv, upkeep,
 };
 use trade_control_cli::replay_args::{CandleSource, DetectorMarkConfig, ReplayArgs as Args};
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan, Trigger};
@@ -294,6 +295,19 @@ async fn run() -> Result<()> {
         );
     }
 
+    if args.save.is_some() && args.upkeep.is_some() {
+        return Err(outcome::bad_input(eyre!(
+            "refusing to --save a fixture under --upkeep: the upkeep series is not frozen \
+             into the fixture, so its expected.json could never reproduce offline. Save \
+             without --upkeep."
+        )));
+    }
+
+    // The upkeep ticks (job 2): a finer bid/ask series over the live window
+    // whose bar closes are the live 900 s order-control instants. `None` (the
+    // default) is byte-identical. Pulled once and shared by both zoom passes.
+    let upkeep = pull_upkeep(&args, &symbol, gran.engine(), start, pull_end).await?;
+
     // Sub-bar zoom (PR-2), run LAZILY in two passes (see `lazy_zoom`).
     //
     // PASS 1: replay with a recorder that serves no finer candles — behaviourally
@@ -313,7 +327,7 @@ async fn run() -> Result<()> {
     // its `SubBars` box (the box is `Rc<RecordingSubBars>`, which impls the trait
     // by delegation) — that's how the recorded windows come back out.
     let recorder = std::rc::Rc::new(lazy_zoom::RecordingSubBars::new());
-    let pass1 = replay::run(
+    let pass1 = replay::run_with_upkeep(
         &plan,
         &candles,
         gran.engine(),
@@ -322,6 +336,7 @@ async fn run() -> Result<()> {
         mark_cfg,
         Some(Box::new(std::rc::Rc::clone(&recorder))),
         cadence,
+        upkeep.as_ref(),
     )
     .await;
 
@@ -372,7 +387,7 @@ async fn run() -> Result<()> {
                     zoom_bars = fetched.clone();
                     // PASS 2: same plan, same coarse candles, same seed — the only
                     // difference is that ambiguous bars can now be resolved.
-                    replay::run(
+                    replay::run_with_upkeep(
                         &plan,
                         &candles,
                         gran.engine(),
@@ -381,6 +396,7 @@ async fn run() -> Result<()> {
                         mark_cfg,
                         Some(Box::new(lazy_zoom::WindowSubBars::new(fetched))),
                         cadence,
+                        upkeep.as_ref(),
                     )
                     .await
                 }
@@ -988,6 +1004,57 @@ impl FixtureRun {
     }
 }
 
+/// Pull the finer bid/ask series `--upkeep <GRAN>` names over the live window
+/// `[start, end]` and wrap it as [`upkeep::UpkeepTicks`]. `None` when the flag
+/// is off. A granularity the plan can't be finer than (equal or coarser) is a
+/// usage error: the ticks must land INSIDE a plan bar to add anything.
+async fn pull_upkeep(
+    args: &Args,
+    symbol: &str,
+    plan_gran: Granularity,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Option<upkeep::UpkeepTicks>> {
+    let Some(raw) = &args.upkeep else {
+        return Ok(None);
+    };
+    let tick_gran = granularity::parse(raw)?;
+    let tick_secs = tick_gran.engine().seconds();
+    if tick_secs >= plan_gran.seconds() {
+        return Err(outcome::bad_input(eyre!(
+            "--upkeep {raw} is not finer than the plan's {} bars; the upkeep ticks must \
+             fall inside a plan bar",
+            granularity::engine_label(plan_gran)
+        )));
+    }
+    let bars = candles::pull(
+        args.source,
+        symbol,
+        tick_gran,
+        start,
+        end,
+        args.cache_dir.clone(),
+    )
+    .await
+    .wrap_err_with(|| format!("pull the --upkeep {raw} bid/ask series"))?;
+    let ticks = upkeep::UpkeepTicks::new(bars, Duration::seconds(tick_secs));
+    if ticks.is_empty() {
+        // Fail-soft, loudly: no series means no ticks, i.e. the plain per-bar
+        // walk — the operator asked for a signal they are not getting.
+        tracing::warn!(
+            granularity = raw,
+            "upkeep: the finer pull returned no bars — running WITHOUT upkeep ticks"
+        );
+    }
+    tracing::info!(
+        granularity = raw,
+        bars = ticks.len(),
+        "upkeep: walking the live order-control cadence between plan bar closes \
+         — a signal, not a baseline (--save / --rebless refuse under it)"
+    );
+    Ok(Some(ticks))
+}
+
 async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> FixtureRun {
     tracing::info!(dir = %dir.display(), "replaying fixture offline");
     let inputs = match fixture::load(dir) {
@@ -1106,6 +1173,19 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
                      meta.json, so this would silently become the corpus's new expected \
                      output. Re-bless at the default cadence (1).",
                     cadence.bars()
+                )),
+            );
+        }
+        // `--upkeep` is the same shape again: the frozen replay never walks it
+        // (the fixture holds no upkeep series), so a golden blessed under it
+        // would be a baseline nothing can reproduce.
+        if let Some(g) = &args.upkeep {
+            return FixtureRun::failed(
+                name,
+                outcome::bad_input(eyre!(
+                    "refusing to re-bless {name} under --upkeep {g}: the upkeep series is \
+                     not frozen into the fixture, so the offline replay could never \
+                     reproduce this golden. Re-bless without --upkeep."
                 )),
             );
         }
@@ -1937,6 +2017,7 @@ mod tests {
             bless_baseline: None,
             baseline_label: None,
             cron_gap: 1,
+            upkeep: None,
             json: false,
             warmup_bars: 200,
             cache_dir: None,

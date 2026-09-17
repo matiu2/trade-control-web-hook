@@ -152,6 +152,48 @@ pub struct Replay {
 /// `live_start` seeds silently (see [`run`]).
 const SEED_BARS: usize = 10;
 
+/// One live upkeep tick per finer bar closing strictly inside `(open, close)`:
+/// pin the store clock and the broker's quote to that bar, then run the SAME
+/// two shared order-control passes the per-bar tick runs, in the same order
+/// (promotion first, then re-price — `order_control_tick::run_both`). The
+/// sample is cleared and the clock re-pinned to `close` afterwards, so the
+/// per-bar pass that follows is byte-identical to a run with no upkeep series.
+async fn walk_upkeep_ticks(
+    upkeep: &super::upkeep::UpkeepTicks,
+    replay_broker: &ReplayBroker,
+    store: &MemStateStore,
+    lifecycle_cfg: &super::lifecycle::ReplayConfigProvider,
+    open: DateTime<Utc>,
+    close: DateTime<Utc>,
+) {
+    let src = super::lifecycle::ReplayVerifiedSource::new(replay_broker);
+    for (at, sample) in upkeep.samples_in(open, close) {
+        store.set_clock(at);
+        replay_broker.set_upkeep_sample(Some(*sample));
+        trade_control_core::order_control::promote_due_orders(
+            replay_broker,
+            store,
+            lifecycle_cfg,
+            &src,
+            trade_control_core::order_control::PromoteScope::Every,
+            at,
+        )
+        .await;
+        trade_control_core::order_control::reprice_due_orders(
+            replay_broker,
+            store,
+            lifecycle_cfg,
+            &src,
+            &mut trade_control_core::order_control::BrokerQuotes(replay_broker),
+            None,
+            at,
+        )
+        .await;
+    }
+    replay_broker.set_upkeep_sample(None);
+    store.set_clock(close);
+}
+
 /// Replay `plan` over `candles` (ascending, the pulled window). `granularity`
 /// is the bar size, used to derive each tick's `now` (a closed bar's close time
 /// = its open time + one bar). `expires_at` stamps the state TTL on each tick
@@ -179,6 +221,40 @@ pub async fn run(
     live_start: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     mark_cfg: DetectorMarkConfig,
+    sub_bars: Option<Box<dyn super::fill_sim::SubBars>>,
+    cadence: CronCadence,
+) -> Replay {
+    run_with_upkeep(
+        plan,
+        candles,
+        granularity,
+        live_start,
+        expires_at,
+        mark_cfg,
+        sub_bars,
+        cadence,
+        None,
+    )
+    .await
+}
+
+/// [`run`], plus the **upkeep ticks** (job 2): a finer bid/ask series whose
+/// bar closes are the instants the live scheduler's 900 s order-control loop
+/// would have run between two plan bar closes. For each such instant the loop
+/// points the broker's quote at that finer bar and calls the SAME shared
+/// `promote_due_orders` + `reprice_due_orders` the per-bar pass calls, so a
+/// widened stop is given back (and a Stored order promoted) when the spread
+/// calms *inside* the bar — which on a daily plan is the only place it ever
+/// calms, the close being the rollover print. `None` is byte-identical to
+/// [`run`]. See `super::upkeep`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_upkeep(
+    plan: &TradePlan,
+    candles: &[EngineCandle],
+    granularity: Granularity,
+    live_start: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    mark_cfg: DetectorMarkConfig,
     // The sub-bar zoom provider (PR-2): when an exit bar straddles both SL and
     // TP, the sim replays that bar's FINER candles (e.g. M1 under an H1 plan) to
     // see which level hit first, instead of pessimistically assuming the stop.
@@ -197,6 +273,7 @@ pub async fn run(
     // byte-identical. A wider cadence reproduces a live cron catch-up: N bars in
     // one call under one `now`. See `super::cadence`.
     cadence: CronCadence,
+    upkeep: Option<&super::upkeep::UpkeepTicks>,
 ) -> Replay {
     // The engine evaluates on MID (matching the live worker, whose
     // `Broker::get_candles` is contractually mid); the bid/ask books are only
@@ -365,6 +442,27 @@ pub async fn run(
                 .await
         {
             tracing::error!(error = %e, "seed spread-blackout window failed");
+        }
+
+        // The upkeep ticks that fell inside this span (job 2). Runs BEFORE the
+        // held state advances to this bar, so the broker still holds what it held
+        // at the previous close: a resting order this bar goes on to fill is
+        // re-priced FIRST (the tick's re-place fires off the previous bar and is
+        // fillable from this one), exactly as live re-prices at 15-minute
+        // cadence ahead of an intra-day fill. Per-bar granularity can't say
+        // whether the fill came before or after a given tick; taking the ticks
+        // first is the side that matches a D1 plan's real shape (rollover widen
+        // at the close, shrink an hour later, fill sometime in the day).
+        if let Some(upkeep) = upkeep {
+            walk_upkeep_ticks(
+                upkeep,
+                &replay_broker,
+                &store,
+                &lifecycle_cfg,
+                prev_close,
+                now,
+            )
+            .await;
         }
 
         tracing::debug!(
@@ -4052,6 +4150,90 @@ mod tests {
             (calm - 1.1020).abs() < 1e-6,
             "a calm book must leave the DRAWN 1.1020 stop untouched, got {calm}",
         );
+    }
+
+    /// An M15 upkeep series over the resting window (13:00Z–17:00Z), every bar
+    /// at `spread`. These are the live scheduler's 900 s ticks the per-bar walk
+    /// never sees.
+    fn m15_upkeep(spread: f64) -> super::super::upkeep::UpkeepTicks {
+        let bars = (13 * 4..17 * 4)
+            .map(|q| {
+                let (h, m) = (q / 4, (q % 4) * 15);
+                ohlc_at_spread(
+                    &format!("2026-07-08T{h:02}:{m:02}:00Z"),
+                    1.1007,
+                    1.1008,
+                    1.1006,
+                    1.1007,
+                    spread,
+                )
+            })
+            .collect();
+        super::super::upkeep::UpkeepTicks::new(bars, Duration::minutes(15))
+    }
+
+    async fn reprice_run_with_upkeep(
+        after_spread: f64,
+        upkeep: &super::super::upkeep::UpkeepTicks,
+    ) -> Replay {
+        super::run_with_upkeep(
+            &eurusd_reprice_plan(),
+            &reprice_candles(after_spread),
+            Granularity::H1,
+            "2026-07-08T12:00:00Z".parse().unwrap(),
+            "2026-07-10T00:00:00Z".parse().unwrap(),
+            no_marks(),
+            None,
+            CronCadence::PER_BAR,
+            Some(upkeep),
+        )
+        .await
+    }
+
+    /// JOB 2, the entry-point mutation test: the plan bars CLOSE wide (the D1
+    /// rollover shape — every close is the widest print), so the per-bar pass
+    /// alone widens the resting stop to the 10× floor and never gives it back.
+    /// An upkeep series whose ticks land in the calm part of each bar must
+    /// shrink it back to the DRAWN stop through the shared re-price pass before
+    /// the 15:00Z fill — a replay that ignores the upkeep quote books 1.1030
+    /// here and goes red.
+    #[tokio::test]
+    async fn calm_upkeep_ticks_give_back_the_widened_stop_before_the_fill() {
+        let floored = reprice_stop(&reprice_run(0.00030).await);
+        assert!(
+            (floored - 1.1030).abs() < 1e-6,
+            "control: no upkeep ⇒ floored"
+        );
+
+        let calm = m15_upkeep(0.00002);
+        let given_back = reprice_stop(&reprice_run_with_upkeep(0.00030, &calm).await);
+        assert!(
+            (given_back - 1.1020).abs() < 1e-6,
+            "calm 15-minute ticks must shrink the stop back to the drawn 1.1020 \
+             before the fill, got {given_back} (per-bar-only gives {floored})",
+        );
+    }
+
+    /// The mirror: upkeep ticks that are themselves wide must NOT give the stop
+    /// back. Without this the test above passes for a walk that shrinks every
+    /// resting order on every tick regardless of the sampled quote.
+    #[tokio::test]
+    async fn wide_upkeep_ticks_keep_the_widened_stop() {
+        let wide = m15_upkeep(0.00030);
+        let kept = reprice_stop(&reprice_run_with_upkeep(0.00030, &wide).await);
+        assert!(
+            (kept - 1.1030).abs() < 1e-6,
+            "wide 15-minute ticks must leave the 10× floor in force, got {kept}",
+        );
+    }
+
+    /// An empty upkeep series is the `None` path in all but name.
+    #[tokio::test]
+    async fn empty_upkeep_series_is_byte_identical_to_none() {
+        let none = reprice_stop(&reprice_run(0.00030).await);
+        let empty = super::super::upkeep::UpkeepTicks::new(Vec::new(), Duration::minutes(15));
+        let with = reprice_stop(&reprice_run_with_upkeep(0.00030, &empty).await);
+        assert_eq!(none, with);
     }
 
     /// The re-price is DIRECTIONAL, and a hardcoded `Direction::Long` is the exact

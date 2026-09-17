@@ -266,6 +266,14 @@ pub struct ReplayBroker {
     /// asks for) and a `WindowSubBars` on pass 2 (serves just those windows).
     /// The broker doesn't care which — it only forwards to the sim.
     finer: Option<Box<dyn super::fill_sim::SubBars>>,
+    /// The sub-bar quote an **upkeep tick** is sampling (job 2: replay walks
+    /// the live scheduler's 900 s order-control cadence). While set, `get_quote`
+    /// answers from THIS bar's book and keys the spread-hour clamp on ITS time,
+    /// instead of the plan bar `as_of` points at. Nothing else reads it: the
+    /// held ledger, fills and `get_bidask_candles` stay bound to `as_of`, so an
+    /// upkeep tick differs from the per-bar pass by exactly the clock and the
+    /// quote — the operator's "shared code" constraint. `None` between ticks.
+    upkeep_sample: RefCell<Option<BidAskCandle>>,
 
     // --- Stateful held model (S1). Mutated by `advance()` per bar and by
     // `place_entry`/`close_positions`; read by `list_open_positions` /
@@ -295,6 +303,7 @@ impl ReplayBroker {
             placed: RefCell::new(Vec::new()),
             armed: RefCell::new(None),
             finer: None,
+            upkeep_sample: RefCell::new(None),
             resting: RefCell::new(Vec::new()),
             open: RefCell::new(Vec::new()),
             closed: RefCell::new(Vec::new()),
@@ -357,6 +366,14 @@ impl ReplayBroker {
     /// gate) take `now` as their own argument and are unaffected by this clock.
     pub fn set_as_of(&self, as_of: DateTime<Utc>) {
         *self.as_of.borrow_mut() = as_of;
+    }
+
+    /// Point `get_quote` at a finer bar's book for the duration of one upkeep
+    /// tick (`Some`), or back at the plan bar `as_of` names (`None`). The held
+    /// state is deliberately NOT moved: a sub-bar tick asks "what is the spread
+    /// right now?" of the shared order-control passes, and nothing else.
+    pub fn set_upkeep_sample(&self, sample: Option<BidAskCandle>) {
+        *self.upkeep_sample.borrow_mut() = sample;
     }
 
     /// Arm the placement for the next `run_enter`: the order id `place_entry`
@@ -1286,7 +1303,13 @@ impl Broker for ReplayBroker {
         // intrabar spike that retraces by the close. So the replay reproduces the
         // common case (sustained wide) and under-reports the sub-bar-spike edge.
         // Better than the old unconditional fail-open, which reproduced nothing.
-        let as_of = *self.as_of.borrow();
+        // An upkeep tick (job 2) samples a finer bar's book at that bar's time;
+        // otherwise the plan bar `as_of` points at. Same clamp below either way.
+        let sample = *self.upkeep_sample.borrow();
+        let (as_of, book) = match sample {
+            Some(s) => (s.time, Some(s)),
+            None => (*self.as_of.borrow(), self.candle_at_as_of().cloned()),
+        };
         // Inside a baked spread hour, the OVERNIGHT LIQUIDITY TROUGH is wide *by
         // definition* — the whole reason the block exists — even when a particular
         // bar's CLOSE happens to print a narrow spread (the trough is sustained;
@@ -1347,7 +1370,7 @@ impl Broker for ReplayBroker {
         // falling back to `get_quote` only when `enter_granularity == None`, which
         // replay never passes. No corpus entry sizes its stop off this value.
         if is_spread_hour(instrument, as_of)
-            && let Some(c) = self.candle_at_as_of()
+            && let Some(c) = &book
         {
             let mid = (c.bid_c + c.ask_c) / 2.0;
             let half = elevated_threshold_pips(instrument) * self.pip_size / 2.0;
@@ -1356,7 +1379,7 @@ impl Broker for ReplayBroker {
                 ask: mid + half,
             });
         }
-        match self.candle_at_as_of() {
+        match book {
             Some(c) => Ok(Quote {
                 bid: c.bid_c,
                 ask: c.ask_c,
@@ -1654,6 +1677,32 @@ mod tests {
         b.set_as_of(Utc.timestamp_opt(0, 0).unwrap());
         let err = b.get_quote("EUR/USD").await.unwrap_err();
         assert_eq!(err, LookupError::Transient);
+    }
+
+    /// Job 2 (replay walks the upkeep ticks): while an upkeep sample is set,
+    /// `get_quote` answers from THAT sub-bar's book, not the plan bar `as_of`
+    /// names; clearing it restores the plan-bar quote. Neither call moves
+    /// `as_of` — the held ledger is untouched by a sample.
+    #[tokio::test]
+    async fn upkeep_sample_overrides_the_as_of_bar_quote_until_cleared() {
+        let wide = spread_candle(0, 1.10000, 1.10050); // 5.0 pip D1 rollover close
+        let b = ReplayBroker::new(vec![wide], 0.0001);
+        b.set_as_of(Utc.timestamp_opt(0, 0).unwrap());
+
+        // A mid-bar H1 sample with a calm 0.3 pip spread.
+        b.set_upkeep_sample(Some(spread_candle(7200, 1.10100, 1.10103)));
+        let q = b.get_quote("EUR/USD").await.unwrap();
+        assert_eq!((q.bid, q.ask), (1.10100, 1.10103));
+        assert!((q.spread() / 0.0001 - 0.3).abs() < 1e-9, "sample spread");
+        assert_eq!(
+            *b.as_of.borrow(),
+            Utc.timestamp_opt(0, 0).unwrap(),
+            "a sample never moves the held clock"
+        );
+
+        b.set_upkeep_sample(None);
+        let q = b.get_quote("EUR/USD").await.unwrap();
+        assert_eq!((q.bid, q.ask), (1.10000, 1.10050), "back to the plan bar");
     }
 
     #[tokio::test]

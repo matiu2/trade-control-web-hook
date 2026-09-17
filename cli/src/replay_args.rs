@@ -507,6 +507,18 @@ pub struct ReplayArgs {
     #[arg(long, value_name = "BARS", default_value_t = 1)]
     pub cron_gap: usize,
 
+    /// Walk the live scheduler's **upkeep ticks** (order-control promote +
+    /// re-price, every 900 s live) between plan bar closes, off a finer bid/ask
+    /// series at this granularity (`15m` mirrors live; `1h` is a cheaper first
+    /// cut on a daily plan). Without it the two shared passes run once per plan
+    /// bar off the bar's CLOSE spread — on D1 the rollover print — so a widened
+    /// stop is never given back and a Stored order never promoted offline.
+    ///
+    /// A SIGNAL, never a baseline: the series is not frozen into a fixture, so
+    /// `--save` and `--rebless` refuse under it. Off by default (byte-identical).
+    #[arg(long, value_name = "GRANULARITY")]
+    pub upkeep: Option<String>,
+
     /// Label recorded in a blessed baseline (e.g. `v113`), shown in later diffs
     /// as the "from" side. Defaults to the engine version the fixtures carry.
     #[arg(long, value_name = "LABEL", requires = "bless_baseline")]
