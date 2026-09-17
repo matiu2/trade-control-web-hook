@@ -1,5 +1,47 @@
 # Changelog
 
+## v147 — 2026-09-17 — `register` arms a cursorless frozen setup at "now"
+
+**Why.** Exporting a setup from local-chart and arming it straight away failed:
+
+    tv-arm --spec-in GBP_NZD-TRADENATION-h1-....json register
+    Error: frozen setup ... has no cursor and no --start was given
+
+A **live** capture has no journaling cursor, so the spec carries no `start`,
+and the arm demanded one for an instant the operator can only call "now". The
+export → arm path — the whole point of `--spec-in` / `--spec-url` — was blocked
+on naming the present.
+
+The cursor was already dead weight in this mode: `pick_prune_as_of` returns
+wall-clock for `register_plan()` and ignores `cursor_unix` entirely, so the
+value being demanded only ever reached the calendar scope range.
+
+**What changed.**
+
+- With no cursor from either source, `register` uses `Utc::now()`.
+- The replay subcommands (`plan-out`, `replay`, no subcommand) still refuse.
+  There the cursor is the yardstick the replay is scored against; defaulting it
+  to today would prune a historical setup's news as elapsed and score it against
+  the wrong calendar. That failure is silent, so it stays an error — and the
+  message now points at `register`.
+- `SetupInputs::start` stays `None` when defaulted, rather than back-filled.
+  Nothing was pinned, so a later re-arm is still free to be given a real cursor.
+
+**Breaking.** None. Every previously-accepted invocation behaves identically;
+this only turns one hard error into a default, and only for `register`.
+
+**Config.** None.
+
+**Tests.** `a_cursorless_spec_registers_at_wall_clock_now` asserts the prune
+as-of lands between two `Utc::now()` reads taken around the call, so it fails on
+any default rather than passing on "not an error". Plus: `--start` still
+outranks the default, a frozen cursor still wins, and the existing replay
+refusal is unchanged (now documented as replay-scoped).
+
+**Follow-up.** `--broker-dry-run` stops the worker sending the order but does
+not stop plan registration; there is no flag that builds a `register` plan
+without POSTing it. `plan-out` is the closest thing but is replay-scoped.
+
 ## v146 — 2026-09-17 — `--spec-url`: arm from a frozen setup fetched over HTTP
 
 **Why.** local-chart has replaced TradingView for drawing setups, and its
