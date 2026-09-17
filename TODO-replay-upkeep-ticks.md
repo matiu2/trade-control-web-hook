@@ -36,13 +36,13 @@ the quote source differ. No replay-local sizing or widen decision.
       series over the live window via `candles::pull`; pass to both zoom
       passes. `--rebless` refuses under `--upkeep` (same shape as `--cron-gap`).
       Fixture replay stays `None` (offline, byte-identical).
-- [~] 5. clippy + fmt green. Corpus: `all_fixtures_match_expected` and the
+- [x] 5. clippy + fmt green. Corpus: `all_fixtures_match_expected` and the
       uk-100 expiry test fail on this branch AND on a clean `staging` baseline
       worktree (same uk-100 fixture; the primary checkout already carries an
       uncommitted edit to its expected.json) — pre-existing drift, not this
       change. No D1 fixture exists in the corpus; smoke on the H4 EUR/CAD
       fixture with `--upkeep 1h` / `15m` pulls 304 / 1216 bars and walks them
-      (report unchanged: no resting order there). Commit + push pending.
+      (report unchanged: no resting order there). Committed 9ff8ccaf, pushed feat/replay-upkeep-ticks.
 
 ## Out of scope / follow-ups (from the job)
 
