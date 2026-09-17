@@ -127,9 +127,109 @@ fn build_url(base_url: &str, symbol: &str, granularity: &str) -> String {
     }
 }
 
+/// Build the `--spec-url` for this plan: local-chart's `GET /arm-setup`, which
+/// emits tv-arm's own `FrozenSetup` shape (`tv-arm/src/frozen_setup.rs`). This
+/// is what lets a replay/fixture capture under `--new-tv` read the LOCAL-CHART
+/// drawings instead of falling through to whatever TradingView happens to be
+/// showing.
+///
+/// Reuses [`local_chart_symbol`] and [`local_chart_tf`] so the arm reads the
+/// **same** instrument+timeframe the `l` key just navigated to — one derivation,
+/// not a second one to drift from [`build_url`].
+///
+/// ## Why an unknown granularity is `None` here, and only a dropped param there
+///
+/// [`build_url`] drops a bad `tf` and still navigates: the operator lands on the
+/// right instrument at the chart's own default timeframe, and can see that it's
+/// wrong. Arming has no such visible gap — `/arm-setup` would classify the
+/// drawings of whatever timeframe local-chart defaulted to and hand back a
+/// setup that looks perfectly valid at the WRONG granularity, which is then
+/// frozen into a replay or a fixture. So this returns `None` and the caller
+/// falls back to the live-chart arm rather than silently arming off-timeframe.
+pub fn arm_setup_url(base_url: &str, instrument: &str, granularity: &str) -> Option<String> {
+    let symbol = local_chart_symbol(instrument);
+    let tf = local_chart_tf(granularity).or_else(|| {
+        warn!(
+            "local-chart: unrecognised granularity {granularity:?} for {symbol} — cannot \
+             build an /arm-setup URL (arming off an unknown timeframe would freeze the \
+             wrong geometry); falling back to the live-chart arm"
+        );
+        None
+    })?;
+    let base = base_url.trim_end_matches('/');
+    Some(format!("{base}/arm-setup?instrument={symbol}&tf={tf}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `--spec-url` points at `/arm-setup` with the SAME instrument+tf
+    /// mapping the navigation URL uses — a replay must arm off the chart the
+    /// `l` key just loaded, not a differently-derived one.
+    #[test]
+    fn arm_setup_url_matches_the_navigation_mapping() {
+        let url = arm_setup_url("http://127.0.0.1:8790", "EUR/CAD", "h1");
+        assert_eq!(
+            url.as_deref(),
+            Some("http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1")
+        );
+        // Same symbol resolution as the navigation path, for the same input.
+        assert!(
+            build_url(
+                "http://127.0.0.1:8790",
+                &local_chart_symbol("EUR/CAD"),
+                "h1"
+            )
+            .contains("instrument=EUR_CAD")
+        );
+    }
+
+    /// Composite-key pair, half one: instrument varies, timeframe fixed.
+    #[test]
+    fn arm_setup_url_varies_with_instrument_granularity_fixed() {
+        let eur = arm_setup_url("http://127.0.0.1:8790", "EUR_USD", "h4");
+        let gbp = arm_setup_url("http://127.0.0.1:8790", "GBP_USD", "h4");
+        assert_ne!(eur, gbp, "different instrument must change the URL");
+        assert!(eur.unwrap_or_default().contains("tf=h4"));
+    }
+
+    /// Composite-key pair, half two: timeframe varies, instrument fixed. Catches
+    /// a mutation that drops `tf` from the arm URL, which the half above cannot
+    /// see. See the repo memory `composite_key_tests_must_vary_each_half`.
+    #[test]
+    fn arm_setup_url_varies_with_granularity_instrument_fixed() {
+        let h4 = arm_setup_url("http://127.0.0.1:8790", "EUR_USD", "h4");
+        let m15 = arm_setup_url("http://127.0.0.1:8790", "EUR_USD", "m15");
+        assert_ne!(h4, m15, "different granularity must change the URL");
+        assert!(h4.unwrap_or_default().contains("tf=h4"));
+        assert!(m15.unwrap_or_default().contains("tf=m15"));
+    }
+
+    /// The deliberate asymmetry from [`build_url`]: navigation drops a bad `tf`
+    /// and still opens, but arming REFUSES. A dropped `tf` here would arm off
+    /// local-chart's default timeframe and freeze geometry that looks valid but
+    /// is read at the wrong granularity — invisible in the resulting plan.
+    #[test]
+    fn arm_setup_url_refuses_an_unknown_granularity_rather_than_dropping_tf() {
+        assert_eq!(
+            arm_setup_url("http://127.0.0.1:8790", "EUR_USD", "not-a-tf"),
+            None
+        );
+        // Contrast: the navigation URL still opens, minus the tf param.
+        assert_eq!(
+            build_url("http://127.0.0.1:8790", "EUR_USD", "not-a-tf"),
+            "http://127.0.0.1:8790/?instrument=EUR_USD"
+        );
+    }
+
+    #[test]
+    fn arm_setup_url_strips_a_trailing_slash_from_the_base_url() {
+        assert_eq!(
+            arm_setup_url("http://127.0.0.1:8790/", "EUR_USD", "h1").as_deref(),
+            Some("http://127.0.0.1:8790/arm-setup?instrument=EUR_USD&tf=h1")
+        );
+    }
 
     #[test]
     fn maps_granularity_tokens_unchanged() {
