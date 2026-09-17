@@ -72,6 +72,20 @@ pub struct ArmContext<'a> {
     pub start: Option<&'a str>,
     /// The broker-qualified TradingView symbol the geometry came from.
     pub chart_symbol: Option<&'a str>,
+    /// The **broker** instrument symbol the plan was built for (`AUD/NZD`,
+    /// `EUR_USD`) — the resolved form, not the qualified chart symbol.
+    ///
+    /// Forwarded as `--instrument` so the replay pulls the candles this plan's
+    /// levels were drawn against. Without it `replay-candles` resolves
+    /// `--instrument` → **TradingView chart** → plan (`resolve_window`), and the
+    /// chart sits *ahead* of the plan: a chart left on another pair replays the
+    /// plan against a different instrument's prices, producing a plausible
+    /// report full of declined entries. See
+    /// `argv_forwards_the_plans_instrument`.
+    ///
+    /// Unlike the `--arm-*` context this is **not** gated on `--save`: it
+    /// selects the candle feed, so every chained replay needs it.
+    pub instrument: Option<&'a str>,
 }
 
 impl ArmContext<'_> {
@@ -211,6 +225,17 @@ fn build_argv(
     if !sets_flag(passthrough, "--source") {
         argv.push("--source".to_string());
         argv.push(source.as_str().to_string());
+    }
+    // The plan's own instrument, so the replay can't inherit an unrelated
+    // TradingView chart's symbol (which outranks the plan in
+    // `replay-candles`' fallback chain). Guarded like every other default:
+    // `ArgAction::Set` rejects a repeated flag, so an operator's explicit
+    // `--instrument` must suppress this rather than collide with it.
+    if let Some(instrument) = arm.instrument
+        && !sets_flag(passthrough, "--instrument")
+    {
+        argv.push("--instrument".to_string());
+        argv.push(instrument.to_string());
     }
     argv.extend(arm.argv(passthrough));
     argv.extend(passthrough.iter().cloned());
@@ -650,5 +675,125 @@ mod tests {
             ReplayArgs::try_parse_from(&argv).is_err(),
             "an unknown passthrough flag is caught by the shared clap parse"
         );
+    }
+
+    /// The bug: a chained replay never forwarded the instrument, so
+    /// `replay-candles` fell back to **the TradingView chart's** symbol
+    /// (`args.instrument` → chart → plan, `replay_candles.rs`'s
+    /// `resolve_window`). A chart left on another pair silently replayed the
+    /// plan against a *different instrument's prices*.
+    ///
+    /// Measured on AUD/NZD 2026-09-17 (`hs-aud-nzd-95167beb`, H1): the plan's
+    /// levels sat at ~1.22 while the candles arrived at ~0.99, so every golden
+    /// signal was declined `entry ... is outside the SL..TP range` and the
+    /// replay reported 0 fills / +0.00R. With the instrument forwarded the same
+    /// plan fills at 1.22464 and stops out for −1.00R. A wrong-feed replay is
+    /// the same hazard `source_for` declines to take for IBKR — caught there,
+    /// missed here.
+    #[test]
+    fn argv_forwards_the_plans_instrument() {
+        let plan = PathBuf::from("/tmp/p.json");
+        let arm = ArmContext {
+            instrument: Some("AUD/NZD"),
+            ..Default::default()
+        };
+        let argv = build_argv("replay-candles", &plan, CandleSource::TradeNation, &[], arm);
+        let parsed = ReplayArgs::try_parse_from(&argv).expect("must parse");
+        assert_eq!(
+            parsed.instrument.as_deref(),
+            Some("AUD/NZD"),
+            "the plan's instrument must reach replay-candles: {argv:?}"
+        );
+    }
+
+    /// `--instrument` is `ArgAction::Set`, which **rejects a repeated flag**
+    /// rather than taking the last value, so the injection has to stand down
+    /// when the operator names one. Same trap as `--annotate`: parse the
+    /// result, never just count token positions.
+    #[test]
+    fn operator_instrument_overrides_the_forwarded_default() {
+        let plan = PathBuf::from("/tmp/p.json");
+        let arm = ArmContext {
+            instrument: Some("AUD/NZD"),
+            ..Default::default()
+        };
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &["--instrument".to_string(), "EUR/USD".to_string()],
+            arm,
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--instrument").count(),
+            1,
+            "exactly one --instrument must survive: {argv:?}"
+        );
+        let parsed = ReplayArgs::try_parse_from(&argv)
+            .expect("an operator --instrument must not collide with the forwarded default");
+        assert_eq!(parsed.instrument.as_deref(), Some("EUR/USD"));
+    }
+
+    /// The `=` form is the same override.
+    #[test]
+    fn operator_instrument_eq_form_also_overrides() {
+        let plan = PathBuf::from("/tmp/p.json");
+        let arm = ArmContext {
+            instrument: Some("AUD/NZD"),
+            ..Default::default()
+        };
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &["--instrument=EUR/USD".to_string()],
+            arm,
+        );
+        let parsed = ReplayArgs::try_parse_from(&argv).expect("=-form must parse");
+        assert_eq!(parsed.instrument.as_deref(), Some("EUR/USD"));
+    }
+
+    /// Unlike every `--arm-*` token, the instrument is **not** gated on
+    /// `--save`: it selects the candle feed for the replay itself, so a plain
+    /// `tv-arm ... replay` (no fixture) needs it just as much. That is the whole
+    /// bug — the reported run had no `--save`.
+    #[test]
+    fn instrument_is_forwarded_without_save() {
+        let plan = PathBuf::from("/tmp/p.json");
+        let arm = ArmContext {
+            instrument: Some("AUD/NZD"),
+            ..Default::default()
+        };
+        let argv = build_argv("replay-candles", &plan, CandleSource::TradeNation, &[], arm);
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--arm-")),
+            "still no --arm-* without --save: {argv:?}"
+        );
+        assert!(
+            argv.contains(&"--instrument".to_string()),
+            "but the instrument IS forwarded: {argv:?}"
+        );
+        ReplayArgs::try_parse_from(&argv).expect("must parse");
+    }
+
+    /// An `ArmContext` with no instrument emits no flag, so `replay-candles`
+    /// keeps its documented chart→plan fallback for any caller that genuinely
+    /// has nothing to forward.
+    #[test]
+    fn no_instrument_emits_no_flag() {
+        let plan = PathBuf::from("/tmp/p.json");
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &[],
+            ArmContext::default(),
+        );
+        assert!(
+            !argv.contains(&"--instrument".to_string()),
+            "nothing to forward ⇒ no flag: {argv:?}"
+        );
+        let parsed = ReplayArgs::try_parse_from(&argv).expect("must parse");
+        assert_eq!(parsed.instrument, None);
     }
 }

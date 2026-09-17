@@ -228,7 +228,16 @@ fn freeze_setup(args: &Args, setup: &SetupInputs, path: &Path) -> Result<()> {
 /// `chart_symbol` is passed broker-qualified (`TRADENATION:EURUSD`) — a bare
 /// symbol silently resolves to the OANDA feed, so an unqualified capture can be
 /// off the wrong price data and still look perfectly plausible.
-fn arm_context<'a>(args: &'a Args, chart_symbol: &'a str) -> crate::replay::ArmContext<'a> {
+///
+/// `instrument` is the *resolved broker* symbol (`AUD/NZD`), a separate value
+/// from `chart_symbol`: it is what a chained replay forwards as `--instrument`
+/// so the candles match the plan's levels rather than whatever pair the
+/// operator's chart happens to be showing.
+fn arm_context<'a>(
+    args: &'a Args,
+    chart_symbol: &'a str,
+    instrument: &'a str,
+) -> crate::replay::ArmContext<'a> {
     crate::replay::ArmContext {
         skip_bcr: args.skip_bcr,
         strategy_v2: args.strategy_v2,
@@ -238,6 +247,7 @@ fn arm_context<'a>(args: &'a Args, chart_symbol: &'a str) -> crate::replay::ArmC
         skip_reversals: args.skip_reversals,
         start: args.start.as_deref(),
         chart_symbol: Some(chart_symbol),
+        instrument: Some(instrument),
     }
 }
 
@@ -924,7 +934,7 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
         // chart symbol (`TRADENATION:EURUSD`) — recorded qualified on purpose: a
         // bare symbol silently resolves to the OANDA feed, so an unqualified
         // capture can be off the wrong price data and look perfectly plausible.
-        let arm = arm_context(args, &chart_symbol);
+        let arm = arm_context(args, &chart_symbol, &instrument);
         crate::replay::run_replay(
             effective_plan_out.as_deref(),
             &trade_id,
@@ -2593,7 +2603,7 @@ mod tests {
         );
         for variant in &grid {
             let cell = variant.apply(&base);
-            let arm = arm_context(&cell, "TRADENATION:EURUSD");
+            let arm = arm_context(&cell, "TRADENATION:EURUSD", "EUR/USD");
             assert_eq!(
                 arm.entry_rule_label(),
                 variant.entry_rule,
@@ -2610,6 +2620,16 @@ mod tests {
                 arm.skip_reversals,
                 variant.skip_reversals,
                 "the reversal axis must reach the arm block for cell {}",
+                variant.fixture_suffix()
+            );
+            // Every cell replays against the plan's own instrument. A matrix
+            // run shells out 24+ times; if this wire is severed each cell
+            // inherits the chart's symbol instead, and a whole grid can be
+            // scored against the wrong pair's candles at once.
+            assert_eq!(
+                arm.instrument,
+                Some("EUR/USD"),
+                "the instrument must reach the arm block for cell {}",
                 variant.fixture_suffix()
             );
         }
