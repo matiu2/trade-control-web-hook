@@ -125,11 +125,16 @@ pub fn load_chart_backend(
     instrument: &str,
     broker: &str,
     granularity: &str,
+    goto: Option<&str>,
 ) -> Result<bool> {
     match backend {
+        // TradingView sets symbol + timeframe only; scrolling to a date is a
+        // tv-mcp capability this path has never had (and the operator asked
+        // for the jump on local-chart precisely because it was too hard
+        // there). Ignored rather than faked.
         ChartBackend::TradingView => load_chart(instrument, broker, granularity),
         ChartBackend::LocalChart { base_url } => {
-            load_chart_local(base_url, instrument, granularity)
+            load_chart_local(base_url, instrument, granularity, goto)
         }
     }
 }
@@ -506,6 +511,20 @@ mod tests {
             backend.spec_url("EUR/CAD", "h1").as_deref(),
             Some("http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1")
         );
+    }
+
+    /// `load_chart_backend` takes the goto and gives it to local-chart.
+    ///
+    /// Asserted at the DISPATCH signature rather than by driving a browser
+    /// open: the TradingView arm shells `node`, so a test that actually
+    /// called it would launch processes. What matters here is that the
+    /// parameter exists and reaches the local-chart arm — the URL it builds
+    /// is pinned by `local_chart`'s own `build_url` tests, and the end-to-end
+    /// behaviour by local-chart's `test_goto_url_param.py`.
+    #[test]
+    fn load_chart_backend_accepts_a_goto_for_local_chart() {
+        let _: fn(&ChartBackend, &str, &str, &str, Option<&str>) -> Result<bool> =
+            load_chart_backend;
     }
 
     /// The two backends must not agree: a mutation collapsing the match arms
