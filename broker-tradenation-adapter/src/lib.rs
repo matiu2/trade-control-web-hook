@@ -290,9 +290,11 @@ impl Broker for TradeNationAdapter {
             })?;
 
         // `get_candles_range_aggregated` is the drop-in for `get_candles_range`
-        // that serves non-native TFs (H4/M5) by fetching the native base (H1/M1)
-        // and rolling it up on 00/04/08/12/16/20 UTC buckets (`tradenation-api`
-        // v0.4.0). Native TFs pass straight through unchanged.
+        // that serves non-native TFs (H4/D1/M5) by fetching the native base
+        // (H1/M1) and rolling it up. H4 and D1 sit on the 17:00 America/New_York
+        // session grid (`tradenation-api` v0.7.0 — the same `session_anchor`
+        // the replay's candle source reaches through candle-cache, so live and
+        // replay see the same bars). Native TFs pass straight through.
         let raw = tradenation_api::aggregation::get_candles_range_aggregated(
             self.0.client(),
             market.market_id,
@@ -692,19 +694,21 @@ fn to_upstream_entry(e: &ResolvedEntry) -> broker_tradenation::ResolvedEntry {
 ///
 /// As of `tradenation-api` v0.4.0 the adapter fetches candles through
 /// `aggregation::get_candles_range_aggregated`, which serves H4/M5 by fetching
-/// the native base (H1/M1) and rolling it up on 00/04/08/12/16/20 UTC buckets
-/// (matches OANDA + TradingView). So H4 and M5 are now **served** — these are
-/// `true`. TN's raw endpoint still has no H4/M5 path of its own, but the adapter
-/// no longer calls it directly for candles. A TF that the aggregator genuinely
-/// cannot build would still be rejected (`UnsupportedGranularity`); today every
-/// engine `Granularity` is covered (min/15m/hour/day native; H4=4×H1, M5=5×M1).
+/// the native base (H1/M1) and rolling it up; since v0.7.0 D1 is built the same
+/// way (24×H1) because TN's native day is cut at a fixed 22:00 UTC, off the
+/// 17:00 New York grid OANDA and TradingView use. So H4, M5 and D1 are
+/// **served** — these are `true`. TN's raw endpoint still has no H4/M5 path of
+/// its own, but the adapter no longer calls it directly for candles. A TF that
+/// the aggregator genuinely cannot build would still be rejected
+/// (`UnsupportedGranularity`); today every engine `Granularity` is covered
+/// (min/15m/hour native; H4=4×H1, D1=24×H1, M5=5×M1).
 const TN_SERVES_H4: bool = true;
 const TN_SERVES_M5: bool = true;
 
 /// Engine [`Granularity`] → `candle_model::Granularity` + whether
 /// `tradenation-api` serves it (native or aggregated). Native TFs are
-/// minute / quarter(15m) / hour / day; H4/M5 are served by aggregation
-/// ([`TN_SERVES_H4`]/[`TN_SERVES_M5`] = `true`, see there). Pure.
+/// minute / quarter(15m) / hour; H4/D1/M5 are served by aggregation
+/// ([`TN_SERVES_H4`]/[`TN_SERVES_M5`] = `true`, see there; D1 always). Pure.
 fn to_cm_granularity(g: Granularity) -> (CmGranularity, bool) {
     match g {
         Granularity::M1 => (CmGranularity::OneMinute, true),
@@ -1136,8 +1140,8 @@ mod candle_fetch_tests {
     fn h4_m5_map_to_the_right_timeframe_and_are_served() {
         // H4/M5 map to the correct `candle_model` timeframe and are now SERVED
         // (`true`): as of tradenation-api v0.4.0 the adapter fetches through
-        // `get_candles_range_aggregated`, which builds H4=4×H1 / M5=5×M1 on
-        // 00/04/08/12/16/20 UTC buckets. So they pass the fetch guard rather than
+        // `get_candles_range_aggregated`, which builds H4=4×H1 / M5=5×M1 (H4 on
+        // the 17:00 New York grid). So they pass the fetch guard rather than
         // being rejected. See `TN_SERVES_H4`.
         let (h4_cm, h4_native) = to_cm_granularity(Granularity::H4);
         assert_eq!(h4_cm, CmGranularity::FourHours);
