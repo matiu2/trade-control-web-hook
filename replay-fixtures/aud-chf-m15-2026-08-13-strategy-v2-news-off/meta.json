@@ -1,0 +1,17 @@
+{
+  "instrument": "AUD/CHF",
+  "granularity": "m15",
+  "source": "tradenation",
+  "start": "2026-08-13T02:00:00Z",
+  "end": "2026-08-13T17:30:00Z",
+  "arm": {
+    "entry_rule": "strategy-v2",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "skip_reversals": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:AUDCHF",
+    "tv_arm_version": "v144-59-gf319f7db",
+    "engine_version": "v144-59-gf319f7db"
+  }
+}

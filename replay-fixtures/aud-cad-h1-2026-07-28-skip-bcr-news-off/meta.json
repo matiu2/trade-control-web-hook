@@ -1,0 +1,17 @@
+{
+  "instrument": "AUD/CAD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-07-28T07:00:00Z",
+  "end": "2026-08-07T17:00:00Z",
+  "arm": {
+    "entry_rule": "skip-bcr",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "skip_reversals": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:AUDCAD",
+    "tv_arm_version": "v144-59-gf319f7db",
+    "engine_version": "v144-59-gf319f7db"
+  }
+}

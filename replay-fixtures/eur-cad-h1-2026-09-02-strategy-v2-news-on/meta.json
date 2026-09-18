@@ -1,0 +1,18 @@
+{
+  "instrument": "EUR/CAD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-09-02T01:00:00Z",
+  "end": "2026-09-07T01:00:00Z",
+  "message": "skip bcr lost money",
+  "arm": {
+    "entry_rule": "strategy-v2",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "skip_reversals": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:EURCAD",
+    "tv_arm_version": "v144-82-gdb50fb62",
+    "engine_version": "v144-82-gdb50fb62"
+  }
+}
