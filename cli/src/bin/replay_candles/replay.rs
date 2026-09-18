@@ -152,6 +152,131 @@ pub struct Replay {
 /// `live_start` seeds silently (see [`run`]).
 const SEED_BARS: usize = 10;
 
+/// The per-bar order-control pass, in the live scheduler's order: the resting-
+/// order lifecycle (spread-hour cancel / restore), then promotion of parked
+/// orders, then re-price. Runs on every live bar AND on every bar after the
+/// plan retires (see the tail loop in [`run_with_upkeep`]): live's order-control
+/// jobs are global over records and resting orders, not per plan, so a park or
+/// a resting order outlives its plan's `Done`.
+async fn order_control_pass(
+    replay_broker: &ReplayBroker,
+    store: &MemStateStore,
+    lifecycle_cfg: &super::lifecycle::ReplayConfigProvider,
+    fires: &mut [Fire],
+    bar_open: DateTime<Utc>,
+    now: DateTime<Utc>,
+) {
+    replay_broker.set_as_of(bar_open);
+    let src = super::lifecycle::ReplayVerifiedSource::new(replay_broker);
+    // Replay is the SOLE owner of the record (no System 2 widened stops
+    // offline), so it clears the record itself — `ClearRecord`, the default
+    // behaviour, byte-identical to before the Option-A clear-policy split.
+    trade_control_core::pending_lifecycle::pending_order_lifecycle(
+        replay_broker,
+        store,
+        lifecycle_cfg,
+        &src,
+        None,
+        now,
+        trade_control_core::pending_lifecycle::ClearPolicy::ClearRecord,
+    )
+    .await;
+
+    // The every-candle order-control re-check — the SAME `core` pass the
+    // live cron runs (`order_control_tick`). Without this a sub-1R entry
+    // parks identically on both sides but only ever *promotes* live, so a
+    // fixture would quietly book 0R for a trade production takes
+    // (`[[strategy_changes_in_both_replayer_and_worker]]`).
+    //
+    // Runs AFTER the lifecycle so an order the lifecycle just re-placed is
+    // already resting, and a promotion this bar is visible to the next bar's
+    // fill simulation — the same ordering the live scheduler gets from
+    // running the sweep and this pass on the same cadence.
+    //
+    // `Every`, not the lifecycle's `None`: this pass enumerates RECORDS,
+    // which carry the plan's real account (`m-and-w` in the sgdjpy fixture),
+    // so an account-equality filter would match nothing offline. The replay
+    // has one broker and one plan, so every record is in scope.
+    let promoted = trade_control_core::order_control::promote_due_orders(
+        replay_broker,
+        store,
+        lifecycle_cfg,
+        &src,
+        trade_control_core::order_control::PromoteScope::Every,
+        now,
+    )
+    .await;
+    adopt_promotions(&promoted, replay_broker, fires);
+
+    // …and the RE-PRICE half of that same tick, which the live
+    // `order_control_tick::run_both` runs immediately after the promotion and
+    // the replay used to skip entirely. Slice 7
+    // (`core::pending_lifecycle`) retired the `HoldReason::SpreadHour` ON-side
+    // derivation in favour of the forward-looking SL floor that ONLY this pass
+    // delivers, so without it the replay had neither the retired hold nor its
+    // replacement: a resting order sat offline at its original stop through a
+    // spread widening while live re-priced it wider or parked it below min-R
+    // (`[[strategy_changes_in_both_replayer_and_worker]]`).
+    //
+    // Promotion runs FIRST, exactly as live: an order promoted this bar was
+    // placed at the current spread, so re-pricing it in the same tick would at
+    // best be redundant and at worst cancel-and-replace an order placed a
+    // moment ago.
+    //
+    // `account: None` — the ReplayBroker doesn't scope orders by account, and
+    // unlike the promotion pass this one enumerates BROKER ORDERS (which the
+    // broker has already scoped) rather than records, so the `PromoteScope`
+    // distinction doesn't arise here.
+    //
+    // `BrokerQuotes`, not the live cron's per-tick cache: the replay's
+    // `get_quote` is a local read off the bar it is already holding, so a cache
+    // would buy nothing and could only go stale within a bar.
+    trade_control_core::order_control::reprice_due_orders(
+        replay_broker,
+        store,
+        lifecycle_cfg,
+        &src,
+        &mut trade_control_core::order_control::BrokerQuotes(replay_broker),
+        None,
+        now,
+    )
+    .await;
+}
+
+/// A park the promote pass just PLACED belongs to the enter fire the gate
+/// rejected: re-point that fire from `Rejected` to `Placed { order_id }` so the
+/// ledger's fill/exit for the promoted order is booked against it — exactly
+/// what the live journal shows, one enter that entered late. Only the newest
+/// still-rejected fire for the trade is adopted (a re-fire re-parks over the
+/// stale park, so it is the one the promotion placed).
+fn adopt_promotions(
+    outcomes: &[(String, trade_control_core::order_control::PromoteOutcome)],
+    replay_broker: &ReplayBroker,
+    fires: &mut [Fire],
+) {
+    use trade_control_core::order_control::PromoteOutcome;
+    for (trade_id, outcome) in outcomes {
+        if !matches!(outcome, PromoteOutcome::Promoted(_)) {
+            continue;
+        }
+        let Some(order_id) = replay_broker.promoted_order_id(trade_id) else {
+            continue;
+        };
+        let fire = fires.iter_mut().rev().find(|f| {
+            f.fired.intent.action == Action::Enter
+                && f.fired.intent.trade_id.as_deref() == Some(trade_id.as_str())
+                && f.rejected_reason()
+                    .is_some_and(|r| r.contains("stored until"))
+        });
+        if let Some(fire) = fire {
+            fire.placed_bracket = replay_broker.placed_bracket(&order_id);
+            fire.gate_outcome = EnterGateOutcome::Placed {
+                order_id: Some(order_id),
+            };
+        }
+    }
+}
+
 /// One live upkeep tick per finer bar closing strictly inside `(open, close)`:
 /// pin the store clock and the broker's quote to that bar, then run the SAME
 /// two shared order-control passes the per-bar tick runs, in the same order
@@ -163,6 +288,7 @@ async fn walk_upkeep_ticks(
     replay_broker: &ReplayBroker,
     store: &MemStateStore,
     lifecycle_cfg: &super::lifecycle::ReplayConfigProvider,
+    fires: &mut [Fire],
     open: DateTime<Utc>,
     close: DateTime<Utc>,
 ) {
@@ -170,7 +296,7 @@ async fn walk_upkeep_ticks(
     for (at, sample) in upkeep.samples_in(open, close) {
         store.set_clock(at);
         replay_broker.set_upkeep_sample(Some(*sample));
-        trade_control_core::order_control::promote_due_orders(
+        let promoted = trade_control_core::order_control::promote_due_orders(
             replay_broker,
             store,
             lifecycle_cfg,
@@ -179,6 +305,7 @@ async fn walk_upkeep_ticks(
             at,
         )
         .await;
+        adopt_promotions(&promoted, replay_broker, fires);
         trade_control_core::order_control::reprice_due_orders(
             replay_broker,
             store,
@@ -352,6 +479,9 @@ pub async fn run_with_upkeep(
     // tick, the first tick after seeding), where every bar closed since the
     // watermark is evaluated under a SINGLE wall-clock instant. See `cadence`.
     let mut lo = seed_end;
+    // Where the plan retired (`eval.done`): the order-control tail below runs
+    // from here to the end of the window. `len` ⇒ the loop ran out of bars.
+    let mut tail_from = candles.len();
     while lo < candles.len() {
         // Inclusive index of the batch's LAST (newest) bar. Everything that is
         // once-per-tick live — the broker advance, the resting-order lifecycle,
@@ -459,6 +589,7 @@ pub async fn run_with_upkeep(
                 &replay_broker,
                 &store,
                 &lifecycle_cfg,
+                &mut fires,
                 prev_close,
                 now,
             )
@@ -776,83 +907,19 @@ pub async fn run_with_upkeep(
         //
         // The lifecycle's own spread-hour gating still keys on the bar CLOSE — it
         // takes `now` as an argument below, independent of the broker's held clock.
-        replay_broker.set_as_of(bar_open);
-        let src = super::lifecycle::ReplayVerifiedSource::new(&replay_broker);
-        // Replay is the SOLE owner of the record (no System 2 widened stops
-        // offline), so it clears the record itself — `ClearRecord`, the default
-        // behaviour, byte-identical to before the Option-A clear-policy split.
-        trade_control_core::pending_lifecycle::pending_order_lifecycle(
+        order_control_pass(
             &replay_broker,
             &store,
             &lifecycle_cfg,
-            &src,
-            None,
-            now,
-            trade_control_core::pending_lifecycle::ClearPolicy::ClearRecord,
-        )
-        .await;
-
-        // The every-candle order-control re-check — the SAME `core` pass the
-        // live cron runs (`order_control_tick`). Without this a sub-1R entry
-        // parks identically on both sides but only ever *promotes* live, so a
-        // fixture would quietly book 0R for a trade production takes
-        // (`[[strategy_changes_in_both_replayer_and_worker]]`).
-        //
-        // Runs AFTER the lifecycle so an order the lifecycle just re-placed is
-        // already resting, and a promotion this bar is visible to the next bar's
-        // fill simulation — the same ordering the live scheduler gets from
-        // running the sweep and this pass on the same cadence.
-        //
-        // `Every`, not the lifecycle's `None`: this pass enumerates RECORDS,
-        // which carry the plan's real account (`m-and-w` in the sgdjpy fixture),
-        // so an account-equality filter would match nothing offline. The replay
-        // has one broker and one plan, so every record is in scope.
-        trade_control_core::order_control::promote_due_orders(
-            &replay_broker,
-            &store,
-            &lifecycle_cfg,
-            &src,
-            trade_control_core::order_control::PromoteScope::Every,
-            now,
-        )
-        .await;
-
-        // …and the RE-PRICE half of that same tick, which the live
-        // `order_control_tick::run_both` runs immediately after the promotion and
-        // the replay used to skip entirely. Slice 7
-        // (`core::pending_lifecycle`) retired the `HoldReason::SpreadHour` ON-side
-        // derivation in favour of the forward-looking SL floor that ONLY this pass
-        // delivers, so without it the replay had neither the retired hold nor its
-        // replacement: a resting order sat offline at its original stop through a
-        // spread widening while live re-priced it wider or parked it below min-R
-        // (`[[strategy_changes_in_both_replayer_and_worker]]`).
-        //
-        // Promotion runs FIRST, exactly as live: an order promoted this bar was
-        // placed at the current spread, so re-pricing it in the same tick would at
-        // best be redundant and at worst cancel-and-replace an order placed a
-        // moment ago.
-        //
-        // `account: None` — the ReplayBroker doesn't scope orders by account, and
-        // unlike the promotion pass this one enumerates BROKER ORDERS (which the
-        // broker has already scoped) rather than records, so the `PromoteScope`
-        // distinction doesn't arise here.
-        //
-        // `BrokerQuotes`, not the live cron's per-tick cache: the replay's
-        // `get_quote` is a local read off the bar it is already holding, so a cache
-        // would buy nothing and could only go stale within a bar.
-        trade_control_core::order_control::reprice_due_orders(
-            &replay_broker,
-            &store,
-            &lifecycle_cfg,
-            &src,
-            &mut trade_control_core::order_control::BrokerQuotes(&replay_broker),
-            None,
+            &mut fires,
+            bar_open,
             now,
         )
         .await;
 
         if eval.done {
             done = true;
+            tail_from = i + 1;
             break;
         }
 
@@ -860,6 +927,46 @@ pub async fn run_with_upkeep(
         // so the next tick starts at `i + 1`; `batch_end` guarantees `i >= lo`,
         // so this always makes progress.
         lo = i + 1;
+    }
+
+    // The order-control TAIL. Live's lifecycle / promote / re-price jobs are
+    // scheduler loops over records and resting orders — they do not stop when
+    // a plan retires. Offline the loop above ends at `eval.done`, which used to
+    // strand everything order-control owned: a `SpreadHour` park from the
+    // plan's single once-mode enter (the plan is Done the moment it fires) was
+    // never promoted, and a resting order was never re-priced or pulled for a
+    // later spread hour. Walk the remaining bars with ONLY the order-control
+    // pass (no engine): same clocks, same upkeep ticks, same shared fns.
+    if done {
+        for j in tail_from..candles.len() {
+            let bar_open = candles[j].time;
+            let now = bar_open + bar;
+            let prev_close = candles[j - 1].time + bar;
+            replay_broker.set_as_of(bar_open);
+            replay_broker.advance(bar_open);
+            if let Some(upkeep) = upkeep {
+                walk_upkeep_ticks(
+                    upkeep,
+                    &replay_broker,
+                    &store,
+                    &lifecycle_cfg,
+                    &mut fires,
+                    prev_close,
+                    now,
+                )
+                .await;
+            }
+            store.set_clock(now);
+            order_control_pass(
+                &replay_broker,
+                &store,
+                &lifecycle_cfg,
+                &mut fires,
+                bar_open,
+                now,
+            )
+            .await;
+        }
     }
 
     // S5b: the report reads each placed enter's outcome from the broker's HELD
@@ -1193,6 +1300,13 @@ async fn dispatch_enter(
         }
         ActionResult::Rejected { outcome, .. } => {
             tracing::debug!(rule = %fired.rule_id, %outcome, "tick: enter rejected (0R skip)");
+            // A reject that PARKED the enter (the spread gate's H4+ delay —
+            // `park_stored_entry` appends "stored until …") keeps its arm, so
+            // the order-control promote pass can recover it by trade id and
+            // place it once the hour releases. Any other reject drops the arm.
+            if outcome.contains("stored until") {
+                broker.park_armed();
+            }
             EnterGateOutcome::Rejected { reason: outcome }
         }
         ActionResult::Failed(reason) => {
@@ -1854,6 +1968,126 @@ mod tests {
         assert!(
             reason.contains("spread-blackout"),
             "expected a spread-blackout rejection from run_enter's seeded gate, got {reason:?}"
+        );
+    }
+
+    /// `plain_enter_plan` on an H4 grid: same geometry, coarser bars.
+    fn plain_enter_plan_h4(instrument: &str, level: f64) -> TradePlan {
+        let mut plan = plain_enter_plan(instrument, level);
+        plan.granularity = Granularity::H4;
+        plan
+    }
+
+    /// JOB 3 at the entry point: on an H4 plan the spread gate DELAYS. The enter
+    /// fires on the bar closing AT the NY close (17:00Z open, 21:00Z close in
+    /// EDT) carrying a 10-pip book — past EUR/USD's 2.5-pip reject threshold —
+    /// so `run_enter` parks it as `SpreadHour`. The next bar closes 01:00Z,
+    /// outside the baked hour: the shared promote pass places it off the calm
+    /// book, and the bars after fill it and run to TP. A replay that still
+    /// rejected-and-forgot (the pre-2026-09-18 clamp, or a park with no offline
+    /// recovery) books NO fill here.
+    #[tokio::test]
+    async fn h4_enter_on_the_ny_close_bar_is_parked_then_promoted_and_fills() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init()
+            .ok();
+        // NY-anchored H4 grid in EDT: 01/05/09/13/17/21Z. Ten tight warm-up bars.
+        let mut candles: Vec<EngineCandle> = Vec::new();
+        let mut t: DateTime<Utc> = "2026-07-07T01:00:00Z".parse().unwrap();
+        for _ in 0..10 {
+            candles.push(ohlc_at_spread(
+                &t.to_rfc3339(),
+                1.1040,
+                1.1042,
+                1.1038,
+                1.1040,
+                0.0002,
+            ));
+            t += Duration::hours(4);
+        }
+        // 2026-07-08 17:00Z: closes 1.1055 above the 1.1050 level → enter fires
+        // at 21:00Z, the NY-close edge, off this bar's WIDE 10-pip book → parked.
+        assert_eq!(t.to_rfc3339(), "2026-07-08T17:00:00+00:00");
+        candles.push(ohlc_at_spread(
+            &t.to_rfc3339(),
+            1.1045,
+            1.1060,
+            1.1043,
+            1.1055,
+            0.0010,
+        ));
+        // 21:00Z bar (the spread hour itself): stays below the 1.1100 entry stop;
+        // its close, 01:00Z, is outside the hour → promotion at the calm book.
+        candles.push(ohlc_at_spread(
+            "2026-07-08T21:00:00Z",
+            1.1055,
+            1.1070,
+            1.1050,
+            1.1060,
+            0.0002,
+        ));
+        // 01:00Z: reaches through 1.1100 → the promoted stop order fills.
+        candles.push(ohlc_at_spread(
+            "2026-07-09T01:00:00Z",
+            1.1060,
+            1.1120,
+            1.1058,
+            1.1110,
+            0.0002,
+        ));
+        // 05:00Z: runs to TP 1.1250.
+        candles.push(ohlc_at_spread(
+            "2026-07-09T05:00:00Z",
+            1.1110,
+            1.1260,
+            1.1105,
+            1.1255,
+            0.0002,
+        ));
+        let live_at: DateTime<Utc> = "2026-07-08T13:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-07-12T00:00:00Z".parse().unwrap();
+
+        let r = run(
+            &plain_enter_plan_h4("EUR/USD", 1.1050),
+            &candles,
+            Granularity::H4,
+            live_at,
+            expires_at,
+            no_marks(),
+            None,
+        )
+        .await;
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("enter fired on the 17:00Z bar");
+        assert_eq!(
+            enter.fired.candle.time,
+            "2026-07-08T17:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "the enter fires on the NY-close bar"
+        );
+        assert!(
+            enter.rejected_reason().is_none(),
+            "the parked enter must be re-pointed at its promotion, got {:?}",
+            enter.rejected_reason()
+        );
+        let realized = enter
+            .realized
+            .as_ref()
+            .expect("the promoted order must fill and be booked against the enter");
+        assert!(
+            realized.fill_at >= "2026-07-09T01:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "the fill comes AFTER the spread hour, got {}",
+            realized.fill_at
+        );
+        assert!(
+            (realized.entry_price - 1.1100).abs() < 1e-6,
+            "entered at the drawn stop trigger, got {}",
+            realized.entry_price
         );
     }
 

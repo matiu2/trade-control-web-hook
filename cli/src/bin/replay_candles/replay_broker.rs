@@ -33,7 +33,6 @@ use trade_control_core::broker::{
 };
 use trade_control_core::incoming::Verified;
 use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, RiskBudget, Shell};
-use trade_control_core::spread_blackout::{elevated_threshold_pips, is_spread_hour};
 
 /// One placed attempt the gate may later ask about, with the geometry needed to
 /// re-simulate it. `order_id` is what [`Broker::place_entry`] handed back (the
@@ -59,6 +58,10 @@ struct PlacedAttempt {
     /// cancelled attempt resolves to [`AttemptState::Cancelled`] regardless of
     /// the price path.
     cancelled: bool,
+    /// Placed by the order-control promote pass out of a gate park (a
+    /// `SpreadHour` delay), not by the fire's own dispatch. Read by
+    /// `promoted_order_id` so the replay can re-point that fire.
+    promoted_from_park: bool,
 }
 
 /// The CONCRETE order levels the broker placed an attempt at — the floored stop,
@@ -255,6 +258,13 @@ pub struct ReplayBroker {
     /// The placement the loop armed for the next `run_enter` (its intent, shell,
     /// and the order id `place_entry` should return). Consumed by `place_entry`.
     armed: RefCell<Option<ArmedPlacement>>,
+    /// Enters the spread-blackout gate PARKED (H4+ delay, `StoredReason::
+    /// SpreadHour`) instead of placing: the armed placement `run_enter` never
+    /// consumed, kept so the park is recoverable by TRADE id
+    /// (`armed_verified`) and so the promotion's `place_entry` — which arrives
+    /// with nothing armed — can adopt its intent, shell and order id. Live has
+    /// the signed body in the store for this; offline the armed map IS the body.
+    parked: RefCell<Vec<ArmedPlacement>>,
     /// The sub-bar zoom provider (PR-2), or `None` ⇒ [`NoZoom`]. Every fill/exit
     /// path passes this to `simulate_fill_resolved_zoom`, so an ambiguous SL/TP
     /// bar is disambiguated by finer candles when available and
@@ -302,6 +312,7 @@ impl ReplayBroker {
             as_of: RefCell::new(last),
             placed: RefCell::new(Vec::new()),
             armed: RefCell::new(None),
+            parked: RefCell::new(Vec::new()),
             finer: None,
             upkeep_sample: RefCell::new(None),
             resting: RefCell::new(Vec::new()),
@@ -382,6 +393,28 @@ impl ReplayBroker {
     /// consumes it. `order_id` must match what the gate stores on the
     /// `EntryAttempt` (`run_enter` stamps `place_entry`'s return there), so the
     /// minted id is the standard `{intent.id}-{attempt_no}` form.
+    /// The gate parked the enter it was armed for (a `SpreadHour` delay): move
+    /// the un-consumed arm to the parked set so the park can be recovered and
+    /// later promoted. A no-op when nothing is armed (the arm was consumed by a
+    /// placement, or this reject wasn't a park).
+    pub fn park_armed(&self) {
+        if let Some(a) = self.armed.borrow_mut().take() {
+            self.parked.borrow_mut().push(a);
+        }
+    }
+
+    /// The broker order id a PROMOTED park was placed under, so the replay can
+    /// re-point the enter fire the gate rejected at the placement it later
+    /// became. `None` while still parked (or never parked).
+    pub fn promoted_order_id(&self, trade_id: &str) -> Option<String> {
+        self.placed
+            .borrow()
+            .iter()
+            .rev()
+            .find(|a| a.promoted_from_park && a.intent.trade_id.as_deref() == Some(trade_id))
+            .map(|a| a.order_id.clone())
+    }
+
     pub fn arm_placement(&self, order_id: String, intent: Intent, shell: Shell) {
         *self.armed.borrow_mut() = Some(ArmedPlacement {
             order_id,
@@ -422,6 +455,7 @@ impl ReplayBroker {
             shell,
             placed,
             cancelled: false,
+            promoted_from_park: false,
         });
     }
 
@@ -458,17 +492,30 @@ impl ReplayBroker {
     /// demotes.
     pub fn armed_verified(&self, key: &str) -> Option<Verified> {
         let placed = self.placed.borrow();
-        let attempt = placed.iter().find(|a| a.order_id == key).or_else(|| {
-            placed
-                .iter()
-                .find(|a| a.intent.trade_id.as_deref() == Some(key))
-        })?;
-        let mut intent = attempt.intent.clone();
+        let parked = self.parked.borrow();
+        let (intent, shell) = placed
+            .iter()
+            .find(|a| a.order_id == key)
+            .or_else(|| {
+                placed
+                    .iter()
+                    .find(|a| a.intent.trade_id.as_deref() == Some(key))
+            })
+            .map(|a| (&a.intent, &a.shell))
+            // A gate-parked enter was never placed, so it lives only here —
+            // the trade-id arm is the ONLY way a `SpreadHour` park promotes.
+            .or_else(|| {
+                parked
+                    .iter()
+                    .find(|a| a.intent.trade_id.as_deref() == Some(key))
+                    .map(|a| (&a.intent, &a.shell))
+            })?;
+        let mut intent = intent.clone();
         if !intent.pip_size.is_some_and(|p| p > 0.0 && p.is_finite()) {
             intent.pip_size = Some(self.pip_size);
         }
         Some(Verified {
-            shell: attempt.shell.clone(),
+            shell: shell.clone(),
             intent,
         })
     }
@@ -484,6 +531,22 @@ impl ReplayBroker {
     /// return its existing `order_id`; the resting order is restored and the ledger
     /// resolves it normally against its forward path (fills on the next clean bar,
     /// the spike bar still skipped by `find_fill`). `None` when nothing matches.
+    /// Remove and return the parked arm whose intent resolves to `req`'s
+    /// instrument + direction — the promotion of a gate-parked enter. One plan
+    /// per replay, so instrument + direction identify it.
+    fn take_parked_matching(&self, req: &EntryRequest<'_>) -> Option<ArmedPlacement> {
+        let mut parked = self.parked.borrow_mut();
+        let idx = parked.iter().position(|a| {
+            if a.intent.instrument != req.instrument {
+                return false;
+            }
+            let tick = a.intent.tick_size.unwrap_or(self.pip_size);
+            Resolved::from_intent(&a.intent, &a.shell, self.pip_size, tick)
+                .is_ok_and(|r| r.direction == req.direction)
+        })?;
+        Some(parked.remove(idx))
+    }
+
     fn reactivate_matching_cancelled(&self, req: &EntryRequest<'_>) -> Option<String> {
         let mut placed = self.placed.borrow_mut();
         let matched = placed.iter_mut().find(|a| {
@@ -665,6 +728,7 @@ impl ReplayBroker {
             shell: shell.clone(),
             placed: placed.clone(),
             cancelled: false,
+            promoted_from_park: false,
         };
         self.resolved_for_sim(&probe, &[])
     }
@@ -788,6 +852,7 @@ impl ReplayBroker {
             shell: shell.clone(),
             placed: placed.clone(),
             cancelled: false,
+            promoted_from_park: false,
         };
         let resolved = self.resolved_for_sim(&probe, &prefix)?;
         let outcome = simulate_fill_resolved_zoom(
@@ -1149,6 +1214,23 @@ impl Broker for ReplayBroker {
             // faithful to the cancel→restore→fill sequence the live path runs.
             None => match self.reactivate_matching_cancelled(req) {
                 Some(order_id) => Ok(replay_placement(order_id, req)),
+                // …or the order-control promote pass placing a gate-PARKED
+                // enter (`StoredReason::SpreadHour`): adopt the arm the gate
+                // set aside, under the id the fire would have placed with, and
+                // hold it at the levels `run_enter` just derived off the calm
+                // spread — the fresh floor and size the promotion is for.
+                None if let Some(a) = self.take_parked_matching(req) => {
+                    let placed = PlacedLevels {
+                        entry: req.entry.clone(),
+                        stop_loss: req.stop_loss,
+                        take_profit: req.take_profit,
+                    };
+                    self.record_attempt(a.order_id.clone(), a.intent, a.shell, Some(placed));
+                    if let Some(rec) = self.placed.borrow_mut().last_mut() {
+                        rec.promoted_from_park = true;
+                    }
+                    Ok(replay_placement(a.order_id, req))
+                }
                 // Neither armed nor a matching cancelled attempt — a genuine
                 // wiring fault (an enter dispatched without arming, and not a
                 // known re-drive). Fail loudly rather than fabricate an id.
@@ -1288,7 +1370,7 @@ impl Broker for ReplayBroker {
         Ok(())
     }
 
-    async fn get_quote(&self, instrument: &str) -> Result<Quote, LookupError> {
+    async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
         // The shared entry gates (spread-blackout + SL-vs-spread floor in
         // `dispatch::run_enter`) sample the live spread via this round-trip. The
         // replay candles carry the real book (`bid_c`/`ask_c`), so synthesize the
@@ -1305,80 +1387,20 @@ impl Broker for ReplayBroker {
         // Better than the old unconditional fail-open, which reproduced nothing.
         // An upkeep tick (job 2) samples a finer bar's book at that bar's time;
         // otherwise the plan bar `as_of` points at. Same clamp below either way.
-        let sample = *self.upkeep_sample.borrow();
-        let (as_of, book) = match sample {
-            Some(s) => (s.time, Some(s)),
-            None => (*self.as_of.borrow(), self.candle_at_as_of().cloned()),
+        let book = match *self.upkeep_sample.borrow() {
+            Some(s) => Some(s),
+            None => self.candle_at_as_of().cloned(),
         };
-        // Inside a baked spread hour, the OVERNIGHT LIQUIDITY TROUGH is wide *by
-        // definition* — the whole reason the block exists — even when a particular
-        // bar's CLOSE happens to print a narrow spread (the trough is sustained;
-        // the close is a noisy sub-sample). The replay has no live tick to know the
-        // instantaneous spread, so a real bar's close-spread mid-block is an
-        // unreliable recovery signal: it dips narrow on some bars and would make
-        // the OFF-side (`pending_lifecycle::off_now`) FALSELY "recover" the trade
-        // early, restoring a cancelled resting order that then gets re-cancelled the
-        // next in-block bar — a cancel↔restore ping-pong. So in-block we report a
-        // spread AT the elevated threshold and the OFF-side stays held until the
-        // baked hour ENDS (its stated deterministic off-signal).
-        // Out of block, the real close-spread flows through unchanged.
-        //
-        // ⚠️ AUDITED 2026-09-15 — three corrections to the paragraph above, all
-        // of which a reader would otherwise take on trust. See finding #10 in
-        // `BUG-replay-vs-live-divergence-audit-2026-09-13.md` and the measured
-        // `EVIDENCE-spread-hour-trough-duration.md`.
-        //
-        // 1. "the entry gate correctly sees the trough" was **FALSE** and has
-        //    been struck. `spread_blackout_decision` is strictly
-        //    `spread_pips > threshold_pips`, and this returns EXACTLY
-        //    `elevated_threshold_pips` — so `8.0 > 8.0` is false and the entry
-        //    gate **never rejects** under the clamp. The clamp sits on the
-        //    permissive boundary. Consequence for anyone retuning this: changing
-        //    the VALUE here wakes a currently-inert gate across the whole corpus
-        //    (a prototype swapping in `hour_p90_frac` flipped 99 of 109 masked
-        //    instrument-hours from ALLOW to REJECT). That is a behaviour change
-        //    needing its own P&L measurement, NOT a side effect of a spread fix.
-        //
-        // 2. The anti-ping-pong property is **CONSTANCY WITHIN THE HOUR, NOT
-        //    MAGNITUDE.** It is tempting to reason "the clamp is safe because it
-        //    always exceeds the 4.0p recovery cutoff" — untrue: 9 of 109 masked
-        //    hours already clamp BELOW it (TN `AUD/USD` 2.00p, `EUR/USD` 2.50p).
-        //    They still can't oscillate, because the value is constant for the
-        //    hour. Any replacement must keep that; the number itself is free.
-        //
-        // 3. This clamp IS a known replay↔live divergence, accepted not fixed.
-        //    Live releases a hold on baked-hour-end OR real-spread-recovery
-        //    (<= `SPREAD_BLACKOUT_RECOVERED_PIPS`); replay can only take the
-        //    first. Measured: EUR/USD's spread genuinely recovers before its
-        //    baked hour ends on **9 of 14 days (64%)** — its clamp is 8.0p,
-        //    exactly 2× the cutoff, so recovery is unreachable by construction.
-        //    GBP/AUD 0/14 and AUD/CHF 0/13 (their spike fills the hour), so this
-        //    bites TIGHT-spread instruments only. Replay is therefore
-        //    systematically MORE CONSERVATIVE than live in spread hours —
-        //    fixtures under-report trades production takes.
-        //
-        // Don't "fix" it with `hour_p90_frac`: that column is a PEAK statistic
-        // (p90 of within-hour minute spreads, generated to size a stop widen),
-        // while early release is driven by the TYPICAL late-hour minute. It
-        // moves EUR/USD 8.00p → 6.85p against a 4.0p cutoff — the wrong
-        // statistic, not a near miss. The shape that would work is to DECOUPLE
-        // the consumers (real bar spread to the entry gate, baked clock to the
-        // hold release), which makes ping-pong impossible by construction.
-        //
-        // NOTE the SL-vs-spread floor does NOT read this: `run_enter` prefers
-        // `windowed_entry_spread` → `get_bidask_candles` (real unclamped bid/ask),
-        // falling back to `get_quote` only when `enter_granularity == None`, which
-        // replay never passes. No corpus entry sizes its stop off this value.
-        if is_spread_hour(instrument, as_of)
-            && let Some(c) = &book
-        {
-            let mid = (c.bid_c + c.ask_c) / 2.0;
-            let half = elevated_threshold_pips(instrument) * self.pip_size / 2.0;
-            return Ok(Quote {
-                bid: mid - half,
-                ask: mid + half,
-            });
-        }
+        // No spread-hour clamp any more. Until 2026-09-18 an in-hour quote was
+        // pinned to EXACTLY `elevated_threshold_pips`, which (a) made the
+        // entry gate's strict `>` inert offline — the replay ENTERED on every
+        // rollover bar live rejects (audit 2026-09-13, finding #10) — and (b)
+        // kept the lifecycle OFF side from ping-ponging on a narrow close
+        // print. (b) is now moot: the OFF rule is the shared
+        // `spread_hour_released_at`, and with `--upkeep` the replay samples the
+        // same sub-bar quotes live does, so an early release off a genuinely
+        // calm sub-bar is the LIVE behaviour, not noise. The real book flows
+        // through; the gate rejects (H1-) or parks (H4+) where live would.
         match book {
             Some(c) => Ok(Quote {
                 bid: c.bid_c,

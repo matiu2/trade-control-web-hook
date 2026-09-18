@@ -31,11 +31,11 @@ recovered), extracted into one fn both call.
       with `SpreadHour` (drawn sl/tp distance, min_r) and return the Rejected
       with a "(parked)" outcome, mirroring the BelowMinR park. Test: H4 parks,
       H1 rejects without a park.
-- [ ] 4. Replay entry-point test (`replay.rs`): an H4 enter firing on the
+- [x] 4. Replay entry-point test (`replay.rs`): an H4 enter firing on the
       spread-hour bar is parked and promoted by the next clean upkeep tick /
       bar, entering at the calm spread. Requires the replay quote clamp to be
       removable — see step 5; until then the replay gate is inert.
-- [ ] 5. Remove `ReplayBroker::get_quote`'s in-spread-hour clamp (audit
+- [~] 5. Remove `ReplayBroker::get_quote`'s in-spread-hour clamp (audit
       finding #10) as its OWN commit; measure the corpus delta; re-bless with
       a note.
 - [ ] 6. clippy + fmt; commit + push each step.
