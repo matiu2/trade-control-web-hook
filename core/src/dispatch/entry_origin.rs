@@ -137,6 +137,19 @@ impl EntryOrigin {
         !matches!(self, Self::Fresh)
     }
 
+    /// Only a `Replacing` re-drive skips the retry gate: it continues an
+    /// attempt the gate already admitted and re-points that row. A
+    /// **`Promotion` is the trade's FIRST placement** — nothing was placed when
+    /// it parked — so it must go through the gate like a fresh fire: it is
+    /// deduplicated against what the trade holds and it WRITES the
+    /// `EntryAttempt` every attempt-keyed cron and every later fire's gate
+    /// reads. Skipping it (pre-2026-09-18) left promoted positions unmanaged
+    /// and let the next fire enter on top of them
+    /// (`BUG-spread-park-bypasses-entry-dedup.md`).
+    pub fn skips_retry_gate(&self) -> bool {
+        matches!(self, Self::Replacing { .. })
+    }
+
     /// The broker order id this call replaces, when there is one to re-point.
     /// `None` for a fresh fire (nothing to replace) and for a promotion (the
     /// parked setup never reached the broker).
@@ -160,6 +173,16 @@ mod tests {
     fn only_a_fresh_fire_runs_the_full_gate_chain() {
         assert!(!EntryOrigin::Fresh.is_replacement());
         assert!(EntryOrigin::Promotion.is_replacement());
+        // The gate bypass is narrower than "replacement": a promotion is the
+        // first placement and must be gated + recorded.
+        assert!(!EntryOrigin::Fresh.skips_retry_gate());
+        assert!(!EntryOrigin::Promotion.skips_retry_gate());
+        assert!(
+            EntryOrigin::Replacing {
+                old_broker_order_id: "o-1".into()
+            }
+            .skips_retry_gate()
+        );
         assert!(
             EntryOrigin::Replacing {
                 old_broker_order_id: "ORD-1".into(),

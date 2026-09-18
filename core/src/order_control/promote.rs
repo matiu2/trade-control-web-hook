@@ -159,7 +159,7 @@ where
         now,
         Some(&order.signed_intent),
         None,
-        crate::dispatch::EntryOrigin::Promotion,
+        promotion_origin(&order),
     )
     .await;
     tracing::info!(
@@ -168,6 +168,21 @@ where
         result.describe(),
     );
     Ok(PromoteOutcome::Promoted(result.describe()))
+}
+
+/// How a promotion re-drives `run_enter`. A park that was RE-PLACING a
+/// cancelled order (re-price demote / failed re-place) continues that attempt:
+/// `Replacing` skips the retry gate and re-points the existing row, exactly as
+/// the re-price's own re-place would have. A park from a FRESH fire (the
+/// spread-hour park, a first placement below the floor) is the trade's first
+/// placement: `Promotion` runs the full gate and records the attempt.
+pub fn promotion_origin(order: &super::StoredOrder) -> crate::dispatch::EntryOrigin {
+    match &order.replaces {
+        Some(old_broker_order_id) => crate::dispatch::EntryOrigin::Replacing {
+            old_broker_order_id: old_broker_order_id.clone(),
+        },
+        None => crate::dispatch::EntryOrigin::Promotion,
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +220,7 @@ mod tests {
                 original_sl_distance: 0.0020,
                 tp_distance: 0.0200,
                 min_r: 1.0,
+                replaces: None,
                 stored_at: now,
                 drop_at: at(drop_at),
                 shell_time: now,
@@ -441,5 +457,39 @@ mod tests {
                 Self::Expired => Recovered::Expired,
             }
         }
+    }
+
+    /// The origin mapping is the whole point of `replaces`: a re-price park
+    /// must re-drive as the re-placement it is, a fresh park as a first
+    /// placement. Mutation: return `Promotion` for both and the first assert
+    /// goes red.
+    #[test]
+    fn a_reprice_park_promotes_as_replacing_and_a_fresh_park_as_promotion() {
+        let base = StoredOrder {
+            signed_intent: String::new(),
+            reason: StoredReason::BelowMinR,
+            original_sl_distance: 0.001,
+            tp_distance: 0.002,
+            min_r: 1.0,
+            stored_at: at("2026-07-23T05:00:00Z"),
+            drop_at: at("2026-07-24T05:00:00Z"),
+            shell_time: at("2026-07-23T05:00:00Z"),
+            bar_seconds: Some(3600),
+            replaces: Some("order-1".into()),
+        };
+        assert_eq!(
+            promotion_origin(&base),
+            crate::dispatch::EntryOrigin::Replacing {
+                old_broker_order_id: "order-1".into()
+            }
+        );
+        let fresh = StoredOrder {
+            replaces: None,
+            ..base
+        };
+        assert_eq!(
+            promotion_origin(&fresh),
+            crate::dispatch::EntryOrigin::Promotion
+        );
     }
 }

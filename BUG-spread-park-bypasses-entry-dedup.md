@@ -1,9 +1,43 @@
 # BUG — a spread-hour PARK bypasses entry dedup, and its PROMOTION records no attempt
 
-**Status:** OPEN, found 2026-09-18 by the offline replay once the entry-instant
-quote made the H4+ park reachable (`feat/replay-upkeep-fixtures`). Live-reachable
-on `staging` (park shipped in `feat/spread-gate-park`, 8b142171). Same shape as
-the EUR/GBP 3×-risk incident (`BUG-mw-everybar-enter-skips-retry-gate.md`).
+**Status:** FIXED 2026-09-18 on `feat/replay-upkeep-fixtures` (same day it was
+found, by the offline replay once the entry-instant quote made the H4+ park
+reachable). It was live-reachable on `staging` from the park's merge
+(`feat/spread-gate-park`, 8b142171) until this lands. Same shape as the EUR/GBP
+3×-risk incident (`BUG-mw-everybar-enter-skips-retry-gate.md`).
+
+## Fix (shipped)
+
+- `retry_gate::probe` — the gate in `GateMode::Probe`: identical classification,
+  no broker side effect; a still-resting prior order is `rejected: order-resting`
+  instead of a cancel. `run_enter` asks it (`dedup_before_park`) before **both**
+  parks that sit above the gate — the spread-hour park and the below-floor
+  (`sl-widen-below-min-r`) park — so a fresh fire the gate would have rejected
+  (open position, resting order, same-bar re-fire) is rejected, never parked and
+  promoted on top of the trade. The full gate stays last (its cancel arm still
+  needs an immediate re-place). The below-floor case is the corpus shape: on
+  AUD/CAD H1 a same-bar re-fire parked below the floor and was promoted on top of
+  the filled first attempt — a second leg on ~100 cells that the 2026-09-18
+  re-bless had blessed as truth.
+- `StoredOrder.replaces` (serde default `None`) records the broker order a park
+  was RE-PLACING when it parked (the re-price's demote / failed-re-place path,
+  and a `Replacing` re-drive that falls below the floor). `promotion_origin`
+  maps it: `Some` ⇒ `EntryOrigin::Replacing` (the gate already admitted that
+  attempt; the row is re-pointed), `None` ⇒ `EntryOrigin::Promotion`.
+- `EntryOrigin::skips_retry_gate()` is true for `Replacing` only. A `Promotion`
+  runs the full gate and therefore `record_placement`: it is deduplicated and it
+  writes the `EntryAttempt` the crons and later fires read.
+- Tests (all mutation-checked): `retry_gate::tests::probe_*`,
+  `spread_gate_park_tests::{a_spread_hour_fire_on_an_open_trade_is_rejected_not_parked,
+  a_spread_hour_fire_with_a_resting_order_is_rejected_not_parked,
+  a_spread_hour_fire_after_a_cancelled_attempt_still_parks,
+  a_below_floor_fire_on_an_open_trade_is_rejected_not_parked,
+  a_below_floor_fire_after_a_cancelled_attempt_still_parks,
+  a_promotion_records_an_entry_attempt}`,
+  `promote::tests::a_reprice_park_promotes_as_replacing_and_a_fresh_park_as_promotion`,
+  and the AUD/NZD D1 fixture
+  `aud-nzd-d1-2026-08-19-strategy-v2-qm-market-news-off-upkeep-15m` (one park, one
+  promotion, one leg, second fire `trade-already-open (backstop)`).
 
 ## Reproduction (offline, real data)
 
@@ -36,7 +70,7 @@ AUD/NZD D1 iH&S, `--strategy-v2 --qm-entry market`, re-armed from
    (pending sweep, break-even, blackout passes, order-control re-price) is blind
    to the promoted position — the exact "manual entries unmanaged" class (v145).
 
-## Fix direction (not done — needs the operator's eyes, it is live-money dedup)
+## Fix direction (as written before the fix)
 
 - Before parking, run the gate's READ-ONLY dedup: an open position or a resting
   order for this trade ⇒ `rejected: trade-already-open`, no park. Do not call

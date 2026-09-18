@@ -209,6 +209,7 @@ where
             expires_at,
             bar_seconds,
             now,
+            order.order_id.clone(),
         )
         .await?;
         tracing::info!(
@@ -273,6 +274,7 @@ where
         expires_at,
         bar_seconds,
         now,
+        order.order_id.clone(),
     )
     .await?;
     Ok(RepriceOutcome::ReplaceFailed(why))
@@ -299,6 +301,9 @@ async fn park_below_min_r<S: StateStore>(
     expires_at: DateTime<Utc>,
     bar_seconds: i64,
     now: DateTime<Utc>,
+    // The order just cancelled, so the promotion re-drives as `Replacing` and
+    // re-points its attempt row instead of being gated as a new entry.
+    replaces: String,
 ) -> Result<(), String> {
     park_order(
         store,
@@ -318,6 +323,7 @@ async fn park_below_min_r<S: StateStore>(
             original_sl_distance: geometry.original_sl_distance,
             tp_distance: geometry.tp_distance,
             min_r: geometry.min_r,
+            replaces: Some(replaces),
             stored_at: now,
             drop_at: drop_at(expires_at, bar_seconds, now),
             shell_time,

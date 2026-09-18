@@ -262,6 +262,17 @@ fn adopt_promotions(
         let Some(order_id) = replay_broker.promoted_order_id(trade_id) else {
             continue;
         };
+        // A promotion that RE-PLACED an order (a `Replacing` park — the
+        // re-price cancelled it, the re-place fell below the floor, the park
+        // restored it) hands back an order id a fire already owns. Leave that
+        // fire as the leg's owner and the park fire as the rejected re-drive it
+        // was: re-pointing it too would book ONE held order as TWO legs.
+        if fires
+            .iter()
+            .any(|f| f.order_id() == Some(order_id.as_str()))
+        {
+            continue;
+        }
         let fire = fires.iter_mut().rev().find(|f| {
             f.fired.intent.action == Action::Enter
                 && f.fired.intent.trade_id.as_deref() == Some(trade_id.as_str())

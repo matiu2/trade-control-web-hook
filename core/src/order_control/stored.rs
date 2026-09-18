@@ -108,6 +108,18 @@ pub struct StoredOrder {
     /// later fire recognise itself as a *fresher* signal for the same setup and
     /// supersede rather than duplicate.
     pub shell_time: DateTime<Utc>,
+    /// The broker order this park was RE-PLACING when it parked, when it came
+    /// from an order-control re-drive (a re-price cancelled the resting order
+    /// and the re-place fell below the floor). `None` for a park from a fresh
+    /// fire (the spread-hour park, or a first placement below the floor).
+    ///
+    /// Decides how the promotion re-drives `run_enter`: `Some` ⇒
+    /// `EntryOrigin::Replacing` (the gate already admitted this attempt; the
+    /// row is re-pointed, never a second one), `None` ⇒ `EntryOrigin::Promotion`
+    /// (the trade's first placement: gated + recorded). Defaults to `None` on a
+    /// pre-field body, which is the gated, conservative reading.
+    #[serde(default)]
+    pub replaces: Option<String>,
     /// Seconds per bar at the enter's granularity, so a per-bar re-check
     /// ([`StoredReason::rechecked_per_bar`]) can tell "a new bar has started"
     /// from "the same bar, a few seconds later" — the order-control loop ticks
@@ -342,6 +354,7 @@ mod tests {
             original_sl_distance: 0.0020,
             tp_distance: 0.0200,
             min_r: 1.0,
+            replaces: None,
             stored_at: at(stored_at),
             drop_at: at(drop_at),
             shell_time: at(stored_at),
@@ -492,6 +505,7 @@ mod tests {
             reason: StoredReason::BelowMinSize,
             shell_time: at(shell),
             drop_at: at(drop_at_s),
+            replaces: None,
             stored_at: at(shell),
             bar_seconds: Some(3600),
             ..order(shell, drop_at_s)

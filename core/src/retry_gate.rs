@@ -147,11 +147,50 @@ fn resolve_max_retries(tunable: &Tunable<u32>, shell: &Shell) -> Result<u32, Ret
 /// `intent.effective_entry_dedup().needs_retry_gate()` — the caller is responsible for
 /// keeping the engine-latched path free of any state-store / broker lookups so
 /// the byte-identical baseline holds.
+/// How [`evaluate_in`] may act on what it finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateMode {
+    /// The real gate: a still-resting prior order is CANCELLED so the caller
+    /// can re-place it (the `Pending` arm's cancel-and-replace bargain).
+    Full,
+    /// Read-only. Every prior-attempt classification is identical, but a
+    /// still-resting prior order is a **rejection** (`order-resting`), never a
+    /// cancel — for a caller that is not about to place anything, such as the
+    /// spread-hour PARK, which must not be handed a cancelled order it will
+    /// only re-create hours later, and must not park on top of a position
+    /// the trade already holds.
+    Probe,
+}
+
+/// The full gate — see the module docs. [`GateMode::Full`].
 pub async fn evaluate<B: Broker, S: StateStore>(
     broker: &B,
     store: &S,
     intent: &Intent,
     shell: &Shell,
+) -> RetryGateOutcome {
+    evaluate_in(broker, store, intent, shell, GateMode::Full).await
+}
+
+/// The gate's verdict with **no broker side effect** ([`GateMode::Probe`]):
+/// answers "would this fire be deduplicated?" for a caller that is going to
+/// defer the placement rather than make it. A resting prior order rejects as
+/// `order-resting` instead of being cancelled.
+pub async fn probe<B: Broker, S: StateStore>(
+    broker: &B,
+    store: &S,
+    intent: &Intent,
+    shell: &Shell,
+) -> RetryGateOutcome {
+    evaluate_in(broker, store, intent, shell, GateMode::Probe).await
+}
+
+async fn evaluate_in<B: Broker, S: StateStore>(
+    broker: &B,
+    store: &S,
+    intent: &Intent,
+    shell: &Shell,
+    mode: GateMode,
 ) -> RetryGateOutcome {
     let shell_time = shell.time;
     let max_retries = match resolve_max_retries(&intent.max_retries, shell) {
@@ -249,6 +288,19 @@ pub async fn evaluate<B: Broker, S: StateStore>(
             .await
         {
             Ok(AttemptState::Pending) => {
+                if mode == GateMode::Probe {
+                    tracing::info!(
+                        "retry: probe found prior attempt #{} still RESTING — rejecting rather \
+                         than cancelling (trade_id={trade_id} order_id={})",
+                        attempt.attempt_no,
+                        attempt.broker_order_id,
+                    );
+                    return RetryGateOutcome::Rejected {
+                        status: 412,
+                        message: "order already resting",
+                        outcome: "rejected: order-resting".into(),
+                    };
+                }
                 let acct = account.unwrap_or("");
                 match broker.cancel_order(acct, &attempt.broker_order_id).await {
                     Ok(()) => {
@@ -1526,6 +1578,67 @@ mod tests {
         let cancels = broker.cancel_calls.borrow();
         assert_eq!(cancels.len(), 1);
         assert_eq!(cancels[0].1, "order-1");
+    }
+
+    /// The PROBE never cancels: a resting prior order is a rejection, and the
+    /// broker's cancel path is untouched. A probe that cancelled would strand
+    /// the order for a caller that is only parking (nothing is re-placed).
+    #[test]
+    fn probe_rejects_a_resting_prior_order_without_cancelling_it() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(3);
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "order-1",
+            Direction::Long,
+            1.05,
+            None,
+            None,
+            None,
+        ));
+        broker.push_lookup(AttemptState::Pending);
+
+        let out = run(probe(&broker, &store, &intent, &fixture_shell()));
+        assert_rejected(out, 412, "order-resting");
+        assert!(
+            broker.cancel_calls.borrow().is_empty(),
+            "the probe must not cancel anything"
+        );
+    }
+
+    /// The probe reads open positions exactly as the full gate does, so a
+    /// caller that defers on a probe `Proceed` is deferring a genuinely new
+    /// entry — and one on an open trade is rejected the same way.
+    #[test]
+    fn probe_rejects_an_open_prior_attempt_like_the_full_gate() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(3);
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "order-1",
+            Direction::Long,
+            1.05,
+            None,
+            None,
+            None,
+        ));
+        broker.push_lookup(AttemptState::OpenPosition {
+            broker_trade_id: "pos-1".into(),
+        });
+        let out = run(probe(&broker, &store, &intent, &fixture_shell()));
+        assert_rejected(out, 412, "trade-already-open");
     }
 
     /// Pending → cancel errors → re-lookup returns OpenPosition → 412

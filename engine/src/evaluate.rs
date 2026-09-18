@@ -2314,7 +2314,13 @@ fn fire_rule(
     // whole of a 15m/1h bar (rubbish) but only a quarter of an H4 bar (the other
     // 3h of real trading dilute it), so H4+ is never suppressed. We trade only
     // 15m/1h/4h/D, so this is "suppress on 15m+1h, allow on 4h+D".
-    let is_wick_cross = !trigger_uses_close(&rule.trigger);
+    // A clock trigger (`TimeReached` — trade expiry) reads no price at all, so
+    // it is neither a wick nor a close cross and must never be held by the
+    // rubbish-candle gate: on UK 100 (masked 21:00–06:00 London) an expiry
+    // landing overnight was delayed to the first clean bar, leaving the
+    // position unmanaged all night.
+    let is_wick_cross =
+        !trigger_uses_close(&rule.trigger) && !matches!(rule.trigger, Trigger::TimeReached { .. });
     if hit
         && is_wick_cross
         && trade_control_core::spread_blackout::suppress_on_spread_hour(
@@ -6441,6 +6447,44 @@ mod tests {
         assert!(
             fired2.contains(&"01-veto-too-low"),
             "the same intrabar veto fires on a clean bar (got {fired2:?})"
+        );
+    }
+
+    /// A `TimeReached` rule is a CLOCK, not a price cross: the rubbish-candle
+    /// gate must never hold it. The trade-expiry veto (`ClosePositions`) landing
+    /// on a spread-hour bar was suppressed as if it were a wick cross, so the
+    /// expiry close ran late — on UK 100 (masked 21:00–06:00 London) a whole
+    /// night with the position unmanaged, and in the uk-100 fixture (window
+    /// ending on that bar) never. Mutation: classify `TimeReached` as a wick
+    /// cross again and this goes red.
+    #[test]
+    fn spread_hour_bar_does_not_suppress_a_time_reached_veto() {
+        let expiry = rule(
+            "02-veto-trade-expiry",
+            Trigger::TimeReached {
+                at_epoch: ts("2026-06-16T21:00:00Z").timestamp(),
+            },
+            FireMode::Once,
+            Action::Veto,
+        );
+        let p = plan(vec![
+            expiry,
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T20:00:00Z");
+        // The 21:00Z spread-hour bar — the same one that suppresses an intrabar
+        // veto wick in `spread_hour_bar_suppresses_an_intrabar_veto_cross`.
+        let c1 = candle("2026-06-16T21:00:00Z", 1.195, 1.196, 1.185, 1.1950);
+        let eval1 = run(&p, &prior, &[c1]);
+        let fired: Vec<&str> = eval1.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            fired.contains(&"02-veto-trade-expiry"),
+            "a clock-driven veto must fire on a spread-hour bar (got {fired:?})"
         );
     }
 

@@ -615,6 +615,21 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                         // discipline above is unchanged.
                         let parked = if crate::order_control::spread_gate_defers(enter_granularity)
                         {
+                            // A park is a placement DEFERRED, so it needs the
+                            // dedup the retry gate gives a placement — and the
+                            // gate sits below this point (it must stay last: its
+                            // cancel arm needs an immediate re-place). Ask it
+                            // read-only: a trade that already holds a position
+                            // or a resting order is REJECTED here, never parked
+                            // on top of itself. Without this the second fire of
+                            // a multi-shot enter inside a spread hour parked,
+                            // was promoted, and opened a second position
+                            // (`BUG-spread-park-bypasses-entry-dedup.md`).
+                            if let Some(rejection) =
+                                dedup_before_park(broker, store, verified, &origin).await
+                            {
+                                return rejection;
+                            }
                             let entry_price = entry_reference_price(&resolved.entry);
                             park_stored_entry(
                                 store,
@@ -628,6 +643,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                                 raw_body,
                                 enter_granularity,
                                 now,
+                                &origin,
                             )
                             .await
                         } else {
@@ -802,6 +818,13 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 // signed body and the drawn geometry so the trade is re-checked
                 // every candle and placed the moment it clears its R-floor.
                 // Still rejected (nothing was placed) — but recoverable.
+                // Same rail as the spread-hour park: this sits ABOVE the retry
+                // gate, so a fresh fire the gate would have deduplicated (an
+                // open position, a resting order, a same-bar re-fire) must be
+                // rejected here, not parked and promoted on top of the trade.
+                if let Some(rejection) = dedup_before_park(broker, store, verified, &origin).await {
+                    return rejection;
+                }
                 let parked = park_stored_entry(
                     store,
                     verified,
@@ -814,6 +837,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                     raw_body,
                     enter_granularity,
                     now,
+                    &origin,
                 )
                 .await;
                 let outcome = format!(
@@ -941,7 +965,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // `effective_entry_dedup`, NOT the raw field: an intent armed before
     // `entry_dedup` existed carries no value, and for a legacy MULTI-shot enter
     // serde's `EngineLatched` default would silently switch its dedup off.
-    let retry_attempt_no = if !origin.is_replacement()
+    let retry_attempt_no = if !origin.skips_retry_gate()
         && verified.intent.effective_entry_dedup().needs_retry_gate()
     {
         match crate::retry_gate::evaluate(broker, store, &verified.intent, &verified.shell).await {
@@ -1174,6 +1198,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 raw_body,
                 enter_granularity,
                 now,
+                &origin,
             )
             .await;
             tracing::info!(
@@ -1283,6 +1308,42 @@ fn placement_verb(entry: &crate::intent::ResolvedEntry) -> &'static str {
 /// Requires the signed body: without it there is nothing to re-drive later, so
 /// a park would be a promise we couldn't keep.
 #[allow(clippy::too_many_arguments)]
+/// The dedup a PARK owes before it is written: a park is a placement deferred,
+/// so a fresh fire must pass the same "does this trade already hold something"
+/// question the retry gate asks a placement — read-only (`retry_gate::probe`),
+/// because nothing is being placed now. A re-drive (`Replacing`) continues an
+/// attempt the gate already admitted and is not re-asked. `Some(rejection)`
+/// means: return it instead of parking.
+async fn dedup_before_park<B: Broker, S: StateStore>(
+    broker: &B,
+    store: &S,
+    verified: &incoming::Verified,
+    origin: &EntryOrigin,
+) -> Option<ActionResult> {
+    if origin.skips_retry_gate() || !verified.intent.effective_entry_dedup().needs_retry_gate() {
+        return None;
+    }
+    match crate::retry_gate::probe(broker, store, &verified.intent, &verified.shell).await {
+        crate::retry_gate::RetryGateOutcome::Proceed { .. } => None,
+        crate::retry_gate::RetryGateOutcome::Rejected {
+            status,
+            message,
+            outcome,
+        } => {
+            tracing::info!(
+                "entry rejected before park: {outcome} (id={})",
+                verified.intent.id
+            );
+            Some(ActionResult::Rejected {
+                status,
+                body: message.to_string(),
+                outcome,
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn park_stored_entry<S: StateStore>(
     store: &S,
     verified: &incoming::Verified,
@@ -1295,6 +1356,7 @@ async fn park_stored_entry<S: StateStore>(
     raw_body: Option<&str>,
     enter_granularity: Option<crate::broker::Granularity>,
     now: chrono::DateTime<chrono::Utc>,
+    origin: &EntryOrigin,
 ) -> String {
     // Prefer the exact signed bytes; fall back to re-serialising the verified
     // intent.
@@ -1349,6 +1411,7 @@ async fn park_stored_entry<S: StateStore>(
         // because `min_r` may be a per-trade override rather than the floor.
         tp_distance,
         min_r,
+        replaces: origin.replaced_order_id().map(str::to_owned),
         stored_at: now,
         drop_at,
         shell_time: verified.shell.time,
@@ -2778,11 +2841,12 @@ mod spread_gate_park_tests {
 
     use super::*;
     use crate::broker::{
-        AttemptState, CancelError, Candle, CloseOutcome, EntryRequest, Granularity, LookupError,
-        OpenPosition, PendingOrder, Placement, Quote,
+        AmendError, AttemptState, CancelError, Candle, CloseOutcome, EntryError, EntryRequest,
+        Granularity, LookupError, OpenPosition, PendingOrder, Placement, Quote,
     };
     use crate::order_control::{StoredOrder, StoredReason, stored_order};
     use crate::state::MemStateStore;
+    use crate::state::StateStore;
     use chrono::{DateTime, Utc};
 
     /// A broker whose book is 50 pips wide — far past EUR_CAD's 5× reject
@@ -2934,6 +2998,295 @@ mod spread_gate_park_tests {
         let (result, parked) = fire(None);
         assert_eq!(outcome(&result), "rejected: spread-blackout");
         assert!(parked.is_none());
+    }
+
+    /// A broker whose prior-attempt lookup is scripted and which records
+    /// placements instead of refusing them. `cancel_order` panics: nothing on
+    /// the park path may cancel.
+    struct EngagedBroker {
+        state: AttemptState,
+        placed: std::cell::RefCell<u32>,
+        /// Half the quoted spread, in price.
+        half_spread: f64,
+    }
+
+    impl Broker for EngagedBroker {
+        async fn place_entry(
+            &self,
+            _max_risk_pct: f64,
+            _max_open_positions: u32,
+            _req: &EntryRequest<'_>,
+        ) -> Result<Placement, EntryError> {
+            *self.placed.borrow_mut() += 1;
+            Ok(Placement::id_only("order-promo"))
+        }
+        async fn close_positions(&self, _instrument: &str) -> CloseOutcome {
+            CloseOutcome::NothingOpen
+        }
+        async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
+            0
+        }
+        async fn lookup_attempt_state(
+            &self,
+            _instrument: &str,
+            _broker_order_id: &str,
+            _broker_trade_id: Option<&str>,
+        ) -> Result<AttemptState, LookupError> {
+            Ok(self.state.clone())
+        }
+        async fn cancel_order(
+            &self,
+            _account_id: &str,
+            broker_order_id: &str,
+        ) -> Result<(), CancelError> {
+            panic!("a park must never cancel (tried {broker_order_id})");
+        }
+        async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
+            Ok(Quote {
+                bid: 1.5925 - self.half_spread,
+                ask: 1.5925 + self.half_spread,
+            })
+        }
+        async fn list_open_positions(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<OpenPosition>, LookupError> {
+            Ok(vec![])
+        }
+        async fn amend_stop(
+            &self,
+            _account_id: &str,
+            _position_or_order_id: &str,
+            _new_stop: f64,
+        ) -> Result<(), AmendError> {
+            Ok(())
+        }
+        async fn list_pending_orders(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<PendingOrder>, LookupError> {
+            Ok(vec![])
+        }
+        async fn get_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<Candle>, crate::broker::CandleError> {
+            Ok(vec![])
+        }
+    }
+
+    /// The gate-owned twin of `enter_verified_with_entry`: cap 2, gate on.
+    fn gate_owned_enter() -> crate::incoming::Verified {
+        let mut v = gate_order_tests::enter_verified_with_entry(
+            r#"{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.5900 }"#,
+        );
+        v.intent.max_retries = crate::tunable::Tunable::Static(2);
+        v.intent.entry_dedup = Some(crate::intent::EntryDedup::GateOwned);
+        v
+    }
+
+    /// Seed attempt #1 for `t-1`, placed a bar earlier, so the gate has
+    /// something to correlate.
+    async fn seed_attempt_one(store: &MemStateStore, intent: &crate::intent::Intent) {
+        let earlier = gate_order_tests::now() - chrono::Duration::hours(4);
+        crate::retry_gate::record_placement(
+            store,
+            intent,
+            earlier,
+            intent.not_after,
+            earlier,
+            1,
+            "order-1",
+            crate::intent::Direction::Long,
+            1.5850,
+            None,
+            None,
+            None,
+        )
+        .await;
+    }
+
+    /// Fire an H4 gate-owned enter inside the spread window against a broker
+    /// reporting attempt #1 in `state`. Returns the result and any park.
+    fn engaged_fire(state: AttemptState) -> (ActionResult, Option<StoredOrder>) {
+        let store = MemStateStore::default();
+        let now = gate_order_tests::now();
+        store.set_clock(now);
+        // 50 pips wide: past EUR_CAD's reject threshold, so the gate trips.
+        let broker = EngagedBroker {
+            state,
+            placed: std::cell::RefCell::new(0),
+            half_spread: 0.0025,
+        };
+        pollster::block_on(async {
+            store
+                .set_spread_blackout_window(
+                    now,
+                    crate::spread_blackout::NY_CLOSE_WINDOW_MARKER_TTL_SECONDS,
+                )
+                .await
+                .expect("open the window");
+            let verified = gate_owned_enter();
+            seed_attempt_one(&store, &verified.intent).await;
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &gate_order_tests::cfg(),
+                now,
+                None,
+                Some(Granularity::H4),
+                EntryOrigin::Fresh,
+            )
+            .await;
+            let parked = stored_order(&store, "t-1").await.expect("read park");
+            (result, parked)
+        })
+    }
+
+    /// THE DEDUP RAIL FOR A PARK: the trade already holds a position, so a
+    /// spread-hour fire on H4 must be rejected `trade-already-open` and NOT
+    /// parked — a park here is a second position an hour later. Mutation:
+    /// drop the probe before `park_stored_entry` and this parks.
+    #[test]
+    fn a_spread_hour_fire_on_an_open_trade_is_rejected_not_parked() {
+        let (result, parked) = engaged_fire(AttemptState::OpenPosition {
+            broker_trade_id: "pos-1".into(),
+        });
+        assert_eq!(outcome(&result), "rejected: trade-already-open");
+        assert!(parked.is_none(), "must not park on top of an open position");
+    }
+
+    /// A still-RESTING prior order is the same rail — rejected, not parked, and
+    /// (per `EngagedBroker::cancel_order`) never cancelled: the lifecycle's own
+    /// spread-hour hold owns that order during the hour.
+    #[test]
+    fn a_spread_hour_fire_with_a_resting_order_is_rejected_not_parked() {
+        let (result, parked) = engaged_fire(AttemptState::Pending);
+        assert_eq!(outcome(&result), "rejected: order-resting");
+        assert!(parked.is_none());
+    }
+
+    /// The control: a trade whose prior attempt was cancelled without filling
+    /// is free, and the park proceeds as before.
+    #[test]
+    fn a_spread_hour_fire_after_a_cancelled_attempt_still_parks() {
+        let (result, parked) = engaged_fire(AttemptState::Cancelled);
+        assert!(
+            outcome(&result).contains("stored until"),
+            "{}",
+            outcome(&result)
+        );
+        assert_eq!(parked.map(|p| p.reason), Some(StoredReason::SpreadHour));
+    }
+
+    /// Fire a gate-owned enter OUTSIDE the spread window but with a book wide
+    /// enough that the SL floor cannot be met (`sl-widen-below-min-r`), against
+    /// a broker reporting attempt #1 in `state`.
+    fn engaged_fire_below_floor(state: AttemptState) -> (ActionResult, Option<StoredOrder>) {
+        let store = MemStateStore::default();
+        let now = gate_order_tests::now();
+        store.set_clock(now);
+        // 25 pips: floor 250p against a 200p TP ⇒ R 0.8 < 1.0 ⇒ the floor parks.
+        let broker = EngagedBroker {
+            state,
+            placed: std::cell::RefCell::new(0),
+            half_spread: 0.00125,
+        };
+        pollster::block_on(async {
+            let verified = gate_owned_enter();
+            seed_attempt_one(&store, &verified.intent).await;
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &gate_order_tests::cfg(),
+                now,
+                None,
+                Some(Granularity::H1),
+                EntryOrigin::Fresh,
+            )
+            .await;
+            let parked = stored_order(&store, "t-1").await.expect("read park");
+            (result, parked)
+        })
+    }
+
+    /// The BELOW-FLOOR park owes the same dedup as the spread-hour park: on an
+    /// open trade it is rejected `trade-already-open`, never parked. This is
+    /// the AUD/CAD corpus shape — a same-bar re-fire parked below the floor and
+    /// was promoted on top of the filled first attempt.
+    #[test]
+    fn a_below_floor_fire_on_an_open_trade_is_rejected_not_parked() {
+        let (result, parked) = engaged_fire_below_floor(AttemptState::OpenPosition {
+            broker_trade_id: "pos-1".into(),
+        });
+        assert_eq!(outcome(&result), "rejected: trade-already-open");
+        assert!(parked.is_none());
+    }
+
+    /// The control: a cancelled prior attempt leaves the trade free, so the
+    /// below-floor park still happens.
+    #[test]
+    fn a_below_floor_fire_after_a_cancelled_attempt_still_parks() {
+        let (result, parked) = engaged_fire_below_floor(AttemptState::Cancelled);
+        assert!(
+            outcome(&result).starts_with("rejected: sl-widen-below-min-r"),
+            "{}",
+            outcome(&result)
+        );
+        assert_eq!(parked.map(|p| p.reason), Some(StoredReason::BelowMinR));
+    }
+
+    /// A PROMOTION is the trade's first placement and must leave the
+    /// `EntryAttempt` row every attempt-keyed cron and every later fire's gate
+    /// reads. Pre-fix `EntryOrigin::Promotion` skipped the gate and wrote none.
+    /// Mutation: make `skips_retry_gate` true for `Promotion` and the row count
+    /// is zero.
+    #[test]
+    fn a_promotion_records_an_entry_attempt() {
+        let store = MemStateStore::default();
+        let now = gate_order_tests::now();
+        store.set_clock(now);
+        // A calm 2-pip book: the promotion is placed at the drawn stop.
+        let broker = EngagedBroker {
+            state: AttemptState::Unknown,
+            placed: std::cell::RefCell::new(0),
+            half_spread: 0.0001,
+        };
+        let verified = gate_owned_enter();
+        pollster::block_on(async {
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &gate_order_tests::cfg(),
+                now,
+                None,
+                Some(Granularity::H4),
+                EntryOrigin::Promotion,
+            )
+            .await;
+            assert!(
+                matches!(result, ActionResult::Ok(_)),
+                "the promotion must place, got {}",
+                result.describe()
+            );
+            let attempts = store
+                .list_entry_attempts(None, "t-1")
+                .await
+                .expect("list attempts");
+            assert_eq!(
+                attempts.len(),
+                1,
+                "exactly one EntryAttempt for the promotion"
+            );
+            assert_eq!(attempts[0].broker_order_id, "order-promo");
+        });
+        assert_eq!(*broker.placed.borrow(), 1);
     }
 }
 

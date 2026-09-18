@@ -1040,6 +1040,52 @@ Fixtures carry the series as `upkeep_bars.json`; absent ⇒ per-bar, corrupt ⇒
 load error. `run` (per-bar) is `#[cfg(test)]`; production goes through
 `run_with_upkeep`.
 
+### A PARK is a deferred placement: it probes the retry gate, and a PROMOTION runs it
+
+Two rails around the H4+ spread-hour park (v-2026-09-18,
+`BUG-spread-park-bypasses-entry-dedup.md`), both in `core/src/dispatch/enter.rs`:
+
+- **Before parking, `run_enter` calls `dedup_before_park` → `retry_gate::probe`**
+  — the gate in `GateMode::Probe`: same dedup, no broker side effect, a
+  still-resting prior order rejects `order-resting` instead of being cancelled.
+  This guards BOTH parks that sit above the gate: the spread-hour park and the
+  below-floor (`sl-widen-below-min-r`) park. The full gate must stay LAST (its
+  cancel arm needs an immediate re-place), but a park is a placement that
+  happens hours later, so it needs the dedup *now*. Without it the second fire
+  of a multi-shot enter inside a spread hour parked, was promoted, and opened a
+  second position (AUD/NZD D1 re-arm: 2 legs +2.10R vs the correct 1 leg
+  +1.05R); and on H1 a same-bar re-fire parked below the floor and was promoted
+  on top of the filled first attempt (~100 corpus cells, AUD/CAD 2 legs +0.56R
+  vs 1 leg +0.26R). M/W `EveryBar` on H4 would park every bar.
+- **A park remembers its origin: `StoredOrder.replaces`.** A park written while
+  RE-PLACING a cancelled order (re-price demote / failed re-place) carries that
+  order id and promotes as `EntryOrigin::Replacing` — the attempt the gate
+  already admitted, row re-pointed. A park from a fresh fire carries `None` and
+  promotes as `EntryOrigin::Promotion`. `promote::promotion_origin` is the one
+  mapping; never re-derive it from the reason.
+- **`EntryOrigin::Promotion` is NOT a gate bypass.** `skips_retry_gate()` is
+  true for `Replacing` only. A promotion is the trade's *first* placement, so it
+  goes through the full gate and `record_placement`: deduplicated, and it writes
+  the `EntryAttempt` every attempt-keyed cron (sweep, break-even, blackout,
+  re-price) and every later fire's gate reads. `is_replacement()` still covers
+  both for the blackout-gate bypasses — don't fold the two predicates together.
+
+The replay could only see this once the entry-instant quote existed; the
+per-bar corpus is structurally blind to it.
+
+### A `TimeReached` trigger is never a rubbish-candle victim
+
+`fire_rule`'s spread-hour suppression classed every trigger that is not an
+`OnClose` price cross as a *wick* cross — including `TimeReached`, the
+trade-expiry veto's clock. On an instrument whose mask covers the overnight
+(UK 100: 21:00–06:00 London) an expiry landing in that window was held until
+the first clean bar, leaving the position unmanaged all night; in the uk-100
+fixture, whose window ends on that bar, the expiry close vanished and the
+`stateful_broker_books_expiry_closes_in_the_report` test sat red for a week as
+"a stale fixture". A clock reads no price: `is_wick_cross` excludes it
+(`spread_hour_bar_does_not_suppress_a_time_reached_veto`). Any new non-price
+trigger must be added to that exclusion, not to `trigger_uses_close`.
+
 ### `PriceRef` is untagged — variant ORDER is load-bearing
 
 `trade_control_core::intent::PriceRef` is `#[serde(untagged)]`, so

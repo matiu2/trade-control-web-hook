@@ -29,7 +29,17 @@ the 2026-09-18 plan, now on staging):
       calm open book does not park). Mutation-check the entry-point test.
 - [x] 4. README (fixture files list + `--upkeep`/`--save`), CLAUDE.md note. clippy,
       fmt, commit, push.
-- [ ] 5. Re-arm AUD/NZD D1 from ~/Downloads/AUD_NZD-TRADENATION-d-20260917T175936.json
+- [x] 5. Re-arm AUD/NZD D1 from ~/Downloads/AUD_NZD-TRADENATION-d-20260917T175936.json
       via `tv-arm --spec-in … --plan-out`, replay with `--upkeep 15m --save` into the
       main checkout's replay-fixtures/, confirm the park+promote shows in the
       timeline. Do NOT re-bless any other fixture.
+- [x] 6. FOUND + FIXED while doing 5: the park bypassed entry dedup and a promotion
+      wrote no EntryAttempt (BUG-spread-park-bypasses-entry-dedup.md). `retry_gate::probe`
+      before the park; `EntryOrigin::skips_retry_gate()` (Replacing only). Fixture
+      `…-upkeep-15m` saved: 1 park, 1 promotion, 1 leg.
+- [x] 7. Below-floor park gets the same probe (AUD/CAD shape); `StoredOrder.replaces`
+      so a re-price park promotes as Replacing. Corpus re-measured vs baseline.
+- [x] 8. uk-100 red test root-caused: `TimeReached` expiry veto was spread-hour
+      suppressed (engine `is_wick_cross`). Fixed + engine test; fixture to re-bless.
+- [x] 9. Re-bless the corpus cells that legitimately changed (duplicate legs removed,
+      uk-100 expiry close restored) with a REBLESS note; cli suite green; commit; push.

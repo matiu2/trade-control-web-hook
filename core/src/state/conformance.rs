@@ -1037,6 +1037,7 @@ fn sample_record(trade_id: &str, account: Option<&str>, instrument: &str) -> Hel
             original_sl_distance: 0.0020,
             tp_distance: 0.0200,
             min_r: 1.0,
+            replaces: None,
             stored_at: now,
             drop_at: now + chrono::Duration::hours(3),
             shell_time: now,

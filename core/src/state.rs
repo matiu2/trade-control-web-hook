@@ -4274,6 +4274,7 @@ mod tests {
                 original_sl_distance: 0.0020,
                 tp_distance: 0.0200,
                 min_r: 1.0,
+                replaces: None,
                 stored_at: ts("2026-03-12T21:05:00Z"),
                 drop_at: ts("2026-03-12T23:05:00Z"),
                 shell_time: ts("2026-03-12T21:00:00Z"),
