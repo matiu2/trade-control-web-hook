@@ -1,0 +1,16 @@
+{
+  "instrument": "AUD/NZD",
+  "granularity": "d1",
+  "source": "tradenation",
+  "start": "2026-08-19T11:00:00Z",
+  "end": "2026-09-29T11:00:00Z",
+  "message": "Daily continuation ihs with the M15 upkeep series: parks on the 18p reopen print, promoted an hour later, one leg; second fire rejected trade-already-open (BUG-spread-park-bypasses-entry-dedup)",
+  "arm": {
+    "entry_rule": "normal",
+    "skip_calendar_bars": false,
+    "skip_golden": false,
+    "skip_reversals": false,
+    "candle_source": "tradenation",
+    "engine_version": "v147-47-geff9cd0b-dirty"
+  }
+}
