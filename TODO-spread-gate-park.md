@@ -35,7 +35,7 @@ recovered), extracted into one fn both call.
       spread-hour bar is parked and promoted by the next clean upkeep tick /
       bar, entering at the calm spread. Requires the replay quote clamp to be
       removable — see step 5; until then the replay gate is inert.
-- [~] 5. Remove `ReplayBroker::get_quote`'s in-spread-hour clamp (audit
+- [x] 5. Remove `ReplayBroker::get_quote`'s in-spread-hour clamp (audit
       finding #10) as its OWN commit; measure the corpus delta; re-bless with
       a note.
 - [ ] 6. clippy + fmt; commit + push each step.
