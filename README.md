@@ -868,10 +868,21 @@ reward:risk floor.
   through the broker's `get_bidask_candles` — **the same provider the
   offline replay uses** (its `ReplayBroker` serves it from the recorded
   series), so worker and replay size the floor off an identical statistic
-  and can't drift. If the windowed read is unavailable (no plan
-  granularity, a candle-fetch error, or an all-degenerate window) the
-  worker **fails open** to a single live `get_quote` spread — the
-  pre-window behaviour. When the stop is *too tight*
+  and can't drift. **Bars that close inside a spread hour are dropped
+  from the window first** (`spread_blackout::closes_outside_spread_hours`,
+  keyed on the bar's *close*, 30-min lead included): those hours belong
+  to the `SpreadHour` hold, which pulls a resting order before the spike
+  and re-places it after, so their rollover print must not size a stop the
+  order never rests through. On the 17:00-New-York D1 grid that is *every*
+  bar. If the windowed read is unavailable (no plan granularity, a
+  candle-fetch error, an all-degenerate window, or a window that is
+  entirely spread-hour closes) the worker **fails open** to a single live
+  `get_quote` spread — the pre-window behaviour, and for a park promoted
+  after the hour exactly the calm spread it is placed into. The baked
+  forecast term of the order-control re-price (`spread_forecast_frac`) is
+  silent for a masked hour for the same reason — pre-widening at 16:xx NY
+  for a 17:00 spike the hold cancels the order through only bought one
+  extra cancel-and-replace per day. When the stop is *too tight*
   (`sl_distance < 10 × spread`) the worker no longer rejects outright —
   it first tries to **widen the stop to `10 × spread`** (exactly the
   floor, pushing it *further* from entry, never tighter) and re-checks

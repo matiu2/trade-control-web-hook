@@ -61,6 +61,8 @@ mod baseline_candle {
 
 mod coverage;
 pub use coverage::*;
+mod sample_mask;
+pub use sample_mask::*;
 
 /// Resolve a spread-schedule FK **name** (as stored in the baked table's
 /// `schedule` column) to its IANA timezone. The table stores the compact FK
@@ -1512,7 +1514,7 @@ pub fn spread_hour_released_at(
 /// schedule timezone, which makes the forecast term vanish from the SL `max` and
 /// degrades cleanly to today's purely-reactive behaviour.
 pub fn spread_forecast_frac(instrument: &str, now: chrono::DateTime<chrono::Utc>) -> (f64, f64) {
-    let Some((schedule, _mask, _widen, forecast)) = baked_forecast_row(instrument) else {
+    let Some((schedule, mask, _widen, forecast)) = baked_forecast_row(instrument) else {
         return (0.0, 0.0);
     };
     let Some(tz) = schedule_tz(schedule) else {
@@ -1525,7 +1527,18 @@ pub fn spread_forecast_frac(instrument: &str, now: chrono::DateTime<chrono::Utc>
     let local = now.with_timezone(&tz);
     let h = local.hour() as usize;
     let next = (h + 1) % 24;
-    (forecast[h], forecast[next])
+    // A MASKED hour contributes nothing: the `SpreadHour` hold pulls a resting
+    // order before that hour and re-places it after, so a stop sized for it is
+    // sized for a window the order never rests through. Pre-widening at 16:xx
+    // for the 17:00 spike only bought one extra cancel-and-replace per day.
+    let unmasked = |hour: usize| {
+        if mask & (1 << hour) != 0 {
+            0.0
+        } else {
+            forecast[hour]
+        }
+    };
+    (unmasked(h), unmasked(next))
 }
 
 /// The baked `(schedule, mask, widen, forecast)` row for `instrument`, or `None`
@@ -1569,35 +1582,37 @@ mod forecast_tests {
         );
     }
 
-    /// The flagged hour must forecast a materially WIDER spread than a quiet
-    /// one — otherwise the column carries no signal and the `max` gains nothing.
+    /// The flagged hour is EXCLUDED from the term: the `SpreadHour` hold owns
+    /// that hour (the order is pulled before it and restored after), so a floor
+    /// sized for it widens a stop that never rests through it. The raw column
+    /// still carries the spike (`every_reviewed_row_with_a_widen_also_has_a_forecast`
+    /// reads it directly); only the *term* is silent there.
     #[test]
-    fn the_flagged_hour_forecasts_a_wider_spread() {
-        // 21:00 UTC in March = 17:00 New York = the flagged local hour.
+    fn the_flagged_hour_is_excluded_from_the_term() {
+        // 21:00 UTC in March (EDT) = 17:00 New York = the flagged local hour.
         let spike = chrono::Utc.with_ymd_and_hms(2026, 3, 12, 21, 0, 0).unwrap();
         let quiet = chrono::Utc.with_ymd_and_hms(2026, 3, 12, 9, 0, 0).unwrap();
         let (at_spike, _) = spread_forecast_frac("EUR_USD", spike);
         let (at_quiet, _) = spread_forecast_frac("EUR_USD", quiet);
-        assert!(
-            at_spike > at_quiet * 2.0,
-            "flagged-hour forecast {at_spike} should be well above the quiet \
-             {at_quiet} (measured ~4.3x)",
-        );
+        assert_eq!(at_spike, 0.0, "the masked hour must not feed the floor");
+        assert!(at_quiet > 0.0, "sanity: the quiet hour is still forecast");
     }
 
-    /// The next-hour term is what covers an order resting at 20:55 that fills at
-    /// 21:05. At 20:xx the *next* slot must already carry the spike.
+    /// The hour BEFORE the spike sees a zero next-hour term: the coming hour is
+    /// masked, and the hold — not the floor — is what protects the order there.
+    /// Before this change the next-hour term "replaced the 30-min lead"; the
+    /// lead now lives in `is_spread_hour` itself, so the term was a second copy.
     #[test]
-    fn next_hour_sees_the_coming_spike() {
-        // 20:30 UTC in March = 16:30 New York — the hour BEFORE the spike.
+    fn the_hour_before_the_spike_does_not_pre_widen_for_it() {
+        // 20:30 UTC in March (EDT) = 16:30 New York — the hour BEFORE the spike.
         let before = chrono::Utc
             .with_ymd_and_hms(2026, 3, 12, 20, 30, 0)
             .unwrap();
         let (this_hour, next_hour) = spread_forecast_frac("EUR_USD", before);
-        assert!(
-            next_hour > this_hour * 2.0,
-            "at 20:30 the NEXT hour ({next_hour}) must already show the spike \
-             vs this hour ({this_hour}) — this is what replaces the 30-min lead",
+        assert!(this_hour > 0.0, "16:xx NY is not itself masked");
+        assert_eq!(
+            next_hour, 0.0,
+            "the masked 17:00 hour must not feed the floor"
         );
     }
 
@@ -1651,17 +1666,20 @@ mod forecast_tests {
         );
     }
 
-    /// DST-invariance: the flagged local hour is 17:00 New York year-round, so
-    /// the forecast peak must follow the clock change (21:00 UTC in summer,
-    /// 22:00 UTC in winter) rather than staying pinned to one UTC hour.
+    /// DST-invariance: the term is indexed by the LOCAL hour, so the same New
+    /// York hour reads the same either side of a clock change rather than
+    /// smearing across two UTC hours. Read at local 16:00 — the hour before the
+    /// (now excluded) spike — so the comparison is between two live values, not
+    /// two zeros.
     #[test]
     fn forecast_follows_new_york_dst() {
-        // July: 17:00 EDT = 21:00 UTC.
-        let jul = chrono::Utc.with_ymd_and_hms(2026, 7, 15, 21, 0, 0).unwrap();
-        // January: 17:00 EST = 22:00 UTC.
-        let jan = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 22, 0, 0).unwrap();
+        // July: 16:00 EDT = 20:00 UTC.
+        let jul = chrono::Utc.with_ymd_and_hms(2026, 7, 15, 20, 0, 0).unwrap();
+        // January: 16:00 EST = 21:00 UTC.
+        let jan = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 21, 0, 0).unwrap();
         let (summer, _) = spread_forecast_frac("EUR_USD", jul);
         let (winter, _) = spread_forecast_frac("EUR_USD", jan);
+        assert!(summer > 0.0, "local 16:00 must carry a live forecast");
         assert!(
             (summer - winter).abs() < 1e-12,
             "the same LOCAL hour must yield the same forecast either side of a \

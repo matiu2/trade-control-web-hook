@@ -1,240 +1,29 @@
-# TODO — entry rate/size on the timeline + broker settlement on archive
+# TODO — SL-spread floor: exclude masked-hour samples (branch feat/stop-floor-masked-hours)
 
-Branch: `feat/entry-rate-size-and-settlement`
-Worktree: `../trade-control-entry-detail` (sibling — path-dep rule)
+Stacked on `feat/spread-gate-park` (3eced28f). Step 4 of the 2026-09-18 spread-gate
+plan; steps 1–3 (park on H4+, promote release, replay clamp removal) shipped there.
+Worktree `../trade-control-web-hook-stop-floor-mask` (sibling — path-dep rule).
 
 ## Why
 
-Two operator asks off the `journal-staging` timeline:
+The entry floor sizes off the mean close spread of the last 5 plan bars. On D1
+(17:00 NY grid) EVERY close is the rollover print, and on H1 the 17:00 bar is in
+the window one bar in five, so the floor is sized off the very spike the
+SpreadHour hold already keeps the order out of (AUD/NZD D1: 147p floor vs 55p
+drawn). The forecast term does the same thing forward: at 16:xx NY it widens a
+resting order for an hour the lifecycle is about to cancel it through anyway.
 
-1. The `fired 05-enter (enter)` line should show **the rate and the trade size**.
-2. Once a trade is **archived**, the server should pull the broker's
-   **activity + transaction** info for the account and fold it into the log.
+## Steps
 
-## Findings so far (verified in code, not prose)
-
-### Where the timeline line comes from
-
-- `journal/src/timeline.rs:91-94` formats `fired {rule_id} ({action})` from
-  `eval.fired[].intent` — the *intent*, not the fill.
-- The placement result rides `dispatch_outcomes[].outcome`
-  (`core/src/tick_bundle.rs:113`), a bare string built at
-  `core/src/dispatch/enter.rs:954` as `entered: order={order_id}`.
-- So enriching that string surfaces in the timeline with **no journal change**.
-
-### Rate and size are computed then discarded
-
-- `Broker::place_entry` returns `Result<String, EntryError>` — order id only
-  (`core/src/broker.rs:248`).
-- OANDA computes `units` at `broker-oanda/src/oanda.rs:146-190` and only
-  `tracing::info!`s it (line 195).
-- **TradeNation computes stake entirely upstream** — the adapter just forwards
-  (`broker-tradenation-adapter/src/lib.rs:53-64`). Units are *not* in scope
-  locally at all for TN.
-- `EntryAttempt` (`core/src/state.rs:163`) stores `stop_loss_price`, `pip_size`,
-  `cancel_at` — but **no entry price and no units**.
-
-⚠️ `ResolvedEntry::reference_price()` is the **requested** price (the trigger for
-a stop/limit), NOT the fill. Slippage means these differ. Label honestly.
-
-### Archive triggers — operator was RIGHT, my first read was wrong
-
-`Phase::Done` → cron archives (`trade-control-cron/src/engine.rs:420-447`).
-
-| Trigger | Archives? | Position closed first? |
-|---|---|---|
-| `too-low` / pcl-exhausted (`StopNextEntry`) | **No** — sets `entries_blocked` | n/a |
-| `too-high` / invalidation (`ClosePositions`) | Yes | Yes (CLOSE-VETO) |
-| `trade-expiry` (`CancelPending`) | Yes | Yes |
-| M/W cancel/abort/overshoot | Yes | Yes |
-| **single-shot enter, first fire** | **Yes, immediately** | **NO** ⚠️ |
-
-- `StopNextEntry` not retiring is deliberate and load-bearing —
-  `engine/src/evaluate.rs:2946` + the XAU_XAG H1 2026-07-21 regression noted at
-  `evaluate.rs:2930-2932`. Confirmed by the operator's own AUD/CAD timeline:
-  `01-veto-too-high` at 11:00 did NOT archive; the plan ran on to a
-  `07-close-on-sr-reversal` a day later and ended at `02-veto-trade-expiry`.
-- **The hole:** `engine/src/evaluate.rs:1048-1055` sets `Phase::Done` on the bar
-  a single-shot (`max_retries == Static(0)`) enter *fires* — before fill, let
-  alone close. Violates the invariant "archive only after all attempts closed".
-
-### Broker history APIs available
-
-- **TradeNation: already implemented, never wired up.**
-  `tradenation-api/src/activity.rs` — `ActivityRecord { price, stake, ... }`
-  (literally the fill rate + size) via `get_activity` / `get_all_activity`.
-  `tradenation-api/src/transactions.rs` — settled ledger, `get_all_transactions`.
-  Neither is reachable through `broker-tradenation` or the adapter.
-- **OANDA: partial.** `oanda_client::trades::Trade` already carries `price`
-  (execution), `initial_units`, `average_close_price`, `close_time`,
-  `realized_pl`, `financing`, `closing_transaction_ids`.
-  `lookup_attempt_state` (`broker-oanda/src/oanda.rs:339`) already queries
-  `TradeState::Closed` and throws the numbers away, keeping only win/loss.
-  **No `/v3/accounts/{id}/transactions` endpoint exists in `oanda-client`** —
-  the full ledger needs that endpoint added (separate repo/submodule).
-- `Broker` trait has **no** `list_transactions` / `get_activity` method.
-
-### Investigation results (single-shot Done-at-fire)
-
-**It is near-unreachable in production.**
-
-- `tv-arm/src/hs_resolve.rs:306-310` defaults `max_retries` to **5**; `--strategy-v2`
-  *rejects* `--max-retries 0` (`args.rs:936-943`).
-- Only single-shot producers: M/W (`tv-arm/src/mw_resolve.rs:266-268`, deliberate)
-  and the interactive `build-trade` wizard (`cli/src/trade_patterns.rs:1041`).
-- **Corpus: 874 plans, 1308 enter rules, ALL `max_retries: 5`. Zero single-shot.**
-
-**It was never a design decision.** `git log -S "phase = Phase::Done"` returns one
-commit — `e3a76aa`, the engine's original naive spine. `83333fa` carved out
-multi-shot and asserted "for a single-shot enter that's correct" without
-justification.
-
-**Dropping the `Done` is safe — `fired` is what prevents re-firing.**
-`evaluate.rs:835-837` skips latched rules *before* `evaluate_one_entry`, and the
-`fired.insert` sits on the line above the `Done` (`:1053-1054`). Keep the insert,
-drop the `Done`.
-
-**What it unlocks (all desirable):** the per-position reversal-close becomes armed
-for single-shot plans (today it can *never* fire — same defect class as the
-XAU_XAG incident); invalidation vetos keep ticking; the pending-order lifecycle
-keeps running (`replay.rs:2608-2612` documents the break skipping spread-hour
-cancel/restore entirely).
-
-⚠️ **Two hard constraints found:**
-
-1. **The engine is deliberately broker-free.** `core::position_view` / `OpenSet` /
-   the `positions` param on `evaluate_plan` were **removed in v66**. The literal
-   "all attempts closed" invariant CANNOT live in `evaluate_plan` — it needs a
-   cron sweep. Reintroducing a broker there regresses a thrice-fixed bug.
-2. **Plan rows have NO TTL** (`core/src/state.rs:1080-1085`) — `Phase::Done` is the
-   only GC. Any fix must guarantee a terminal path or plans leak and tick every
-   ~5s forever. `02-veto-trade-expiry` (`ClosePositions`) is the backstop, but it
-   needs a bar to *close* past the epoch (guards test `candle.time`, not wall
-   clock — `evaluate.rs:601-603`).
-
-⚠️ `not_after` is **NOT enforced by the engine** — it appears only in a test
-fixture. Comments at `:336`, `:731`, `:1024`, `:2937` claiming otherwise are wrong.
-The only retirement is `02-veto-trade-expiry`.
-
-**Replay parity:** `replay.rs:674-677` `break`s the candle loop on `eval.done`
-(its only early exit). Golden compares `done` AND `final_phase` exactly
-(`golden_eq.rs:131-139`). Corpus terminating fires: `02-veto-trade-expiry` 471,
-`01-veto-too-high` 213, `01-veto-too-low` 129, `06-close-on-reversal` 3 —
-**none reach Done via the enter**, so the change moves ZERO fixtures. Safe, but
-also *unvalidated by the corpus* → needs its own targeted test.
-
-**Tests to update (~7):** `evaluate.rs:6668`, `:6744`, `:6768`, `:7347`
-(`assert!(eval.done, "single-shot retires the plan on its fire")` — the explicit
-guard), `:4885`; verify `:5648`, `:8694`. Multi-shot twins already assert
-`!eval.done` and stay green.
-
-## Operator decisions taken
-
-- Enter line: **widen `place_entry` to return units** — `reversals` (the account
-  in the timeline) is **TradeNation**, where stake is computed upstream and never
-  returned, so string-only would give rate but NO size on that very account.
-  Corpus: tradenation/reversals 774 enters, oanda/m-and-w 534.
-- Archive settlement: **trade-level + full transaction ledger**.
-- Single-shot Done-at-fire: **fix it** — don't retire until the position closed.
-
-## Plan
-
-- [x] **1. Investigate single-shot retirement** — done, see above.
-- [x] **2. Widen `place_entry`** to return `Placement { order_id, size, price }`.
-      **DONE** — commit `de91749`. 15 impls across 11 files. Upstream
-      `broker-tradenation` shipped `v0.16.0` (commit `40d768a`, tagged+pushed)
-      so TN returns its stake; **every** TN pin in the workspace moved
-      v0.14.0 → v0.16.0 together (a split pin links two copies of the crate —
-      `spread-baseline-gen` caught this at compile time).
-- [x] **3. Enrich the enter outcome string** at `core/src/dispatch/enter.rs`.
-      **DONE** — same commit. `entered: order=… size=… @ …`, empty halves when
-      unreported so the historic shape survives.
-- [ ] **4. Fix single-shot Done-at-fire** (`engine/src/evaluate.rs:1054`) — drop
-      the `Done`, keep the `fired.insert`. Update the ~7 tests.
-      **Deprioritised**: unreachable in production (all 874 corpus plans are
-      multi-shot; tv-arm defaults to 5). Correctness cleanup, not a live fix.
-- [x] **5. Broker settlement on archive** — **DONE**, commit `ca24b7e`.
-      `core::settlement` (`Settlement` / `SettledTrade` / `LedgerEntry`), a
-      fail-open `Broker::fetch_settlement`, and the TN impl wired onto its
-      existing-but-never-called `get_all_activity` + `get_all_transactions`.
-      **No upstream change needed** — `TradeNationBroker::{client,session}()`
-      accessors exist for exactly this extension case.
-- [x] **6. Persist settlement on `ArchivedPlan`** — **DONE**, same commit.
-      jsonb + `#[serde(default)]`, no migration; the store-conformance
-      round-trip runs against **both** backends, and two tests pin the serde
-      attrs so an existing (no-TTL, never-expiring) archived row still decodes.
-- [x] **7. Surface it in the journal** — **DONE**, commit `f43ac5a`. Plus the
-      `dispatch_outcomes` join, which is what actually puts the size + rate on
-      the `05-enter` line.
-
-## Remaining
-
-- [ ] **OANDA settlement.** `oanda-client` has **no
-      `/v3/accounts/{id}/transactions` endpoint** — it needs adding to that
-      separate repo, then an impl here. OANDA uses the fail-open default (empty
-      + warning) until then. Note `oanda_client::trades::Trade` **already**
-      carries `price`, `initial_units`, `average_close_price`, `close_time`,
-      `realized_pl`, `financing`, `closing_transaction_ids` — so a *trade-level*
-      impl needs no new endpoint and could land first; only the full **ledger**
-      needs it.
-- [ ] **4. Single-shot Done-at-fire** (`engine/src/evaluate.rs:1054`) — drop the
-      `Done`, keep the `fired.insert`. Update the ~7 tests. **Deprioritised**:
-      unreachable in production (all 874 corpus plans are multi-shot; tv-arm
-      defaults to 5). Correctness cleanup, not a live-trading fix.
-- [ ] **Verify against a real TradeNation session.** Nothing here has run
-      against live TN data: the builder is unit-tested on synthetic records and
-      the field names come from the upstream structs, not from an observed
-      response. **The first plan archived after deploy is the real test** —
-      check the ledger rows attribute and the P&L matches the platform.
-
-## Gates (per CLAUDE.md)
-
-- Tests first; prove each test can fail (mutate the source, confirm red).
-- `cargo clippy` + `cargo fmt` before each commit.
-- Keep changes < ~600 lines each; commit + push as each lands.
-- Strategy changes must land in **both** replayer and worker.
-
-## Screenshot host widening (branch `feat/screenshot-image-host`)
-
-TradingView's camera button is gone with the subscription; `local-chart` now
-captures and uploads its own chart. Downstream, that needed exactly **one**
-change: `ScreenshotUrl::parse` learning the new host's shape.
-
-- [x] `core/src/screenshot.rs` — accept `https://files.catbox.moe/<stem>.<ext>`
-      as a **specific additional shape**, never "any URL". Split into two named
-      recognisers (`parse_tradingview`, `parse_catbox`), each a complete
-      host+path match, so neither can shadow the other. Requires an image
-      extension and exactly one path segment; no trailing-slash tolerance
-      (a real Catbox image URL never has one).
-- [x] **TradingView parsing is untouched and still tested** — old plans carry
-      those links. This is an addition, not a replacement.
-- [x] `core/src/trade_plan.rs` — no new field, no new top-level signed key.
-      Added `catbox_screenshot_url_round_trips_on_the_plan`; the pre-field
-      `plan_without_screenshot_url_still_parses` test stays green.
-- [x] `core/tests/real_upload_url.rs` — the two URLs from the real
-      upload-and-fetch-back proofs, pinned so a future narrowing that would
-      reject a genuine upload fails loudly.
-- [x] `journal` needed **zero changes**: `open_screenshot` just `xdg-open`s
-      whatever string the plan holds. 124 journal tests green.
-
-### Where the upload lives, and why not here
-
-In `local-chart`, server-side, handing the URL over via the **clipboard** —
-because `tv-arm register` already reads the clipboard at arm time. So the
-operator's workflow is unchanged (capture, then arm) and neither `tv-arm` nor
-`journal` needed touching. Server-side rather than in the browser keeps the
-Catbox `userhash` out of view-source.
-
-### Mutations run (each must go RED)
-
-- widen `parse` to accept any URL → **RED, 6 tests** — including the
-  pre-existing `rejects_non_snapshot_clipboard_contents`, which proves that
-  test was really testing rejection and not just passing.
-- drop the Catbox host check (take any last path segment) → **RED, 2 tests**
-- break normalisation (no extension-case folding) → **RED**
-- echo the input instead of canonicalising → **RED, 3 tests** (incl. the plan
-  round-trip)
-
-1219 core tests green. `cargo clippy` on the changed files is clean; the one
-workspace clippy error (`signals/state_machine.rs` "too many arguments") is
-**pre-existing** — verified by reproducing it with these changes stashed.
+- [x] 1. `spread_blackout::closes_outside_spread_hours(instrument, candles, bar_seconds)`
+      — pure; keeps bars whose CLOSE instant is not `is_spread_hour`. Tests: keyed
+      on close not open; empty in → empty out; unmasked instrument passes through.
+- [x] 2. `spread_forecast_frac` returns 0.0 for a masked hour (this or next).
+      Flip the two forecast tests that pinned the spike; keep the raw-column tests.
+- [x] 3. `enter.rs::windowed_entry_spread` filters via (1) before the shared mean;
+      an all-masked window → `None` → live-quote fallback (logged). Entry-point
+      test: 5 D1 bars all closing at 17:00 NY with a 20p spread must NOT widen /
+      reject a 10p-stop EUR/USD enter when the live quote is 1p. Mutation: drop the
+      filter → rejected.
+- [x] 4. README floor section + CLAUDE.md note; clippy + fmt; commit + push.
+- [ ] 5. Corpus run + re-bless: OPERATOR does this at the end. Do not `--rebless` here.

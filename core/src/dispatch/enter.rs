@@ -1815,6 +1815,30 @@ async fn windowed_entry_spread<B: Broker>(
             return None;
         }
     };
+    // Drop every bar whose CLOSE lands in a spread hour before reducing. Those
+    // hours belong to the `SpreadHour` hold (the order is pulled before the
+    // spike and re-placed after), so their rollover print must not size a stop
+    // the order never rests through. On the 17:00-NY D1 grid that is EVERY bar,
+    // and the floor then falls back to the live quote below — which is exactly
+    // the calm, post-hour spread a promoted park is placed into.
+    let fetched = candles.len();
+    let candles = crate::spread_blackout::closes_outside_spread_hours(
+        instrument,
+        &candles,
+        granularity.seconds(),
+    );
+    if candles.len() != fetched {
+        tracing::info!(
+            "sl-spread-floor: dropped {} of {fetched} window bars for {instrument} that close inside a spread hour",
+            fetched - candles.len()
+        );
+    }
+    if candles.is_empty() {
+        tracing::info!(
+            "sl-spread-floor: every window bar for {instrument} closes inside a spread hour — falling back to live quote"
+        );
+        return None;
+    }
     // Reduce via the SHARED trailing-window mean (the same fn the replay's
     // Fire-builder calls on candles from the same `get_bidask_candles`
     // provider), so worker and replay size the floor off an identical statistic.
@@ -3766,8 +3790,8 @@ mod widen_rounding_tests {
     use super::gate_order_tests::{describe, store_at_incident};
     use super::*;
     use crate::broker::{
-        AmendError, AttemptState, CancelError, Candle, CandleError, EntryError, EntryRequest,
-        Granularity, LookupError, OpenPosition, PendingOrder, Placement, Quote,
+        AmendError, AttemptState, BidAskCandle, CancelError, Candle, CandleError, EntryError,
+        EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Placement, Quote,
     };
     use crate::intent::{Intent, Shell};
     use crate::state::MemStateStore;
@@ -3795,6 +3819,9 @@ mod widen_rounding_tests {
     struct SpyBroker {
         places: RefCell<Vec<PlacedGeometry>>,
         quote: Quote,
+        /// The bid/ask window `get_bidask_candles` serves. Empty (the default)
+        /// makes `windowed_entry_spread` fall through to `quote`.
+        bidask: Vec<BidAskCandle>,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -3812,6 +3839,7 @@ mod widen_rounding_tests {
                     bid: mid - spread / 2.0,
                     ask: mid + spread / 2.0,
                 },
+                bidask: Vec::new(),
             }
         }
         /// The one placement this fire made. Panics if the count isn't exactly
@@ -3888,6 +3916,15 @@ mod widen_rounding_tests {
             _now: DateTime<Utc>,
         ) -> Result<Vec<Candle>, CandleError> {
             Ok(vec![])
+        }
+        async fn get_bidask_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<BidAskCandle>, CandleError> {
+            Ok(self.bidask.clone())
         }
     }
 
@@ -4019,6 +4056,149 @@ mod widen_rounding_tests {
             "expected the widened stop snapped away from entry to 4016.00, got {}",
             placed.stop_loss
         );
+    }
+
+    /// A single-shot EUR/USD long, built from wire JSON like `gold_enter`.
+    /// Fractional-pip FX: pip 0.0001, tick 0.00001.
+    fn eurusd_enter(entry_at: f64, stop_loss: f64, take_profit: f64) -> crate::incoming::Verified {
+        let json = format!(
+            r#"{{
+                "v": 1,
+                "id": "eu-1-enter",
+                "not_after": "2026-08-09T00:00:00Z",
+                "action": "enter",
+                "instrument": "EUR_USD",
+                "direction": "long",
+                "entry": {{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": {entry_at} }},
+                "stop_loss": {{ "absolute": {stop_loss} }},
+                "take_profit": {{ "absolute": {take_profit} }},
+                "broker": "oanda",
+                "trade_id": "eu-1",
+                "pip_size": 0.0001,
+                "tick_size": 0.00001,
+                "max_retries": 0,
+                "entry_dedup": "engine_latched"
+            }}"#
+        );
+        let intent: Intent = serde_json::from_str(&json).expect("valid EUR_USD enter intent");
+        let shell = Shell::from_candle(&Candle {
+            time: at("2026-08-07T17:00:00Z"),
+            o: entry_at,
+            h: entry_at + 0.001,
+            l: entry_at - 0.001,
+            c: entry_at,
+        });
+        crate::incoming::Verified { shell, intent }
+    }
+
+    /// A D1 bar on the 17:00-New-York grid (opens 21:00Z in August) whose close
+    /// book is `spread` wide around `mid`.
+    fn ny_daily_bar(open: &str, mid: f64, spread: f64) -> BidAskCandle {
+        BidAskCandle {
+            time: at(open),
+            o: mid,
+            h: mid,
+            l: mid,
+            c: mid,
+            bid_o: mid,
+            bid_h: mid,
+            bid_l: mid,
+            bid_c: mid - spread / 2.0,
+            ask_o: mid,
+            ask_h: mid,
+            ask_l: mid,
+            ask_c: mid + spread / 2.0,
+        }
+    }
+
+    /// THE STEP-4 TEST, at the dispatch entry point. Five D1 bars, every one
+    /// closing on the 17:00 NY rollover print at a 20p spread, with the live
+    /// quote at 1p. Off the window the floor is 10 × 20p = 200p, so a 10p drawn
+    /// stop against a 100p TP would be widened to R = 0.5 and REJECTED below
+    /// `min_r`. Every one of those closes is inside the spread hour, so the
+    /// window is discarded and the floor sizes off the 1p quote: 10p, exactly the
+    /// drawn stop, which reaches the broker untouched.
+    ///
+    /// Mutation: delete the `closes_outside_spread_hours` call in
+    /// `windowed_entry_spread` and this fire is rejected `sl-spread-floor`.
+    #[test]
+    fn a_daily_window_of_rollover_prints_does_not_size_the_stop() {
+        let mut broker = SpyBroker::quoting(1.1000, 0.0001);
+        broker.bidask = [
+            "2026-08-02T21:00:00Z",
+            "2026-08-03T21:00:00Z",
+            "2026-08-04T21:00:00Z",
+            "2026-08-05T21:00:00Z",
+            "2026-08-06T21:00:00Z",
+        ]
+        .into_iter()
+        .map(|open| ny_daily_bar(open, 1.1000, 0.0020))
+        .collect();
+        let store = store();
+        let verified = eurusd_enter(1.1000, 1.0990, 1.1100);
+        pollster::block_on(async {
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                Some(Granularity::D1),
+                EntryOrigin::Fresh,
+            )
+            .await;
+            assert!(
+                matches!(result, ActionResult::Ok(_)),
+                "the entry must place off the live quote, got {}",
+                describe(&result)
+            );
+        });
+        let placed = broker.only_placement();
+        assert!(
+            (placed.stop_loss - 1.0990).abs() < 1e-9,
+            "the drawn 10p stop must reach the broker unwidened, got {}",
+            placed.stop_loss
+        );
+    }
+
+    /// The control: the same window at a QUIET hour is used, and it widens.
+    /// Proves the test above passes because of the mask, not because the spy's
+    /// window is ignored.
+    #[test]
+    fn a_quiet_hour_window_still_sizes_the_stop() {
+        let mut broker = SpyBroker::quoting(1.1000, 0.0001);
+        // H1 bars closing 09:00–13:00Z — nowhere near the New York close.
+        broker.bidask = [
+            "2026-08-06T08:00:00Z",
+            "2026-08-06T09:00:00Z",
+            "2026-08-06T10:00:00Z",
+            "2026-08-06T11:00:00Z",
+            "2026-08-06T12:00:00Z",
+        ]
+        .into_iter()
+        .map(|open| ny_daily_bar(open, 1.1000, 0.0020))
+        .collect();
+        let store = store();
+        let verified = eurusd_enter(1.1000, 1.0990, 1.1100);
+        pollster::block_on(async {
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &cfg(),
+                now(),
+                None,
+                Some(Granularity::H1),
+                EntryOrigin::Fresh,
+            )
+            .await;
+            assert!(
+                !matches!(result, ActionResult::Ok(_)),
+                "a 200p floor against a 100p TP must be rejected, got {}",
+                describe(&result)
+            );
+        });
     }
 
     /// The same defect on the SHORT side, where "away from entry" is UP. A

@@ -992,6 +992,29 @@ On the Python side: `--risk-amount` adds `risk_amount: <n>` to the spec;
 `--broker-dry-run` adds `dry_run: true`. The Python `--dry-run` flag is
 unrelated — that one short-circuits before any POST to TradingView.
 
+### Spread-hour samples never size a stop (window + forecast term)
+
+Two floor inputs read the 17:00-New-York rollover print unless told not to,
+and on the D1 grid **every** bar closes on it (AUD/NZD D1: 147p floor vs 55p
+drawn). Both now exclude masked hours, and the exclusion must stay in the
+shared code both live and replay reach:
+
+- `dispatch::enter::windowed_entry_spread` filters via
+  `spread_blackout::closes_outside_spread_hours` **before** the shared
+  `trailing_spread_mean`. Keyed on the bar's **close** instant (open +
+  bar length), lead included — an H1 bar opening 16:00 NY is dropped, the one
+  opening 17:00 is kept. An all-masked window is the live-quote fallback,
+  which is the calm post-hour spread a promoted park is placed into.
+- `spread_blackout::spread_forecast_frac` returns `0.0` for a masked hour
+  (this or next). The forecast's old job of "replacing the 30-min lead" is
+  done by `is_spread_hour`'s own lead plus the `SpreadHour` hold; keeping the
+  term there cost one cancel-and-replace per resting order per day.
+
+The raw baked forecast column still carries the spike — only the *term* is
+silent. Entry-point tests in `widen_rounding_tests` (D1 rollover window must
+not widen; a quiet-hour window still does) are the tripwire; a fixture is not
+evidence here until the corpus is re-run after this change.
+
 ### `PriceRef` is untagged — variant ORDER is load-bearing
 
 `trade_control_core::intent::PriceRef` is `#[serde(untagged)]`, so
