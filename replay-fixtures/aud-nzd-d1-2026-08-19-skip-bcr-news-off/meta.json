@@ -1,0 +1,18 @@
+{
+  "instrument": "AUD/NZD",
+  "granularity": "d1",
+  "source": "tradenation",
+  "start": "2026-08-19T21:00:00Z",
+  "end": "2026-09-29T21:00:00Z",
+  "message": "Daily continuation ihs",
+  "arm": {
+    "entry_rule": "skip-bcr",
+    "skip_calendar_bars": true,
+    "skip_golden": false,
+    "skip_reversals": false,
+    "candle_source": "tradenation",
+    "chart_symbol": "TRADENATION:AUDNZD",
+    "tv_arm_version": "v147-37-g906bcc05-dirty",
+    "engine_version": "v147-37-g906bcc05-dirty"
+  }
+}
