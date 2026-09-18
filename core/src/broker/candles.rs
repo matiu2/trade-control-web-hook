@@ -110,6 +110,34 @@ pub fn trailing_spread_mean(candles: &[BidAskCandle], window: u32) -> Option<(f6
     Some((mean, spreads.len()))
 }
 
+/// [`trailing_spread_mean`] over the bars whose CLOSE is **outside**
+/// `instrument`'s baked spread hour.
+///
+/// The entry floor sizes the stop off the trailing mean close spread, and a bar
+/// closing inside the spread hour (the 17:00-New-York rollover print) leaks that
+/// spike into it: one bar in five on H1, one in six on H4, EVERY bar on D1.
+/// The operator's rule is that nothing enters in the spread hour (H1- rejects,
+/// H4+ parks and enters after it), so the hour's prints must not size the stop
+/// either. Bars are judged at their close (`time + bar_seconds`) — the instant
+/// the print was taken — through [`crate::spread_blackout::is_spread_hour`], the
+/// same predicate the gate and the lifecycle use. `None` when nothing clean
+/// remains (a D1 window is all rollover closes); the caller then falls open to
+/// its single-quote path exactly as for an empty fetch.
+pub fn trailing_spread_mean_outside_spread_hour(
+    instrument: &str,
+    bar_seconds: i64,
+    candles: &[BidAskCandle],
+    window: u32,
+) -> Option<(f64, usize)> {
+    let bar = chrono::Duration::seconds(bar_seconds);
+    let clean: Vec<BidAskCandle> = candles
+        .iter()
+        .filter(|c| !crate::spread_blackout::is_spread_hour(instrument, c.time + bar))
+        .copied()
+        .collect();
+    trailing_spread_mean(&clean, window)
+}
+
 /// The candle timeframes the engine fetches. Deliberately a small closed set —
 /// only the granularities trades are actually armed on — so every broker can
 /// map it without an "unsupported" runtime branch leaking into the engine.
@@ -258,6 +286,61 @@ mod tests {
     #[test]
     fn trailing_mean_empty_is_none() {
         assert_eq!(trailing_spread_mean(&[], 5), None);
+    }
+
+    /// The spread-hour-aware reducer: a bar CLOSING inside the instrument's
+    /// baked hour (EUR/USD: 17:00 New York = 21:00Z in July) is dropped before
+    /// the mean; a window of nothing but such bars (a D1 window) is `None` so
+    /// the caller falls open to its single quote. Mutation: judge the bar at its
+    /// OPEN instead of its close and the 20:00Z-open bar survives.
+    #[test]
+    fn spread_hour_closes_are_dropped_from_the_trailing_mean() {
+        use chrono::{TimeZone, Utc};
+        let bar = |h: u32, spread: f64| BidAskCandle {
+            time: Utc.with_ymd_and_hms(2026, 7, 8, h, 0, 0).unwrap(),
+            o: 1.1,
+            h: 1.1,
+            l: 1.1,
+            c: 1.1,
+            bid_o: 1.1,
+            bid_h: 1.1,
+            bid_l: 1.1,
+            bid_c: 1.1,
+            ask_o: 1.1 + spread,
+            ask_h: 1.1 + spread,
+            ask_l: 1.1 + spread,
+            ask_c: 1.1 + spread,
+        };
+        // 16..19 open tight; the 20:00Z-open bar CLOSES 21:00Z with a 30p book.
+        let bars = vec![
+            bar(16, 0.0002),
+            bar(17, 0.0002),
+            bar(18, 0.0002),
+            bar(19, 0.0002),
+            bar(20, 0.0030),
+        ];
+        let (mean, n) =
+            trailing_spread_mean_outside_spread_hour("EUR/USD", 3600, &bars, 5).expect("some");
+        assert_eq!(n, 4, "the 21:00Z close is dropped");
+        assert!(
+            (mean - 0.0002).abs() < 1e-12,
+            "mean of the clean bars, got {mean}"
+        );
+        // Control: the plain reducer still counts it.
+        let (raw, _) = trailing_spread_mean(&bars, 5).expect("some");
+        assert!(raw > 0.0007, "unfiltered mean carries the spike, got {raw}");
+        // A D1 window: every bar closes at the rollover → nothing clean.
+        let daily: Vec<BidAskCandle> = (0..5)
+            .map(|d| {
+                let mut b = bar(21, 0.0020);
+                b.time = Utc.with_ymd_and_hms(2026, 7, 6 + d, 21, 0, 0).unwrap();
+                b
+            })
+            .collect();
+        assert_eq!(
+            trailing_spread_mean_outside_spread_hour("EUR/USD", 86400, &daily, 5),
+            None
+        );
     }
 
     #[test]

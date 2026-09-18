@@ -1815,10 +1815,16 @@ async fn windowed_entry_spread<B: Broker>(
             return None;
         }
     };
-    // Reduce via the SHARED trailing-window mean (the same fn the replay's
-    // Fire-builder calls on candles from the same `get_bidask_candles`
-    // provider), so worker and replay size the floor off an identical statistic.
-    crate::broker::trailing_spread_mean(&candles, window)
+    // Reduce via the SHARED trailing-window mean — the replay reaches this
+    // very fn through `run_enter`, so worker and replay size the floor off an
+    // identical statistic — with spread-hour closes DROPPED first: the
+    // rollover print must not size a stop the operator never enters on.
+    crate::broker::trailing_spread_mean_outside_spread_hour(
+        instrument,
+        granularity.seconds(),
+        &candles,
+        window,
+    )
 }
 
 #[cfg(test)]
@@ -2910,6 +2916,206 @@ mod spread_gate_park_tests {
         let (result, parked) = fire(None);
         assert_eq!(outcome(&result), "rejected: spread-blackout");
         assert!(parked.is_none());
+    }
+}
+
+#[cfg(test)]
+mod entry_floor_spread_hour_tests {
+    //! Design item 2 of the replay/upkeep job: the SL floor's trailing spread
+    //! window must not include a bar that CLOSED inside the instrument's spread
+    //! hour. Pinned at `run_enter` — the stop the broker is handed — not at the
+    //! reducer alone (`[[mutation_test_the_entry_point_not_just_the_layer_below]]`).
+
+    use super::*;
+    use crate::broker::{
+        AttemptState, BidAskCandle, CancelError, Candle, CandleError, CloseOutcome, EntryRequest,
+        Granularity, LookupError, OpenPosition, PendingOrder, Placement, Quote,
+    };
+    use crate::state::MemStateStore;
+    use chrono::{DateTime, Utc};
+    use std::cell::RefCell;
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s)
+            .expect("valid test timestamp")
+            .with_timezone(&Utc)
+    }
+
+    fn bar(open: &str, spread: f64) -> BidAskCandle {
+        let p = 1.5895;
+        BidAskCandle {
+            time: at(open),
+            o: p,
+            h: p,
+            l: p,
+            c: p,
+            bid_o: p,
+            bid_h: p,
+            bid_l: p,
+            bid_c: p,
+            ask_o: p + spread,
+            ask_h: p + spread,
+            ask_l: p + spread,
+            ask_c: p + spread,
+        }
+    }
+
+    /// Serves a fixed bid/ask window to the floor and records the stop it is
+    /// asked to place. The live quote is tight so the fallback path (no clean
+    /// bars) never widens either — the window is the only thing under test.
+    struct WindowBroker {
+        window: Vec<BidAskCandle>,
+        stops: RefCell<Vec<f64>>,
+    }
+
+    impl Broker for WindowBroker {
+        async fn place_entry(
+            &self,
+            _max_risk_pct: f64,
+            _max_open_positions: u32,
+            req: &EntryRequest<'_>,
+        ) -> Result<Placement, EntryError> {
+            self.stops.borrow_mut().push(req.stop_loss);
+            Ok(Placement::id_only("order-1"))
+        }
+        async fn close_positions(&self, _instrument: &str) -> CloseOutcome {
+            CloseOutcome::NothingOpen
+        }
+        async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
+            0
+        }
+        async fn lookup_attempt_state(
+            &self,
+            _instrument: &str,
+            _broker_order_id: &str,
+            _broker_trade_id: Option<&str>,
+        ) -> Result<AttemptState, LookupError> {
+            Ok(AttemptState::Unknown)
+        }
+        async fn cancel_order(
+            &self,
+            _account_id: &str,
+            _broker_order_id: &str,
+        ) -> Result<(), CancelError> {
+            Ok(())
+        }
+        async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
+            Ok(Quote {
+                bid: 1.5895,
+                ask: 1.5897,
+            })
+        }
+        async fn list_open_positions(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<OpenPosition>, LookupError> {
+            Ok(vec![])
+        }
+        async fn amend_stop(
+            &self,
+            _account_id: &str,
+            _position_or_order_id: &str,
+            _new_stop: f64,
+        ) -> Result<(), crate::broker::AmendError> {
+            Ok(())
+        }
+        async fn list_pending_orders(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<PendingOrder>, LookupError> {
+            Ok(vec![])
+        }
+        async fn get_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<Candle>, CandleError> {
+            Ok(vec![])
+        }
+        async fn get_bidask_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<BidAskCandle>, CandleError> {
+            Ok(self.window.clone())
+        }
+    }
+
+    /// Fire the EUR_CAD enter (stop 1.5900, SL 1.5850 = 50 pips, TP 1.6100) on
+    /// H1 against `window`; return the stop the broker was handed.
+    fn placed_stop(window: Vec<BidAskCandle>) -> f64 {
+        let broker = WindowBroker {
+            window,
+            stops: RefCell::new(Vec::new()),
+        };
+        let store = MemStateStore::default();
+        let now = gate_order_tests::now();
+        store.set_clock(now);
+        let verified = gate_order_tests::enter_verified_with_entry(
+            r#"{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.5900 }"#,
+        );
+        let result = pollster::block_on(run_enter(
+            &broker,
+            &store,
+            &verified,
+            &gate_order_tests::cfg(),
+            now,
+            None,
+            Some(Granularity::H1),
+            EntryOrigin::Fresh,
+        ));
+        assert!(
+            matches!(result, ActionResult::Ok(_)),
+            "the enter must place: {}",
+            result.describe()
+        );
+        let stops = broker.stops.borrow();
+        assert_eq!(stops.len(), 1);
+        stops[0]
+    }
+
+    /// Four tight H1 bars plus one that CLOSED at 21:00Z (EUR_CAD's 17:00-NY
+    /// spread hour) with a 30-pip book. Unfiltered the mean is 6.1p → a 61-pip
+    /// floor that widens the 50-pip stop; with the rollover close dropped the
+    /// mean is 0.2p and the DRAWN stop is placed. Mutation: reduce with the plain
+    /// `trailing_spread_mean` and this widens.
+    #[test]
+    fn a_bar_closing_in_the_spread_hour_does_not_size_the_stop() {
+        let window = vec![
+            bar("2026-08-06T20:00:00Z", 0.0030), // closes 21:00Z — the rollover print
+            bar("2026-08-07T13:00:00Z", 0.0002),
+            bar("2026-08-07T14:00:00Z", 0.0002),
+            bar("2026-08-07T15:00:00Z", 0.0002),
+            bar("2026-08-07T16:00:00Z", 0.0002),
+        ];
+        let stop = placed_stop(window);
+        assert!(
+            (stop - 1.5850).abs() < 1e-9,
+            "the drawn 1.5850 stop must stand; the 21:00Z close must not widen it, got {stop}"
+        );
+    }
+
+    /// The control: the same 30-pip print on a CLEAN close (16:00Z) is a real
+    /// sample and does widen the stop — so the test above is not passing because
+    /// the floor is dead.
+    #[test]
+    fn the_same_print_on_a_clean_close_still_widens() {
+        let window = vec![
+            bar("2026-08-07T12:00:00Z", 0.0002),
+            bar("2026-08-07T13:00:00Z", 0.0002),
+            bar("2026-08-07T14:00:00Z", 0.0002),
+            bar("2026-08-07T15:00:00Z", 0.0002),
+            bar("2026-08-07T16:00:00Z", 0.0030), // closes 17:00Z — clean
+        ];
+        let stop = placed_stop(window);
+        assert!(
+            stop < 1.5850 - 1e-9,
+            "a clean 30-pip sample must widen the long's stop below 1.5850, got {stop}"
+        );
     }
 }
 
