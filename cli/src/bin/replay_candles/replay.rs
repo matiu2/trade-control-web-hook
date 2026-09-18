@@ -25,7 +25,7 @@ use trade_control_core::signals::{
 };
 
 use super::cadence::CronCadence;
-use super::replay_broker::{ExitReason, RealizedOutcome, ReplayBroker};
+use super::replay_broker::{ExitReason, QuoteSample, RealizedOutcome, ReplayBroker};
 use super::verbose::{BarTrace, DetectedMark};
 use trade_control_cli::replay_args::DetectorMarkConfig;
 use trade_control_core::broker::Broker;
@@ -295,7 +295,7 @@ async fn walk_upkeep_ticks(
     let src = super::lifecycle::ReplayVerifiedSource::new(replay_broker);
     for (at, sample) in upkeep.samples_in(open, close) {
         store.set_clock(at);
-        replay_broker.set_upkeep_sample(Some(*sample));
+        replay_broker.set_upkeep_sample(Some(QuoteSample::at_close(at, sample)));
         let promoted = trade_control_core::order_control::promote_due_orders(
             replay_broker,
             store,
@@ -321,6 +321,9 @@ async fn walk_upkeep_ticks(
     store.set_clock(close);
 }
 
+/// Test-only since the driver went through [`run_with_upkeep`]: the plain
+/// per-bar walk, which every existing replay test drives.
+#[cfg(test)]
 /// Replay `plan` over `candles` (ascending, the pulled window). `granularity`
 /// is the bar size, used to derive each tick's `now` (a closed bar's close time
 /// = its open time + one bar). `expires_at` stamps the state TTL on each tick
@@ -595,6 +598,14 @@ pub async fn run_with_upkeep(
             )
             .await;
         }
+        // The ENTRY-INSTANT quote: for the rest of this per-bar pass (the engine
+        // tick, every `run_enter` it dispatches, the lifecycle and order-control
+        // passes at `now`) `get_quote` answers from the finer bar OPENING at
+        // `now` — the first print after the close, which is what the live cron
+        // samples seconds after a bar closes. Without a series (or no bar opening
+        // exactly at `now`) the plan bar's close book stands, as before. Cleared
+        // at the end of the pass, so the next bar's ticks start clean.
+        replay_broker.set_upkeep_sample(upkeep.and_then(|u| u.opening_at(now)));
 
         tracing::debug!(
             bar = %candles[i].time,
@@ -916,6 +927,7 @@ pub async fn run_with_upkeep(
             now,
         )
         .await;
+        replay_broker.set_upkeep_sample(None);
 
         if eval.done {
             done = true;
@@ -957,6 +969,7 @@ pub async fn run_with_upkeep(
                 .await;
             }
             store.set_clock(now);
+            replay_broker.set_upkeep_sample(upkeep.and_then(|u| u.opening_at(now)));
             order_control_pass(
                 &replay_broker,
                 &store,
@@ -966,6 +979,7 @@ pub async fn run_with_upkeep(
                 now,
             )
             .await;
+            replay_broker.set_upkeep_sample(None);
         }
     }
 
@@ -1976,6 +1990,159 @@ mod tests {
         let mut plan = plain_enter_plan(instrument, level);
         plan.granularity = Granularity::H4;
         plan
+    }
+
+    /// The bars of `h4_enter_on_the_ny_close_bar_is_parked_then_promoted_and_fills`,
+    /// but with the TradeNation-aggregated shape: the 17:00Z bar CLOSES on a
+    /// calm 2-pip book (its last H1's close, before the rollover), and the
+    /// 21:00Z bar reaches through the 1.1100 entry stop.
+    fn ny_close_bars_with_a_calm_close() -> Vec<EngineCandle> {
+        let mut candles: Vec<EngineCandle> = Vec::new();
+        let mut t: DateTime<Utc> = "2026-07-07T01:00:00Z".parse().unwrap();
+        for _ in 0..10 {
+            candles.push(ohlc_at_spread(
+                &t.to_rfc3339(),
+                1.1040,
+                1.1042,
+                1.1038,
+                1.1040,
+                0.0002,
+            ));
+            t += Duration::hours(4);
+        }
+        assert_eq!(t.to_rfc3339(), "2026-07-08T17:00:00+00:00");
+        // Fires the enter at 21:00Z off a CALM close book.
+        candles.push(ohlc_at_spread(
+            &t.to_rfc3339(),
+            1.1045,
+            1.1060,
+            1.1043,
+            1.1055,
+            0.0002,
+        ));
+        // The spread-hour bar itself reaches 1.1120: an order resting from 21:00
+        // fills HERE; an order only placed at 01:00Z cannot.
+        candles.push(ohlc_at_spread(
+            "2026-07-08T21:00:00Z",
+            1.1055,
+            1.1120,
+            1.1050,
+            1.1110,
+            0.0002,
+        ));
+        candles.push(ohlc_at_spread(
+            "2026-07-09T01:00:00Z",
+            1.1110,
+            1.1125,
+            1.1100,
+            1.1115,
+            0.0002,
+        ));
+        candles.push(ohlc_at_spread(
+            "2026-07-09T05:00:00Z",
+            1.1115,
+            1.1260,
+            1.1105,
+            1.1255,
+            0.0002,
+        ));
+        candles
+    }
+
+    /// An M15 series covering only the rollover hour: the bar OPENING at 21:00Z
+    /// carries a 10-pip open book (the first post-close print — the spike), and
+    /// every tick inside the hour stays 10 pips wide, so nothing releases the
+    /// park before the 01:00Z per-bar pass. Deliberately no bar opens at 01:00Z.
+    fn rollover_hour_m15(open_spread: f64) -> super::super::upkeep::UpkeepTicks {
+        let mut bars: Vec<EngineCandle> = ["21:00", "21:15", "21:30"]
+            .iter()
+            .map(|hm| {
+                ohlc_at_spread(
+                    &format!("2026-07-08T{hm}:00Z"),
+                    1.1056,
+                    1.1058,
+                    1.1054,
+                    1.1056,
+                    0.0010,
+                )
+            })
+            .collect();
+        let half = open_spread / 2.0;
+        bars[0].bid_o = 1.1056 - half;
+        bars[0].ask_o = 1.1056 + half;
+        super::super::upkeep::UpkeepTicks::new(bars, Duration::minutes(15))
+    }
+
+    async fn calm_close_run(upkeep: Option<&super::super::upkeep::UpkeepTicks>) -> Replay {
+        run_with_upkeep(
+            &plain_enter_plan_h4("EUR/USD", 1.1050),
+            &ny_close_bars_with_a_calm_close(),
+            Granularity::H4,
+            "2026-07-08T13:00:00Z".parse().unwrap(),
+            "2026-07-12T00:00:00Z".parse().unwrap(),
+            no_marks(),
+            None,
+            CronCadence::PER_BAR,
+            upkeep,
+        )
+        .await
+    }
+
+    fn enter_fill_at(r: &Replay) -> DateTime<Utc> {
+        r.fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("enter fired")
+            .realized
+            .as_ref()
+            .expect("the enter fills")
+            .fill_at
+    }
+
+    /// THE ENTRY-INSTANT QUOTE. Live, the cron dispatches an enter seconds after
+    /// the bar closes, so `run_enter` samples the first print AFTER the close —
+    /// on the NY-close bar that is the rollover spike. A plan bar's own close
+    /// book is the last print BEFORE it, and for TradeNation's H1-aggregated D1
+    /// that is the calm 20:59 spread: the spread gate could never trip offline
+    /// and a park was unreachable, however wide the real reopen was.
+    ///
+    /// With an upkeep series the per-bar pass must quote from the OPEN book of
+    /// the finer bar opening at the close. Here that book is 10 pips (> the
+    /// 8-pip EUR/USD threshold) while the plan bar's close is 2 pips: the enter
+    /// PARKS, the in-hour ticks stay wide, and the promote lands at the 01:00Z
+    /// pass — so the fill comes on the 01:00Z bar. Per-bar only (the control)
+    /// places at 21:00Z off the calm close and fills on the 21:00Z bar. A replay
+    /// that clears the sample before the enter dispatch, or quotes the finer
+    /// bar's CLOSE, fills at 21:00Z with the series too and goes red.
+    #[tokio::test]
+    async fn the_enter_quotes_the_first_print_after_the_close_not_the_last_before_it() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init()
+            .ok();
+        let control = enter_fill_at(&calm_close_run(None).await);
+        assert_eq!(
+            control,
+            "2026-07-08T21:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "control: off the calm close book the enter places at 21:00Z and fills on that bar"
+        );
+
+        let wide_open = rollover_hour_m15(0.0010);
+        let with_series = enter_fill_at(&calm_close_run(Some(&wide_open)).await);
+        assert_eq!(
+            with_series,
+            "2026-07-09T01:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "the 21:00Z open book is the spike: the enter must park and only fill \
+             after the 01:00Z promote"
+        );
+
+        // A calm first print with the same in-hour ticks places straight away:
+        // proves the park keyed on the OPEN book, not on the series merely
+        // existing.
+        let calm_open = rollover_hour_m15(0.0002);
+        let calm = enter_fill_at(&calm_close_run(Some(&calm_open)).await);
+        assert_eq!(calm, control, "a calm first print must not park");
     }
 
     /// JOB 3 at the entry point: on an H4 plan the spread gate DELAYS. The enter

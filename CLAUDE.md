@@ -1015,6 +1015,31 @@ silent. Entry-point tests in `widen_rounding_tests` (D1 rollover window must
 not widen; a quiet-hour window still does) are the tripwire; a fixture is not
 evidence here until the corpus is re-run after this change.
 
+### Replay: the entry quote is the FIRST print after the close, and a promotion goes live at its own bar
+
+Two replay-only rules, both in `cli/src/bin/replay_candles/`, that a refactor of
+`ReplayBroker` or the loop can quietly lose (2026-09-18):
+
+- **`get_quote` at a plan-bar close reads the finer bar OPENING at that instant**
+  when an upkeep series is present (`UpkeepTicks::opening_at` → `QuoteSample`,
+  set in the per-bar pass and the order-control tail *after* `walk_upkeep_ticks`
+  clears the tick sample, cleared again after `order_control_pass`). The plan
+  bar's close book is the last print *before* the close; for TradeNation's
+  H1-aggregated D1 it is the calm 20:59 spread, so the spread gate never trips
+  and the H4+ park is unreachable offline. Test:
+  `the_enter_quotes_the_first_print_after_the_close_not_the_last_before_it` —
+  it is differential (calm close + wide open ⇒ fill a bar later) and goes red
+  if the sample is cleared before the enter dispatch OR quoted from the close.
+- **A promoted park's shell is re-stamped at `as_of`** in `place_entry`'s
+  park-adoption arm. `prefix_from_fire` opens the fill window at `shell.time`;
+  the adopted fire-bar shell let a park promoted at 01:00Z fill on the 21:00Z
+  bar that had already closed. The tick walk still sees `as_of` = the previous
+  bar, so a tick promotion inside bar N stays fillable from N.
+
+Fixtures carry the series as `upkeep_bars.json`; absent ⇒ per-bar, corrupt ⇒
+load error. `run` (per-bar) is `#[cfg(test)]`; production goes through
+`run_with_upkeep`.
+
 ### `PriceRef` is untagged — variant ORDER is load-bearing
 
 `trade_control_core::intent::PriceRef` is `#[serde(untagged)]`, so

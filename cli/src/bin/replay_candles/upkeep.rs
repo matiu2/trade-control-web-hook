@@ -35,6 +35,19 @@
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::BidAskCandle;
 
+use super::replay_broker::QuoteSample;
+
+/// The on-disk form of an [`UpkeepTicks`] series (`upkeep_bars.json` in a
+/// fixture): the finer bars plus their length, so a fixture that was saved
+/// under `--upkeep` replays the SAME sub-bar ticks offline. `bar_seconds`
+/// rather than a `Granularity` so the file is self-describing without the
+/// CLI's parser.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FrozenUpkeep {
+    pub bar_seconds: i64,
+    pub bars: Vec<BidAskCandle>,
+}
+
 /// A finer bid/ask series whose bar CLOSES are the instants the replay runs
 /// its upkeep (order-control) ticks at.
 #[derive(Debug, Clone)]
@@ -52,6 +65,35 @@ impl UpkeepTicks {
         bars.sort_by_key(|c| c.time);
         bars.dedup_by_key(|c| c.time);
         Self { bars, bar_len }
+    }
+
+    /// The series as saved into / loaded from a fixture.
+    pub fn to_frozen(&self) -> FrozenUpkeep {
+        FrozenUpkeep {
+            bar_seconds: self.bar_len.num_seconds(),
+            bars: self.bars.clone(),
+        }
+    }
+
+    /// Rebuild from the fixture form (sorted + deduplicated like [`Self::new`]).
+    pub fn from_frozen(frozen: FrozenUpkeep) -> Self {
+        Self::new(frozen.bars, Duration::seconds(frozen.bar_seconds))
+    }
+
+    /// The quote at the INSTANT `at` — the open book of the finer bar that
+    /// opens exactly then, or `None` when the series has no such bar.
+    ///
+    /// This is the entry-instant sample. Live, a plan bar closes and the cron
+    /// dispatches the enter seconds later, so the spread `run_enter` sees is
+    /// the first print AFTER the close — on the 17:00 New York grid that is the
+    /// rollover spike, not the last print before it. A plan bar's own close
+    /// book (`bid_c`/`ask_c`) is that last print: for TradeNation's aggregated
+    /// D1 it is the calm 20:59 spread, so the spread gate could never trip
+    /// offline and a park was unreachable. The finer bar OPENING at the close
+    /// carries the first post-close print in its open book.
+    pub fn opening_at(&self, at: DateTime<Utc>) -> Option<QuoteSample> {
+        let i = self.bars.binary_search_by_key(&at, |c| c.time).ok()?;
+        Some(QuoteSample::at_open(&self.bars[i]))
     }
 
     /// How many finer bars the series holds.
@@ -133,6 +175,44 @@ mod tests {
         // is this bar's per-bar pass). Bars from 24h on close outside.
         let want: Vec<i64> = (0..23).map(|h| h * 3600).collect();
         assert_eq!(got, want);
+    }
+
+    /// The entry-instant sample is the OPEN book of the bar opening at `at`
+    /// — not the close book of the bar closing there (which is the previous
+    /// bar). A bar opening at 3600 with a wide open and calm close must report
+    /// the wide open.
+    #[test]
+    fn opening_at_reads_the_open_book_of_the_bar_opening_then() {
+        let mut wide_open = bar(3600);
+        wide_open.bid_o = 0.9990;
+        wide_open.ask_o = 1.0010;
+        // Its close is calm; the PREVIOUS bar's close is calm too.
+        let t = UpkeepTicks::new(vec![bar(0), wide_open, bar(7200)], Duration::hours(1));
+        let q = t
+            .opening_at(Utc.timestamp_opt(3600, 0).unwrap())
+            .expect("a bar opens at 3600");
+        assert_eq!(q.at, Utc.timestamp_opt(3600, 0).unwrap());
+        assert!(
+            (q.ask - q.bid - 0.0020).abs() < 1e-12,
+            "the OPEN book, got {q:?}"
+        );
+        assert!(
+            t.opening_at(Utc.timestamp_opt(1800, 0).unwrap()).is_none(),
+            "no bar opens at 1800"
+        );
+    }
+
+    /// `upkeep_bars.json` round-trips the series exactly, and rebuilding sorts
+    /// + dedups like `new` so a hand-edited file can't smuggle a duplicate in.
+    #[test]
+    fn frozen_form_round_trips() {
+        let t = UpkeepTicks::new(vec![bar(7200), bar(3600), bar(3600)], Duration::minutes(15));
+        let json = serde_json::to_string(&t.to_frozen()).unwrap();
+        let back: FrozenUpkeep = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.bar_seconds, 900);
+        let rebuilt = UpkeepTicks::from_frozen(back);
+        assert_eq!(rebuilt.len(), 2);
+        assert_eq!(rebuilt.to_frozen(), t.to_frozen());
     }
 
     #[test]

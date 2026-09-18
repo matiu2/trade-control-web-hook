@@ -1822,6 +1822,38 @@ ambiguous — one the fixture has no bars for — the replay refetches just that
 window from the broker/candle-cache and says so, rather than scoring it as a
 stop; re-save to re-freeze the new set.
 
+**Walking the live 15-minute order-control cadence (`--upkeep <GRAN>`).** Live
+runs the promote + re-price passes every 900 s off a fresh quote; the replay's
+per-bar pass runs them once per plan bar off that bar's close book. On a daily
+plan every close is the 17:00 New York rollover print, so offline a widened stop
+was never given back and a parked order never promoted until the next daily
+close. `--upkeep 15m` (or `1h`) pulls the finer bid/ask series over the live
+window and, between two plan-bar closes, runs the **same shared passes** once per
+finer bar close with the broker's quote pointed at that bar. Only the clock and
+the quote differ; no replay-side sizing or widen/shrink decision.
+
+Two things ride on the series (2026-09-18):
+
+- **The entry-instant quote.** Live, the cron dispatches an enter seconds after
+  the bar closes, so `run_enter` samples the first print *after* the close — on
+  the NY-close bar that is the rollover spike. A plan bar's own close book is
+  the last print *before* it, and for TradeNation's H1-aggregated D1 that is the
+  calm 20:59 spread, so the spread gate could never trip offline and the H4+
+  park was unreachable. With a series, the per-bar pass quotes from the **open
+  book of the finer bar opening at the close**; without one, the close book
+  stands as before.
+- **A promoted park goes live at the promotion bar, not the fire bar.** The
+  fill window opens at the placement's bar; adopting the original fire-bar
+  shell let a park promoted at 01:00Z fill on the 21:00Z bar that had already
+  closed — a look-ahead. Fixed alongside; goldens with a promoted park can move.
+
+`--save` freezes the series as `upkeep_bars.json` (`{bar_seconds, bars}`), and
+a test-mode replay of that fixture walks the same ticks with no network. A
+fixture without the file replays per-bar exactly as before; a file that exists
+but will not parse is a load error, never a silent per-bar fallback.
+`--rebless` under a *live* `--upkeep` flag is still refused — the fixture's own
+frozen series is the one that counts.
+
 **Seeing the engine's silent state changes (`--verbose` / `--all-events`).**
 The normal report lists only *fires* — intents the engine emits. But the engine
 also advances state per bar that fires nothing: the spine phase

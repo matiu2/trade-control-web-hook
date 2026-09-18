@@ -89,6 +89,8 @@ use super::economics::ReplayEconomics;
 use super::replay::Replay;
 use trade_control_cli::replay_args::CandleSource;
 
+use super::upkeep::{FrozenUpkeep, UpkeepTicks};
+
 /// The resolved scalars a fixture replay needs, beyond the plan + candles. Saved
 /// so `--test-mode` can reconstruct the run without re-resolving from flags, the
 /// plan, or the TradingView chart.
@@ -232,6 +234,10 @@ const CANDLES_FILE: &str = "candles.json";
 const META_FILE: &str = "meta.json";
 const EXPECTED_FILE: &str = "expected.json";
 const SUB_BARS_FILE: &str = "sub_bars.json";
+/// The finer bid/ask series the fixture's upkeep ticks walk (job 2), frozen
+/// so a fixture saved under `--upkeep` replays the same sub-bar cadence
+/// offline. Absent on a fixture saved without it.
+const UPKEEP_FILE: &str = "upkeep_bars.json";
 
 /// Write a complete fixture to `dir` (created if absent): the plan, the frozen
 /// candle window, the resolved meta, and the expected outcome — each as
@@ -248,12 +254,22 @@ pub fn save(
     meta: &FixtureMeta,
     expected: &ReplayOutcome,
     sub_bars: &[EngineCandle],
+    upkeep: Option<&UpkeepTicks>,
 ) -> Result<()> {
     fs::create_dir_all(dir).wrap_err_with(|| format!("create fixture dir {}", dir.display()))?;
     write_json(&dir.join(PLAN_FILE), plan)?;
     write_json(&dir.join(CANDLES_FILE), &candles.to_vec())?;
     write_json(&dir.join(META_FILE), meta)?;
     write_json(&dir.join(EXPECTED_FILE), expected)?;
+    let upkeep_path = dir.join(UPKEEP_FILE);
+    match upkeep {
+        Some(ticks) => write_json(&upkeep_path, &ticks.to_frozen())?,
+        // Same discipline as `sub_bars.json`: a re-save WITHOUT the series must
+        // not leave a stale one behind that a later offline run would walk.
+        None if upkeep_path.exists() => fs::remove_file(&upkeep_path)
+            .wrap_err_with(|| format!("remove stale {}", upkeep_path.display()))?,
+        None => {}
+    }
     let sub_bars_path = dir.join(SUB_BARS_FILE);
     if sub_bars.is_empty() {
         // Re-saving a fixture that used to have an ambiguous bar but no longer
@@ -279,13 +295,18 @@ pub struct FixtureInputs {
     /// for a fixture with no ambiguous bar, and for every fixture saved before
     /// `sub_bars.json` existed — both of which replay exactly as they did then.
     pub sub_bars: Vec<EngineCandle>,
+    /// The frozen upkeep series (`upkeep_bars.json`), when the fixture carries
+    /// one. `None` replays per-bar only — byte-identical to a fixture saved
+    /// without `--upkeep`.
+    pub upkeep: Option<UpkeepTicks>,
 }
 
-/// Read a fixture's inputs (plan + candles + meta + any saved sub-bars). The
-/// expected outcome is read separately by the caller that needs it
-/// ([`load_expected`]).
+/// Read a fixture's inputs (plan + candles + meta + any saved sub-bars + any
+/// frozen upkeep series). The expected outcome is read separately by the
+/// caller that needs it ([`load_expected`]).
 pub fn load(dir: &Path) -> Result<FixtureInputs> {
     let sub_bars_path = dir.join(SUB_BARS_FILE);
+    let upkeep_path = dir.join(UPKEEP_FILE);
     Ok(FixtureInputs {
         plan: read_json(&dir.join(PLAN_FILE))?,
         candles: read_json(&dir.join(CANDLES_FILE))?,
@@ -298,6 +319,14 @@ pub fn load(dir: &Path) -> Result<FixtureInputs> {
             read_json(&sub_bars_path)?
         } else {
             Vec::new()
+        },
+        // Same rule: absent is the per-bar fixture; present-but-corrupt is an
+        // error, never a silent fall-back to per-bar.
+        upkeep: if upkeep_path.exists() {
+            let frozen: FrozenUpkeep = read_json(&upkeep_path)?;
+            Some(UpkeepTicks::from_frozen(frozen))
+        } else {
+            None
         },
     })
 }
@@ -1123,7 +1152,7 @@ mod tests {
         let meta = sample_meta();
         let expected = sample_outcome();
 
-        save(&dir, &plan, &candles, &meta, &expected, &[]).unwrap();
+        save(&dir, &plan, &candles, &meta, &expected, &[], None).unwrap();
         let inputs = load(&dir).unwrap();
         let loaded_expected = load_expected(&dir).unwrap();
 
@@ -1140,7 +1169,89 @@ mod tests {
         // support existed.
         assert!(inputs.sub_bars.is_empty());
         assert!(!dir.join(SUB_BARS_FILE).exists());
+        // Likewise no upkeep series ⇒ no `upkeep_bars.json`, and the fixture
+        // loads as the per-bar replay it always was.
+        assert!(inputs.upkeep.is_none());
+        assert!(!dir.join(UPKEEP_FILE).exists());
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fixture saved under `--upkeep` carries its finer series and loads it
+    /// back as the SAME ticks; a re-save without one removes the stale file so
+    /// an offline run can't walk ticks the saving run never had.
+    #[test]
+    fn upkeep_series_round_trips_and_a_resave_without_one_removes_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "fixture-upkeep-{}",
+            std::process::id() as u64 + 991_003
+        ));
+        fs::remove_dir_all(&dir).ok();
+        let plan = sample_plan();
+        let candles = vec![sample_candle()];
+        let ticks = UpkeepTicks::new(vec![sample_candle()], chrono::Duration::minutes(15));
+
+        save(
+            &dir,
+            &plan,
+            &candles,
+            &sample_meta(),
+            &sample_outcome(),
+            &[],
+            Some(&ticks),
+        )
+        .unwrap();
+        assert!(
+            dir.join(UPKEEP_FILE).exists(),
+            "upkeep_bars.json not written"
+        );
+        let loaded = load(&dir).unwrap().upkeep.expect("the series loads back");
+        assert_eq!(loaded.to_frozen(), ticks.to_frozen());
+        assert_eq!(loaded.to_frozen().bar_seconds, 900);
+
+        save(
+            &dir,
+            &plan,
+            &candles,
+            &sample_meta(),
+            &sample_outcome(),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(
+            !dir.join(UPKEEP_FILE).exists(),
+            "stale upkeep_bars.json survived a re-save without a series"
+        );
+        assert!(load(&dir).unwrap().upkeep.is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A corrupt `upkeep_bars.json` is a LOUD load error, never a silent
+    /// per-bar fallback that would quietly change the fixture's cadence.
+    #[test]
+    fn a_corrupt_upkeep_file_is_a_load_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "fixture-upkeep-corrupt-{}",
+            std::process::id() as u64 + 991_004
+        ));
+        fs::remove_dir_all(&dir).ok();
+        save(
+            &dir,
+            &sample_plan(),
+            &[sample_candle()],
+            &sample_meta(),
+            &sample_outcome(),
+            &[],
+            None,
+        )
+        .unwrap();
+        fs::write(dir.join(UPKEEP_FILE), "{ not json").unwrap();
+        assert!(
+            load(&dir).is_err(),
+            "a corrupt upkeep file must not load as None"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1162,6 +1273,7 @@ mod tests {
             &sample_meta(),
             &sample_outcome(),
             &subs,
+            None,
         )
         .unwrap();
         assert!(
@@ -1179,6 +1291,7 @@ mod tests {
             &sample_meta(),
             &sample_outcome(),
             &[],
+            None,
         )
         .unwrap();
         assert!(
@@ -1206,6 +1319,7 @@ mod tests {
             &sample_meta(),
             &sample_outcome(),
             &[],
+            None,
         )
         .unwrap();
         assert!(!dir.join(SUB_BARS_FILE).exists());

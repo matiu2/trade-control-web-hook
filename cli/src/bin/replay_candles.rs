@@ -295,14 +295,6 @@ async fn run() -> Result<()> {
         );
     }
 
-    if args.save.is_some() && args.upkeep.is_some() {
-        return Err(outcome::bad_input(eyre!(
-            "refusing to --save a fixture under --upkeep: the upkeep series is not frozen \
-             into the fixture, so its expected.json could never reproduce offline. Save \
-             without --upkeep."
-        )));
-    }
-
     // The upkeep ticks (job 2): a finer bid/ask series over the live window
     // whose bar closes are the live 900 s order-control instants. `None` (the
     // default) is byte-identical. Pulled once and shared by both zoom passes.
@@ -489,7 +481,17 @@ async fn run() -> Result<()> {
         // common no-ambiguous-bar case, which writes no `sub_bars.json` at all),
         // so the fixture can reproduce its own verdict instead of degrading to
         // the pessimistic stop offline.
-        fixture::save(&dir, &plan, &candles, &meta, &expected, &zoom_bars)?;
+        // The upkeep series is frozen alongside (`upkeep_bars.json`) so the
+        // fixture replays the same sub-bar ticks offline.
+        fixture::save(
+            &dir,
+            &plan,
+            &candles,
+            &meta,
+            &expected,
+            &zoom_bars,
+            upkeep.as_ref(),
+        )?;
         tracing::info!(
             dir = %dir.display(),
             sub_bars = zoom_bars.len(),
@@ -1084,6 +1086,7 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
         &inputs.sub_bars,
         Some(&refetch),
         CronCadence::new(args.cron_gap),
+        inputs.upkeep.as_ref(),
     )
     .await;
 
@@ -1233,6 +1236,9 @@ async fn run_frozen(
     // being able to regression-test the corpus against a timing-sensitive gate;
     // the goldens will diverge, and that divergence IS the signal.
     cadence: CronCadence,
+    // The fixture's frozen upkeep series (`upkeep_bars.json`), `None` for a
+    // per-bar fixture.
+    upkeep: Option<&upkeep::UpkeepTicks>,
 ) -> replay::Replay {
     let expires_at = candles.last().map(|c| c.time).unwrap_or_else(Utc::now) + Duration::days(365);
     // The market-hours gate reads the baked mask keyed on the instrument, so a
@@ -1252,7 +1258,7 @@ async fn run_frozen(
         saved_sub_bars.to_vec(),
         finer_bar,
     ));
-    let first = replay::run(
+    let first = replay::run_with_upkeep(
         plan,
         candles,
         gran,
@@ -1261,6 +1267,7 @@ async fn run_frozen(
         mark_cfg,
         Some(Box::new(std::rc::Rc::clone(&provider))),
         cadence,
+        upkeep,
     )
     .await;
 
@@ -1312,7 +1319,7 @@ async fn run_frozen(
     // fixture knew about and the newly-ambiguous ones resolve.
     let mut merged = saved_sub_bars.to_vec();
     merged.extend(fetched);
-    replay::run(
+    replay::run_with_upkeep(
         plan,
         candles,
         gran,
@@ -1321,6 +1328,7 @@ async fn run_frozen(
         mark_cfg,
         Some(Box::new(lazy_zoom::WindowSubBars::new(merged))),
         cadence,
+        upkeep,
     )
     .await
 }
@@ -2208,6 +2216,7 @@ mod tests {
             // Fully offline: no broker, no candle-cache.
             None,
             CronCadence::PER_BAR,
+            inputs.upkeep.as_ref(),
         )
         .await;
 

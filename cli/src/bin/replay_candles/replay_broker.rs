@@ -243,6 +243,39 @@ struct ArmedPlacement {
     shell: Shell,
 }
 
+/// One sampled book the replay's `get_quote` answers from instead of the plan
+/// bar `as_of` names: a finer bar's CLOSE book at an upkeep tick, or the OPEN
+/// book of the finer bar opening at a plan-bar close (the entry-instant
+/// sample — see `UpkeepTicks::opening_at`). Carries only what a quote is —
+/// the instant and the two sides — so no caller can accidentally read a
+/// candle's other fields through it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuoteSample {
+    pub at: DateTime<Utc>,
+    pub bid: f64,
+    pub ask: f64,
+}
+
+impl QuoteSample {
+    /// The bar's close book, stamped at its close (`at`).
+    pub fn at_close(at: DateTime<Utc>, bar: &BidAskCandle) -> Self {
+        Self {
+            at,
+            bid: bar.bid_c,
+            ask: bar.ask_c,
+        }
+    }
+
+    /// The bar's open book, stamped at its open.
+    pub fn at_open(bar: &BidAskCandle) -> Self {
+        Self {
+            at: bar.time,
+            bid: bar.bid_o,
+            ask: bar.ask_o,
+        }
+    }
+}
+
 /// Offline broker that resolves prior-attempt state from the candle window.
 pub struct ReplayBroker {
     /// The full pulled bid/ask candle window (warm-up + live), ascending. Each
@@ -283,7 +316,7 @@ pub struct ReplayBroker {
     /// held ledger, fills and `get_bidask_candles` stay bound to `as_of`, so an
     /// upkeep tick differs from the per-bar pass by exactly the clock and the
     /// quote — the operator's "shared code" constraint. `None` between ticks.
-    upkeep_sample: RefCell<Option<BidAskCandle>>,
+    upkeep_sample: RefCell<Option<QuoteSample>>,
 
     // --- Stateful held model (S1). Mutated by `advance()` per bar and by
     // `place_entry`/`close_positions`; read by `list_open_positions` /
@@ -383,7 +416,7 @@ impl ReplayBroker {
     /// tick (`Some`), or back at the plan bar `as_of` names (`None`). The held
     /// state is deliberately NOT moved: a sub-bar tick asks "what is the spread
     /// right now?" of the shared order-control passes, and nothing else.
-    pub fn set_upkeep_sample(&self, sample: Option<BidAskCandle>) {
+    pub fn set_upkeep_sample(&self, sample: Option<QuoteSample>) {
         *self.upkeep_sample.borrow_mut() = sample;
     }
 
@@ -1225,7 +1258,16 @@ impl Broker for ReplayBroker {
                         stop_loss: req.stop_loss,
                         take_profit: req.take_profit,
                     };
-                    self.record_attempt(a.order_id.clone(), a.intent, a.shell, Some(placed));
+                    // The order goes live NOW, not on the bar the enter fired:
+                    // `prefix_from_fire` opens the fill window at `shell.time`,
+                    // so an adopted fire-bar shell would let a park promoted at
+                    // 01:00Z fill on the 21:00Z bar that closed BEFORE it — a
+                    // look-ahead. Stamp the placement at the broker's clock:
+                    // the bar being processed (an upkeep tick inside bar N
+                    // still sees `as_of` = N−1, so it stays fillable from N).
+                    let mut shell = a.shell;
+                    shell.time = *self.as_of.borrow();
+                    self.record_attempt(a.order_id.clone(), a.intent, shell, Some(placed));
                     if let Some(rec) = self.placed.borrow_mut().last_mut() {
                         rec.promoted_from_park = true;
                     }
@@ -1385,12 +1427,17 @@ impl Broker for ReplayBroker {
         // intrabar spike that retraces by the close. So the replay reproduces the
         // common case (sustained wide) and under-reports the sub-bar-spike edge.
         // Better than the old unconditional fail-open, which reproduced nothing.
-        // An upkeep tick (job 2) samples a finer bar's book at that bar's time;
-        // otherwise the plan bar `as_of` points at. Same clamp below either way.
-        let book = match *self.upkeep_sample.borrow() {
-            Some(s) => Some(s),
-            None => self.candle_at_as_of().cloned(),
-        };
+        // An upkeep tick (job 2) samples a finer bar's CLOSE book at that bar's
+        // close, and the per-bar pass samples the OPEN book of the finer bar
+        // opening at the plan-bar close (the entry-instant quote); with no
+        // sample set, the plan bar `as_of` points at answers.
+        if let Some(s) = *self.upkeep_sample.borrow() {
+            return Ok(Quote {
+                bid: s.bid,
+                ask: s.ask,
+            });
+        }
+        let book = self.candle_at_as_of().cloned();
         // No spread-hour clamp any more. Until 2026-09-18 an in-hour quote was
         // pinned to EXACTLY `elevated_threshold_pips`, which (a) made the
         // entry gate's strict `>` inert offline — the replay ENTERED on every
@@ -1712,7 +1759,10 @@ mod tests {
         b.set_as_of(Utc.timestamp_opt(0, 0).unwrap());
 
         // A mid-bar H1 sample with a calm 0.3 pip spread.
-        b.set_upkeep_sample(Some(spread_candle(7200, 1.10100, 1.10103)));
+        b.set_upkeep_sample(Some(QuoteSample::at_close(
+            Utc.timestamp_opt(10800, 0).unwrap(),
+            &spread_candle(7200, 1.10100, 1.10103),
+        )));
         let q = b.get_quote("EUR/USD").await.unwrap();
         assert_eq!((q.bid, q.ask), (1.10100, 1.10103));
         assert!((q.spread() / 0.0001 - 0.3).abs() < 1e-9, "sample spread");
