@@ -52,10 +52,10 @@
       {
         "entry_time": "2026-07-27T21:00:00Z",
         "entry_price": 1.60571,
-        "stop_loss": 1.60361,
+        "stop_loss": 1.60355,
         "take_profit": 1.61888,
         "exit_time": "2026-07-28T09:00:00Z",
-        "exit_price": 1.60361,
+        "exit_price": 1.60355,
         "exit_reason": "stopped_out",
         "r": -1.0
       },
