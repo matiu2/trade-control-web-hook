@@ -733,6 +733,42 @@ fn block_hours_by_probe(instrument: &str, opened_at: chrono::DateTime<chrono::Ut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `spread_hour_released_at` — the shared off-rule. AUD/CHF's baked spread
+    /// hour is 17:00 New York (21:00Z in July); midday is clean.
+    #[test]
+    fn spread_hour_released_at_hour_end_or_live_recovery_only() {
+        let inside: chrono::DateTime<chrono::Utc> = "2026-07-08T21:20:00Z".parse().unwrap();
+        let outside: chrono::DateTime<chrono::Utc> = "2026-07-08T12:00:00Z".parse().unwrap();
+        assert!(
+            is_spread_hour("AUD/CHF", inside),
+            "precondition: 21:20Z is the spread hour"
+        );
+        // Hour ended ⇒ released, whatever the quote says (even none).
+        assert!(spread_hour_released_at("AUD/CHF", 0.0001, None, outside));
+        assert!(spread_hour_released_at(
+            "AUD/CHF",
+            0.0001,
+            Some(0.0020),
+            outside
+        ));
+        // Inside the hour: only a recovered LIVE spread releases early.
+        assert!(
+            !spread_hour_released_at("AUD/CHF", 0.0001, None, inside),
+            "no quote ⇒ wait"
+        );
+        assert!(
+            !spread_hour_released_at("AUD/CHF", 0.0001, Some(0.0020), inside),
+            "20p ⇒ wait"
+        );
+        let ok = SPREAD_BLACKOUT_RECOVERED_PIPS * 0.0001;
+        assert!(
+            spread_hour_released_at("AUD/CHF", 0.0001, Some(ok), inside),
+            "at cutoff ⇒ released"
+        );
+        // A degenerate pip size can't convert to pips ⇒ never an early release.
+        assert!(!spread_hour_released_at("AUD/CHF", 0.0, Some(0.0), inside));
+    }
     use chrono::{DateTime, Utc};
 
     fn ts(s: &str) -> DateTime<Utc> {
@@ -1442,6 +1478,36 @@ mod tests {
 /// errors. The caller feeds both into
 /// [`SpreadInputs`](crate::order_control::SpreadInputs), which takes the worse.
 ///
+/// Has `instrument`'s spread hour **released** at `now`?
+///
+/// The ONE off-rule for everything a spread hour holds back — a resting order
+/// the lifecycle cancelled, and (H4+) an enter the gate parked as
+/// `StoredReason::SpreadHour` — so both come back on the same tick:
+///
+/// - the baked hour has ended ([`is_spread_hour`] false) — the deterministic
+///   off-signal replay and live share; or
+/// - the LIVE spread has recovered (`≤ SPREAD_BLACKOUT_RECOVERED_PIPS`) — the
+///   early un-block, still inside the hour. `measured_spread` is the quote's
+///   `ask − bid` in price; `None` (quote error) or a degenerate `pip_size`
+///   means "not yet recovered", so the caller waits for the hour end.
+pub fn spread_hour_released_at(
+    instrument: &str,
+    pip_size: f64,
+    measured_spread: Option<f64>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if !is_spread_hour(instrument, now) {
+        return true;
+    }
+    let Some(spread) = measured_spread else {
+        return false;
+    };
+    if !(pip_size > 0.0 && pip_size.is_finite()) {
+        return false;
+    }
+    spread / pip_size <= SPREAD_BLACKOUT_RECOVERED_PIPS
+}
+
 /// Returns `(0.0, 0.0)` for an instrument with no baked row or no resolvable
 /// schedule timezone, which makes the forecast term vanish from the SL `max` and
 /// degrades cleanly to today's purely-reactive behaviour.

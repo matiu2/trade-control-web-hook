@@ -136,25 +136,35 @@ where
         // the re-price pass): a parked order is rare, so the extra round-trip is
         // noise, and the caller's broker may cache anyway.
         let measured = match broker.get_quote(&record.instrument).await {
-            Ok(q) => q.spread(),
+            Ok(q) => Some(q.spread()),
             Err(err) => {
-                // A quote we can't read contributes 0.0 rather than blocking the
-                // decision — the baked forecast still applies, and `sl_target`
-                // drops degenerate readings from its `max`.
                 tracing::warn!(
                     "order-control promote: get_quote({}) failed: {err:?}",
                     record.instrument,
                 );
-                0.0
+                None
             }
         };
+        // A spread-hour park (H4+ enter delayed by the blackout gate) releases
+        // on the SAME rule the lifecycle restores a cancelled order by: baked
+        // hour ended, or live spread recovered. Asked here, once, so
+        // `stored_verdict` stays pure.
+        let spread_hour_over = crate::spread_blackout::spread_hour_released_at(
+            &record.instrument,
+            record.pip_size,
+            measured,
+            now,
+        );
         let (expected_this_hour, expected_next_hour) =
             spread_forecast_frac(&record.instrument, now);
         // A parked order has no stop distinct from its drawn one — it was never
         // placed — so the drawn distance is both the original and the current.
         let target = sl_target(
             SpreadInputs {
-                last_candle: measured,
+                // A quote we can't read contributes 0.0 rather than blocking the
+                // decision — the baked forecast still applies, and `sl_target`
+                // drops degenerate readings from its `max`.
+                last_candle: measured.unwrap_or(0.0),
                 expected_this_hour,
                 expected_next_hour,
             },
@@ -169,6 +179,7 @@ where
         let check = StoredCheck {
             clears_min_r: target.action != SlAction::BelowMinR,
             bar_time: Some(now),
+            spread_hour_over,
         };
         match promote_stored_order(broker, store, cfg, src, &record.trade_id, check, now).await {
             Ok(outcome) => {

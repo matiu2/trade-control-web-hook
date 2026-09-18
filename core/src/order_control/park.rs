@@ -27,11 +27,17 @@ use crate::state::{HeldTradeRecord, StateError, StateStore};
 /// Creates the record if the trade has none. An existing record is preserved
 /// otherwise — its holders, remembered stops and cancelled orders all belong to
 /// other subsystems and must survive a park.
+#[allow(clippy::too_many_arguments)]
 pub async fn park_order<S: StateStore>(
     store: &S,
     trade_id: &str,
     instrument: &str,
     account: Option<&str>,
+    // The instrument's pip size, so a `SpreadHour` park can judge an EARLY
+    // release off the live spread in pips (`spread_hour_released_at`). A record
+    // that already carries one keeps it; `0.0` means "unknown" and the park
+    // waits for the baked hour end instead.
+    pip_size: f64,
     order: StoredOrder,
     expires_at: DateTime<Utc>,
     now: DateTime<Utc>,
@@ -49,11 +55,14 @@ pub async fn park_order<S: StateStore>(
         holders: crate::hold::Holders::new(),
         opened_at: now,
         expires_at,
-        pip_size: 0.0,
+        pip_size,
         original_stops: Vec::new(),
         cancelled_orders: Vec::new(),
         stored_orders: Vec::new(),
     });
+    if record.pip_size <= 0.0 && pip_size > 0.0 {
+        record.pip_size = pip_size;
+    }
     record.stored_orders = vec![order];
     // Keep the record alive at least as long as the parked order needs to be
     // promotable; a shorter TTL would age the park out from under itself.
@@ -138,6 +147,7 @@ mod tests {
             "t-1",
             "SGD_JPY",
             None,
+            0.0001,
             order("2026-07-22T13:30:00Z", 0.0020),
             at("2026-07-24T00:00:00Z"),
             now,
@@ -167,6 +177,7 @@ mod tests {
                 "t-1",
                 "SGD_JPY",
                 None,
+                0.0001,
                 order(shell, sl),
                 expiry,
                 now,
@@ -196,6 +207,7 @@ mod tests {
             "t-1",
             "SGD_JPY",
             None,
+            0.0001,
             order("2026-07-22T13:30:00Z", 0.0020),
             at("2026-07-24T00:00:00Z"),
             now,
@@ -235,6 +247,7 @@ mod tests {
             "t-1",
             "SGD_JPY",
             None,
+            0.0001,
             order("2026-07-22T13:30:00Z", 0.0020),
             expiry,
             now,
@@ -263,6 +276,7 @@ mod tests {
             "t-1",
             "SGD_JPY",
             None,
+            0.0001,
             order("2026-07-22T13:30:00Z", 0.0020),
             at("2026-07-24T00:00:00Z"),
             now,
@@ -336,6 +350,7 @@ mod tests {
             "t-size",
             "XAU_USD",
             None,
+            0.0001,
             o,
             at("2026-07-24T00:00:00Z"),
             now,

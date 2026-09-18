@@ -182,6 +182,7 @@ mod tests {
         StoredCheck {
             clears_min_r,
             bar_time: None,
+            spread_hour_over: false,
         }
     }
 
@@ -197,6 +198,7 @@ mod tests {
             "t-1",
             "SGD_JPY",
             None,
+            0.01,
             StoredOrder {
                 signed_intent: "body".into(),
                 reason: StoredReason::BelowMinR,

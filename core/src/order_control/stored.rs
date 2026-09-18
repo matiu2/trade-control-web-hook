@@ -173,6 +173,14 @@ pub enum StoredReason {
     /// contract multiplier), so unlike the two spread reasons above it cannot
     /// change within a bar; see [`StoredReason::rechecked_per_bar`].
     BelowMinSize,
+    /// The spread-blackout gate tripped (live spread > the reject threshold
+    /// inside the NY-close window) on a plan coarse enough that the next signal
+    /// bar is hours or a day away, so the enter is DELAYED rather than lost:
+    /// parked here and promoted when the spread hour is over — the lifecycle's
+    /// own OFF rule (baked hour ended OR live spread recovered). Only plans for
+    /// which [`spread_gate_defers`] is true park this way; finer plans keep the
+    /// reject, since their setup can change materially within the hour.
+    SpreadHour,
 }
 
 impl StoredReason {
@@ -182,6 +190,7 @@ impl StoredReason {
             Self::BelowMinR => "below-min-r",
             Self::BelowMinRForecast => "below-min-r-forecast",
             Self::BelowMinSize => "below-min-size",
+            Self::SpreadHour => "spread-hour",
         }
     }
 
@@ -203,10 +212,24 @@ impl StoredReason {
     /// park exists to fix, while looking like a fix.
     pub fn rechecked_per_bar(self) -> bool {
         match self {
-            Self::BelowMinR | Self::BelowMinRForecast => false,
+            Self::BelowMinR | Self::BelowMinRForecast | Self::SpreadHour => false,
             Self::BelowMinSize => true,
         }
     }
+}
+
+/// Does the spread-blackout gate DELAY (park as [`StoredReason::SpreadHour`])
+/// rather than reject an enter on a plan of this granularity?
+///
+/// Operator rule (2026-09-18): **H4 and coarser delay; H1 and finer reject.**
+/// On an hourly or faster plan the next signal bar is minutes to an hour away
+/// and price can move materially in a spread hour, so waiting for a fresh
+/// signal is the safer read. On H4 and daily the next signal is four hours to a
+/// day away — the setup is the same setup an hour later, and a reject loses the
+/// trade outright (on D1 every close IS the spread hour). `None` (no plan
+/// granularity in hand: webhook / restore re-drive) keeps the reject.
+pub fn spread_gate_defers(granularity: Option<crate::broker::Granularity>) -> bool {
+    granularity.is_some_and(|g| g.seconds() >= crate::broker::Granularity::H4.seconds())
 }
 
 /// The instant a stored order stops being promotable: [`DROP_BARS_BEFORE_EXPIRY`]
@@ -253,6 +276,13 @@ pub struct StoredCheck {
     /// bar — a size-park keeps waiting rather than promoting blind, matching the
     /// fail-closed reading of a legacy park elsewhere in this module.
     pub bar_time: Option<DateTime<Utc>>,
+    /// Has the instrument's spread hour released — baked hour ended, or the
+    /// live spread recovered? Read only for [`StoredReason::SpreadHour`].
+    /// Computed by the caller through the SAME rule the resting-order
+    /// lifecycle uses to restore a cancelled order
+    /// (`spread_blackout::spread_hour_released_at`), so a delayed enter and a
+    /// pulled order come back on the same tick.
+    pub spread_hour_over: bool,
 }
 
 /// Should this stored order be promoted, kept, or dropped?
@@ -274,10 +304,10 @@ pub fn stored_verdict(
     if now >= order.drop_at {
         return StoredVerdict::Drop;
     }
-    let promote = if order.reason.rechecked_per_bar() {
-        order.is_a_later_bar(check.bar_time)
-    } else {
-        check.clears_min_r
+    let promote = match order.reason {
+        StoredReason::SpreadHour => check.spread_hour_over,
+        r if r.rechecked_per_bar() => order.is_a_later_bar(check.bar_time),
+        _ => check.clears_min_r,
     };
     if promote {
         StoredVerdict::Promote
@@ -295,6 +325,7 @@ mod tests {
         StoredCheck {
             clears_min_r,
             bar_time: None,
+            spread_hour_over: false,
         }
     }
 
@@ -474,6 +505,7 @@ mod tests {
             // would promote immediately — which is exactly the bug.
             clears_min_r: true,
             bar_time: Some(at(bar)),
+            spread_hour_over: false,
         }
     }
 
@@ -554,6 +586,7 @@ mod tests {
                 StoredCheck {
                     clears_min_r: true,
                     bar_time: None,
+                    spread_hour_over: false,
                 },
             ),
             StoredVerdict::KeepWaiting,
@@ -576,11 +609,52 @@ mod tests {
                 StoredCheck {
                     clears_min_r: true,
                     bar_time: Some(at("2026-07-22T13:00:30Z")),
+                    spread_hour_over: false,
                 },
             ),
             StoredVerdict::Promote,
             "the spread calmed mid-bar; that is a real signal and must be acted on",
         );
+    }
+
+    /// A spread-hour park promotes on exactly one signal — the hour released —
+    /// and ignores both the R re-check and the per-bar gate, which are other
+    /// reasons' questions. Mutation check: route `SpreadHour` through
+    /// `clears_min_r` and the second assertion goes red.
+    #[test]
+    fn a_spread_hour_park_promotes_only_when_the_hour_has_released() {
+        let mut o = order("2026-07-22T21:00:00Z", "2026-07-24T00:00:00Z");
+        o.reason = StoredReason::SpreadHour;
+        let at_ = at("2026-07-22T21:20:00Z");
+        let check = |spread_hour_over: bool, clears_min_r: bool| StoredCheck {
+            clears_min_r,
+            bar_time: Some(at_),
+            spread_hour_over,
+        };
+        assert_eq!(
+            stored_verdict(&o, at_, check(false, true)),
+            StoredVerdict::KeepWaiting,
+            "hour still on: an R that clears is not a reason to place into the spike",
+        );
+        assert_eq!(
+            stored_verdict(&o, at_, check(true, false)),
+            StoredVerdict::Promote,
+            "hour released: promote — the full entry path re-derives the floor and size",
+        );
+    }
+
+    /// The granularity split the operator chose: H4 and coarser delay, H1 and
+    /// finer reject, and no granularity (webhook / re-drive) rejects.
+    #[test]
+    fn spread_gate_defers_on_h4_and_coarser_only() {
+        use crate::broker::Granularity as G;
+        for g in [G::M1, G::M5, G::M15, G::H1] {
+            assert!(!spread_gate_defers(Some(g)), "{g:?} must keep the reject");
+        }
+        for g in [G::H4, G::D1] {
+            assert!(spread_gate_defers(Some(g)), "{g:?} must delay");
+        }
+        assert!(!spread_gate_defers(None), "no plan granularity ⇒ reject");
     }
 
     /// The slug is written into stored bodies and read back, so a disagreement
@@ -591,6 +665,7 @@ mod tests {
             StoredReason::BelowMinR,
             StoredReason::BelowMinRForecast,
             StoredReason::BelowMinSize,
+            StoredReason::SpreadHour,
         ] {
             let json = serde_json::to_string(&r).expect("serialises");
             assert_eq!(

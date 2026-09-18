@@ -298,8 +298,9 @@ async fn clear<S: StateStore>(
 
 // The OFF-side recovery/backstop DECISION (spread-recovered, block-lift, the 12h
 // safety ceiling) moved to `core::pending_lifecycle` (PR 2) — the SAME fn the
-// replay drives — so the cron no longer owns those predicates. `spread_recovered`
-// / `backstop_due` / `spread_in_pips` and their tests now live in `core`. This
+// replay drives — so the cron no longer owns those predicates. The recovery rule
+// is `core::spread_blackout::spread_hour_released_at` (shared with the order-control
+// promote pass); `backstop_due` and their tests now live in `core`. This
 // module keeps only the LIVE-specific System-2 restore (`restore_remembered_stops`)
 // + the record `clear`.
 

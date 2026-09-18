@@ -601,10 +601,42 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                             resolved.instrument,
                             verified.intent.id
                         );
+                        // DELAY, not just reject, on H4 and coarser
+                        // (`spread_gate_defers`): the next signal bar is hours
+                        // to a day away — on D1 every close IS the spread hour
+                        // — so a bare reject loses the trade. Park the drawn
+                        // geometry as a `SpreadHour` Stored order; the
+                        // order-control promote pass places it through THIS
+                        // same entry path (fresh floor, fresh 1% size) once the
+                        // hour releases — the lifecycle's own off-rule. Finer
+                        // plans keep the plain reject: their next signal is an
+                        // hour away and the setup can change in a spike.
+                        // Still `Rejected` here (nothing placed), so the seen-id
+                        // discipline above is unchanged.
+                        let parked = if crate::order_control::spread_gate_defers(enter_granularity)
+                        {
+                            let entry_price = entry_reference_price(&resolved.entry);
+                            park_stored_entry(
+                                store,
+                                verified,
+                                crate::order_control::StoredReason::SpreadHour,
+                                trade_id,
+                                &resolved.instrument,
+                                (entry_price - resolved.stop_loss).abs(),
+                                (entry_price - resolved.take_profit).abs(),
+                                resolved.min_r,
+                                raw_body,
+                                enter_granularity,
+                                now,
+                            )
+                            .await
+                        } else {
+                            String::new()
+                        };
                         return ActionResult::Rejected {
                             status: 423,
                             body: message,
-                            outcome: "rejected: spread-blackout".into(),
+                            outcome: format!("rejected: spread-blackout{parked}"),
                         };
                     }
                 }
@@ -1331,6 +1363,7 @@ async fn park_stored_entry<S: StateStore>(
         trade_id,
         instrument,
         verified.intent.account.as_deref(),
+        verified.intent.pip_size.unwrap_or(0.0),
         order,
         verified.intent.not_after,
         now,
@@ -2708,6 +2741,175 @@ mod placement_is_not_a_fill_tests {
                 "the broker order id must survive the rename, got {outcome}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod spread_gate_park_tests {
+    //! The spread-blackout gate's granularity split (operator, 2026-09-18):
+    //! H4 and coarser DELAY — park as `StoredReason::SpreadHour` — while H1 and
+    //! finer keep the plain reject. Pinned at `run_enter`, the production entry
+    //! point, not at `spread_gate_defers` alone
+    //! (`[[mutation_test_the_entry_point_not_just_the_layer_below]]`).
+
+    use super::*;
+    use crate::broker::{
+        AttemptState, CancelError, Candle, CloseOutcome, EntryRequest, Granularity, LookupError,
+        OpenPosition, PendingOrder, Placement, Quote,
+    };
+    use crate::order_control::{StoredOrder, StoredReason, stored_order};
+    use crate::state::MemStateStore;
+    use chrono::{DateTime, Utc};
+
+    /// A broker whose book is 50 pips wide — far past EUR_CAD's 5× reject
+    /// threshold — and which must NEVER be asked to place anything here.
+    struct WideBookBroker;
+
+    impl Broker for WideBookBroker {
+        async fn place_entry(
+            &self,
+            _max_risk_pct: f64,
+            _max_open_positions: u32,
+            _req: &EntryRequest<'_>,
+        ) -> Result<Placement, EntryError> {
+            panic!("the spread gate must stop the entry before the broker");
+        }
+        async fn close_positions(&self, _instrument: &str) -> CloseOutcome {
+            CloseOutcome::NothingOpen
+        }
+        async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
+            0
+        }
+        async fn lookup_attempt_state(
+            &self,
+            _instrument: &str,
+            _broker_order_id: &str,
+            _broker_trade_id: Option<&str>,
+        ) -> Result<AttemptState, LookupError> {
+            Ok(AttemptState::Unknown)
+        }
+        async fn cancel_order(
+            &self,
+            _account_id: &str,
+            _broker_order_id: &str,
+        ) -> Result<(), CancelError> {
+            Ok(())
+        }
+        async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
+            Ok(Quote {
+                bid: 1.5900,
+                ask: 1.5950,
+            })
+        }
+        async fn list_open_positions(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<OpenPosition>, LookupError> {
+            Ok(vec![])
+        }
+        async fn amend_stop(
+            &self,
+            _account_id: &str,
+            _position_or_order_id: &str,
+            _new_stop: f64,
+        ) -> Result<(), crate::broker::AmendError> {
+            Ok(())
+        }
+        async fn list_pending_orders(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<PendingOrder>, LookupError> {
+            Ok(vec![])
+        }
+        async fn get_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<Candle>, crate::broker::CandleError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Fire the EUR_CAD enter with the NY-close window OPEN against the wide
+    /// book, at `granularity`. Returns the result and the park (if any).
+    fn fire(granularity: Option<Granularity>) -> (ActionResult, Option<StoredOrder>) {
+        let store = MemStateStore::default();
+        let now = gate_order_tests::now();
+        store.set_clock(now);
+        pollster::block_on(async {
+            store
+                .set_spread_blackout_window(
+                    now,
+                    crate::spread_blackout::NY_CLOSE_WINDOW_MARKER_TTL_SECONDS,
+                )
+                .await
+                .expect("open the window");
+            let verified = gate_order_tests::enter_verified_with_entry(
+                r#"{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.5900 }"#,
+            );
+            let result = run_enter(
+                &WideBookBroker,
+                &store,
+                &verified,
+                &gate_order_tests::cfg(),
+                now,
+                None,
+                granularity,
+                EntryOrigin::Fresh,
+            )
+            .await;
+            let parked = stored_order(&store, "t-1").await.expect("read park");
+            (result, parked)
+        })
+    }
+
+    fn outcome(r: &ActionResult) -> &str {
+        match r {
+            ActionResult::Rejected { outcome, .. } => outcome,
+            other => panic!("expected Rejected, got {}", other.describe()),
+        }
+    }
+
+    #[test]
+    fn h4_enter_in_the_spread_window_is_parked_not_lost() {
+        let (result, parked) = fire(Some(Granularity::H4));
+        let parked = parked.expect("an H4 enter must be parked as SpreadHour");
+        assert_eq!(parked.reason, StoredReason::SpreadHour);
+        // The DRAWN geometry, not a floored one: 1.5900 trigger, 1.5850 SL,
+        // 1.6100 TP — promotion re-derives the floor off the calm spread.
+        assert!((parked.original_sl_distance - 0.0050).abs() < 1e-9);
+        assert!((parked.tp_distance - 0.0200).abs() < 1e-9);
+        assert!(
+            outcome(&result).starts_with("rejected: spread-blackout")
+                && outcome(&result).contains("stored until"),
+            "still a reject (nothing placed) but reported as parked: {}",
+            outcome(&result)
+        );
+    }
+
+    #[test]
+    fn d1_enter_in_the_spread_window_is_parked_too() {
+        let (_, parked) = fire(Some(Granularity::D1));
+        assert_eq!(parked.map(|p| p.reason), Some(StoredReason::SpreadHour));
+    }
+
+    /// The mirror: H1 keeps today's plain reject — no park — so a replay that
+    /// parked everything would fail here.
+    #[test]
+    fn h1_enter_in_the_spread_window_is_rejected_without_a_park() {
+        let (result, parked) = fire(Some(Granularity::H1));
+        assert_eq!(outcome(&result), "rejected: spread-blackout");
+        assert!(parked.is_none(), "H1 must not park");
+    }
+
+    /// No plan granularity in hand (webhook / re-drive) ⇒ reject, as before.
+    #[test]
+    fn enter_without_a_granularity_is_rejected_without_a_park() {
+        let (result, parked) = fire(None);
+        assert_eq!(outcome(&result), "rejected: spread-blackout");
+        assert!(parked.is_none());
     }
 }
 

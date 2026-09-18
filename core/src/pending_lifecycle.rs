@@ -128,8 +128,7 @@ use crate::hold::{HoldReason, Holders, Release};
 use crate::incoming::{self, IncomingError, Verified};
 use crate::intent::Resolved;
 use crate::spread_blackout::{
-    SAFETY_FORCE_RESTORE_SECONDS, SPREAD_BLACKOUT_RECOVERED_PIPS, is_spread_hour,
-    spread_block_ttl_seconds,
+    SAFETY_FORCE_RESTORE_SECONDS, is_spread_hour, spread_block_ttl_seconds,
 };
 use crate::state::{CancelledOrder, HeldTradeRecord, StateStore};
 use crate::sweep_gate::market_blackout_due_symbol;
@@ -960,15 +959,26 @@ async fn spread_hour_released<B: Broker>(
     record: &HeldTradeRecord,
     now: DateTime<Utc>,
 ) -> bool {
-    // Baked-hour-end — the deterministic off-signal (replay + live).
+    // Baked-hour-end — the deterministic off-signal (replay + live) — so no
+    // quote round-trip on a clean bar.
     if !is_spread_hour(&record.instrument, now) {
         return true;
     }
     // Live-spread recovery — the early un-block, still inside the baked hour.
-    match broker.get_quote(&record.instrument).await {
-        Ok(quote) => spread_recovered(spread_in_pips(quote.spread(), record.pip_size)),
-        Err(_) => false,
-    }
+    // The rule itself is the shared `spread_hour_released_at`, which the
+    // order-control promote pass also asks for a `StoredReason::SpreadHour`
+    // park, so a pulled order and a delayed enter come back on the same tick.
+    let measured = broker
+        .get_quote(&record.instrument)
+        .await
+        .ok()
+        .map(|q| q.spread());
+    crate::spread_blackout::spread_hour_released_at(
+        &record.instrument,
+        record.pip_size,
+        measured,
+        now,
+    )
 }
 
 /// The OFF-side decision (excluding the backstop, handled by the caller):
@@ -1271,23 +1281,6 @@ pub fn backstop_due(opened_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     now >= opened_at + Duration::seconds(SAFETY_FORCE_RESTORE_SECONDS as i64)
 }
 
-/// Convert an absolute `ask − bid` spread to pips via the record's baked pip.
-/// Returns `f64::INFINITY` for an unusable pip so recovery never fires on a
-/// bogus division (backstop becomes the only clear).
-fn spread_in_pips(spread_abs: f64, pip_size: f64) -> f64 {
-    if pip_size > 0.0 && pip_size.is_finite() {
-        spread_abs / pip_size
-    } else {
-        f64::INFINITY
-    }
-}
-
-/// True when the sampled spread (in pips) has dropped to/under the recovered
-/// cutoff — the live-only early-un-block side of the OFF decision.
-fn spread_recovered(spread_pips: f64) -> bool {
-    spread_pips <= SPREAD_BLACKOUT_RECOVERED_PIPS
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1328,23 +1321,6 @@ mod tests {
         // Notably NOT due at 3h (00:05Z) — the old bug fired here, mid-AUD/CHF-block.
         assert!(!backstop_due(opened, ts("2026-07-09T00:05:00Z")));
         assert!(!backstop_due(opened, ts("2026-07-08T21:20:00Z")));
-    }
-
-    #[test]
-    fn spread_in_pips_uses_record_pip_size() {
-        assert!((spread_in_pips(0.0022, 0.0001) - 22.0).abs() < 1e-9);
-        // Unusable pip → INFINITY so recovery never fires on a bogus division.
-        assert_eq!(spread_in_pips(0.0022, 0.0), f64::INFINITY);
-        assert_eq!(spread_in_pips(0.0022, f64::NAN), f64::INFINITY);
-        assert!(!spread_recovered(spread_in_pips(0.0001, 0.0)));
-    }
-
-    #[test]
-    fn spread_recovered_below_and_at_cutoff() {
-        assert!(spread_recovered(2.0));
-        assert!(spread_recovered(SPREAD_BLACKOUT_RECOVERED_PIPS));
-        assert!(!spread_recovered(20.0));
-        assert!(!spread_recovered(6.0), "hysteresis band is not recovered");
     }
 
     // --- merge_cancelled_order (relocated from blackout_cancel) ---
