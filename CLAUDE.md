@@ -1019,11 +1019,44 @@ Hazards:
   call site that uses one gets a warning naming the `_on` variant. Don't
   `#[allow]` it; resolve the anchor (`broker-tradenation-adapter::session_anchor`).
 - **A bar that ends at the session close is only "closed" a full bucket later**
-  (Spain's 15:00Z H4 bar at 19:00Z, its D1 bar at 07:00Z next day), when the
-  market is shut or just opening. Acting on it at the next open is an OPEN
-  operator decision — the market-hours gate still rejects, never delays.
+  (Spain's 15:00Z H4 bar at 19:00Z, its D1 bar at 07:00Z next day — Saturday for
+  Friday's), when the market is shut. `run_enter` PARKS that enter
+  (`StoredReason::MarketClosed`) and the promote pass places it at the open. See
+  the next section.
 - The market-hours baked table blocks only the CLOSE hours (Spain: 15,16Z). It
   has no notion of "closed overnight".
+
+### A shut SESSION market parks the enter; everything else still rejects
+
+"Market hours rejects, never delays" has exactly ONE exception (operator,
+2026-09-19): an instrument with a row in `core/src/session_hours_baked.rs` whose
+session is shut at fire time (`market_session::session_closed` — outside its
+local-time span, or inside the universal weekend halt). `run_enter` parks it as
+`StoredReason::MarketClosed` *before* the market-hours reject, and
+`order_control::tick` promotes it when `market_session::market_open` — session
+started AND the full market-hours mask clear, so a promotion never lands in a
+blocked close hour. Applies on every granularity: an H1 plan's last bar of the
+day has the same problem (South Africa 40 fixtures).
+
+- **No row ⇒ never "shut" ⇒ plain reject, as before.** FX, 24h indices, split
+  day/night sessions (Hong Kong) and anything with < 4 closed hours get no row.
+  The generator (`market-hours-gen`, `--session-out`) errs toward no row because
+  a wrong row parks entries on an OPEN market.
+- **Rows are local wall-clock time**, measured per venue from H1 presence
+  (TN Spain 35 `09:00 +9h Europe/Madrid`, OANDA `08:00 +12h`). An instrument on
+  the `fx` anchor is measured in New York time, so a market in a no-DST zone
+  (the TRY crosses) is an hour off at the span edges for part of the year.
+- **Same two park rails as the others:** `dedup_before_park` first, and the
+  result is `Rejected` (nothing placed, intent id not consumed).
+- **Replay: the newest PARK wins.** `ReplayBroker::armed_verified(trade_id)`
+  tries parked-by-trade-id BEFORE placed-by-trade-id. Reversed, a trade that
+  placed an order and later parked a new fire promotes the OLD placement's
+  shell — a days-stale order — and the new fire vanishes. Live reads the signed
+  intent stored on the park, so this was replay-only, and it silently ate
+  legitimate re-entries in 30 corpus cells.
+- The replay does not model a closed market: without the park it would still
+  "place" at 19:00Z and fill the next day. The entry-point tests in
+  `spread_gate_park_tests` are what pin the park, not the corpus.
 
 ### Spread-hour samples never size a stop (window + forecast term)
 

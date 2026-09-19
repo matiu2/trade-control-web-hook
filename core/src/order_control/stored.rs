@@ -193,6 +193,15 @@ pub enum StoredReason {
     /// which [`spread_gate_defers`] is true park this way; finer plans keep the
     /// reject, since their setup can change materially within the hour.
     SpreadHour,
+    /// The enter fired while a session-bound market was SHUT
+    /// ([`crate::market_session::session_closed`]). With D1/H4 bars on the
+    /// instrument's session anchor, the bar that ends at the session close is
+    /// only closed a full bucket later — overnight, or on Saturday for Friday's
+    /// daily bar — so a reject would lose every signal that bar carries. Parked
+    /// here and promoted at the open ([`crate::market_session::market_open`]).
+    /// The one relaxation of "market hours rejects, never delays", and only for
+    /// an instrument with a baked session row.
+    MarketClosed,
 }
 
 impl StoredReason {
@@ -203,6 +212,7 @@ impl StoredReason {
             Self::BelowMinRForecast => "below-min-r-forecast",
             Self::BelowMinSize => "below-min-size",
             Self::SpreadHour => "spread-hour",
+            Self::MarketClosed => "market-closed",
         }
     }
 
@@ -224,7 +234,9 @@ impl StoredReason {
     /// park exists to fix, while looking like a fix.
     pub fn rechecked_per_bar(self) -> bool {
         match self {
-            Self::BelowMinR | Self::BelowMinRForecast | Self::SpreadHour => false,
+            Self::BelowMinR | Self::BelowMinRForecast | Self::SpreadHour | Self::MarketClosed => {
+                false
+            }
             Self::BelowMinSize => true,
         }
     }
@@ -295,6 +307,10 @@ pub struct StoredCheck {
     /// (`spread_blackout::spread_hour_released_at`), so a delayed enter and a
     /// pulled order come back on the same tick.
     pub spread_hour_over: bool,
+    /// Has the instrument's session started, with the market-hours mask clear
+    /// (`market_session::market_open`)? Read only for
+    /// [`StoredReason::MarketClosed`].
+    pub market_open: bool,
 }
 
 /// Should this stored order be promoted, kept, or dropped?
@@ -318,6 +334,7 @@ pub fn stored_verdict(
     }
     let promote = match order.reason {
         StoredReason::SpreadHour => check.spread_hour_over,
+        StoredReason::MarketClosed => check.market_open,
         r if r.rechecked_per_bar() => order.is_a_later_bar(check.bar_time),
         _ => check.clears_min_r,
     };
@@ -332,12 +349,41 @@ pub fn stored_verdict(
 mod tests {
     use super::*;
 
+    /// A market-closed park reads ONLY `market_open`: a calm spread, a cleared
+    /// R-floor or a new bar must not place an order into a shut market, and an
+    /// open market must not be held back by the spread questions. Mutation
+    /// check: route `MarketClosed` through `clears_min_r` and the first
+    /// assertion fails.
+    #[test]
+    fn a_market_closed_park_promotes_on_the_open_and_on_nothing_else() {
+        let mut o = order("2026-07-22T13:30:00Z", "2026-07-24T00:00:00Z");
+        o.reason = StoredReason::MarketClosed;
+        let now = o.drop_at - chrono::Duration::hours(1);
+        let check = |market_open: bool| StoredCheck {
+            clears_min_r: !market_open,
+            spread_hour_over: !market_open,
+            bar_time: Some(now),
+            market_open,
+        };
+        assert_eq!(
+            stored_verdict(&o, now, check(false)),
+            StoredVerdict::KeepWaiting
+        );
+        assert_eq!(stored_verdict(&o, now, check(true)), StoredVerdict::Promote);
+        // Expiry still wins.
+        assert_eq!(
+            stored_verdict(&o, o.drop_at, check(true)),
+            StoredVerdict::Drop
+        );
+    }
+
     /// The spread-reason check: `BelowMinR` reads only `clears_min_r`.
     fn spread_check(clears_min_r: bool) -> StoredCheck {
         StoredCheck {
             clears_min_r,
             bar_time: None,
             spread_hour_over: false,
+            market_open: false,
         }
     }
 
@@ -520,6 +566,7 @@ mod tests {
             clears_min_r: true,
             bar_time: Some(at(bar)),
             spread_hour_over: false,
+            market_open: false,
         }
     }
 
@@ -601,6 +648,7 @@ mod tests {
                     clears_min_r: true,
                     bar_time: None,
                     spread_hour_over: false,
+                    market_open: false,
                 },
             ),
             StoredVerdict::KeepWaiting,
@@ -624,6 +672,7 @@ mod tests {
                     clears_min_r: true,
                     bar_time: Some(at("2026-07-22T13:00:30Z")),
                     spread_hour_over: false,
+                    market_open: false,
                 },
             ),
             StoredVerdict::Promote,
@@ -641,6 +690,7 @@ mod tests {
         o.reason = StoredReason::SpreadHour;
         let at_ = at("2026-07-22T21:20:00Z");
         let check = |spread_hour_over: bool, clears_min_r: bool| StoredCheck {
+            market_open: false,
             clears_min_r,
             bar_time: Some(at_),
             spread_hour_over,

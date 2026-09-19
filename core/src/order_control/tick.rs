@@ -180,6 +180,10 @@ where
             clears_min_r: target.action != SlAction::BelowMinR,
             bar_time: Some(now),
             spread_hour_over,
+            // A market-closed park (the enter fired while a session-bound
+            // market was shut) releases once the session has started and the
+            // market-hours mask is clear. Pure clock — no quote needed.
+            market_open: crate::market_session::market_open(&record.instrument, now),
         };
         match promote_stored_order(broker, store, cfg, src, &record.trade_id, check, now).await {
             Ok(outcome) => {

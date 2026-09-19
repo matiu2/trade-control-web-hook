@@ -2269,6 +2269,117 @@ mod tests {
         );
     }
 
+    /// The session-anchor consequence, end to end through the SHARED promote
+    /// pass: Spain 35's last H4 bar of the day (15:00Z, 17:00 Madrid) is only
+    /// closed at 19:00Z, three hours after TradeNation shut the market. The
+    /// enter it fires must not reach a closed market and must not be lost: it
+    /// parks as `MarketClosed` and is placed once the next session is open, then
+    /// fills on that day's bars. A replay (or a worker) whose promote pass never
+    /// learns the market opened — `market_open` wired to `false` in
+    /// `order_control::tick` — books NO fill here; one that skips the park fills
+    /// on the 19:00Z instant instead of the next day.
+    #[tokio::test]
+    async fn an_enter_on_the_last_bar_of_a_session_is_parked_and_placed_next_open() {
+        // Session-anchored H4 grid, CEST: 07/11/15Z, weekdays only.
+        let mut candles: Vec<EngineCandle> = [
+            "2026-09-03T07",
+            "2026-09-03T11",
+            "2026-09-03T15",
+            "2026-09-04T07",
+            "2026-09-04T11",
+            "2026-09-04T15",
+            "2026-09-07T07",
+            "2026-09-07T11",
+            "2026-09-07T15",
+            "2026-09-08T07",
+            "2026-09-08T11",
+        ]
+        .iter()
+        .map(|t| {
+            ohlc_at_spread(
+                &format!("{t}:00:00Z"),
+                1.1040,
+                1.1042,
+                1.1038,
+                1.1040,
+                0.0002,
+            )
+        })
+        .collect();
+        // Tue 15:00Z — the day's LAST bar: closes 1.1055 above the 1.1050 level.
+        candles.push(ohlc_at_spread(
+            "2026-09-08T15:00:00Z",
+            1.1045,
+            1.1060,
+            1.1043,
+            1.1055,
+            0.0002,
+        ));
+        // Wed 07:00Z: the open. Stays below the 1.1100 entry stop.
+        candles.push(ohlc_at_spread(
+            "2026-09-09T07:00:00Z",
+            1.1055,
+            1.1070,
+            1.1050,
+            1.1060,
+            0.0002,
+        ));
+        // Wed 11:00Z: trades through 1.1100 → the promoted stop order fills.
+        candles.push(ohlc_at_spread(
+            "2026-09-09T11:00:00Z",
+            1.1060,
+            1.1120,
+            1.1058,
+            1.1110,
+            0.0002,
+        ));
+        candles.push(ohlc_at_spread(
+            "2026-09-09T15:00:00Z",
+            1.1110,
+            1.1260,
+            1.1105,
+            1.1255,
+            0.0002,
+        ));
+        let live_at: DateTime<Utc> = "2026-09-08T11:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-09-14T00:00:00Z".parse().unwrap();
+
+        let r = run(
+            &plain_enter_plan_h4("Spain 35", 1.1050),
+            &candles,
+            Granularity::H4,
+            live_at,
+            expires_at,
+            no_marks(),
+            None,
+        )
+        .await;
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("enter fired on the 15:00Z bar");
+        assert_eq!(
+            enter.fired.candle.time,
+            "2026-09-08T15:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert!(
+            enter.rejected_reason().is_none(),
+            "the parked enter must be re-pointed at its promotion, got {:?}",
+            enter.rejected_reason()
+        );
+        let realized = enter
+            .realized
+            .as_ref()
+            .expect("the order placed at the next open must fill and be booked");
+        assert!(
+            realized.fill_at >= "2026-09-09T07:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "the fill comes in the NEXT session, got {}",
+            realized.fill_at
+        );
+    }
+
     /// Finding #3 of the 2026-09-13 replay↔live audit, at the entry point.
     ///
     /// The replay samples the NY-close edge ONCE per tick, at the newest bar's

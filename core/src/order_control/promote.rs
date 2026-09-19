@@ -198,6 +198,7 @@ mod tests {
             clears_min_r,
             bar_time: None,
             spread_hour_over: false,
+            market_open: false,
         }
     }
 

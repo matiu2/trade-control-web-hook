@@ -529,16 +529,25 @@ impl ReplayBroker {
         let (intent, shell) = placed
             .iter()
             .find(|a| a.order_id == key)
-            .or_else(|| {
-                placed
-                    .iter()
-                    .find(|a| a.intent.trade_id.as_deref() == Some(key))
-            })
             .map(|a| (&a.intent, &a.shell))
-            // A gate-parked enter was never placed, so it lives only here —
-            // the trade-id arm is the ONLY way a `SpreadHour` park promotes.
+            // A gate-parked enter (`SpreadHour` / `MarketClosed`) was never
+            // placed, so it lives only here, and the trade-id arm is the ONLY
+            // way it promotes. It is tried BEFORE the placed-by-trade-id arm:
+            // a trade that already placed an order on an earlier day and then
+            // parks a NEW fire must promote the new fire, not re-derive the old
+            // placement's intent + shell (which re-placed a days-stale order at
+            // a stale price — South Africa 40, parks on 08-12 and 08-18). The
+            // newest park wins, matching live, which reads the signed intent
+            // stored on the park itself.
             .or_else(|| {
                 parked
+                    .iter()
+                    .rev()
+                    .find(|a| a.intent.trade_id.as_deref() == Some(key))
+                    .map(|a| (&a.intent, &a.shell))
+            })
+            .or_else(|| {
+                placed
                     .iter()
                     .find(|a| a.intent.trade_id.as_deref() == Some(key))
                     .map(|a| (&a.intent, &a.shell))
@@ -2102,6 +2111,37 @@ mod tests {
         assert!(
             b.armed_verified("nope").is_none(),
             "an unknown key must still resolve to nothing, not to some other trade",
+        );
+    }
+
+    /// A trade that placed an order on an earlier day and then PARKS a new fire
+    /// must promote the new fire. The trade-id key matches both; the park has to
+    /// win, or the promotion re-derives the old placement's shell and re-places
+    /// a days-stale order (South Africa 40: parks on 08-12 and 08-18, the second
+    /// promotion came back at the first one's price).
+    ///
+    /// Mutation check: try the placed-by-trade-id arm first and this returns the
+    /// bar-0 shell.
+    #[tokio::test]
+    async fn a_new_park_wins_over_an_older_placement_of_the_same_trade() {
+        let b = ReplayBroker::new(vec![candle(0, 1.1010), candle(1, 1.1020)], 0.0001);
+        b.arm_placement(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&candle(0, 1.1010).mid()),
+        );
+        b.place_entry(1.0, 3, &entry_req(RiskBudget::Percent(0.5)))
+            .await
+            .expect("placed");
+
+        let later = Shell::from_candle(&candle(1, 1.1020).mid());
+        b.arm_placement("o2".into(), short_enter_intent(), later.clone());
+        b.park_armed();
+
+        let recovered = b.armed_verified("t").expect("trade-id key resolves");
+        assert_eq!(
+            recovered.shell.time, later.time,
+            "the PARKED fire, not the old placement"
         );
     }
 

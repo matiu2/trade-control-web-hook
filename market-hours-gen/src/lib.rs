@@ -27,10 +27,11 @@
 pub mod compute;
 pub mod fetch;
 pub mod render;
+pub mod session;
 pub mod universe;
 
 pub use compute::{MarketHoursProfile, profile_from_bars};
-pub use render::render_table;
+pub use render::{render_session_table, render_table};
 
 /// Which venue a computed row belongs to. Tags each table row so the gate can
 /// disambiguate the two venues' symbol namespaces.
@@ -59,6 +60,9 @@ pub struct MarketHoursRow {
     /// Human display name (validation report only).
     pub display_name: String,
     pub profile: MarketHoursProfile,
+    /// The measured local-time trading session, or why there is none (a 24h
+    /// market, a split session, too little history).
+    pub session: Result<session::SessionSpan, session::NoSpan>,
     /// Set when the instrument produced too few gap events or errored — the row
     /// is still emitted (weekend block only) but flagged unreviewed.
     pub error: Option<String>,

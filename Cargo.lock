@@ -2264,6 +2264,7 @@ version = "0.1.0"
 dependencies = [
  "candle-model",
  "chrono",
+ "chrono-tz",
  "clap",
  "color-eyre",
  "instrument-lookup",
