@@ -1,5 +1,10 @@
 # BUG — D1/H4 bucket grid should follow the instrument's session for non-FX CFDs
 
+**Status:** FIXED 2026-09-19 for every index row — per-instrument session anchor (see CLAUDE.md "D1/H4 bars start at the INSTRUMENT's session anchor"). Shares, bonds, Coffee and the LME metals are still on the FX day. `local-chart` not yet moved.
+
+*(original report below)*
+
+
 **Status:** recorded 2026-09-18, deferred. Do NOT fold into job 1
 (`job_consistent_session_start_hour_across_toolchain`), which is FX-only and
 correctly standardises one 17:00-NY grid. Ignore until a non-FX daily/H4 plan

@@ -992,6 +992,39 @@ On the Python side: `--risk-amount` adds `risk_amount: <n>` to the spec;
 `--broker-dry-run` adds `dry_run: true`. The Python `--dry-run` flag is
 unrelated — that one short-circuits before any POST to TradingView.
 
+### D1/H4 bars start at the INSTRUMENT's session anchor, not one 17:00 New York grid
+
+Since 2026-09-19 every D1/H4 bucket counts from a per-instrument **session
+anchor** — a local hour in an IANA timezone, the market's primary cash open
+(Spain 35 = 09:00 Europe/Madrid → D1 07:00Z, H4 07/11/15Z in summer). FX and
+anything unlisted keep `fx`, 17:00 America/New_York. The table is
+`instrument-lookup/src/session_anchors.toml`; the bucket maths exists ONCE, in
+`instrument-lookup` feature `session-grid` (`Anchor::{for_instrument,
+bucket_start, bucket_end}`), and is called by all three producers:
+
+- `candle-cache` — bucket KEYS, the aggregator, `rebuild-h4`.
+- `tradenation-api` — the H1→H4/D1 aggregator (`*_aggregated_on`).
+- `oanda-client` — `dailyAlignment` + `alignmentTimezone` on every request.
+
+Hazards:
+
+- **The three must agree, and cached rows must be migrated.** A row filed on the
+  old grid stays in Postgres and is served alongside new-grid rows. After giving
+  an instrument an anchor: `rebuild-h4 --instrument <name>` and delete its `D`
+  rows (no `rebuild-d1` yet).
+- **`tradenation-api` is a GIT dep and depends on `instrument-lookup` by git
+  tag**; the root `[patch]` redirects that to the local path so there is one
+  `Anchor` type. Drop the patch and the adapter stops compiling (two `Anchor`s).
+- **The instrument-blind TN functions are `#[deprecated]`, not removed** — a new
+  call site that uses one gets a warning naming the `_on` variant. Don't
+  `#[allow]` it; resolve the anchor (`broker-tradenation-adapter::session_anchor`).
+- **A bar that ends at the session close is only "closed" a full bucket later**
+  (Spain's 15:00Z H4 bar at 19:00Z, its D1 bar at 07:00Z next day), when the
+  market is shut or just opening. Acting on it at the next open is an OPEN
+  operator decision — the market-hours gate still rejects, never delays.
+- The market-hours baked table blocks only the CLOSE hours (Spain: 15,16Z). It
+  has no notion of "closed overnight".
+
 ### Spread-hour samples never size a stop (window + forecast term)
 
 Two floor inputs read the 17:00-New-York rollover print unless told not to,

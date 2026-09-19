@@ -10,3 +10,11 @@ members = ["broker-ibkr", "broker-oanda", "broker-tradenation-adapter", "cli", "
 # candle-model to the same local path so there is one crate.
 [patch."https://github.com/matiu2/tradenation-api.git"]
 candle-model = { path = "../candle-model" }
+
+# `tradenation-api` (a git dep) depends on `instrument-lookup` by git tag, since a
+# git-sourced crate cannot path-dep outside its repo. Members path-dep the local
+# `instrument-lookup`. Same problem as candle-model above: redirect the git
+# source to the local path so there is ONE crate — and one session `Anchor` type
+# shared by candle-cache, oanda-client and the TradeNation aggregator.
+[patch."https://github.com/matiu2/instrument-lookup.git"]
+instrument-lookup = { path = "../instrument-lookup" }

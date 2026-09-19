@@ -1,45 +1,10 @@
-# TODO — replay: entry-instant quote + frozen upkeep series in fixtures (feat/replay-upkeep-fixtures)
+# TODO — per-instrument D1/H4 session anchor (webhook side)
 
-From staging 2241c56b. Worktree `../trade-control-web-hook-stop-floor-mask`.
-Claimed on ./llm-work.txt (main checkout); the other session has not started any of it.
-
-## Why
-
-Three gaps stop a D1 fixture from exercising the spread-gate park (steps 1-3 of
-the 2026-09-18 plan, now on staging):
-(a) TradeNation's aggregated D1 close book is the last H1 close — the calm
-    print BEFORE the rollover — so the replay's synthesised entry quote never
-    trips the gate. Live samples the first print AFTER the close.
-(b) fixtures carry no finer series; `--upkeep` was live-window only.
-(c) even under `--upkeep`, the sample was cleared before the enter dispatch.
-
-## Steps
-
-- [x] 1. `ReplayBroker::QuoteSample {at,bid,ask}` replaces the raw candle sample;
-      `UpkeepTicks::opening_at(now)` = OPEN book of the finer bar opening at `now`.
-      The per-bar pass (and the order-control tail) sets it after the tick walk and
-      clears it after `order_control_pass`. Fixes (a)+(c).
-- [x] 2. `UpkeepTicks::{to_frozen,from_frozen}` + `upkeep_bars.json` in
-      `fixture::{save,load}`; `run_frozen` walks it; `--save` under `--upkeep` is
-      allowed (refusal lifted); `--rebless` under a live `--upkeep` still refused.
-      Fixes (b).
-- [x] 3. Tests: upkeep unit (opening_at, frozen round trip); fixture round trip +
-      corrupt-file-is-an-error; replay entry-point differential (calm close +
-      wide 21:00Z open book ⇒ park ⇒ fill on the 01:00Z bar; control fills 21:00Z;
-      calm open book does not park). Mutation-check the entry-point test.
-- [x] 4. README (fixture files list + `--upkeep`/`--save`), CLAUDE.md note. clippy,
-      fmt, commit, push.
-- [x] 5. Re-arm AUD/NZD D1 from ~/Downloads/AUD_NZD-TRADENATION-d-20260917T175936.json
-      via `tv-arm --spec-in … --plan-out`, replay with `--upkeep 15m --save` into the
-      main checkout's replay-fixtures/, confirm the park+promote shows in the
-      timeline. Do NOT re-bless any other fixture.
-- [x] 6. FOUND + FIXED while doing 5: the park bypassed entry dedup and a promotion
-      wrote no EntryAttempt (BUG-spread-park-bypasses-entry-dedup.md). `retry_gate::probe`
-      before the park; `EntryOrigin::skips_retry_gate()` (Replacing only). Fixture
-      `…-upkeep-15m` saved: 1 park, 1 promotion, 1 leg.
-- [x] 7. Below-floor park gets the same probe (AUD/CAD shape); `StoredOrder.replaces`
-      so a re-price park promotes as Replacing. Corpus re-measured vs baseline.
-- [x] 8. uk-100 red test root-caused: `TimeReached` expiry veto was spread-hour
-      suppressed (engine `is_wick_cross`). Fixed + engine test; fixture to re-bless.
-- [x] 9. Re-bless the corpus cells that legitimately changed (duplicate legs removed,
-      uk-100 expiry close restored) with a REBLESS note; cli suite green; commit; push.
+- [x] bump `tradenation-api` to `broker-tradenation-v0.20.0`; `[patch]` instrument-lookup to the local path
+- [x] TN adapter: both fetch paths use `get_candles_range_aggregated_on` + `session_anchor(instrument)`
+- [x] CLAUDE.md hazards; BUG doc statuses
+- [x] repair the stale-binary re-bless (separate commit)
+- [ ] cache migration: `rebuild-h4` per anchored instrument, delete their D rows (both Postgres tables)
+- [ ] `local-chart` granularity.rs (separate repo)
+- [ ] replay: `replay.rs:567` NY-close comment/logic assumes H4 lands on the NY close — check for anchored instruments
+- [ ] OPEN (operator): act on a session's last bar at the next open

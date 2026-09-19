@@ -18,7 +18,9 @@ use trade_control_core::settlement::Settlement;
 use tradenation_api::ohlcv::PriceType;
 use tradenation_api::{OpeningOrder, Position, TransactionRecord};
 
+mod session_anchor;
 mod settlement;
+use session_anchor::session_anchor;
 
 /// Closed-trade scan window. Plan §3 recommends ~50; one TN page
 /// returns ~50 records so we fetch a single page. **Caveat: TN's
@@ -291,17 +293,19 @@ impl Broker for TradeNationAdapter {
 
         // `get_candles_range_aggregated` is the drop-in for `get_candles_range`
         // that serves non-native TFs (H4/D1/M5) by fetching the native base
-        // (H1/M1) and rolling it up. H4 and D1 sit on the 17:00 America/New_York
-        // session grid (`tradenation-api` v0.7.0 — the same `session_anchor`
+        // (H1/M1) and rolling it up. H4 and D1 sit on the INSTRUMENT's session
+        // anchor (17:00 New York for FX, the cash open for an exchange-bound
+        // market — `instrument-lookup`'s table, the same `Anchor`
         // the replay's candle source reaches through candle-cache, so live and
         // replay see the same bars). Native TFs pass straight through.
-        let raw = tradenation_api::aggregation::get_candles_range_aggregated(
+        let raw = tradenation_api::aggregation::get_candles_range_aggregated_on(
             self.0.client(),
             market.market_id,
             cm_gran,
             PriceType::Mid,
             count,
             now,
+            session_anchor(instrument),
         )
         .await
         .map_err(|err| {
@@ -378,13 +382,14 @@ impl Broker for TradeNationAdapter {
             // Aggregating fetch: H4/M5 built from the native base per PriceType,
             // each side rolled up on the same UTC buckets (see `get_candles`).
             let fetch = |price: PriceType| {
-                tradenation_api::aggregation::get_candles_range_aggregated(
+                tradenation_api::aggregation::get_candles_range_aggregated_on(
                     self.0.client(),
                     market.market_id,
                     cm_gran,
                     price,
                     count,
                     end,
+                    session_anchor(instrument),
                 )
             };
             // Sequential (the session client is `!Send`).
