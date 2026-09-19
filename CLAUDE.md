@@ -1044,8 +1044,11 @@ day has the same problem (South Africa 40 fixtures).
   a wrong row parks entries on an OPEN market.
 - **Rows are local wall-clock time**, measured per venue from H1 presence
   (TN Spain 35 `09:00 +9h Europe/Madrid`, OANDA `08:00 +12h`). An instrument on
-  the `fx` anchor is measured in New York time, so a market in a no-DST zone
-  (the TRY crosses) is an hour off at the span edges for part of the year.
+  the `fx` anchor is measured in New York time — right for the TRY crosses, which
+  OANDA runs on the New York clock (measured in the March week when only the US
+  had switched). The UK gilt follows London and sits on the `london` anchor.
+  `DE10YB_EUR` opens at a fixed 00:00Z and shuts 22:00 Berlin, so its row is an
+  hour off at the open in winter: a 00:00Z fire parks for one hour. Accepted.
 - **Same two park rails as the others:** `dedup_before_park` first, and the
   result is `Rejected` (nothing placed, intent id not consumed).
 - **Replay: the newest PARK wins.** `ReplayBroker::armed_verified(trade_id)`
