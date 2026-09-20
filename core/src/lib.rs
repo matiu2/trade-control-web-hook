@@ -19,6 +19,7 @@ pub mod dispatch_config;
 pub mod hold;
 pub mod incoming;
 pub mod intent;
+pub mod market_session;
 pub mod ny_clock;
 pub mod order_control;
 pub mod pause_gate;

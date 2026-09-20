@@ -17,6 +17,7 @@ mod jobs;
 mod keys;
 mod opener;
 mod plan;
+mod prompt;
 mod screen;
 mod search;
 mod timeline;

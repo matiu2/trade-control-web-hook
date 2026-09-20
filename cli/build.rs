@@ -20,6 +20,14 @@ fn main() {
     // Re-run when HEAD or the tag set moves so the baked string stays fresh.
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/refs/tags");
+    // `.git/HEAD` only says "ref: refs/heads/staging" — it does NOT change when
+    // that branch moves, so a pull or a commit left `--version` frozen at an
+    // old hash while the code was current. That misled a "is my replay binary
+    // stale?" check three times. `logs/HEAD` is appended on every commit, pull,
+    // merge and checkout; `packed-refs` covers a packed branch ref. Same fix
+    // `journal/build.rs` already carries.
+    println!("cargo:rerun-if-changed=../.git/packed-refs");
+    println!("cargo:rerun-if-changed=../.git/logs/HEAD");
 
     // Bake the per-environment webhook URL into the binary. The deploy
     // scripts (`deploy-dev.sh` / `deploy-staging.sh` / future

@@ -18,7 +18,7 @@ mod sl_spread_floor;
 
 pub use blackout::{
     BlackoutCloseAction, Buffers, MINUTES_PER_DAY, MINUTES_PER_WEEK, NoEntryWindow, WeekMask,
-    baked_market_hours, is_inside_any, is_inside_window, market_hours_blocked,
+    baked_market_hours, is_inside_any, is_inside_window, market_hours_blocked, weekend_blocked,
     windows_from_session,
 };
 pub use breakeven::{Breakeven, DEFAULT_BREAKEVEN_THRESHOLD};

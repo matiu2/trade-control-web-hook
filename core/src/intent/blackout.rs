@@ -146,7 +146,7 @@ mod week_mask;
 // The legacy session-string deriver is kept until Step C retires its last
 // consumer (cron / replay). `windows_from_session` + the minute-of-day
 // `NoEntryWindow` path above are superseded by the weekday-aware `baked` table.
-pub use baked::{baked_market_hours, market_hours_blocked};
+pub use baked::{baked_market_hours, market_hours_blocked, weekend_blocked};
 pub use derive::{Buffers, windows_from_session};
 pub use week_mask::{MINUTES_PER_WEEK, WeekMask};
 

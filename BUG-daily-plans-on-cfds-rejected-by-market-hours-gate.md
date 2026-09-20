@@ -1,5 +1,10 @@
 # BUG — daily/H4 plans on non-FX CFDs fire inside the market-hours close block
 
+**Status:** FIXED 2026-09-19 (the report's premise was partly wrong). Measured: the gate blocks only the close HOURS (Spain 35: 15,16Z), so a 21Z daily enter was never rejected by it — it reached a closed market. The grid is now per-instrument, but a bar ending at the session close still "closes" when the market is shut; so the enter now PARKS (`StoredReason::MarketClosed`) and is placed at the next open — CLAUDE.md "A shut SESSION market parks the enter".
+
+*(original report below)*
+
+
 **Status:** recorded 2026-09-18, deferred. Most work is FX; ignore until a
 trade needs it. Companion: `BUG-d1-h4-grid-should-follow-instrument-session.md`.
 

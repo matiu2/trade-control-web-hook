@@ -23,8 +23,9 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use market_hours_gen::compute::{DAILY_TURN_ON_FRACTION, MIN_SAMPLES, profile_from_bars};
 use market_hours_gen::fetch::{oanda_bars, tn_bars};
+use market_hours_gen::session::{NoSpan, SessionSpan, session_span};
 use market_hours_gen::universe::{WorkItem, work_items};
-use market_hours_gen::{MarketHoursRow, Venue, render_table};
+use market_hours_gen::{MarketHoursRow, Venue, render_session_table, render_table};
 
 #[derive(Parser, Debug)]
 #[command(about = "Generate the candle-derived market-hours blackout table")]
@@ -32,6 +33,9 @@ struct Args {
     /// Where to write the generated table (default: core/src/market_hours_baked.rs).
     #[arg(long, default_value = "../core/src/market_hours_baked.rs")]
     out: PathBuf,
+    /// Where to write the measured session-span table.
+    #[arg(long, default_value = "../core/src/session_hours_baked.rs")]
+    session_out: PathBuf,
 
     /// Include stock instruments (part-time exchanges, gappy candles). Off by
     /// default.
@@ -96,8 +100,12 @@ async fn main() -> color_eyre::Result<()> {
 
     print_report(&rows);
 
+    print_session_report(&rows);
+
     let table = render_table(&rows);
     std::fs::write(&args.out, &table)?;
+    std::fs::write(&args.session_out, render_session_table(&rows))?;
+    tracing::info!("wrote session spans to {}", args.session_out.display());
     tracing::info!("wrote {} rows to {}", rows.len(), args.out.display());
     Ok(())
 }
@@ -141,11 +149,13 @@ async fn profile_one(
     match bars {
         Ok(bars) => {
             let profile = profile_from_bars(&bars);
+            let session = session_of(&item.symbol, &bars);
             MarketHoursRow {
                 venue: item.venue,
                 symbol: item.symbol.clone(),
                 display_name: item.display_name.clone(),
                 profile,
+                session,
                 error: None,
             }
         }
@@ -156,8 +166,44 @@ async fn profile_one(
                 symbol: item.symbol.clone(),
                 display_name: item.display_name.clone(),
                 profile: profile_from_bars(&[]),
+                session: Err(NoSpan::TooFewDays(0)),
                 error: Some(e.to_string()),
             }
+        }
+    }
+}
+
+/// The session span in the instrument's own session-anchor clock. An anchor
+/// that cannot be resolved is an FX-day instrument for this purpose.
+fn session_of(
+    symbol: &str,
+    bars: &[market_hours_gen::compute::Bar],
+) -> Result<SessionSpan, NoSpan> {
+    let anchor =
+        instrument_lookup::Anchor::for_instrument(symbol).unwrap_or(instrument_lookup::Anchor::FX);
+    session_span(bars, anchor)
+}
+
+/// Every instrument that got a session row, and every split-session one that
+/// deliberately did not — the two the operator should eyeball.
+fn print_session_report(rows: &[MarketHoursRow]) {
+    println!("\n===== SESSION SPANS (local time; no row = never treated as closed) =====\n");
+    for r in rows {
+        match &r.session {
+            Ok(s) => println!(
+                "[span ] {:12} {:32} {:02}:00 +{}h {}",
+                r.venue.as_str(),
+                r.symbol,
+                s.start_hour,
+                s.hours,
+                s.timezone
+            ),
+            Err(NoSpan::SplitSession(hours)) => println!(
+                "[split] {:12} {:32} open hours {hours:?} — no row",
+                r.venue.as_str(),
+                r.symbol
+            ),
+            Err(_) => {}
         }
     }
 }

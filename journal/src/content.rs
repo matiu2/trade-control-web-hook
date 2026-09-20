@@ -194,6 +194,7 @@ mod tests {
             tv_loaded: true,
             max_depth: 3,
             fixture_report: None,
+            ..Default::default()
         });
         app.set_screen(screen);
         app

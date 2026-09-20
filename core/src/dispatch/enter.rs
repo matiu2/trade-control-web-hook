@@ -518,6 +518,49 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // blackout-cancelled resting orders. The lifecycle's own `is_spread_hour` /
     // `off_now` timing already governs WHEN a restore may run.
     if !origin.is_replacement() {
+        // MARKET SHUT (session-bound instruments only): with D1/H4 bars on the
+        // instrument's session anchor, the bar that ends at the session close
+        // is only closed a full bucket later — overnight, or Saturday for
+        // Friday's daily bar. A reject would lose every signal that bar
+        // carries, so the enter is PARKED and the promote pass places it at the
+        // open (`market_session::market_open`). Runs BEFORE the market-hours
+        // reject on purpose: for these instruments "shut" includes the weekend.
+        // An instrument with no baked session row is never "shut" here and
+        // falls straight through to the plain reject below. Same two rails as
+        // every park above the retry gate: probe the dedup first, and answer
+        // `Rejected` (nothing was placed, so the intent id is not consumed).
+        if crate::market_session::session_closed(&resolved.instrument, now) {
+            if let Some(rejection) = dedup_before_park(broker, store, verified, &origin).await {
+                return rejection;
+            }
+            let entry_price = entry_reference_price(&resolved.entry);
+            let parked = park_stored_entry(
+                store,
+                verified,
+                crate::order_control::StoredReason::MarketClosed,
+                trade_id,
+                &resolved.instrument,
+                (entry_price - resolved.stop_loss).abs(),
+                (entry_price - resolved.take_profit).abs(),
+                resolved.min_r,
+                raw_body,
+                enter_granularity,
+                now,
+                &origin,
+            )
+            .await;
+            tracing::info!(
+                "entry deferred: market-closed instrument={} now={now} (id={})",
+                resolved.instrument,
+                verified.intent.id
+            );
+            return ActionResult::Rejected {
+                status: 423,
+                body: "entry deferred: market closed — parked until the session opens".to_string(),
+                outcome: format!("rejected: market-closed{parked}"),
+            };
+        }
+
         if crate::intent::market_hours_blocked(&resolved.instrument, now) {
             tracing::info!(
                 "entry rejected: market-blackout instrument={} now={now} (id={})",
@@ -3181,6 +3224,100 @@ mod spread_gate_park_tests {
             outcome(&result)
         );
         assert_eq!(parked.map(|p| p.reason), Some(StoredReason::SpreadHour));
+    }
+
+    /// Fire a gate-owned H4 enter on `instrument` at `now`, tight book, spread
+    /// window shut, against a broker reporting attempt #1 in `state` (or no
+    /// prior attempt at all when `state` is `None`). Returns the result, any
+    /// park, and how many orders reached the broker.
+    fn session_fire(
+        instrument: &str,
+        now: DateTime<Utc>,
+        state: Option<AttemptState>,
+    ) -> (ActionResult, Option<StoredOrder>, u32) {
+        let store = MemStateStore::default();
+        store.set_clock(now);
+        let broker = EngagedBroker {
+            state: state.clone().unwrap_or(AttemptState::Unknown),
+            placed: std::cell::RefCell::new(0),
+            half_spread: 0.00005,
+        };
+        pollster::block_on(async {
+            let mut verified = gate_owned_enter();
+            verified.intent.instrument = instrument.to_string();
+            if state.is_some() {
+                seed_attempt_one(&store, &verified.intent).await;
+            }
+            let result = run_enter(
+                &broker,
+                &store,
+                &verified,
+                &gate_order_tests::cfg(),
+                now,
+                None,
+                Some(Granularity::H4),
+                EntryOrigin::Fresh,
+            )
+            .await;
+            let parked = stored_order(&store, "t-1").await.expect("read park");
+            let placed = *broker.placed.borrow();
+            (result, parked, placed)
+        })
+    }
+
+    /// Friday 2026-08-07 17:00Z = 19:00 Madrid: TradeNation's Spain 35 shut an
+    /// hour ago. This is the instant its last H4 bar of the day closes.
+    fn spain_shut() -> DateTime<Utc> {
+        gate_order_tests::now()
+    }
+
+    /// The reason the park exists: an enter fired while a session-bound market
+    /// is shut is DEFERRED to the open, not sent to a closed market and not
+    /// lost. Mutation check: delete the `session_closed` branch in `run_enter`
+    /// and this places an order instead.
+    #[test]
+    fn an_enter_on_a_shut_session_market_is_parked_until_the_open() {
+        let (result, parked, placed) = session_fire("Spain 35", spain_shut(), None);
+        assert_eq!(placed, 0, "nothing may reach a closed market");
+        assert_eq!(parked.map(|p| p.reason), Some(StoredReason::MarketClosed));
+        assert!(
+            outcome(&result).starts_with("rejected: market-closed")
+                && outcome(&result).contains("stored until"),
+            "{}",
+            outcome(&result)
+        );
+    }
+
+    /// Mid-session the same enter is an ordinary placement — the park must not
+    /// swallow entries on an open market.
+    #[test]
+    fn the_same_enter_mid_session_is_placed_not_parked() {
+        let midday = "2026-08-07T10:00:01Z".parse().expect("rfc3339");
+        let (_, parked, placed) = session_fire("Spain 35", midday, None);
+        assert!(parked.is_none(), "an open market must not park");
+        assert_eq!(placed, 1);
+    }
+
+    /// An instrument with NO baked session row keeps today's behaviour at the
+    /// very same instant: no park, straight to the broker.
+    #[test]
+    fn an_instrument_without_a_session_row_is_never_parked_as_market_closed() {
+        let (_, parked, placed) = session_fire("EUR_CAD", spain_shut(), None);
+        assert!(parked.is_none());
+        assert_eq!(placed, 1);
+    }
+
+    /// Same dedup rail as every park above the retry gate: a trade already
+    /// holding a position is rejected, never parked on top of itself.
+    #[test]
+    fn a_shut_market_fire_on_an_open_trade_is_rejected_not_parked() {
+        let open = AttemptState::OpenPosition {
+            broker_trade_id: "pos-1".into(),
+        };
+        let (result, parked, placed) = session_fire("Spain 35", spain_shut(), Some(open));
+        assert_eq!(outcome(&result), "rejected: trade-already-open");
+        assert!(parked.is_none());
+        assert_eq!(placed, 0);
     }
 
     /// Fire a gate-owned enter OUTSIDE the spread window but with a book wide

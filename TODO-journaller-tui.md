@@ -9,6 +9,46 @@ outcome`) → Replay (full `replay-candles` report) → Compare (replay ‖ live
 side-by-side). Delete guard blocks unopened plans; confirm modal, `i` detail
 popup, and `←`-unwind all work. 13 tests (incl. 2 TestBackend render tests).
 
+**Done (2026-09-21) — `f` fixture key + `R` raw replay:**
+- **`f`** — branches on the fixture status the info bar is already showing, so
+  the key does what the operator just read.
+  - **Has a fixture → RE-BLESS** its matched cells:
+    `replay-candles-<env> --test-mode --fixture <CELL> --fixtures-dir <DIR>
+    --rebless`, once per cell. Offline; no chart, no broker. Scoped to *this
+    plan's* matched cells and never `--fixtures-glob` — a re-bless launched
+    from one plan's page must not rewrite another setup's goldens. A partial
+    run (some cells failed) is reported as an **error**, since "3/8 re-blessed"
+    is the state most easily mistaken for a clean run and committed.
+  - **No fixture → prompt for a message, then CAPTURE** via the existing
+    `tv-arm --save-fixture … --message <TEXT> replay`. The prompt comes first
+    because `--rebless` rewrites only `expected.json` — the message can be
+    written at capture time or never. It rides through the chart-load park
+    (`save_fixture_pending: Option<Option<String>>`) so a deferred capture
+    cannot silently drop it.
+- **`R`** — **raw replay**: the plan the worker actually holds, exported and
+  fed straight to `replay-candles --plan`. The counterpart to `r`, not a faster
+  version: `r` re-arms from the chart and answers *"what would this setup do if
+  armed today"*; `R` answers *"what does the plan that is really out there
+  do"*. When they disagree, the difference is the re-arm.
+  Both `--instrument` and `--start` are passed **always**. `resolve_window`
+  ranks the TradingView chart above the plan for both, so omitting either hands
+  the chart control: a wrong instrument reports a plausible 0R under the right
+  banner, and a missing start on an expired plan dies `bad-input: the replay
+  window runs backwards` (measured against the real CLI, `hs-aud-nzd-ff8e66e8`,
+  chart start 2026-09-18 vs plan end 2026-09-09).
+- Three reports now share the Replay pane, so `PlanData::shown_report` records
+  which one landed **last**. A fixed precedence over the three `Option`s was
+  the first attempt and is wrong — a re-bless would shadow every later `r` for
+  the rest of the session.
+- **Not a bug, checked and left alone:** the journal's replay omits
+  `--skip-bcr` for plans that carry both BCR preps. `BcrPreps::tv_arm_skip_flags`
+  derives the flags from which prep rules the plan actually has, which is the
+  faithful reproduction. Verified against live staging plan
+  `hs-aud-nzd-ff8e66e8`: it carries `03-prep-break-and-close` + `04-prep-retest`
+  and its `05-enter` has `requires_preps: [break-and-close, retest]`. Arming a
+  setup `--skip-bcr` is an *arming* choice; forcing it onto the replay would
+  make the replay diverge from the plan it is supposed to reproduce.
+
 **Done (v3):**
 - **Arm-time screenshot** — SHIPPED. `tv-arm register` reads the system
   clipboard (`wl-paste` → `xclip` → `xsel`) and, when it holds a TradingView

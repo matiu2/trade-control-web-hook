@@ -1669,6 +1669,7 @@ mod tests {
                     clears_min_r: true,
                     bar_time: Some(ts("2026-07-08T21:00:00Z")),
                     spread_hour_over: false,
+                    market_open: false,
                 };
                 let outcome = promote_stored_order(
                     &PlacingBroker,

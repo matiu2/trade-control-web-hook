@@ -369,7 +369,7 @@ dependencies = [
 [[package]]
 name = "broker-tradenation"
 version = "0.12.0"
-source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.19.0#09bb965f8ae3a09570f0f97bb9f13f8338389c81"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.20.0#3769b68bbe712a288591921b487f7a3c88ceb61c"
 dependencies = [
  "color-eyre",
  "reqwest 0.12.23",
@@ -441,6 +441,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "color-eyre",
+ "instrument-lookup",
  "redb",
  "serde",
  "sqlx",
@@ -2004,6 +2005,8 @@ dependencies = [
 name = "instrument-lookup"
 version = "0.5.0"
 dependencies = [
+ "chrono",
+ "chrono-tz",
  "clap",
  "clap_complete",
  "color-eyre",
@@ -2261,6 +2264,7 @@ version = "0.1.0"
 dependencies = [
  "candle-model",
  "chrono",
+ "chrono-tz",
  "clap",
  "color-eyre",
  "instrument-lookup",
@@ -2440,6 +2444,7 @@ dependencies = [
  "color-eyre",
  "getrandom 0.4.2",
  "gloo-timers",
+ "instrument-lookup",
  "reqwest 0.12.23",
  "serde",
  "serde_json",
@@ -4760,8 +4765,8 @@ dependencies = [
 
 [[package]]
 name = "tradenation-api"
-version = "0.7.0"
-source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.19.0#09bb965f8ae3a09570f0f97bb9f13f8338389c81"
+version = "0.7.2"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.20.0#3769b68bbe712a288591921b487f7a3c88ceb61c"
 dependencies = [
  "aes-gcm",
  "candle-model",
@@ -4772,6 +4777,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "getrandom 0.4.2",
+ "instrument-lookup",
  "reqwest 0.12.23",
  "serde",
  "serde_json",
@@ -4786,7 +4792,7 @@ dependencies = [
 [[package]]
 name = "tradenation-instrument-cache"
 version = "0.2.0"
-source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.19.0#09bb965f8ae3a09570f0f97bb9f13f8338389c81"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.20.0#3769b68bbe712a288591921b487f7a3c88ceb61c"
 dependencies = [
  "chrono",
  "dirs",

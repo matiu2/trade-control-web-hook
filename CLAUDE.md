@@ -992,6 +992,75 @@ On the Python side: `--risk-amount` adds `risk_amount: <n>` to the spec;
 `--broker-dry-run` adds `dry_run: true`. The Python `--dry-run` flag is
 unrelated — that one short-circuits before any POST to TradingView.
 
+### D1/H4 bars start at the INSTRUMENT's session anchor, not one 17:00 New York grid
+
+Since 2026-09-19 every D1/H4 bucket counts from a per-instrument **session
+anchor** — a local hour in an IANA timezone, the market's primary cash open
+(Spain 35 = 09:00 Europe/Madrid → D1 07:00Z, H4 07/11/15Z in summer). FX and
+anything unlisted keep `fx`, 17:00 America/New_York. The table is
+`instrument-lookup/src/session_anchors.toml`; the bucket maths exists ONCE, in
+`instrument-lookup` feature `session-grid` (`Anchor::{for_instrument,
+bucket_start, bucket_end}`), and is called by all three producers:
+
+- `candle-cache` — bucket KEYS, the aggregator, `rebuild-h4`.
+- `tradenation-api` — the H1→H4/D1 aggregator (`*_aggregated_on`).
+- `oanda-client` — `dailyAlignment` + `alignmentTimezone` on every request.
+
+Hazards:
+
+- **The three must agree, and cached rows must be migrated.** A row filed on the
+  old grid stays in Postgres and is served alongside new-grid rows. After giving
+  an instrument an anchor: `rebuild-h4 --instrument <name>` and delete its `D`
+  rows (no `rebuild-d1` yet).
+- **`tradenation-api` is a GIT dep and depends on `instrument-lookup` by git
+  tag**; the root `[patch]` redirects that to the local path so there is one
+  `Anchor` type. Drop the patch and the adapter stops compiling (two `Anchor`s).
+- **The instrument-blind TN functions are `#[deprecated]`, not removed** — a new
+  call site that uses one gets a warning naming the `_on` variant. Don't
+  `#[allow]` it; resolve the anchor (`broker-tradenation-adapter::session_anchor`).
+- **A bar that ends at the session close is only "closed" a full bucket later**
+  (Spain's 15:00Z H4 bar at 19:00Z, its D1 bar at 07:00Z next day — Saturday for
+  Friday's), when the market is shut. `run_enter` PARKS that enter
+  (`StoredReason::MarketClosed`) and the promote pass places it at the open. See
+  the next section.
+- The market-hours baked table blocks only the CLOSE hours (Spain: 15,16Z). It
+  has no notion of "closed overnight".
+
+### A shut SESSION market parks the enter; everything else still rejects
+
+"Market hours rejects, never delays" has exactly ONE exception (operator,
+2026-09-19): an instrument with a row in `core/src/session_hours_baked.rs` whose
+session is shut at fire time (`market_session::session_closed` — outside its
+local-time span, or inside the universal weekend halt). `run_enter` parks it as
+`StoredReason::MarketClosed` *before* the market-hours reject, and
+`order_control::tick` promotes it when `market_session::market_open` — session
+started AND the full market-hours mask clear, so a promotion never lands in a
+blocked close hour. Applies on every granularity: an H1 plan's last bar of the
+day has the same problem (South Africa 40 fixtures).
+
+- **No row ⇒ never "shut" ⇒ plain reject, as before.** FX, 24h indices, split
+  day/night sessions (Hong Kong) and anything with < 4 closed hours get no row.
+  The generator (`market-hours-gen`, `--session-out`) errs toward no row because
+  a wrong row parks entries on an OPEN market.
+- **Rows are local wall-clock time**, measured per venue from H1 presence
+  (TN Spain 35 `09:00 +9h Europe/Madrid`, OANDA `08:00 +12h`). An instrument on
+  the `fx` anchor is measured in New York time — right for the TRY crosses, which
+  OANDA runs on the New York clock (measured in the March week when only the US
+  had switched). The UK gilt follows London and sits on the `london` anchor.
+  `DE10YB_EUR` opens at a fixed 00:00Z and shuts 22:00 Berlin, so its row is an
+  hour off at the open in winter: a 00:00Z fire parks for one hour. Accepted.
+- **Same two park rails as the others:** `dedup_before_park` first, and the
+  result is `Rejected` (nothing placed, intent id not consumed).
+- **Replay: the newest PARK wins.** `ReplayBroker::armed_verified(trade_id)`
+  tries parked-by-trade-id BEFORE placed-by-trade-id. Reversed, a trade that
+  placed an order and later parked a new fire promotes the OLD placement's
+  shell — a days-stale order — and the new fire vanishes. Live reads the signed
+  intent stored on the park, so this was replay-only, and it silently ate
+  legitimate re-entries in 30 corpus cells.
+- The replay does not model a closed market: without the park it would still
+  "place" at 19:00Z and fill the next day. The entry-point tests in
+  `spread_gate_park_tests` are what pin the park, not the corpus.
+
 ### Spread-hour samples never size a stop (window + forecast term)
 
 Two floor inputs read the 17:00-New-York rollover print unless told not to,

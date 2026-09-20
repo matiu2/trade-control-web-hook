@@ -102,6 +102,13 @@ pub fn baked_market_hours(symbol: &str) -> Option<WeekMask> {
     Some(mask)
 }
 
+/// Is `now` inside the universal weekend halt (Fri 21:00Z → Sun 22:00Z)?
+/// Instrument-blind. Exposed for [`crate::market_session`], which needs "is it
+/// the weekend" separately from an instrument's close-hour overlay.
+pub fn weekend_blocked(now: DateTime<Utc>) -> bool {
+    weekend_mask().is_blocked_at(now)
+}
+
 /// Is entry blocked for `symbol` at this UTC instant, per the baked market-hours
 /// mask? `false` when the symbol isn't catalogued (fail open) or the instant is
 /// outside every blocked span. This is the single predicate the reject gate and
