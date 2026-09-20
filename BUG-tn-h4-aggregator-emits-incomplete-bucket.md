@@ -7,6 +7,14 @@ The diagnosis in this doc was **correct** and is what the fix implements.
 closed on prices that never became a close. Live and replay score different trades.
 **Scope:** **TradeNation only.** OANDA is unaffected (it filters `complete == false`).
 Affects every TN H4 and M5 plan.
+
+> ⚠️ **The fix here covered the AGGREGATED path only.** `aggregate_candles` is reached only
+> when `resolve_native` returns `Some`, and it returns `None` for M1/M15/H1 — so those
+> granularities kept this exact bug until **2026-09-21**. The scope note below ("`resolve_native`
+> returns `None` for H1/M15/D1, so they never reach `aggregate_candles`") means they were
+> *unprotected*, not that they were safe. Closed for every granularity by
+> [`BUG-tn-native-granularity-emits-forming-bar.md`](BUG-tn-native-granularity-emits-forming-bar.md),
+> which drops the forming bar in the adapter instead.
 **Found:** 2026-09-08, journalling GBP/NZD H4 iH&S (demo trade 153, plan `ihs-gbp-nzd-9e63a168`)
 
 ## Symptom
