@@ -1,0 +1,26 @@
+{
+  "records": [],
+  "ticks": [
+    {
+      "schema_version": 1,
+      "tick_ts": "2026-09-07T02:11:43.512004821Z",
+      "correlation_id": "hs-aud-nzd-412e8650",
+      "eval": {
+        "fired": [
+          {
+            "rule_id": "01-veto-too-high",
+            "intent": { "action": "pause" },
+            "candle": {
+              "time": "2026-09-07T01:00:00Z",
+              "o": 1.22610,
+              "h": 1.22648,
+              "l": 1.22602,
+              "c": 1.22641
+            },
+            "signal": null
+          }
+        ]
+      }
+    }
+  ]
+}

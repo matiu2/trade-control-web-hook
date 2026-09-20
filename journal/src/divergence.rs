@@ -198,8 +198,18 @@ pub fn parse_replay_outcome(report: &str) -> ReplayOutcome {
 /// Extract the live engine fires from the `plan timeline` JSON. Reads only the
 /// `ticks[].eval.fired[]` objects (never the inbound `records`, which include
 /// this tool's own recursive plan-show/plan-timeline queries), keyed by
-/// `rule_id`, timestamped by the tick's `tick_ts` normalised to Brisbane
-/// `YYYY-MM-DD HH:MM` (the same `ts_to_bne` the timeline view uses).
+/// `rule_id`, timestamped by the **firing bar** (`fired[].candle.time`)
+/// normalised to Brisbane `YYYY-MM-DD HH:MM` (the same `ts_to_bne` the
+/// timeline view uses).
+///
+/// **Not the tick.** `tick_ts` is the cron's wall clock — when the scheduler
+/// happened to observe the bar, not when the rule fired. A cron that runs at
+/// half past stamps a 10:00 bar `10:30`, and the replay (which prints the bar)
+/// then looks an hour out, so every fire was reported as a phantom timing
+/// divergence. Both sides run the same `evaluate_plan`, and its `FiredIntent`
+/// carries the firing `candle` on each side, so the bar is the one instant
+/// they can agree on. `candle.time` is the bar's **open** (the OANDA /
+/// TradeNation convention), matching what the replay report prints.
 pub fn live_fires(timeline_json: &str) -> Vec<FireFact> {
     let Ok(v) = serde_json::from_str::<Value>(timeline_json) else {
         return Vec::new();
@@ -212,8 +222,8 @@ pub fn live_fires(timeline_json: &str) -> Vec<FireFact> {
 
 /// The fire facts from a single tick object.
 fn live_fires_from_tick(tick: &Value) -> Vec<FireFact> {
-    let ts = tick.get("tick_ts").and_then(|x| x.as_str()).unwrap_or("");
-    let ts = ts_to_bne(ts);
+    let tick_ts = tick.get("tick_ts").and_then(|x| x.as_str()).unwrap_or("");
+    let tick_ts = ts_to_bne(tick_ts);
     let Some(fired) = tick
         .get("eval")
         .and_then(|e| e.get("fired"))
@@ -236,10 +246,19 @@ fn live_fires_from_tick(tick: &Value) -> Vec<FireFact> {
             Some(FireFact {
                 rule_id: rule_id.to_string(),
                 action,
-                ts: ts.clone(),
+                ts: fire_bar(rule).unwrap_or_else(|| tick_ts.clone()),
             })
         })
         .collect()
+}
+
+/// The Brisbane `YYYY-MM-DD HH:MM` of the bar a fire triggered on, read from
+/// the `FiredIntent`'s own `candle.time`. `None` when the fire carries no
+/// candle (an older bundle schema), leaving the caller to fall back to the
+/// tick rather than dropping the fire from the diff.
+fn fire_bar(rule: &Value) -> Option<String> {
+    let t = rule.get("candle")?.get("time")?.as_str()?;
+    Some(ts_to_bne(t))
 }
 
 /// Classify the live vs replay fire sets by `rule_id`. A rule id present on both
@@ -282,6 +301,10 @@ mod tests {
 
     const REPLAY: &str = include_str!("../tests/fixtures/replay_report.txt");
     const TIMELINE: &str = include_str!("../tests/fixtures/plan_timeline.json");
+    /// A single `01-veto-too-high` fire on the 11:00 Brisbane bar, evaluated by
+    /// a cron tick that ran at 12:11 Brisbane — the late-cron shape that made
+    /// the journal report a phantom one-hour timing divergence.
+    const LATE_CRON: &str = include_str!("../tests/fixtures/veto_late_cron_timeline.json");
 
     #[test]
     fn parses_the_four_replay_fires_with_rule_ids() {
@@ -355,9 +378,13 @@ mod tests {
 
     #[test]
     fn aud_cad_diff_is_four_matches_and_four_timing_divergences() {
-        // The headline test: live fires pause/resume/news-start/news-end spread
-        // across 03:30–12:30 Brisbane; the replay fires all four at 13:00. So the
-        // rule ids all match, but every one is a timing divergence.
+        // The headline test: live fires pause/resume/news-start/news-end on the
+        // 02:00/10:00/10:00/11:00 Brisbane bars; the replay fires all four at
+        // 13:00. So the rule ids all match, but every one is a GENUINE timing
+        // divergence — a real disagreement about the bar, not the late-cron
+        // artefact `a_late_cron_tick_is_not_a_timing_divergence` covers. (The
+        // live bars read off each fire's own candle; this fixture's cron ticks
+        // ran at 03:30/11:30/12:30, which is what used to be reported here.)
         let live = live_fires(TIMELINE);
         let replay = parse_replay_fires(REPLAY);
         let d = diff(&live, &replay);
@@ -370,14 +397,71 @@ mod tests {
         );
         assert_eq!(d.timing.len(), 4, "every fire is on a different bar");
         assert!(!d.is_clean(), "a timing divergence is not clean");
-        // Spot-check one timing tuple: pause fired live 03:30, replay 13:00.
+        // Spot-check one timing tuple: pause fired on the live 02:00 bar
+        // (observed by the 03:30 cron tick), replay 13:00.
         let pause = d
             .timing
             .iter()
             .find(|(id, _, _)| id.starts_with("01-pause"))
             .expect("pause timing divergence");
-        assert_eq!(pause.1, "2026-07-23 03:30", "live pause bar");
+        assert_eq!(pause.1, "2026-07-23 02:00", "live pause bar");
         assert_eq!(pause.2, "2026-07-23 13:00", "replay pause bar");
+    }
+
+    #[test]
+    fn a_live_fire_is_stamped_with_its_bar_not_the_cron_tick() {
+        // The cron evaluated the 11:00 bar at 12:11; the fire belongs to the
+        // bar, which is the only instant the replay can also name.
+        let fires = live_fires(LATE_CRON);
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        assert_eq!(
+            fires[0].ts, "2026-09-07 11:00",
+            "the firing bar, not the 12:11 cron tick that observed it"
+        );
+    }
+
+    #[test]
+    fn a_late_cron_tick_is_not_a_timing_divergence() {
+        // The regression this fixes: both sides agree the veto fired on the
+        // 11:00 bar, so the journal must report no divergence at all.
+        let live = live_fires(LATE_CRON);
+        let replay = parse_replay_fires(
+            "2026-09-07 11:00:00 +10:00  PAUSE entries (01-veto-too-high) — entry level exceeded  (close=1.22641)\n",
+        );
+        assert_eq!(replay.len(), 1, "{replay:?}");
+        let d = diff(&live, &replay);
+        assert_eq!(d.matches.len(), 1);
+        assert!(
+            d.timing.is_empty(),
+            "same bar, different observation clock: {:?}",
+            d.timing
+        );
+        assert!(d.is_clean());
+    }
+
+    #[test]
+    fn a_fire_on_a_genuinely_different_bar_is_still_a_divergence() {
+        // The guard on the fix: stamping by bar must not blind the diff to a
+        // real disagreement. Same rule, replay one bar later — still reported.
+        let live = live_fires(LATE_CRON);
+        let replay = parse_replay_fires(
+            "2026-09-07 12:00:00 +10:00  PAUSE entries (01-veto-too-high) — entry level exceeded  (close=1.22641)\n",
+        );
+        let d = diff(&live, &replay);
+        assert_eq!(d.timing.len(), 1, "a real one-bar divergence survives");
+        assert_eq!(d.timing[0].1, "2026-09-07 11:00", "live bar");
+        assert_eq!(d.timing[0].2, "2026-09-07 12:00", "replay bar");
+    }
+
+    #[test]
+    fn a_fire_without_a_candle_falls_back_to_the_tick() {
+        // Tolerance: a bundle whose fire carries no candle (an older schema)
+        // must still produce a fact rather than vanish from the diff.
+        let json = r#"{"ticks":[{"tick_ts":"2026-09-07T02:11:43Z",
+          "eval":{"fired":[{"rule_id":"01-veto-too-high"}]}}]}"#;
+        let fires = live_fires(json);
+        assert_eq!(fires.len(), 1, "{fires:?}");
+        assert_eq!(fires[0].ts, "2026-09-07 12:11", "falls back to the tick");
     }
 
     #[test]
