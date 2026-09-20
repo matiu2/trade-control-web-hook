@@ -17,7 +17,7 @@
 //! * `replay-candles-<env> --plan <FILE> [--annotate true]`
 //!   → replay report on stdout; `--annotate` also draws it on the live TV chart.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use color_eyre::eyre::{Result, eyre};
@@ -112,6 +112,163 @@ pub fn plan_export_json(trade_id: &str) -> Result<String> {
 /// `plan delete <id>` → deletes the plan + engine state. Idempotent.
 pub fn plan_delete(trade_id: &str) -> Result<String> {
     run_trade_control(&["plan", "delete", trade_id])
+}
+
+/// Build the argv for re-blessing ONE saved fixture cell:
+/// `--test-mode --fixture <CELL> --fixtures-dir <DIR> --rebless`.
+///
+/// Split out from [`rebless_fixture_cell`] so the argv is testable without
+/// launching anything — every flag here is load-bearing and three of them are
+/// silent-failure traps if dropped:
+///
+/// * **`--test-mode`** is what makes this read the frozen `plan.json` +
+///   `candles.json` off disk instead of pulling from the broker. clap declares
+///   it `requires = "fixture"`, so the pair moves together.
+/// * **`--fixture <CELL>`** is the single-cell selector. The alternative,
+///   `--fixtures-glob`, re-blesses the whole matching set — deliberately NOT
+///   used here: a re-bless launched from one plan's page must not rewrite
+///   another setup's goldens.
+/// * **`--fixtures-dir <DIR>`** is passed ALWAYS, never left to the CLI's own
+///   resolution. That default walks up from the cwd and falls back to a
+///   build-time `CARGO_MANIFEST_DIR`, which in a deployed binary points at the
+///   throwaway deploy worktree — the recorded trap where a `--rebless` covered
+///   19 of 63 cells with no error either way. The caller passes the very
+///   directory the cells were matched in ([`crate::fixtures::default_dir`]), so
+///   what is re-blessed is what the info bar counted.
+///
+/// `--rebless` rewrites **only** `expected.json`; `meta.json`'s hand-written
+/// `message`, the plan and the candles are untouched. That is exactly why a
+/// re-bless is the right verb for "the behaviour changed on purpose" and a
+/// re-capture is not.
+fn rebless_args(cell: &str, fixtures_dir: &Path) -> Vec<String> {
+    vec![
+        "--test-mode".to_string(),
+        "--fixture".to_string(),
+        cell.to_string(),
+        "--fixtures-dir".to_string(),
+        fixtures_dir.to_string_lossy().to_string(),
+        "--rebless".to_string(),
+    ]
+}
+
+/// Re-bless one saved fixture cell — recompute its outcome from the frozen
+/// plan + candles and overwrite its `expected.json`.
+///
+/// Offline: no broker, no chart, no TradingView. Returns the CLI's stdout
+/// (ANSI stripped, as the replay paths do) so the caller can show the operator
+/// what the new golden says.
+pub fn rebless_fixture_cell(cell: &str, fixtures_dir: &Path) -> Result<String> {
+    let program = bin("replay-candles");
+    let args = rebless_args(cell, fixtures_dir);
+    run_replay_candles(&program, &args)
+}
+
+/// Build the argv for a RAW replay — the stored plan, replayed as-is:
+/// `--plan <FILE> --instrument <INST> --source <BROKER> --start <ARMED_AT>
+/// --annotate true`.
+///
+/// "Raw" is the distinction from the journal's `r`: that one re-arms the setup
+/// from the chart via tv-arm and replays what it just built, so it answers
+/// "what would this setup do if armed today". This one feeds `replay-candles`
+/// the plan the worker actually holds, so it answers "what does the plan that
+/// is really out there do" — no chart read, no re-arm, no geometry drift.
+///
+/// **`--instrument` is not optional**, even though clap lets it be. Its
+/// resolution order inside `replay-candles` is `--instrument` → **the live
+/// TradingView chart symbol** → the plan, so the chart outranks the plan: omit
+/// it and whatever pair the chart happens to be sitting on selects the candle
+/// feed. That failure is silent — the plan's levels simply sit nowhere near the
+/// prices, every entry is declined as outside the SL..TP range, and the run
+/// reports a plausible 0R under a banner still naming the right instrument
+/// (measured twice, most recently an AUD/NZD plan replayed at ~0.99 instead of
+/// ~1.22, hiding a real −1.00R stop-out). Passing it also spares the run an MCP
+/// round-trip to the chart it would otherwise need.
+///
+/// `--source` likewise comes from the plan's own broker rather than the CLI's
+/// `tradenation` default, so an OANDA plan pulls OANDA candles.
+///
+/// **`--start` is not optional either**, for the same reason and with a louder
+/// failure. `resolve_window` takes the window start from `--start` → **the
+/// TradingView chart** → the plan, so omitting it hands the chart the window as
+/// well as the feed. Measured against the real CLI on 2026-09-21 with an
+/// expired plan (`hs-aud-nzd-ff8e66e8`): the chart supplied a start of
+/// 2026-09-18 while the plan's expiry ended the window on 2026-09-09, and the
+/// run died `bad-input: the replay window runs backwards: it ends 9.8 days
+/// before it starts`. Passing the plan's own `armed_at` is what makes a raw
+/// replay of an old plan work at all — and it is the same instant the journal's
+/// re-armed replay already uses as its cursor, so the two runs cover the same
+/// window and stay comparable.
+///
+/// `--annotate true` needs its explicit value (the flag is `ArgAction::Set`,
+/// not a bare switch) and draws the simulated trades onto the chart, matching
+/// what the tv-arm replay path already does.
+fn raw_replay_args(
+    plan_file: &Path,
+    instrument: &str,
+    broker: &str,
+    armed_at: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "--plan".to_string(),
+        plan_file.to_string_lossy().to_string(),
+        "--instrument".to_string(),
+        instrument.to_string(),
+        "--start".to_string(),
+        armed_at.to_string(),
+    ];
+    if !broker.is_empty() {
+        args.push("--source".to_string());
+        args.push(broker.to_string());
+    }
+    args.push("--annotate".to_string());
+    args.push("true".to_string());
+    args
+}
+
+/// Replay the STORED plan as-is: export it from the worker to a temp file, then
+/// `replay-candles --plan <FILE> --instrument <INST> --source <BROKER>`.
+///
+/// See [`raw_replay_args`] for why each flag is there. The plan file is written
+/// under the OS temp dir keyed by `trade_id`, mirroring where tv-arm puts its
+/// own replay plan, and is left in place afterwards so an operator can re-run
+/// the same command by hand from the status line.
+pub fn raw_replay(
+    trade_id: &str,
+    instrument: &str,
+    broker: &str,
+    armed_at: &str,
+) -> Result<String> {
+    let plan_json = plan_export_json(trade_id)?;
+    let plan_file = std::env::temp_dir().join(format!("journal-raw-replay-{trade_id}.json"));
+    std::fs::write(&plan_file, plan_json)
+        .map_err(|e| eyre!("write plan to {}: {e}", plan_file.display()))?;
+    let program = bin("replay-candles");
+    let args = raw_replay_args(&plan_file, instrument, broker, armed_at);
+    run_replay_candles(&program, &args)
+}
+
+/// Run `replay-candles-<env>` with `args`, returning ANSI-stripped stdout.
+/// Shared by the re-bless and raw-replay paths, which differ only in argv —
+/// the quieting, the ANSI strip and the failure shape are identical to the
+/// tv-arm wrappers above and must not drift from them.
+fn run_replay_candles(program: &str, args: &[String]) -> Result<String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    if std::env::var_os("RUST_LOG").is_none() {
+        cmd.env("RUST_LOG", "warn");
+    }
+    let out = cmd.output().map_err(|e| launch_error(program, e))?;
+    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
+    if !out.status.success() {
+        let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+        return Err(eyre!(
+            "`{program} {}` failed ({}): {}\n{stdout}",
+            args.join(" "),
+            out.status,
+            stderr.trim()
+        ));
+    }
+    Ok(stdout)
 }
 
 /// Build the argv for a replay: `tv-arm [--spec-url <URL>] --start <armed_at>
@@ -526,6 +683,142 @@ mod tests {
         assert!(!replay.iter().any(|a| a == "--spec-url"), "{replay:?}");
         let fixture = save_fixture_args("2026-07-22T20:58:53Z", &[], "t", None, None);
         assert!(!fixture.iter().any(|a| a == "--spec-url"), "{fixture:?}");
+    }
+
+    /// `--test-mode` and `--fixture` move together (clap declares
+    /// `requires = "fixture"`), and the cell named is the ONE cell re-blessed.
+    #[test]
+    fn rebless_selects_exactly_one_cell() {
+        let args = rebless_args(
+            "aud-nzd-h1-2026-09-04-normal-news-off",
+            Path::new("/repo/replay-fixtures"),
+        );
+        assert!(args.iter().any(|a| a == "--test-mode"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--rebless"), "{args:?}");
+        let i = args
+            .iter()
+            .position(|a| a == "--fixture")
+            .unwrap_or_default();
+        assert_eq!(
+            args.get(i + 1).map(String::as_str),
+            Some("aud-nzd-h1-2026-09-04-normal-news-off")
+        );
+        // The whole-corpus form must NOT appear: a re-bless launched from one
+        // plan's page must never rewrite another setup's goldens.
+        assert!(!args.iter().any(|a| a == "--fixtures-glob"), "{args:?}");
+    }
+
+    /// `--fixtures-dir` is ALWAYS passed, never left to the CLI's own
+    /// resolution — that default walks up from the cwd and falls back to a
+    /// build-time manifest path, which in a deployed binary is a deleted deploy
+    /// worktree. The recorded cost: a `--rebless` that covered 19 of 63 cells
+    /// with no error either way.
+    #[test]
+    fn rebless_always_passes_the_fixtures_dir() {
+        let args = rebless_args("cell", Path::new("/some/where/replay-fixtures"));
+        let i = args
+            .iter()
+            .position(|a| a == "--fixtures-dir")
+            .unwrap_or_else(|| panic!("--fixtures-dir must be explicit: {args:?}"));
+        assert_eq!(
+            args.get(i + 1).map(String::as_str),
+            Some("/some/where/replay-fixtures")
+        );
+    }
+
+    /// `--rebless` refuses at the CLI under `--simulate false`, `--cron-gap N`
+    /// and `--upkeep`, so this argv must carry none of them — otherwise the
+    /// re-bless fails as bad input instead of writing the new golden.
+    #[test]
+    fn rebless_carries_nothing_that_would_make_the_cli_refuse() {
+        let args = rebless_args("cell", Path::new("/repo/replay-fixtures"));
+        for forbidden in ["--simulate", "--cron-gap", "--upkeep", "--check"] {
+            assert!(
+                !args.iter().any(|a| a == forbidden),
+                "{forbidden} makes --rebless refuse: {args:?}"
+            );
+        }
+    }
+
+    /// An arm time to build raw-replay argv against.
+    const TS: &str = "2026-09-04T09:50:43Z";
+
+    /// The OTHER raw-replay trap, and the one that fails loudly rather than
+    /// quietly: without `--start`, `replay-candles` takes the window start from
+    /// the TradingView chart. Measured against the real CLI with an expired
+    /// plan — the chart said 2026-09-18, the plan's expiry ended the window on
+    /// 2026-09-09, and the run died `bad-input: the replay window runs
+    /// backwards`. So a raw replay of any plan whose chart has moved on is
+    /// simply impossible without this flag.
+    #[test]
+    fn raw_replay_always_names_the_start() {
+        let args = raw_replay_args(Path::new("/tmp/p.json"), "AUD/NZD", "tradenation", TS);
+        let i = args
+            .iter()
+            .position(|a| a == "--start")
+            .unwrap_or_else(|| panic!("--start must be explicit: {args:?}"));
+        assert_eq!(args.get(i + 1).map(String::as_str), Some(TS));
+    }
+
+    /// **The** raw-replay trap: without `--instrument`, `replay-candles` ranks
+    /// the live TradingView chart's symbol ABOVE the plan's own instrument, so
+    /// whatever pair the chart sits on picks the candle feed. It fails
+    /// silently — a plausible 0R under a banner naming the right instrument.
+    #[test]
+    fn raw_replay_always_names_the_instrument() {
+        let args = raw_replay_args(Path::new("/tmp/p.json"), "AUD/NZD", "tradenation", TS);
+        let i = args
+            .iter()
+            .position(|a| a == "--instrument")
+            .unwrap_or_else(|| panic!("--instrument must be explicit: {args:?}"));
+        assert_eq!(args.get(i + 1).map(String::as_str), Some("AUD/NZD"));
+    }
+
+    /// The plan file is the stored plan, and the source is the plan's OWN
+    /// broker — not the CLI's `tradenation` default, which would pull the wrong
+    /// feed for an OANDA plan.
+    #[test]
+    fn raw_replay_passes_the_plan_file_and_the_plans_broker() {
+        let args = raw_replay_args(
+            Path::new("/tmp/journal-raw-replay-x.json"),
+            "EUR_CAD",
+            "oanda",
+            TS,
+        );
+        let p = args.iter().position(|a| a == "--plan").unwrap_or_default();
+        assert_eq!(
+            args.get(p + 1).map(String::as_str),
+            Some("/tmp/journal-raw-replay-x.json")
+        );
+        let s = args
+            .iter()
+            .position(|a| a == "--source")
+            .unwrap_or_default();
+        assert_eq!(args.get(s + 1).map(String::as_str), Some("oanda"));
+    }
+
+    /// An unknown broker (no rule carried one) must emit NO `--source` at all,
+    /// not an empty value — clap would reject the empty string as an invalid
+    /// variant and the replay would never start. Same trap `--message` and
+    /// `--spec-url` document on the tv-arm paths.
+    #[test]
+    fn raw_replay_omits_an_unknown_source() {
+        let args = raw_replay_args(Path::new("/tmp/p.json"), "AUD/NZD", "", TS);
+        assert!(!args.iter().any(|a| a == "--source"), "{args:?}");
+        // The instrument is still named — it is the flag that must never drop.
+        assert!(args.iter().any(|a| a == "--instrument"), "{args:?}");
+    }
+
+    /// `--annotate` is `ArgAction::Set`, not a bare switch: the value must be
+    /// spelled out or clap consumes the next token as its value.
+    #[test]
+    fn raw_replay_spells_out_the_annotate_value() {
+        let args = raw_replay_args(Path::new("/tmp/p.json"), "AUD/NZD", "tradenation", TS);
+        let i = args
+            .iter()
+            .position(|a| a == "--annotate")
+            .unwrap_or_default();
+        assert_eq!(args.get(i + 1).map(String::as_str), Some("true"));
     }
 
     #[test]

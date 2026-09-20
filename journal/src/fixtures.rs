@@ -142,8 +142,9 @@ fn strip_entry_rule(head: &str, fallback_dash: usize) -> &str {
 pub enum Status {
     /// No cell matched this plan.
     None,
-    /// `cells` cells of one capture matched.
-    Saved { base: String, cells: usize },
+    /// The cells of one capture matched. `names` are those cells' directory
+    /// names, in the corpus scan's sorted order — what a re-bless iterates.
+    Saved { base: String, names: Vec<String> },
 }
 
 impl Status {
@@ -151,12 +152,32 @@ impl Status {
     pub fn label(&self) -> String {
         match self {
             Status::None => "no fixture".to_string(),
-            Status::Saved { cells, .. } => format!("fixture {cells} ✓"),
+            Status::Saved { names, .. } => format!("fixture {} ✓", names.len()),
         }
     }
 
     pub fn is_saved(&self) -> bool {
         matches!(self, Status::Saved { .. })
+    }
+
+    /// How many cells matched. This was the whole of `Saved` until the
+    /// re-bless key needed to *name* the cells rather than just count them.
+    pub fn cells(&self) -> usize {
+        self.names().len()
+    }
+
+    /// The matched cells' directory names — what a re-bless iterates.
+    ///
+    /// These are exactly the cells the info bar counted, which is the point:
+    /// the operator re-blesses what they were just told exists, and nothing
+    /// else. A plan with no fixture yields an empty slice, so a caller that
+    /// forgets to check [`Self::is_saved`] re-blesses **nothing** rather than
+    /// falling back to the whole corpus.
+    pub fn names(&self) -> &[String] {
+        match self {
+            Status::None => &[],
+            Status::Saved { names, .. } => names,
+        }
     }
 }
 
@@ -230,8 +251,12 @@ pub fn status_for(
         return Status::None;
     };
     let base = best.base().to_string();
-    let cells = candidates.iter().filter(|c| c.base() == base).count();
-    Status::Saved { base, cells }
+    let names: Vec<String> = candidates
+        .iter()
+        .filter(|c| c.base() == base)
+        .map(|c| c.name.clone())
+        .collect();
+    Status::Saved { base, names }
 }
 
 /// Parse an RFC3339 instant, tolerating the sub-second precision plan exports
@@ -415,7 +440,11 @@ mod tests {
             status,
             Status::Saved {
                 base: "aud-cad-h1-2026-07-22".into(),
-                cells: 3
+                names: vec![
+                    "aud-cad-h1-2026-07-22-normal-news-off".into(),
+                    "aud-cad-h1-2026-07-22-normal-news-on".into(),
+                    "aud-cad-h1-2026-07-22-skip-bcr-news-off".into(),
+                ]
             }
         );
         assert_eq!(status.label(), "fixture 3 ✓");
@@ -464,12 +493,13 @@ mod tests {
         ));
         let status = status_for(&cells, "AUD_CAD", "h1", Some("2026-07-22T09:12:10Z"));
         assert_eq!(
-            status,
-            Status::Saved {
-                base: "aud-cad-h1-2026-07-22".into(),
-                cells: 2
-            },
-            "the nearer capture's 2 cells, not all 3"
+            status.names(),
+            [
+                "aud-cad-h1-2026-07-22-normal-news-off",
+                "aud-cad-h1-2026-07-22-normal-news-on"
+            ],
+            "the nearer capture's 2 cells, not all 3 — and the far cell must \
+             not be named, or a re-bless would rewrite another setup's golden"
         );
     }
 
@@ -539,6 +569,15 @@ mod tests {
         );
     }
 
+    /// A plan with no fixture must name NO cells. The re-bless key iterates
+    /// `names()`, so an empty slice here is what stops a "re-bless" on an
+    /// unmatched plan from reaching for the whole corpus.
+    #[test]
+    fn no_fixture_names_no_cells() {
+        assert_eq!(Status::None.names(), [] as [String; 0]);
+        assert_eq!(Status::None.cells(), 0);
+    }
+
     /// An empty or missing corpus directory is a normal state, not an error.
     #[test]
     fn scanning_a_missing_dir_yields_an_empty_corpus() {
@@ -594,12 +633,13 @@ mod tests {
         let cells = scan(&tmp);
         assert_eq!(cells.len(), 2, "only the two real cells: {cells:?}");
         let status = status_for(&cells, "AUD_CAD", "h1", Some("2026-07-22T09:12:10Z"));
+        assert_eq!(status.cells(), 2);
         assert_eq!(
-            status,
-            Status::Saved {
-                base: "aud-cad-h1-2026-07-22".into(),
-                cells: 2
-            }
+            status.names(),
+            [
+                "aud-cad-h1-2026-07-22-normal-news-off",
+                "aud-cad-h1-2026-07-22-normal-news-on"
+            ]
         );
         std::fs::remove_dir_all(&tmp).ok();
     }

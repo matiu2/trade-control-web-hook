@@ -28,6 +28,23 @@ pub enum Action {
     /// launched with. The count isn't restated in the status message; that
     /// reports what actually landed on disk (see `App::apply_job`).
     SaveFixture,
+    /// The `f` key: re-bless this plan's saved fixture cells, or — when it has
+    /// none — prompt for a message and capture one. Which arm runs is decided
+    /// by the fixture status the info bar is already showing, so the key does
+    /// what the operator just read.
+    FixtureKey,
+    /// The `R` key: replay the STORED plan as-is (`replay-candles --plan`),
+    /// with no chart read and no tv-arm re-arm. Capital-R deliberately: it is
+    /// a different question from `r`, not a variation of it.
+    RawReplay,
+    /// Type a character into the open one-line prompt.
+    PromptPush(char),
+    /// Backspace one character in the open prompt.
+    PromptPop,
+    /// Accept the prompt and run its pending action (Enter).
+    PromptAccept,
+    /// Cancel the prompt, dropping the text and the action (Esc).
+    PromptCancel,
     TogglePopup,
     RequestDelete,
     ConfirmYes,
@@ -70,6 +87,24 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
     // on any screen or modal.
     if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return Action::Redraw;
+    }
+
+    // An open one-line prompt (the fixture message) is a text field and must
+    // swallow every printable key, exactly as the `/` search prompt does — a
+    // typed `q` would otherwise quit mid-message. It sits ABOVE the search
+    // block because it is modal on every screen, including the list where a
+    // search prompt could also exist; only one can be open at a time, and this
+    // one wins while it is.
+    if app.prompt.is_some() {
+        return match key.code {
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::PromptPush(c)
+            }
+            KeyCode::Backspace => Action::PromptPop,
+            KeyCode::Enter => Action::PromptAccept,
+            KeyCode::Esc => Action::PromptCancel,
+            _ => Action::None,
+        };
     }
 
     // An open `/` search prompt is a text field: it swallows every printable
@@ -142,6 +177,9 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
             KeyCode::Left => Action::Shallower,
             KeyCode::Char('l') => Action::LoadTv,
             KeyCode::Char('r') => Action::Replay,
+            KeyCode::Char('R') => Action::RawReplay,
+            KeyCode::Char('f') | KeyCode::Char('F') => Action::FixtureKey,
+            KeyCode::Char('s') | KeyCode::Char('S') => Action::SaveFixture,
             KeyCode::Char('c') => Action::Copy,
             KeyCode::Char('o') => Action::OpenScreenshot,
             KeyCode::Char('i') => Action::TogglePopup,
@@ -165,6 +203,8 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
         KeyCode::Left => Action::Shallower,
         KeyCode::Char('l') => Action::LoadTv,
         KeyCode::Char('r') => Action::Replay,
+        KeyCode::Char('R') => Action::RawReplay,
+        KeyCode::Char('f') | KeyCode::Char('F') => Action::FixtureKey,
         KeyCode::Char('s') | KeyCode::Char('S') => Action::SaveFixture,
         KeyCode::Char('c') => Action::Copy,
         KeyCode::Char('o') => Action::OpenScreenshot,
@@ -185,6 +225,12 @@ pub fn apply(app: &mut App, action: Action) {
         Action::LoadTv => app.load_tv(),
         Action::Replay => app.rerun_replay(),
         Action::SaveFixture => app.save_fixture_current(),
+        Action::FixtureKey => app.fixture_key(),
+        Action::RawReplay => app.raw_replay_current(),
+        Action::PromptPush(c) => app.prompt_push(c),
+        Action::PromptPop => app.prompt_pop(),
+        Action::PromptAccept => app.prompt_accept(),
+        Action::PromptCancel => app.prompt_cancel(),
         Action::TogglePopup => app.toggle_popup(),
         Action::RequestDelete => app.request_delete(),
         Action::ConfirmYes => app.resolve_confirm(true),
@@ -289,6 +335,84 @@ mod tests {
         // With no filter, Esc quits as before.
         app.search_clear();
         assert_eq!(map_key(&app, esc), Action::Quit);
+    }
+
+    /// **The** thing that would break the message prompt: while typing a
+    /// reason, letters that are command bindings must be captured as text.
+    /// `f` would re-open the prompt, `q` would quit, `x` would ask to delete,
+    /// `R` would fire a raw replay — mid-message.
+    #[test]
+    fn typing_in_the_message_prompt_never_triggers_commands() {
+        let mut app = app_with_one_plan();
+        app.prompt = Some(crate::prompt::Prompt::new(
+            "fixture message",
+            crate::prompt::Pending::SaveFixture {
+                trade_id: "hs-eur-usd-1".into(),
+            },
+        ));
+        for c in [
+            'q', 'd', 'r', 'R', 'c', 'l', 's', 'i', 'n', 'x', 'o', 'f', '/',
+        ] {
+            assert_eq!(
+                map_key(&app, press(c)),
+                Action::PromptPush(c),
+                "'{c}' must be typed into the message, not run as a command"
+            );
+        }
+        // Enter accepts, Esc cancels, Backspace edits.
+        let key = |code| map_key(&app, KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(key(KeyCode::Enter), Action::PromptAccept);
+        assert_eq!(key(KeyCode::Esc), Action::PromptCancel);
+        assert_eq!(key(KeyCode::Backspace), Action::PromptPop);
+        // Ctrl-C still escapes — a text field must never trap the operator.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(&app, ctrl_c), Action::Quit);
+    }
+
+    /// `f` and `R` work on BOTH the list and the Replay screen — the Replay
+    /// screen rebinds most letters for scrolling, so a binding added only to
+    /// the list would be dead exactly where the fixture status is displayed.
+    #[test]
+    fn the_fixture_and_raw_replay_keys_work_on_both_screens() {
+        let mut app = app_with_one_plan();
+        for (upper, action) in [('F', Action::FixtureKey), ('R', Action::RawReplay)] {
+            let lower = upper.to_ascii_lowercase();
+            app.screen = crate::screen::Screen::List;
+            assert_eq!(map_key(&app, press(upper)), action, "list, '{upper}'");
+            app.screen = crate::screen::Screen::Replay;
+            assert_eq!(map_key(&app, press(upper)), action, "replay, '{upper}'");
+            // `f` is case-insensitive; `r`/`R` are NOT — lowercase r is the
+            // re-arm replay and must stay that way on both screens.
+            if upper == 'F' {
+                assert_eq!(map_key(&app, press(lower)), action, "replay, '{lower}'");
+            } else {
+                assert_eq!(map_key(&app, press(lower)), Action::Replay, "'{lower}'");
+            }
+        }
+    }
+
+    /// `R` (raw) and `r` (re-arm) are different questions, so they must never
+    /// collapse onto one action — on either screen.
+    #[test]
+    fn capital_r_is_not_the_same_action_as_lowercase_r() {
+        let mut app = app_with_one_plan();
+        for screen in [crate::screen::Screen::List, crate::screen::Screen::Replay] {
+            app.screen = screen;
+            assert_ne!(map_key(&app, press('R')), map_key(&app, press('r')));
+        }
+    }
+
+    /// The Replay screen's scroll bindings still win over the new letters —
+    /// `j`/`k`/`g`/`G` scroll there, and adding `f`/`R` must not have shadowed
+    /// them.
+    #[test]
+    fn replay_scroll_keys_survive_the_new_bindings() {
+        let mut app = app_with_one_plan();
+        app.screen = crate::screen::Screen::Replay;
+        assert_eq!(map_key(&app, press('j')), Action::ReplayScroll(1));
+        assert_eq!(map_key(&app, press('k')), Action::ReplayScroll(-1));
+        assert_eq!(map_key(&app, press('g')), Action::ReplayHome);
+        assert_eq!(map_key(&app, press('G')), Action::ReplayEnd);
     }
 
     /// Off the list, `/` is not a search key (no prompt on deeper screens), and

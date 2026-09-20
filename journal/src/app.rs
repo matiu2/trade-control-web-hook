@@ -55,6 +55,36 @@ pub struct PlanData {
     pub max_depth: u8,
     /// The last fixture-capture report (`s`), if one has run this session.
     pub fixture_report: Option<String>,
+    /// The last re-bless report (`f` on a plan that already has a fixture).
+    pub rebless_report: Option<String>,
+    /// Which of the three reports the Replay pane should show — the one whose
+    /// job landed **most recently**.
+    ///
+    /// Three runs land in one pane and they answer different questions, so
+    /// "which is on screen" is a fact that has to be recorded, not inferred. A
+    /// fixed precedence over the three `Option`s was the first attempt and is
+    /// wrong: a re-bless would permanently shadow every later `r`, and the
+    /// operator would read a stale report under a confident title. Keeping the
+    /// three bodies side by side (rather than one field they overwrite) means
+    /// switching back costs nothing.
+    pub shown_report: ReportKind,
+    /// The last RAW replay report (`R`) — the stored plan replayed as-is,
+    /// kept separate from `replay_report` (the re-armed run) so the two are
+    /// never mistaken for each other: they answer different questions.
+    pub raw_replay_report: Option<String>,
+}
+
+/// Which report the Replay pane is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReportKind {
+    /// `r` — the setup re-armed from the chart and replayed. The default,
+    /// since it is what the Replay screen runs on entry.
+    #[default]
+    Replay,
+    /// `R` — the stored plan replayed as-is.
+    RawReplay,
+    /// `f` — a re-bless of this plan's saved fixture cells.
+    Rebless,
 }
 
 /// A confirmation the operator must answer before a destructive action.
@@ -96,17 +126,26 @@ pub struct App {
     pub needs_clear: bool,
     /// The `/` search prompt + live query. Filters the list screen.
     pub search: SearchState,
+    /// An open one-line text prompt (today: the fixture-capture message), with
+    /// the action to run on accept. `None` when nothing is being typed.
+    pub prompt: Option<crate::prompt::Prompt>,
     /// A TV-load was **requested** (`l`, or the replay needing the chart) but
     /// the plan detail — which carries the broker for the exchange prefix —
     /// wasn't loaded yet, so it's parked until the timeline job lands. Nothing
     /// loads the chart unless the operator asked for it: there is no auto-load
     /// on screen entry (removed 2026-07-27).
     tv_load_pending: bool,
-    /// A fixture capture (`s`) was **requested** but the chart wasn't loaded (or
-    /// the detail wasn't fetched) yet, so it's parked. Separate from
-    /// [`Self::tv_load_pending`]: that one means "load the chart", this one means
-    /// "capture once the chart is up". Both can be set by a single `s` press.
-    save_fixture_pending: bool,
+    /// A fixture capture (`s` / `f`) was **requested** but the chart wasn't
+    /// loaded (or the detail wasn't fetched) yet, so it's parked. Separate from
+    /// [`Self::tv_load_pending`]: that one means "load the chart", this one
+    /// means "capture once the chart is up". Both can be set by one press.
+    ///
+    /// `Some(None)` is a parked capture with no message (the `s` key);
+    /// `Some(Some(text))` carries the `f` key's typed message through the wait,
+    /// which is why this is not a bare `bool` any more. Parking the message
+    /// with the request is what stops a chart load from silently dropping the
+    /// note the operator just wrote — and `--rebless` can never add it later.
+    save_fixture_pending: Option<Option<String>>,
     /// Every fixture cell found under `replay-fixtures/`, scanned once at
     /// startup and re-scanned when a capture completes. Held on the app rather
     /// than read per-frame because the info bar draws many times a second and
@@ -148,8 +187,9 @@ impl App {
             replay_scroll: 0,
             needs_clear: false,
             search: SearchState::default(),
+            prompt: None,
             tv_load_pending: false,
-            save_fixture_pending: false,
+            save_fixture_pending: None,
             fixtures: crate::fixtures::scan(&crate::fixtures::default_dir()),
             chart_backend,
         })
@@ -553,6 +593,7 @@ impl App {
             }
             JobOutcome::Replay(report) => {
                 self.data.entry(trade_id.clone()).or_default().replay_report = Some(report);
+                self.show_report(&trade_id, ReportKind::Replay);
                 self.status = Status::info(format!("{trade_id}: replay done"));
             }
             JobOutcome::LoadTv { already_there } => {
@@ -573,16 +614,17 @@ impl App {
                 if is_open && matches!(self.screen, Screen::Replay | Screen::Compare) {
                     self.start_replay(&trade_id);
                 }
-                // A parked `s` capture was waiting on exactly this chart.
-                if is_open && self.save_fixture_pending {
-                    self.save_fixture_pending = false;
+                // A parked capture was waiting on exactly this chart. Take the
+                // parked MESSAGE with it — dropping it here would silently lose
+                // the note the operator typed, and no later re-bless can add one.
+                if is_open && let Some(message) = self.save_fixture_pending.take() {
                     let armed_at = self
                         .data
                         .get(&trade_id)
                         .and_then(|d| d.detail.as_ref())
                         .and_then(|d| d.armed_at.clone());
                     match armed_at {
-                        Some(a) => self.spawn_save_fixture(&trade_id, a),
+                        Some(a) => self.spawn_save_fixture(&trade_id, a, message),
                         None => {
                             self.status =
                                 Status::error(format!("{trade_id}: no armed_at — cannot capture"))
@@ -606,12 +648,42 @@ impl App {
                 // `strategy-v2-qm-market`, joined the news on/off pair), and a
                 // baked-in number silently goes stale the next time it changes.
                 let cells = match self.current_fixture_status() {
-                    crate::fixtures::Status::Saved { cells, .. } => format!("{cells} cells"),
+                    st @ crate::fixtures::Status::Saved { .. } => {
+                        format!("{} cells", st.cells())
+                    }
                     crate::fixtures::Status::None => "saved".to_string(),
                 };
                 self.status = Status::info(format!(
                     "{trade_id}: fixtures in replay-fixtures/ ({cells})"
                 ));
+            }
+            JobOutcome::Rebless { report, ok, total } => {
+                self.data
+                    .entry(trade_id.clone())
+                    .or_default()
+                    .rebless_report = Some(report);
+                self.show_report(&trade_id, ReportKind::Rebless);
+                // A re-bless rewrites `expected.json` only, so the corpus's
+                // shape is unchanged and there is nothing to re-scan — but say
+                // plainly how many cells took the new golden. A partial run is
+                // an ERROR, not an info line: some goldens moved and some did
+                // not, which is the state most likely to be mistaken for a
+                // clean re-bless and committed.
+                self.status = if ok == total {
+                    Status::info(format!("{trade_id}: re-blessed {ok}/{total} cells"))
+                } else {
+                    Status::error(format!(
+                        "{trade_id}: re-blessed only {ok}/{total} cells — see the report"
+                    ))
+                };
+            }
+            JobOutcome::RawReplay(report) => {
+                self.data
+                    .entry(trade_id.clone())
+                    .or_default()
+                    .raw_replay_report = Some(report);
+                self.show_report(&trade_id, ReportKind::RawReplay);
+                self.status = Status::info(format!("{trade_id}: raw replay done (stored plan)"));
             }
             JobOutcome::Failed(msg) => {
                 self.status = Status::error(format!("{trade_id} {}: {msg}", kind.verb()));
@@ -691,6 +763,18 @@ impl App {
         let Some(trade_id) = self.current_plan().map(|p| p.trade_id.clone()) else {
             return;
         };
+        self.save_fixture_with_message(&trade_id, None);
+    }
+
+    /// Capture the fixture grid for `trade_id`, optionally recording `message`
+    /// as the capture's `--message`.
+    ///
+    /// The message is written into each cell's `meta.json` and is the one part
+    /// of a fixture a later `--rebless` will NOT touch — so it is written now
+    /// or never. That is why it rides through the chart-load park rather than
+    /// being read off the UI when the job finally spawns.
+    fn save_fixture_with_message(&mut self, trade_id: &str, message: Option<String>) {
+        let trade_id = trade_id.to_string();
         let armed_at = self
             .data
             .get(&trade_id)
@@ -700,7 +784,7 @@ impl App {
             // No detail yet (it carries `armed_at` and the broker). Park the
             // capture, and load the chart — which itself parks behind the
             // timeline fetch. Both land via `apply_job`.
-            self.save_fixture_pending = true;
+            self.save_fixture_pending = Some(message);
             self.status = Status::info(format!("{trade_id}: loading plan before capture…"));
             self.start_load_tv(&trade_id);
             return;
@@ -711,18 +795,18 @@ impl App {
             .map(|d| d.tv_loaded)
             .unwrap_or(false);
         if !tv_loaded {
-            self.save_fixture_pending = true;
+            self.save_fixture_pending = Some(message);
             self.status = Status::info(format!("{trade_id}: loading chart before capture…"));
             self.start_load_tv(&trade_id);
             return;
         }
-        self.spawn_save_fixture(&trade_id, armed_at);
+        self.spawn_save_fixture(&trade_id, armed_at, message);
     }
 
     /// Spawn the capture job for a plan whose chart is already loaded. Split from
     /// [`Self::save_fixture_current`] so the deferred path (chart just finished
     /// loading) can reuse it without re-running the gates.
-    fn spawn_save_fixture(&mut self, trade_id: &str, armed_at: String) {
+    fn spawn_save_fixture(&mut self, trade_id: &str, armed_at: String, message: Option<String>) {
         if !self.mark_in_flight(trade_id, JobKind::SaveFixture) {
             return;
         }
@@ -748,8 +832,190 @@ impl App {
             armed_at,
             skip_flags,
             trade_id.to_string(),
+            message,
             spec_url,
         );
+    }
+
+    /// Point the Replay pane at `kind` for `trade_id`, and send it back to the
+    /// top.
+    ///
+    /// The scroll reset matters: the three reports differ wildly in length, so
+    /// carrying a scroll offset across a switch can land the operator in blank
+    /// space below a short report with nothing visible to explain it.
+    ///
+    /// Only the OPEN plan's pane is retargeted — a job finishing for a plan the
+    /// operator has already navigated away from must not yank what they are
+    /// reading. Its report is still stored, and shows when they return.
+    fn show_report(&mut self, trade_id: &str, kind: ReportKind) {
+        if let Some(d) = self.data.get_mut(trade_id) {
+            d.shown_report = kind;
+        }
+        let is_open = self
+            .current_plan()
+            .map(|p| p.trade_id == trade_id)
+            .unwrap_or(false);
+        if is_open {
+            self.replay_scroll = 0;
+        }
+    }
+
+    /// The `f` key: **re-bless** this plan's saved fixture cells if it has any,
+    /// otherwise **record** one.
+    ///
+    /// The branch is on the very status the info bar is showing, so the key
+    /// does what the operator just read. The two arms are deliberately
+    /// different verbs, not two spellings of one:
+    ///
+    /// * **Has a fixture → re-bless.** Recompute each matched cell's outcome
+    ///   from its own frozen plan + candles and overwrite `expected.json`.
+    ///   Offline, no chart, no broker. Crucially it rewrites *only* that file,
+    ///   so the hand-written `meta.message` — the note saying why the fixture
+    ///   exists — survives. That is why re-blessing is right after an intended
+    ///   behaviour change and a re-capture is not: a re-capture would destroy
+    ///   the message.
+    /// * **No fixture → capture one**, after prompting for that message. The
+    ///   prompt comes first precisely because `--rebless` will never be able to
+    ///   add it later.
+    ///
+    /// A re-bless is *destructive to goldens*: it says "the new answer is
+    /// correct". It is scoped to this plan's matched cells and never the whole
+    /// corpus — see [`jobs::spawn_rebless`].
+    pub fn fixture_key(&mut self) {
+        let Some(trade_id) = self.current_plan().map(|p| p.trade_id.clone()) else {
+            return;
+        };
+        let status = self.current_fixture_status();
+        if status.is_saved() {
+            self.start_rebless(&trade_id, status.names().to_vec());
+        } else {
+            // No fixture yet: ask why it will exist, then capture. The capture
+            // itself needs the chart, and `save_fixture_current` already owns
+            // that parking dance — so the prompt only collects the text.
+            self.prompt = Some(crate::prompt::Prompt::new(
+                format!("fixture message for {trade_id}"),
+                crate::prompt::Pending::SaveFixture {
+                    trade_id: trade_id.clone(),
+                },
+            ));
+            self.status = Status::info(format!(
+                "{trade_id}: no fixture — type a message, Enter to capture, Esc to cancel"
+            ));
+        }
+    }
+
+    /// Spawn the re-bless job for `cells`.
+    ///
+    /// The fixtures directory is resolved **here**, once, and handed down —
+    /// never left to `replay-candles`' own resolution, which walks up from the
+    /// cwd and falls back to a build-time manifest path. In a deployed binary
+    /// that has pointed at a deleted deploy worktree, and the recorded cost was
+    /// a `--rebless` that silently covered 19 of 63 cells. Resolving it here
+    /// also guarantees the cells re-blessed are the cells the info bar matched,
+    /// since both read [`crate::fixtures::default_dir`].
+    fn start_rebless(&mut self, trade_id: &str, cells: Vec<String>) {
+        if cells.is_empty() {
+            self.status = Status::error(format!("{trade_id}: no fixture cells to re-bless"));
+            return;
+        }
+        if !self.mark_in_flight(trade_id, JobKind::Rebless) {
+            return;
+        }
+        let dir = crate::fixtures::default_dir();
+        self.status = Status::info(format!("{trade_id}: re-blessing {} cell(s)…", cells.len()));
+        jobs::spawn_rebless(self.job_tx.clone(), trade_id.to_string(), cells, dir);
+    }
+
+    /// The `R` key: **raw replay** — replay the plan the worker actually holds,
+    /// exported straight from it, with no chart read and no re-arm.
+    ///
+    /// This is the counterpart to `r`, not a faster version of it. `r` re-arms
+    /// the setup from the chart through tv-arm and replays what it just built,
+    /// so it answers *"what would this setup do if I armed it today"* — useful,
+    /// but it depends on the chart being loaded and on the geometry tv-arm
+    /// re-reads. `R` feeds `replay-candles --plan` the stored plan verbatim, so
+    /// it answers *"what does the plan that is really out there do"*. When the
+    /// two disagree, the difference is the re-arm.
+    ///
+    /// Needs no chart, so there is no parking dance — but it does need the
+    /// plan's broker, which lives in the detail. A plan whose detail hasn't
+    /// been fetched yet loads it first and says so, rather than silently
+    /// falling back to the CLI's `tradenation` default and pulling the wrong
+    /// feed for an OANDA plan.
+    pub fn raw_replay_current(&mut self) {
+        let Some(row) = self.current_plan().cloned() else {
+            return;
+        };
+        let trade_id = row.trade_id.clone();
+        // Both facts live in the detail: the broker (which picks the candle
+        // feed) and `armed_at` (which becomes `--start`). Neither may be
+        // guessed — a missing `--source` pulls the wrong broker's candles and a
+        // missing `--start` lets the chart set the window — so a plan whose
+        // detail has not landed loads it first and says so.
+        let detail = self
+            .data
+            .get(&trade_id)
+            .and_then(|d| d.detail.as_ref())
+            .map(|d| (d.broker.clone(), d.armed_at.clone()));
+        let Some((broker, Some(armed_at))) = detail else {
+            self.status = Status::info(format!("{trade_id}: loading plan before raw replay…"));
+            self.start_timeline(&trade_id);
+            return;
+        };
+        if broker.is_empty() {
+            self.status = Status::info(format!("{trade_id}: loading plan before raw replay…"));
+            self.start_timeline(&trade_id);
+            return;
+        }
+        if !self.mark_in_flight(&trade_id, JobKind::RawReplay) {
+            return;
+        }
+        self.status = Status::info(format!("{trade_id}: raw replay of the stored plan…"));
+        jobs::spawn_raw_replay(
+            self.job_tx.clone(),
+            trade_id,
+            row.instrument.clone(),
+            broker,
+            armed_at,
+        );
+    }
+
+    /// Type a character into the open prompt.
+    pub fn prompt_push(&mut self, c: char) {
+        if let Some(p) = self.prompt.as_mut() {
+            p.push(c);
+        }
+    }
+
+    /// Backspace one character in the open prompt.
+    pub fn prompt_pop(&mut self) {
+        if let Some(p) = self.prompt.as_mut() {
+            p.pop();
+        }
+    }
+
+    /// Accept the prompt and run its pending action.
+    ///
+    /// The action's trade id comes from the PROMPT, not from the current
+    /// selection — the operator may have moved the cursor while typing, and the
+    /// message they wrote belongs to the trade they opened the prompt on.
+    pub fn prompt_accept(&mut self) {
+        let Some(p) = self.prompt.take() else {
+            return;
+        };
+        let message = p.text().map(str::to_string);
+        match p.pending {
+            crate::prompt::Pending::SaveFixture { trade_id } => {
+                self.save_fixture_with_message(&trade_id, message);
+            }
+        }
+    }
+
+    /// Cancel the prompt, dropping both the text and the pending action.
+    pub fn prompt_cancel(&mut self) {
+        if self.prompt.take().is_some() {
+            self.status = Status::info("cancelled");
+        }
     }
 
     /// Request a replay re-run (the `r` key), bypassing the cache.
@@ -760,8 +1026,11 @@ impl App {
         if let Some(d) = self.data.get_mut(&trade_id) {
             d.replay_report = None;
         }
-        // A fresh report starts at the top.
-        self.replay_scroll = 0;
+        // Point the pane back at the re-armed report NOW, not when the job
+        // lands: otherwise a prior `R`/`f` keeps its report on screen for the
+        // ~25s the replay takes, under its own title, looking like the answer
+        // to the `r` that was just pressed.
+        self.show_report(&trade_id, ReportKind::Replay);
         self.start_replay(&trade_id);
     }
 
@@ -958,8 +1227,9 @@ impl App {
             replay_scroll: 0,
             needs_clear: false,
             search: SearchState::default(),
+            prompt: None,
             tv_load_pending: false,
-            save_fixture_pending: false,
+            save_fixture_pending: None,
             // Render tests must not depend on whatever is on the developer's
             // disk; a test that wants a corpus sets `fixtures` explicitly.
             fixtures: Vec::new(),
@@ -1009,9 +1279,10 @@ impl App {
         self.in_flight.len()
     }
 
-    /// Whether a fixture capture is parked waiting on the chart (test helper).
-    pub fn save_fixture_pending(&self) -> bool {
-        self.save_fixture_pending
+    /// Whether a fixture capture is parked waiting on the chart, and the
+    /// message parked with it (test helper).
+    pub fn save_fixture_pending(&self) -> Option<Option<&str>> {
+        self.save_fixture_pending.as_ref().map(|m| m.as_deref())
     }
 
     /// Whether a specific job is in flight (test helper).
@@ -1174,6 +1445,231 @@ mod tests {
     const TIMELINE: &str = include_str!("../tests/fixtures/plan_timeline.json");
     const REPLAY: &str = include_str!("../tests/fixtures/replay_report.txt");
 
+    /// Seed a plan whose corpus already holds a matching fixture cell, so the
+    /// `f` key's saved arm is reachable. The cell's instrument/granularity/start
+    /// must satisfy `fixtures::status_for` against the plan's `armed_at`.
+    fn app_with_a_saved_fixture() -> App {
+        let mut app = App::from_rows(vec![row("hs-aud-cad-a07622da")]);
+        let detail = parse_plan_export(EXPORT).expect("the fixture parses");
+        let armed = detail
+            .armed_at
+            .clone()
+            .expect("the export fixture carries armed_at");
+        let start = chrono::DateTime::parse_from_rfc3339(&armed)
+            .expect("armed_at parses")
+            .with_timezone(&chrono::Utc);
+        app.fixtures = ["normal-news-off", "normal-news-on"]
+            .iter()
+            .map(|rule| crate::fixtures::Cell {
+                name: format!("aud-cad-h1-2026-07-22-{rule}"),
+                instrument: detail.instrument.clone(),
+                granularity: detail.granularity.clone(),
+                start,
+            })
+            .collect();
+        app.seed_current(PlanData {
+            detail: Some(detail),
+            tv_loaded: true,
+            ..Default::default()
+        });
+        app
+    }
+
+    /// `f` on a plan that HAS a fixture re-blesses it — it must not open the
+    /// message prompt, and it must not start a capture (which would rewrite
+    /// the cells' candles and destroy their hand-written `meta.message`).
+    #[test]
+    fn f_on_a_saved_fixture_reblesses_rather_than_recapturing() {
+        let mut app = app_with_a_saved_fixture();
+        assert!(app.current_fixture_status().is_saved(), "precondition");
+        app.fixture_key();
+        assert!(app.prompt.is_none(), "no prompt on the re-bless arm");
+        assert!(
+            app.is_current_loading(JobKind::Rebless),
+            "a re-bless job started"
+        );
+        assert!(
+            !app.is_current_loading(JobKind::SaveFixture),
+            "must NOT re-capture: that would destroy meta.message"
+        );
+    }
+
+    /// `f` on a plan with NO fixture prompts for the message first, and starts
+    /// nothing until the prompt is answered. The message can only be written at
+    /// capture time — `--rebless` never adds one — so asking first is the whole
+    /// point of the prompt.
+    #[test]
+    fn f_without_a_fixture_prompts_before_capturing() {
+        let mut app = App::from_rows(vec![row("hs-aud-cad-a07622da")]);
+        app.seed_current(PlanData {
+            detail: parse_plan_export(EXPORT).ok(),
+            tv_loaded: true,
+            ..Default::default()
+        });
+        assert!(!app.current_fixture_status().is_saved(), "precondition");
+        app.fixture_key();
+        assert!(app.prompt.is_some(), "prompt opened");
+        assert!(
+            !app.is_current_loading(JobKind::SaveFixture),
+            "nothing captured until the prompt is answered"
+        );
+        assert!(!app.is_current_loading(JobKind::Rebless), "nothing blessed");
+    }
+
+    /// Accepting the prompt runs the capture. Cancelling runs NOTHING — an
+    /// abandoned prompt must not leave a capture queued behind it.
+    #[test]
+    fn the_prompt_accepts_into_a_capture_and_cancels_into_nothing() {
+        let mut app = App::from_rows(vec![row("hs-aud-cad-a07622da")]);
+        app.seed_current(PlanData {
+            detail: parse_plan_export(EXPORT).ok(),
+            tv_loaded: true,
+            ..Default::default()
+        });
+        app.fixture_key();
+        app.prompt_cancel();
+        assert!(app.prompt.is_none(), "cancelled");
+        assert!(
+            !app.is_current_loading(JobKind::SaveFixture),
+            "cancel starts nothing"
+        );
+
+        app.fixture_key();
+        for c in "news spike".chars() {
+            app.prompt_push(c);
+        }
+        app.prompt_accept();
+        assert!(app.prompt.is_none(), "prompt closed on accept");
+        assert!(
+            app.is_current_loading(JobKind::SaveFixture),
+            "accept starts the capture"
+        );
+    }
+
+    /// The typed message must survive the chart-load wait. A capture requested
+    /// with the chart down is PARKED, and dropping the message there would
+    /// silently lose the note — which no later re-bless can restore.
+    #[test]
+    fn a_parked_capture_keeps_the_typed_message() {
+        let mut app = App::from_rows(vec![row("hs-aud-cad-a07622da")]);
+        app.seed_current(PlanData {
+            detail: parse_plan_export(EXPORT).ok(),
+            // Chart NOT loaded: the capture must park.
+            tv_loaded: false,
+            ..Default::default()
+        });
+        app.fixture_key();
+        for c in "why".chars() {
+            app.prompt_push(c);
+        }
+        app.prompt_accept();
+        assert_eq!(
+            app.save_fixture_pending(),
+            Some(Some("why")),
+            "the message is parked with the request, not dropped"
+        );
+    }
+
+    /// A plan with no fixture must re-bless NOTHING rather than falling back to
+    /// the corpus — a stray `f` cannot be allowed to rewrite other setups'
+    /// goldens.
+    #[test]
+    fn rebless_with_no_matched_cells_starts_no_job() {
+        let mut app = App::from_rows(vec![row("t1")]);
+        app.start_rebless("t1", Vec::new());
+        assert!(!app.is_current_loading(JobKind::Rebless));
+        assert!(app.status.is_error, "and says so: {}", app.status.text);
+    }
+
+    /// A partial re-bless is an ERROR, not an info line: some goldens moved and
+    /// some did not, which is the state most easily mistaken for a clean run
+    /// and committed.
+    #[test]
+    fn a_partial_rebless_is_reported_as_an_error() {
+        let mut app = App::from_rows(vec![row("t1")]);
+        app.mark_in_flight_test("t1", JobKind::Rebless);
+        app.inject_job(JobResult {
+            trade_id: "t1".into(),
+            kind: JobKind::Rebless,
+            outcome: JobOutcome::Rebless {
+                report: "…".into(),
+                ok: 3,
+                total: 8,
+            },
+        });
+        app.drain_jobs();
+        assert!(app.status.is_error, "{}", app.status.text);
+        assert!(app.status.text.contains("3/8"), "{}", app.status.text);
+
+        // A complete one is not an error.
+        app.mark_in_flight_test("t1", JobKind::Rebless);
+        app.inject_job(JobResult {
+            trade_id: "t1".into(),
+            kind: JobKind::Rebless,
+            outcome: JobOutcome::Rebless {
+                report: "…".into(),
+                ok: 8,
+                total: 8,
+            },
+        });
+        app.drain_jobs();
+        assert!(!app.status.is_error, "{}", app.status.text);
+    }
+
+    /// The three reports share one pane, so which is shown must track the job
+    /// that landed LAST — not a fixed precedence, which would let a re-bless
+    /// shadow every later replay for the rest of the session.
+    #[test]
+    fn the_pane_follows_the_most_recent_run() {
+        let mut app = App::from_rows(vec![row("t1")]);
+        let land = |app: &mut App, kind: JobKind, outcome: JobOutcome| {
+            app.mark_in_flight_test("t1", kind);
+            app.inject_job(JobResult {
+                trade_id: "t1".into(),
+                kind,
+                outcome,
+            });
+            app.drain_jobs();
+        };
+        land(
+            &mut app,
+            JobKind::Rebless,
+            JobOutcome::Rebless {
+                report: "blessed".into(),
+                ok: 1,
+                total: 1,
+            },
+        );
+        assert_eq!(
+            app.data.get("t1").map(|d| d.shown_report),
+            Some(ReportKind::Rebless)
+        );
+        // A replay landing AFTER the re-bless must take the pane back.
+        land(
+            &mut app,
+            JobKind::Replay,
+            JobOutcome::Replay("re-armed".into()),
+        );
+        assert_eq!(
+            app.data.get("t1").map(|d| d.shown_report),
+            Some(ReportKind::Replay),
+            "a later replay must not stay hidden behind the re-bless"
+        );
+        // And a raw replay after that.
+        land(
+            &mut app,
+            JobKind::RawReplay,
+            JobOutcome::RawReplay("stored".into()),
+        );
+        assert_eq!(
+            app.data.get("t1").map(|d| d.shown_report),
+            Some(ReportKind::RawReplay)
+        );
+        // All three bodies are still held, so switching back costs nothing.
+        let d = app.data.get("t1").expect("cached");
+        assert!(d.replay_report.is_some() && d.rebless_report.is_some());
+    }
+
     /// The capture re-arms from the live chart, so pressing `s` with the chart
     /// NOT loaded must not fire tv-arm against whatever chart happens to be up —
     /// it parks the request and loads the chart first.
@@ -1188,9 +1684,10 @@ mod tests {
             tv_loaded: false, // chart NOT up
             max_depth: 1,
             fixture_report: None,
+            ..Default::default()
         });
         app.save_fixture_current();
-        assert!(app.save_fixture_pending(), "capture parked");
+        assert!(app.save_fixture_pending().is_some(), "capture parked");
         assert!(
             !app.in_flight_test("hs-aud-cad-a07622da", JobKind::SaveFixture),
             "must NOT capture against an unloaded chart"
@@ -1209,6 +1706,7 @@ mod tests {
             tv_loaded: true,
             max_depth: 3,
             fixture_report: None,
+            ..Default::default()
         });
         app.save_fixture_current();
         assert!(
@@ -1216,7 +1714,7 @@ mod tests {
             "capture spawned: {}",
             app.status.text
         );
-        assert!(!app.save_fixture_pending(), "not parked — it ran");
+        assert!(app.save_fixture_pending().is_none(), "not parked — it ran");
     }
 
     /// A finished capture caches its report and reports success.
@@ -1275,6 +1773,7 @@ mod tests {
             tv_loaded: true,
             max_depth: 1,
             fixture_report: None,
+            ..Default::default()
         });
         // The plan row must carry the fixture's instrument/granularity for the
         // match; `row()` already uses AUD_CAD / h1, and EXPORT's armed_at is
@@ -1476,6 +1975,7 @@ mod tests {
             tv_loaded: false,
             max_depth: 0,
             fixture_report: None,
+            ..Default::default()
         });
         app.push_deeper(); // List → Timeline
         assert_eq!(app.screen, Screen::Timeline);
@@ -1559,6 +2059,7 @@ mod tests {
             tv_loaded: false, // chart not loaded yet
             max_depth: 2,
             fixture_report: None,
+            ..Default::default()
         });
         app.set_screen(Screen::Replay);
         app.start_replay("hs-aud-cad-a07622da");
