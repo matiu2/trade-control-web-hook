@@ -205,11 +205,21 @@ pub fn parse_replay_outcome(report: &str) -> ReplayOutcome {
 /// **Not the tick.** `tick_ts` is the cron's wall clock — when the scheduler
 /// happened to observe the bar, not when the rule fired. A cron that runs at
 /// half past stamps a 10:00 bar `10:30`, and the replay (which prints the bar)
-/// then looks an hour out, so every fire was reported as a phantom timing
-/// divergence. Both sides run the same `evaluate_plan`, and its `FiredIntent`
-/// carries the firing `candle` on each side, so the bar is the one instant
-/// they can agree on. `candle.time` is the bar's **open** (the OANDA /
-/// TradeNation convention), matching what the replay report prints.
+/// then looks half an hour out. Both sides run the same `evaluate_plan`, and
+/// its `FiredIntent` carries the firing `candle` on each side, so the bar is
+/// the one instant they can agree on. `candle.time` is the bar's **open** (the
+/// OANDA / TradeNation convention), matching what the replay report prints.
+///
+/// **This is a display fix, and a narrow one.** It only moves a stamp where
+/// `tick_ts` and `candle.time` disagree — a cron that ticked mid-bar on a
+/// granularity coarser than its own period. It does NOT explain a one-bar Δ
+/// where the two agree: there the engine really did fire on a different bar
+/// from the replay, and the cause is upstream. The known instance is the
+/// TradeNation forming-bar bug (`BUG-tn-native-granularity-emits-forming-bar.md`):
+/// the adapter served the still-open bar, so the worker fired an `on_close`
+/// rule against a provisional close. Timelines recorded before that fix keep
+/// their forming-bar stamps, so their Δ is a TRUE record of what live did —
+/// do not try to normalise it away here.
 pub fn live_fires(timeline_json: &str) -> Vec<FireFact> {
     let Ok(v) = serde_json::from_str::<Value>(timeline_json) else {
         return Vec::new();
