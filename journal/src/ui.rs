@@ -53,6 +53,12 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.confirm.is_some() {
         popup::render_confirm(f, app);
     }
+    // Drawn last so it sits above the others — while a prompt is open every
+    // key goes to it (see `keys::map_key`), so it must be what the operator
+    // sees on top.
+    if app.prompt.is_some() {
+        popup::render_prompt(f, app);
+    }
 }
 
 /// Dispatch the body area to the active screen's renderer.
@@ -75,16 +81,18 @@ fn render_body(f: &mut Frame, app: &App, area: Rect) {
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let load_hint = load_hint(&app.chart_backend);
     let hints = match app.screen {
-        Screen::List => "↑↓ move  →/n open  / search  s fixtures  c copy  q quit".to_string(),
+        Screen::List => {
+            "↑↓ move  →/n open  / search  f fixture  s fixtures  c copy  q quit".to_string()
+        }
         Screen::Replay => {
-            "↑↓/jk scroll  ←/→ nav  r replay  c copy  o shot  ^L refresh  i detail  x delete  q quit"
+            "↑↓/jk scroll  ←/→ nav  r replay  R raw  f fixture  c copy  o shot  i detail  x del  q quit"
                 .to_string()
         }
         Screen::Compare => format!(
-            "← back  l {load_hint}  r replay  s fixtures  c copy  o shot  i detail  d/x delete  q quit"
+            "← back  l {load_hint}  r replay  R raw  f fixture  c copy  o shot  i detail  d/x delete  q quit"
         ),
         _ => format!(
-            "← back  →/n deeper  l {load_hint}  r replay  s fixtures  c copy  o shot  i detail  d/x delete  q quit"
+            "← back  →/n deeper  l {load_hint}  r replay  R raw  f fixture  c copy  o shot  i detail  d/x del  q quit"
         ),
     };
     let status_style = if app.status.is_error {
@@ -242,6 +250,7 @@ mod tests {
             tv_loaded: true,
             max_depth: 1,
             fixture_report: None,
+            ..Default::default()
         });
         app.set_screen(Screen::Timeline);
 
@@ -272,6 +281,7 @@ mod tests {
             tv_loaded: true,
             max_depth: 1,
             fixture_report: None,
+            ..Default::default()
         });
         app.set_screen(Screen::Timeline);
 
@@ -307,6 +317,7 @@ mod tests {
             tv_loaded: true,
             max_depth: 1,
             fixture_report: None,
+            ..Default::default()
         });
         app.fixtures = fixtures;
         app.set_screen(Screen::Timeline);
@@ -370,6 +381,7 @@ mod tests {
             tv_loaded: true,
             max_depth: 1,
             fixture_report: None,
+            ..Default::default()
         });
         app.set_screen(Screen::Timeline);
         app.toggle_popup(); // open the detail popup
@@ -417,6 +429,7 @@ mod tests {
             tv_loaded: true,
             max_depth: 3,
             fixture_report: None,
+            ..Default::default()
         });
         app.set_screen(Screen::Compare);
 
@@ -467,6 +480,7 @@ mod tests {
             tv_loaded: true,
             max_depth: 2,
             fixture_report: None,
+            ..Default::default()
         });
         app.set_screen(Screen::Replay);
 

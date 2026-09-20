@@ -90,6 +90,45 @@ pub fn render_confirm(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// The one-line text prompt (today: the fixture-capture message).
+///
+/// A cursor block is drawn after the typed text rather than moving the
+/// terminal's real cursor — the TUI runs with the cursor hidden, so an
+/// unrendered caret would leave the operator typing into what looks like a
+/// dead box.
+pub fn render_prompt(f: &mut Frame, app: &App) {
+    let Some(prompt) = app.prompt.as_ref() else {
+        return;
+    };
+    let area = centered(70, 20, f.area());
+
+    let lines = vec![
+        Line::from(Span::styled(
+            prompt.title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("> "),
+            Span::styled(prompt.value.clone(), Style::default().fg(Color::White)),
+            Span::styled("█", Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter capture   Esc cancel   (the message is written once — a re-bless never adds one)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Fixture message ")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 /// Pretty-print single-line JSON; echo the input on parse failure.
 fn pretty_json(s: &str) -> String {
     serde_json::from_str::<serde_json::Value>(s)

@@ -26,6 +26,12 @@ pub enum JobKind {
     LoadTv,
     /// `tv-arm --save-fixture … replay` — capture the six-cell fixture corpus.
     SaveFixture,
+    /// `replay-candles --test-mode --fixture <cell> --rebless` over this plan's
+    /// matched cells — recompute their goldens from the frozen inputs.
+    Rebless,
+    /// `replay-candles --plan <FILE>` — replay the STORED plan as-is, with no
+    /// chart read and no re-arm.
+    RawReplay,
 }
 
 impl JobKind {
@@ -36,6 +42,8 @@ impl JobKind {
             JobKind::Replay => "running replay",
             JobKind::LoadTv => "loading TradingView",
             JobKind::SaveFixture => "saving fixtures",
+            JobKind::Rebless => "re-blessing fixtures",
+            JobKind::RawReplay => "running raw replay",
         }
     }
 }
@@ -64,6 +72,16 @@ pub enum JobOutcome {
     LoadTv { already_there: bool },
     /// The fixture-capture report text (tv-arm's per-cell summary).
     SaveFixture(String),
+    /// A re-bless run: the per-cell report, and how many of the attempted cells
+    /// succeeded. The count is carried separately rather than scraped back out
+    /// of the text so the status line can state it without parsing a report.
+    Rebless {
+        report: String,
+        ok: usize,
+        total: usize,
+    },
+    /// The raw (stored-plan) replay's report text.
+    RawReplay(String),
     /// The job failed; the string is the error to surface in the footer.
     Failed(String),
 }
@@ -111,7 +129,9 @@ pub fn spawn_replay(
 /// chart precondition and same `skip_flags` caveat as the replay: the capture
 /// must reproduce the ORIGINAL plan's prep set or it pins the wrong gates.
 /// `fixture_name` is the plan's `trade_id`, so a fixture traces back to its
-/// journal page.
+/// journal page. `message` is the operator's note on why the fixture exists,
+/// recorded in each cell's `meta.json`; it is the one field a later
+/// `--rebless` will not overwrite, so it is written here or never.
 ///
 /// `spec_url` is the replay's, with higher stakes: a capture off the wrong
 /// backend writes a wrong expectation into the committed corpus.
@@ -121,6 +141,7 @@ pub fn spawn_save_fixture(
     armed_at: String,
     skip_flags: Vec<String>,
     fixture_name: String,
+    message: Option<String>,
     spec_url: Option<String>,
 ) {
     spawn(tx, trade_id, JobKind::SaveFixture, move || {
@@ -129,10 +150,72 @@ pub fn spawn_save_fixture(
             &armed_at,
             &flags,
             &fixture_name,
-            None,
+            message.as_deref(),
             spec_url.as_deref(),
         )?;
         Ok(JobOutcome::SaveFixture(report))
+    });
+}
+
+/// Spawn the re-bless job — `replay-candles --test-mode --fixture <cell>
+/// --fixtures-dir <dir> --rebless`, once per cell, on a worker thread.
+///
+/// `cells` are the directory names [`crate::fixtures::Status::names`] matched
+/// for this plan, and **only** those: a re-bless launched from one plan's page
+/// must never rewrite another setup's goldens, which is why this takes an
+/// explicit list rather than a glob.
+///
+/// `fixtures_dir` is passed through to every cell's invocation. Resolving it
+/// once in the caller and handing it down is deliberate — the CLI's own default
+/// walks up from the cwd, and a deployed binary has resolved that to a
+/// different checkout before, re-blessing 19 of 63 cells with no error either
+/// way.
+///
+/// **A failing cell does not abort the run.** Each cell's outcome is appended
+/// to the report and the loop continues, so one bad cell can't hide the rest —
+/// the same contract `replay-candles`' own batch mode keeps.
+pub fn spawn_rebless(
+    tx: Sender<JobResult>,
+    trade_id: String,
+    cells: Vec<String>,
+    fixtures_dir: std::path::PathBuf,
+) {
+    spawn(tx, trade_id, JobKind::Rebless, move || {
+        let total = cells.len();
+        let mut report = String::new();
+        let mut ok = 0usize;
+        for cell in &cells {
+            match cli::rebless_fixture_cell(cell, &fixtures_dir) {
+                Ok(out) => {
+                    ok += 1;
+                    report.push_str(&format!("=== {cell}: re-blessed ===\n{out}\n"));
+                }
+                Err(e) => report.push_str(&format!("=== {cell}: FAILED ===\n{e}\n")),
+            }
+        }
+        Ok(JobOutcome::Rebless { report, ok, total })
+    });
+}
+
+/// Spawn the raw-replay job — export the stored plan and feed it straight to
+/// `replay-candles --plan`. No chart, no re-arm, so unlike [`spawn_replay`]
+/// this has no chart precondition and no skip flags to reproduce: the plan is
+/// replayed exactly as the worker holds it.
+///
+/// `armed_at` becomes `--start`. It is the same cursor the re-armed replay
+/// uses, so the two runs cover the same window and stay comparable — and
+/// without it `replay-candles` takes the window start from the TradingView
+/// chart, which for an expired plan produces a window that runs backwards.
+pub fn spawn_raw_replay(
+    tx: Sender<JobResult>,
+    trade_id: String,
+    instrument: String,
+    broker: String,
+    armed_at: String,
+) {
+    spawn(tx, trade_id.clone(), JobKind::RawReplay, move || {
+        let report = cli::raw_replay(&trade_id, &instrument, &broker, &armed_at)?;
+        Ok(JobOutcome::RawReplay(report))
     });
 }
 
