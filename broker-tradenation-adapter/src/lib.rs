@@ -316,20 +316,7 @@ impl Broker for TradeNationAdapter {
             CandleError::Transient
         })?;
 
-        let candles = raw
-            .iter()
-            .map(|c| Candle {
-                time: c.timestamp.with_timezone(&Utc),
-                o: c.open,
-                h: c.high,
-                l: c.low,
-                c: c.close,
-            })
-            .collect();
-
-        Ok(trade_control_core::broker::filter_new_candles(
-            candles, since,
-        ))
+        Ok(closed_candles_since(&raw, granularity, since, now))
     }
 
     async fn get_bidask_candles(
@@ -431,9 +418,7 @@ impl Broker for TradeNationAdapter {
             }
         }
 
-        let mut candles: Vec<BidAskCandle> = by_ts.into_values().collect();
-        candles.sort_by_key(|c| c.time);
-        Ok(candles)
+        Ok(closed_bidask_window(by_ts, granularity, now))
     }
 
     async fn amend_stop(
@@ -730,6 +715,141 @@ fn to_cm_granularity(g: Granularity) -> (CmGranularity, bool) {
 /// `granularity` step in the window plus a small slack for boundary alignment,
 /// clamped to TN's per-request ceiling. `filter_new_candles` trims any extra.
 /// Pure — unit-tested.
+/// Drop the still-forming bar: keep only candles whose bar has **fully closed**
+/// by `as_of`, i.e. `open + granularity <= as_of`.
+///
+/// # Why this exists
+///
+/// [`Broker::get_candles`]'s contract is "closed only — the still-forming
+/// current bar is dropped", and `filter_new_candles` says in its own docs that
+/// "broker impls call this after dropping any still-forming bar". It cannot do
+/// the dropping itself: it filters on `time > watermark`, and a bar that opened
+/// one second ago is legitimately newer than the watermark.
+///
+/// OANDA honours the contract upstream — its feed carries an authoritative
+/// `complete` flag and `broker-oanda/src/candles.rs` filters on it. **TradeNation's
+/// feed carries no such flag**: `charts.finsatechnology.com` is count-back-from-
+/// `end_time`, so its newest row is *always* the bar currently forming. Nothing
+/// between that response and the engine removed it, so this adapter was handing
+/// the engine a partial bar on every native-granularity tick.
+///
+/// # What that cost
+///
+/// The engine treats every candle it is given as closed
+/// (`engine/src/evaluate.rs`, `for candle in new_candles`), and stamps the fire
+/// with that candle. So an `on_close` rule fired against a *provisional* close.
+/// With a 5s cron that is ~720 chances per H1 bar to fire on a transient touch
+/// that the bar's real close never confirms — a false fire, not merely an early
+/// one. Measured on AUD/NZD H1 (plan `hs-aud-nzd-ff8e66e8`, 2026-09-07): the
+/// cron ticked at 02:00:21Z, 21 seconds into the 02:00Z bar, and recorded the
+/// `01-veto-too-high` fire against `candle.time = 02:00Z` with `c = 1.22726`.
+/// The 02:00Z bar's *actual* close was 1.22636 — the recorded o/h matched the
+/// real bar but l/c did not, the signature of a bar caught mid-formation. The
+/// offline replay, which pulls through candle-cache (where `markable_buckets`
+/// enforces `start + bar <= as_of`), used the closed 01:00Z bar and so reported
+/// the fire one bar earlier. That replay↔live gap is what surfaced this.
+///
+/// This is the **same defect** as `BUG-tn-h4-aggregator-emits-incomplete-bucket.md`,
+/// which was diagnosed as CRITICAL and fixed on 2026-09-08 — but that fix landed
+/// in `tradenation-api::aggregate_candles`, which is reached **only** when
+/// `resolve_native` returns `Some`. It returns `None` for M1/M15/H1 (they have a
+/// native endpoint), so the native granularities never reached the fix. Fixing it
+/// here, in the adapter, covers every granularity including the aggregated ones,
+/// and needs no bump of the pinned git dependency.
+///
+/// # Boundary
+///
+/// The comparison is `open + granularity <= as_of`, so a bar is kept the instant
+/// it closes and not before. A `<` would discard the just-closed bar for a whole
+/// extra cron tick, which is the delay this function exists to avoid, and would
+/// then drop it permanently once the watermark moved past. Pure, so the boundary
+/// is unit-tested without a live feed.
+/// The whole post-fetch transform for [`Broker::get_candles`]: map TN's raw
+/// rows to [`Candle`], drop the still-forming bar, then trim to the watermark.
+///
+/// Extracted from the async method so the ORDER and the PRESENCE of those three
+/// steps are testable without a network client. That is not a nicety: with the
+/// drop inlined in the method, deleting it left every test green (the pure
+/// [`drop_forming_bar`] tests still passed — they just weren't reached), so the
+/// defect this fixes could silently return. A test at this seam goes red
+/// instead.
+///
+/// What is load-bearing is that the drop happens **at all**, not the order of
+/// the two steps: both are pure predicate filters over the same list, so they
+/// commute (verified by mutation — swapping them changes nothing, and no test
+/// pretends otherwise). `filter_new_candles` on its own is NOT sufficient: it
+/// trims on `time > watermark`, and a bar that opened seconds ago is
+/// legitimately newer than the watermark, which is exactly why its own docs say
+/// "broker impls call this after dropping any still-forming bar".
+fn closed_candles_since(
+    raw: &[candle_model::CandleData],
+    granularity: Granularity,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Vec<Candle> {
+    let candles: Vec<Candle> = raw
+        .iter()
+        .map(|c| Candle {
+            time: c.timestamp.with_timezone(&Utc),
+            o: c.open,
+            h: c.high,
+            l: c.low,
+            c: c.close,
+        })
+        .collect();
+    let closed = drop_forming_bar(candles, granularity, now);
+    trade_control_core::broker::filter_new_candles(closed, since)
+}
+
+/// Finish the bid/ask window: order it, then drop the still-forming bar.
+///
+/// The sibling of [`closed_candles_since`] for the two-sided path, and extracted
+/// for the same reason — with the drop inlined in the async method, removing it
+/// left every test green because nothing without a network client could reach
+/// it. This path is easy to overlook: it builds its own window by hand (a
+/// `time <= since` skip while zipping the three price series) instead of calling
+/// `filter_new_candles`, and that hand-rolled trim only cuts the OLD end, so the
+/// newest bar it yields is the forming one exactly as on the mid path.
+fn closed_bidask_window(
+    by_ts: std::collections::HashMap<DateTime<Utc>, BidAskCandle>,
+    granularity: Granularity,
+    as_of: DateTime<Utc>,
+) -> Vec<BidAskCandle> {
+    let mut candles: Vec<BidAskCandle> = by_ts.into_values().collect();
+    candles.sort_by_key(|c| c.time);
+    drop_forming_bar(candles, granularity, as_of)
+}
+
+/// Generic over the candle shape so the mid and the bid/ask paths share ONE
+/// rule. They had two independent hand-written windowing expressions before and
+/// only the mid one was ever examined; a second copy of this predicate is how
+/// the bid/ask side silently keeps the bug after the mid side is fixed.
+fn drop_forming_bar<C: BarOpen>(candles: Vec<C>, g: Granularity, as_of: DateTime<Utc>) -> Vec<C> {
+    let bar = chrono::Duration::seconds(g.seconds());
+    candles
+        .into_iter()
+        .filter(|c| c.open_time() + bar <= as_of)
+        .collect()
+}
+
+/// A candle that knows when its bar opened. Implemented for both candle shapes
+/// the adapter returns so [`drop_forming_bar`] is written once.
+trait BarOpen {
+    fn open_time(&self) -> DateTime<Utc>;
+}
+
+impl BarOpen for Candle {
+    fn open_time(&self) -> DateTime<Utc> {
+        self.time
+    }
+}
+
+impl BarOpen for BidAskCandle {
+    fn open_time(&self) -> DateTime<Utc> {
+        self.time
+    }
+}
+
 fn candle_count_for_window(g: Granularity, since: DateTime<Utc>, now: DateTime<Utc>) -> usize {
     const SLACK: i64 = 3;
     let span = (now - since).num_seconds().max(0);
@@ -1441,5 +1561,229 @@ mod mapping_tests {
     #[test]
     fn amend_target_none_when_id_absent() {
         assert!(find_amend_target("404", &[], &[]).is_none());
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().expect("test timestamp parses")
+    }
+
+    fn bar(time: &str, c: f64) -> Candle {
+        Candle {
+            time: at(time),
+            o: c,
+            h: c,
+            l: c,
+            c,
+        }
+    }
+
+    /// **The** regression case, from the incident that found this: AUD/NZD H1,
+    /// plan `hs-aud-nzd-ff8e66e8`. The cron ticked at 02:00:21Z — 21 seconds
+    /// into the 02:00Z bar — and TN's count-back feed returned that bar as its
+    /// newest row. It must be dropped; the closed 01:00Z bar must survive.
+    ///
+    /// Before the fix the engine evaluated the partial bar and stamped the
+    /// `01-veto-too-high` fire `candle.time = 02:00Z, c = 1.22726`, while that
+    /// bar's real close was 1.22636.
+    #[test]
+    fn the_bar_still_forming_at_the_cron_tick_is_dropped() {
+        let got = drop_forming_bar(
+            vec![
+                bar("2026-09-07T01:00:00Z", 1.22739), // closed at 02:00Z
+                bar("2026-09-07T02:00:00Z", 1.22726), // 21s old — still forming
+            ],
+            Granularity::H1,
+            at("2026-09-07T02:00:21.100804768Z"),
+        );
+        assert_eq!(
+            got.iter().map(|c| c.time).collect::<Vec<_>>(),
+            vec![at("2026-09-07T01:00:00Z")],
+            "only the closed 01:00Z bar survives"
+        );
+    }
+
+    /// A bar is kept the INSTANT it closes, not a tick later. `open + bar ==
+    /// as_of` is closed. A strict `<` here would withhold the just-closed bar
+    /// until the next cron tick — the very delay this fix removes — and once
+    /// the watermark advanced past it, drop it for good.
+    #[test]
+    fn a_bar_is_kept_the_instant_it_closes() {
+        let exactly_closed = drop_forming_bar(
+            vec![bar("2026-09-07T01:00:00Z", 1.0)],
+            Granularity::H1,
+            at("2026-09-07T02:00:00Z"),
+        );
+        assert_eq!(exactly_closed.len(), 1, "open+bar == as_of is CLOSED");
+
+        // One second short of the close, the same bar is still forming.
+        let one_second_early = drop_forming_bar(
+            vec![bar("2026-09-07T01:00:00Z", 1.0)],
+            Granularity::H1,
+            at("2026-09-07T01:59:59Z"),
+        );
+        assert!(one_second_early.is_empty(), "not closed yet");
+    }
+
+    /// The cut is per-granularity, not a fixed hour: the same open time and the
+    /// same `as_of` give opposite answers on M15 and H4. A hard-coded bar length
+    /// would silently mis-cut every other timeframe.
+    #[test]
+    fn the_cut_scales_with_the_granularity() {
+        let open = "2026-09-07T01:00:00Z";
+        let as_of = at("2026-09-07T01:30:00Z");
+        assert_eq!(
+            drop_forming_bar(vec![bar(open, 1.0)], Granularity::M15, as_of).len(),
+            1,
+            "an M15 bar opened 01:00 closed at 01:15 — closed by 01:30"
+        );
+        assert!(
+            drop_forming_bar(vec![bar(open, 1.0)], Granularity::H4, as_of).is_empty(),
+            "an H4 bar opened 01:00 closes at 05:00 — still forming at 01:30"
+        );
+    }
+
+    fn raw(time: &str, close: f64) -> candle_model::CandleData {
+        candle_model::CandleData {
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 0.0,
+            timestamp: at(time).into(),
+        }
+    }
+
+    /// **The call-site test.** The pure `drop_forming_bar` tests above pass
+    /// whether or not anything CALLS it — verified by mutation: deleting the
+    /// call from `get_candles` left all of them green. This drives the whole
+    /// post-fetch transform, so unwiring the drop turns it red.
+    ///
+    /// The scenario is the real incident: the cron ticks 21s into the 02:00Z
+    /// bar with a watermark of 00:00Z. The 01:00Z bar is new and closed (keep);
+    /// the 02:00Z bar is new but still forming (drop).
+    #[test]
+    fn the_returned_window_never_includes_the_forming_bar() {
+        let got = closed_candles_since(
+            &[
+                raw("2026-09-07T00:00:00Z", 1.22579), // == watermark, trimmed
+                raw("2026-09-07T01:00:00Z", 1.22739), // closed + new: KEEP
+                raw("2026-09-07T02:00:00Z", 1.22726), // still forming: DROP
+            ],
+            Granularity::H1,
+            at("2026-09-07T00:00:00Z"),
+            at("2026-09-07T02:00:21.100804768Z"),
+        );
+        assert_eq!(
+            got.iter().map(|c| c.time).collect::<Vec<_>>(),
+            vec![at("2026-09-07T01:00:00Z")],
+            "the engine must receive only the closed 01:00Z bar"
+        );
+    }
+
+    /// `filter_new_candles` alone is not enough, and this is the sharpest case:
+    /// the forming bar is the ONLY candle newer than the watermark, so a
+    /// watermark trim on its own returns it and the engine evaluates a bar that
+    /// has not closed. (The two filters commute — what matters is that the drop
+    /// happens, not which runs first.)
+    #[test]
+    fn the_forming_bar_is_dropped_even_when_it_is_the_only_new_one() {
+        let got = closed_candles_since(
+            &[
+                raw("2026-09-07T01:00:00Z", 1.22739), // == watermark, trimmed
+                raw("2026-09-07T02:00:00Z", 1.22726), // forming
+            ],
+            Granularity::H1,
+            at("2026-09-07T01:00:00Z"),
+            at("2026-09-07T02:00:21Z"),
+        );
+        assert!(
+            got.is_empty(),
+            "no closed bar is new, so the tick must see nothing: {got:?}"
+        );
+    }
+
+    fn ba(time: &str, c: f64) -> BidAskCandle {
+        BidAskCandle {
+            time: at(time),
+            o: c,
+            h: c,
+            l: c,
+            c,
+            bid_o: c,
+            bid_h: c,
+            bid_l: c,
+            bid_c: c,
+            ask_o: c,
+            ask_h: c,
+            ask_l: c,
+            ask_c: c,
+        }
+    }
+
+    /// The bid/ask call site, pinned the same way as the mid one. This path is
+    /// the easier of the two to forget: it never calls `filter_new_candles`, so
+    /// a reader checking "where is the watermark trim" finds nothing here and
+    /// may assume the whole window is already handled upstream.
+    ///
+    /// Also pins the ordering the method relied on: the candles arrive from a
+    /// `HashMap` (arbitrary iteration order) and must come back ascending.
+    #[test]
+    fn the_bidask_window_is_sorted_and_never_includes_the_forming_bar() {
+        // 24 closed bars plus the forming one. A handful of entries can come
+        // out of a `HashMap` in insertion order by luck, which would let a
+        // missing `sort` pass — verified by mutation. This many does not.
+        let by_ts: std::collections::HashMap<_, _> = (0..24)
+            .map(|h| ba(&format!("2026-09-06T{h:02}:00:00Z"), 1.0 + h as f64))
+            .chain(std::iter::once(ba("2026-09-07T02:00:00Z", 1.22726))) // forming
+            .map(|c| (c.time, c))
+            .collect();
+        let got = closed_bidask_window(by_ts, Granularity::H1, at("2026-09-07T02:00:21Z"));
+
+        assert_eq!(
+            got.len(),
+            24,
+            "the forming bar is gone, the 24 closed remain"
+        );
+        assert!(
+            !got.iter().any(|c| c.time == at("2026-09-07T02:00:00Z")),
+            "the forming bar must not be returned"
+        );
+        let times: Vec<_> = got.iter().map(|c| c.time).collect();
+        let mut sorted = times.clone();
+        sorted.sort();
+        assert_eq!(times, sorted, "the window must come back ascending");
+    }
+
+    /// A window of fully-closed history is untouched — the filter must not
+    /// thin out a historical backfill, only the live tail.
+    #[test]
+    fn closed_history_passes_through_untouched() {
+        let candles = vec![
+            bar("2026-09-07T00:00:00Z", 1.0),
+            bar("2026-09-07T01:00:00Z", 2.0),
+            bar("2026-09-07T02:00:00Z", 3.0),
+        ];
+        let got = drop_forming_bar(candles.clone(), Granularity::H1, at("2026-09-07T05:00:00Z"));
+        assert_eq!(got.len(), candles.len(), "all three are long closed");
+    }
+
+    /// Order is preserved (ascending, as the feed delivers it) — the engine
+    /// iterates candles in order and `filter_new_candles` sorts afterwards, but
+    /// this must not be the thing that scrambles them.
+    #[test]
+    fn surviving_candles_keep_their_order() {
+        let got = drop_forming_bar(
+            vec![
+                bar("2026-09-07T00:00:00Z", 1.0),
+                bar("2026-09-07T01:00:00Z", 2.0),
+                bar("2026-09-07T02:00:00Z", 3.0), // forming
+            ],
+            Granularity::H1,
+            at("2026-09-07T02:30:00Z"),
+        );
+        assert_eq!(
+            got.iter().map(|c| c.time).collect::<Vec<_>>(),
+            vec![at("2026-09-07T00:00:00Z"), at("2026-09-07T01:00:00Z")]
+        );
     }
 }
