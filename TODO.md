@@ -1,3 +1,10 @@
+# TODO — journal timing diff stamps the firing bar (2026-09-21)
+
+- [x] `live_fires` stamps each fire with `fired[].candle.time`, not the cron's `tick_ts`
+- [x] fall back to the tick when a fire carries no candle (older bundle schema)
+- [x] fixture + tests: late cron is clean; a real one-bar divergence still reported
+- [x] timeline view deliberately unchanged — it is a wall-clock event log
+
 # TODO — per-instrument D1/H4 session anchor (webhook side)
 
 - [x] bump `tradenation-api` to `broker-tradenation-v0.20.0`; `[patch]` instrument-lookup to the local path
