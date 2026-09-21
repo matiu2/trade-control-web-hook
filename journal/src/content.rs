@@ -143,9 +143,14 @@ fn compare(app: &App) -> String {
                 f.ts
             ));
         }
-        for (rule_id, live_ts, replay_ts) in &div.timing {
+        for d in &div.timing {
+            let (rule_id, live_ts, replay_ts) = (&d.rule_id, &d.live_ts, &d.replay_ts);
+            let seen = match d.lateness_secs {
+                Some(secs) => format!(" (cron {secs:+}s from bar close)"),
+                None => String::new(),
+            };
             out.push_str(&format!(
-                "Δ timing {rule_id}: live {live_ts} vs replay {replay_ts}\n"
+                "Δ timing {rule_id}: live {live_ts}{seen} vs replay {replay_ts}\n"
             ));
         }
     }
