@@ -19,6 +19,7 @@
 //! drop the seconds + offset) so a *timing* divergence — the same rule firing on
 //! a different bar — is comparable.
 
+use chrono::DateTime;
 use serde_json::Value;
 
 use crate::timeline::ts_to_bne;
@@ -31,6 +32,17 @@ pub struct FireFact {
     pub rule_id: String,
     pub action: Option<String>,
     pub ts: String,
+    /// How long after its bar CLOSED the cron observed this fire, in seconds —
+    /// `tick_ts - (candle.time + granularity)`. `None` on the replay side (a
+    /// report has no wall clock) and for a live fire whose bundle carries no
+    /// plan granularity, where the bar length is unknown.
+    ///
+    /// Measured across the 20 live staging plans: price/pattern rules land
+    /// 0-42s (median 12s, a 5s cron), while time-scheduled news rules sit
+    /// 1802-12634s because a news window opens mid-bar. **Negative** means the
+    /// cron evaluated the bar BEFORE it closed, so the close it read was
+    /// provisional — see [`FORMING_BAR`] and [`diff`].
+    pub lateness_secs: Option<i64>,
 }
 
 /// Outcome-level facts parsed from the replay summary line, for a coarse
@@ -46,6 +58,16 @@ pub struct ReplayOutcome {
     pub net_r: Option<String>,
 }
 
+/// One timing divergence: the same rule, on bars that do not line up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimingDelta {
+    pub rule_id: String,
+    pub live_ts: String,
+    pub replay_ts: String,
+    /// The live fire's lateness past its bar close; see [`FireFact`].
+    pub lateness_secs: Option<i64>,
+}
+
 /// The classified diff between the live fires and the replay fires.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Divergences {
@@ -55,9 +77,11 @@ pub struct Divergences {
     pub live_only: Vec<FireFact>,
     /// Fired in the replay but not live (replay over-fired).
     pub replay_only: Vec<FireFact>,
-    /// Same rule id fired on both sides but on a different bar:
-    /// `(rule_id, live_ts, replay_ts)`.
-    pub timing: Vec<(String, String, String)>,
+    /// Same rule id fired on both sides but not comparably: a different bar,
+    /// or the same bar read before it closed. `lateness_secs` is the live
+    /// side's, so the view can show WHEN the cron observed the bar alongside
+    /// which bar it was.
+    pub timing: Vec<TimingDelta>,
 }
 
 impl Divergences {
@@ -119,6 +143,8 @@ fn parse_replay_fire_line(line: &str) -> Option<FireFact> {
         rule_id,
         action,
         ts,
+        // A replay report has no wall clock — it never observed anything late.
+        lateness_secs: None,
     })
 }
 
@@ -232,8 +258,13 @@ pub fn live_fires(timeline_json: &str) -> Vec<FireFact> {
 
 /// The fire facts from a single tick object.
 fn live_fires_from_tick(tick: &Value) -> Vec<FireFact> {
-    let tick_ts = tick.get("tick_ts").and_then(|x| x.as_str()).unwrap_or("");
-    let tick_ts = ts_to_bne(tick_ts);
+    let tick_raw = tick.get("tick_ts").and_then(|x| x.as_str()).unwrap_or("");
+    let tick_ts = ts_to_bne(tick_raw);
+    let bar_secs = tick
+        .get("plan")
+        .and_then(|p| p.get("granularity"))
+        .and_then(|g| g.as_str())
+        .and_then(granularity_secs);
     let Some(fired) = tick
         .get("eval")
         .and_then(|e| e.get("fired"))
@@ -257,6 +288,7 @@ fn live_fires_from_tick(tick: &Value) -> Vec<FireFact> {
                 rule_id: rule_id.to_string(),
                 action,
                 ts: fire_bar(rule).unwrap_or_else(|| tick_ts.clone()),
+                lateness_secs: lateness_secs(rule, tick_raw, bar_secs),
             })
         })
         .collect()
@@ -269,6 +301,71 @@ fn live_fires_from_tick(tick: &Value) -> Vec<FireFact> {
 fn fire_bar(rule: &Value) -> Option<String> {
     let t = rule.get("candle")?.get("time")?.as_str()?;
     Some(ts_to_bne(t))
+}
+
+/// The bar length of a plan `granularity` as the timeline spells it (lowercase,
+/// e.g. `h1`), in seconds. `None` for anything unrecognised, which leaves the
+/// lateness unknown rather than computing it against a guessed bar.
+fn granularity_secs(g: &str) -> Option<i64> {
+    match g.to_ascii_lowercase().as_str() {
+        "m1" => Some(60),
+        "m5" => Some(5 * 60),
+        "m15" => Some(15 * 60),
+        "m30" => Some(30 * 60),
+        "h1" => Some(60 * 60),
+        "h4" => Some(4 * 60 * 60),
+        "d1" | "d" => Some(24 * 60 * 60),
+        "w" => Some(7 * 24 * 60 * 60),
+        _ => None,
+    }
+}
+
+/// Seconds between a fire's bar CLOSING and the cron tick that observed it.
+/// Negative when the tick landed inside the still-forming bar. `None` when
+/// either instant, or the bar length, is missing.
+fn lateness_secs(rule: &Value, tick_raw: &str, bar_secs: Option<i64>) -> Option<i64> {
+    let bar = bar_secs?;
+    let open = rule.get("candle")?.get("time")?.as_str()?;
+    let open = DateTime::parse_from_rfc3339(open).ok()?;
+    let tick = DateTime::parse_from_rfc3339(tick_raw).ok()?;
+    Some((tick - open).num_seconds() - bar)
+}
+
+/// A fire whose lateness is below this evaluated a bar that had not closed yet.
+///
+/// The boundary is the bar close itself, not a tolerance window, because the
+/// live data made a magnitude threshold unnecessary. Across 96 recorded fires
+/// on the 20 staging plans, the price/pattern rules this diff judges land
+/// **0-42s** past their bar close (median 12s, on a 5s engine tick), and the
+/// only larger values — 1802-12634s — are time-scheduled `pause`/`resume`/
+/// `news-*` rules firing mid-bar by design, which are NOT divergences. So no
+/// positive lateness distinguishes a healthy fire from a faulty one; only the
+/// SIGN does. A fire at exactly `0` read a complete bar and is fine.
+const FORMING_BAR: i64 = 0;
+
+/// Whether a same-bar match should still be reported as a timing divergence.
+///
+/// One case survives the same-bar check: **negative lateness**. The cron read
+/// the bar mid-formation, so the close it fired on was provisional and may
+/// never have been the bar's real close. That is a genuine disagreement about
+/// what the engine saw, not jitter. The known cause is the TradeNation
+/// forming-bar bug (`BUG-tn-native-granularity-emits-forming-bar.md`);
+/// timelines recorded before that fix keep the signature, and must keep
+/// reporting it.
+///
+/// **Unknown lateness is NOT a divergence.** An older bundle carries no plan
+/// granularity, so the bar length — and therefore the close — is unknowable.
+/// The bars themselves still agree, and that is positive evidence; inventing a
+/// divergence from a missing field would flag every pre-schema timeline and
+/// re-create the noise this check exists to remove. Absence of evidence is
+/// not evidence of divergence.
+///
+/// Large POSITIVE lateness is deliberately NOT a divergence. Every one of the
+/// 12 such fires measured is a time-scheduled `pause`/`resume`/`news-*` rule
+/// firing mid-bar by design; flagging them would re-create the noise this
+/// tolerance exists to remove.
+fn same_bar_is_still_divergent(lateness: Option<i64>) -> bool {
+    matches!(lateness, Some(secs) if secs < FORMING_BAR)
 }
 
 /// Classify the live vs replay fire sets by `rule_id`. A rule id present on both
@@ -289,9 +386,14 @@ pub fn diff(live: &[FireFact], replay: &[FireFact]) -> Divergences {
             Some((i, rf)) => {
                 replay_used[i] = true;
                 out.matches.push(lf.clone());
-                if rf.ts != lf.ts {
-                    out.timing
-                        .push((lf.rule_id.clone(), lf.ts.clone(), rf.ts.clone()));
+                let different_bar = rf.ts != lf.ts;
+                if different_bar || same_bar_is_still_divergent(lf.lateness_secs) {
+                    out.timing.push(TimingDelta {
+                        rule_id: lf.rule_id.clone(),
+                        live_ts: lf.ts.clone(),
+                        replay_ts: rf.ts.clone(),
+                        lateness_secs: lf.lateness_secs,
+                    });
                 }
             }
             None => out.live_only.push(lf.clone()),
@@ -412,10 +514,10 @@ mod tests {
         let pause = d
             .timing
             .iter()
-            .find(|(id, _, _)| id.starts_with("01-pause"))
+            .find(|d| d.rule_id.starts_with("01-pause"))
             .expect("pause timing divergence");
-        assert_eq!(pause.1, "2026-07-23 02:00", "live pause bar");
-        assert_eq!(pause.2, "2026-07-23 13:00", "replay pause bar");
+        assert_eq!(pause.live_ts, "2026-07-23 02:00", "live pause bar");
+        assert_eq!(pause.replay_ts, "2026-07-23 13:00", "replay pause bar");
     }
 
     #[test]
@@ -459,8 +561,8 @@ mod tests {
         );
         let d = diff(&live, &replay);
         assert_eq!(d.timing.len(), 1, "a real one-bar divergence survives");
-        assert_eq!(d.timing[0].1, "2026-09-07 11:00", "live bar");
-        assert_eq!(d.timing[0].2, "2026-09-07 12:00", "replay bar");
+        assert_eq!(d.timing[0].live_ts, "2026-09-07 11:00", "live bar");
+        assert_eq!(d.timing[0].replay_ts, "2026-09-07 12:00", "replay bar");
     }
 
     #[test]
@@ -475,17 +577,153 @@ mod tests {
     }
 
     #[test]
+    fn a_fire_carries_how_late_the_cron_observed_its_bar() {
+        // 11:00Z bar on h1 closes 12:00Z; the cron ticked 12:00:14Z.
+        let json = r#"{"ticks":[{"tick_ts":"2026-09-07T12:00:14Z",
+          "plan":{"granularity":"h1"},
+          "eval":{"fired":[{"rule_id":"01-veto-too-high",
+            "candle":{"time":"2026-09-07T11:00:00Z"}}]}}]}"#;
+        let fires = live_fires(json);
+        assert_eq!(fires[0].lateness_secs, Some(14));
+    }
+
+    #[test]
+    fn a_fire_on_a_bar_that_had_not_closed_yet_is_negative() {
+        // THE forming-bar signature: the cron ticked 21s INTO the 02:00Z bar,
+        // which does not close until 03:00Z. Recorded on AUD/NZD before the
+        // TradeNation adapter was fixed.
+        let json = r#"{"ticks":[{"tick_ts":"2026-09-07T02:00:21Z",
+          "plan":{"granularity":"h1"},
+          "eval":{"fired":[{"rule_id":"01-veto-too-high",
+            "candle":{"time":"2026-09-07T02:00:00Z"}}]}}]}"#;
+        let fires = live_fires(json);
+        assert_eq!(fires[0].lateness_secs, Some(-3579));
+    }
+
+    #[test]
+    fn lateness_is_unknown_without_a_granularity() {
+        // An older bundle carries no plan granularity: report None rather than
+        // guessing a bar length and inventing a verdict from it.
+        let json = r#"{"ticks":[{"tick_ts":"2026-09-07T12:00:14Z",
+          "eval":{"fired":[{"rule_id":"01-veto-too-high",
+            "candle":{"time":"2026-09-07T11:00:00Z"}}]}}]}"#;
+        assert_eq!(live_fires(json)[0].lateness_secs, None);
+    }
+
+    #[test]
+    fn ordinary_cron_jitter_on_the_same_bar_is_not_a_divergence() {
+        // The headline: same bar, cron 14s late — the measured median across
+        // the 20 live staging plans. Must not be reported.
+        let live = live_fires(
+            r#"{"ticks":[{"tick_ts":"2026-09-07T12:00:14Z",
+              "plan":{"granularity":"h1"},
+              "eval":{"fired":[{"rule_id":"01-veto-too-high",
+                "candle":{"time":"2026-09-07T11:00:00Z"}}]}}]}"#,
+        );
+        let replay = parse_replay_fires(
+            "2026-09-07 21:00:00 +10:00  Veto (01-veto-too-high) — x  (close=1.2)\n",
+        );
+        let d = diff(&live, &replay);
+        assert_eq!(d.matches.len(), 1);
+        assert!(d.timing.is_empty(), "14s of jitter is not a divergence");
+        assert!(d.is_clean());
+    }
+
+    #[test]
+    fn a_fire_before_its_bar_closed_is_always_a_divergence() {
+        // Even though both sides name the SAME bar, live evaluated it while it
+        // was still forming, so its close was provisional. That is a real
+        // disagreement about what the engine saw, not cron jitter.
+        let live = live_fires(
+            r#"{"ticks":[{"tick_ts":"2026-09-07T02:00:21Z",
+              "plan":{"granularity":"h1"},
+              "eval":{"fired":[{"rule_id":"01-veto-too-high",
+                "candle":{"time":"2026-09-07T02:00:00Z"}}]}}]}"#,
+        );
+        let replay = parse_replay_fires(
+            "2026-09-07 12:00:00 +10:00  Veto (01-veto-too-high) — x  (close=1.2)\n",
+        );
+        let d = diff(&live, &replay);
+        assert_eq!(d.timing.len(), 1, "a forming bar is always reported");
+        assert!(!d.is_clean());
+    }
+
+    #[test]
+    fn a_tick_landing_exactly_on_the_bar_close_read_a_complete_bar() {
+        // The boundary: lateness 0 means the cron fired the instant the bar
+        // closed, so it read a COMPLETE bar — not a forming one. Three fires
+        // in the live staging sample sit exactly here, so this is reachable,
+        // and `<=` would wrongly call every one of them a divergence.
+        let live = live_fires(
+            r#"{"ticks":[{"tick_ts":"2026-09-07T12:00:00Z",
+              "plan":{"granularity":"h1"},
+              "eval":{"fired":[{"rule_id":"01-veto-too-high",
+                "candle":{"time":"2026-09-07T11:00:00Z"}}]}}]}"#,
+        );
+        assert_eq!(live[0].lateness_secs, Some(0));
+        let replay = parse_replay_fires(
+            "2026-09-07 21:00:00 +10:00  Veto (01-veto-too-high) — x  (close=1.2)\n",
+        );
+        let d = diff(&live, &replay);
+        assert!(d.timing.is_empty(), "0s is a closed bar, not a forming one");
+        assert!(d.is_clean());
+    }
+
+    #[test]
+    fn a_news_rule_firing_deep_inside_its_bar_is_not_a_divergence() {
+        // Measured: all 12 time-scheduled fires (pause/resume/news) sit
+        // 1802-12634s past their H4 bar close, because a news window opens
+        // mid-bar. Thresholding lateness alone would flag every one of them.
+        let live = live_fires(
+            r#"{"ticks":[{"tick_ts":"2026-09-10T12:30:33Z",
+              "plan":{"granularity":"h4"},
+              "eval":{"fired":[{"rule_id":"01-news-start-1789043400-1789047000",
+                "candle":{"time":"2026-09-10T05:00:00Z"}}]}}]}"#,
+        );
+        assert_eq!(live[0].lateness_secs, Some(12633));
+        let replay = parse_replay_fires(
+            "2026-09-10 15:00:00 +10:00  NEWS START (01-news-start-1789043400-1789047000) — x\n",
+        );
+        let d = diff(&live, &replay);
+        assert!(
+            d.timing.is_empty(),
+            "same bar, news fires mid-bar by design: {:?}",
+            d.timing
+        );
+    }
+
+    #[test]
+    fn a_genuinely_different_bar_is_still_a_divergence() {
+        // The guard: none of the above may blind the diff to a real one.
+        let live = live_fires(
+            r#"{"ticks":[{"tick_ts":"2026-09-07T12:00:05Z",
+              "plan":{"granularity":"h1"},
+              "eval":{"fired":[{"rule_id":"01-veto-too-high",
+                "candle":{"time":"2026-09-07T11:00:00Z"}}]}}]}"#,
+        );
+        let replay = parse_replay_fires(
+            "2026-09-07 22:00:00 +10:00  Veto (01-veto-too-high) — x  (close=1.2)\n",
+        );
+        let d = diff(&live, &replay);
+        assert_eq!(d.timing.len(), 1);
+        assert_eq!(d.timing[0].live_ts, "2026-09-07 21:00", "live bar");
+        assert_eq!(d.timing[0].replay_ts, "2026-09-07 22:00", "replay bar");
+    }
+
+    #[test]
     fn live_only_and_replay_only_are_detected() {
         let live = vec![
             FireFact {
                 rule_id: "05-enter".into(),
                 action: Some("enter".into()),
                 ts: "2026-07-23 08:00".into(),
+                lateness_secs: None,
             },
             FireFact {
                 rule_id: "01-only-live".into(),
                 action: Some("pause".into()),
                 ts: "2026-07-23 09:00".into(),
+                lateness_secs: None,
             },
         ];
         let replay = vec![
@@ -493,11 +731,13 @@ mod tests {
                 rule_id: "05-enter".into(),
                 action: Some("enter".into()),
                 ts: "2026-07-23 08:00".into(),
+                lateness_secs: None,
             },
             FireFact {
                 rule_id: "02-only-replay".into(),
                 action: Some("close".into()),
                 ts: "2026-07-23 10:00".into(),
+                lateness_secs: None,
             },
         ];
         let d = diff(&live, &replay);
@@ -518,6 +758,7 @@ mod tests {
             rule_id: "05-enter".into(),
             action: Some("enter".into()),
             ts: "2026-07-23 08:00".into(),
+            lateness_secs: None,
         }];
         let d = diff(&fires, &fires);
         assert!(d.is_clean());
