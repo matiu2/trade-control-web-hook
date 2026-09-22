@@ -448,4 +448,138 @@ mod tests {
         assert_eq!(strip_exchange("TRADENATION:EURUSD"), "EURUSD");
         assert_eq!(strip_exchange("OANDA:EUR_USD"), "EUR_USD");
     }
+
+    /// Every `(broker, symbol)` leg the catalog lists, excluding stocks.
+    ///
+    /// Stocks are excluded because `spread-baseline-gen` defers them by default
+    /// (`--include-stocks`), so 1100+ of them have no row **by design** and
+    /// including them would drown the signal.
+    fn tradeable_catalog_legs() -> Vec<(IlBroker, &'static str, &'static str)> {
+        let Ok(assets) = instrument_lookup::all() else {
+            return Vec::new();
+        };
+        assets
+            .iter()
+            .filter(|a| a.class != AssetClass::Stock)
+            .flat_map(|a| {
+                [IlBroker::Oanda, IlBroker::TradeNation]
+                    .into_iter()
+                    .filter_map(move |b| {
+                        a.symbol_for(b)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| (b, s, a.id.as_str()))
+                    })
+            })
+            .collect()
+    }
+
+    fn baked_leg(broker: IlBroker, symbol: &str) -> bool {
+        let want = match broker {
+            IlBroker::Oanda => "oanda",
+            IlBroker::TradeNation => "tradenation",
+            _ => return false,
+        };
+        trade_control_core::spread_blackout::baked_rows().any(|(b, s)| b == want && s == symbol)
+    }
+
+    /// **The catalog↔table cross-check, direction 1: a catalog asset with no row.**
+    ///
+    /// This is the report `coverage`'s module docs promise ("the cross-check
+    /// that the table and the catalog agree lives in `cli`") and which did not
+    /// actually exist anywhere — the gap that let TradeNation `Bitcoin` sit
+    /// unbaked until an arm attempt failed in front of the operator. `tv-arm`
+    /// is the right home: it is the one crate that links **both** the catalog
+    /// and the baked table.
+    ///
+    /// It deliberately **reports rather than fails**. A missing row is a
+    /// legitimate state — the bake is an hours-long manual operation against
+    /// two live brokers, new catalog assets land between bakes, and part-time
+    /// markets genuinely cannot be profiled. Failing here would make every
+    /// catalog addition a red build with no way to land it. The arm-time gate
+    /// (`require_spread_coverage`) is what actually protects a trade; this
+    /// makes the backlog *visible* with `cargo test -p tv-arm -- --nocapture`
+    /// instead of discoverable only by trying to arm.
+    ///
+    /// What it does assert is that the check itself still works: the catalog
+    /// must yield legs and the table must contain rows. Both empty would make
+    /// an all-clear report meaningless.
+    #[test]
+    fn report_catalog_legs_with_no_baked_spread_row() {
+        let legs = tradeable_catalog_legs();
+        assert!(
+            !legs.is_empty(),
+            "the catalog yielded no non-stock legs — the cross-check would \
+             report an empty all-clear and prove nothing",
+        );
+        assert!(
+            trade_control_core::spread_blackout::baked_rows()
+                .next()
+                .is_some(),
+            "the baked table is empty — every instrument would report missing",
+        );
+
+        let mut missing: Vec<String> = legs
+            .iter()
+            .filter(|(broker, symbol, _id)| !baked_leg(*broker, symbol))
+            .map(|(broker, symbol, id)| format!("{broker:?} {symbol:?} (asset {id})"))
+            .collect();
+        missing.sort();
+
+        if missing.is_empty() {
+            println!(
+                "spread-table coverage: all {} tradeable legs baked",
+                legs.len()
+            );
+        } else {
+            println!(
+                "spread-table coverage: {} of {} tradeable legs have NO baked row \
+                 (each REFUSES to arm until re-baked):",
+                missing.len(),
+                legs.len(),
+            );
+            for m in &missing {
+                println!("  - {m}");
+            }
+        }
+    }
+
+    /// **Direction 2: a baked row naming an instrument the catalog no longer lists.**
+    ///
+    /// The mirror of the report above, and the one that genuinely *should*
+    /// fail. An orphan row is never legitimate: it means a symbol was renamed
+    /// or dropped from the catalog while its row stayed behind, so the table
+    /// now carries a spread profile keyed on a string nothing can resolve. That
+    /// row can never be read (no resolution produces its key) and it silently
+    /// inflates the row count the shrink guard trusts.
+    ///
+    /// Zero orphans as of 2026-09-22, which is also the evidence that the
+    /// TradingView-era names are fully migrated off this table.
+    #[test]
+    fn no_baked_row_names_an_instrument_the_catalog_lost() {
+        let Ok(assets) = instrument_lookup::all() else {
+            panic!("catalog must load for the cross-check to mean anything");
+        };
+        let listed: std::collections::BTreeSet<(&str, &str)> = assets
+            .iter()
+            .flat_map(|a| {
+                [
+                    ("oanda", a.symbols.oanda.as_deref()),
+                    ("tradenation", a.symbols.tradenation.as_deref()),
+                ]
+            })
+            .filter_map(|(b, s)| s.filter(|s| !s.is_empty()).map(|s| (b, s)))
+            .collect();
+
+        let orphans: Vec<String> = trade_control_core::spread_blackout::baked_rows()
+            .filter(|(b, s)| !listed.contains(&(*b, *s)))
+            .map(|(b, s)| format!("{b} {s:?}"))
+            .collect();
+
+        assert!(
+            orphans.is_empty(),
+            "these baked rows name instruments the catalog does not list, so \
+             nothing can ever resolve to them — the row is dead weight and its \
+             symbol was probably renamed: {orphans:?}",
+        );
+    }
 }
