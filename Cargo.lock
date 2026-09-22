@@ -3796,20 +3796,18 @@ dependencies = [
 name = "spread-baseline-gen"
 version = "0.1.0"
 dependencies = [
- "broker-tradenation",
- "broker-tradenation-adapter",
+ "candle-cache",
+ "candle-model",
  "chrono",
  "chrono-tz",
  "clap",
  "color-eyre",
  "instrument-lookup",
  "oanda-client",
- "serde_json",
  "tokio",
  "tracing",
  "tracing-error",
  "tracing-subscriber",
- "trade-control-core",
  "tradenation-api",
 ]
 
