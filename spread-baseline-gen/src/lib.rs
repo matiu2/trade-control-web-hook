@@ -13,6 +13,7 @@
 //! broker's candles. No canonical sharing. The gate already keys on the exact
 //! broker symbol string, so both rows coexist as distinct keys.
 
+pub mod cache;
 pub mod compute;
 pub mod fetch;
 pub mod render;

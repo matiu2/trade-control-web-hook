@@ -1,12 +1,17 @@
-//! Broker fetchers → normalized [`Bar`]s for the pure computation.
+//! Direct (uncached) broker fetchers → normalized [`Bar`]s / [`MinuteBar`]s.
 //!
-//! Two paths, both producing the same `Vec<Bar>` in timestamp order:
-//! - OANDA via `oanda_client::OandaClient::get_candles` (`price=MBA`).
-//! - TradeNation via the `broker-tradenation-adapter`'s `get_bidask_candles`.
+//! **The generator itself no longer uses these** — it goes through
+//! [`crate::cache`], which serves from the warm per-broker candle-cache table,
+//! backs off on rate limits, and only fetches the sub-ranges it's missing.
+//! What remains here is the direct OANDA path, still used by the
+//! `forecast_vs_reality` example (a single-instrument spot check where the
+//! cache's Postgres dependency isn't worth requiring).
 //!
-//! Both filter to bars with finite, positive mid and finite spread ≥ 0, then
-//! reduce to `(utc_hour, spread_frac, mid_close)`. Networking + auth live here;
-//! [`crate::compute`] stays pure.
+//! The shared reducers stay here and are used by both paths, so the
+//! degenerate-bar rules (non-positive mid, inverted spread) and the
+//! DST-invariant local-hour stamping have exactly one definition:
+//! [`bar_from_closes`] and [`minute_bar_from_closes`]. Networking + auth live
+//! here; [`crate::compute`] stays pure.
 
 use chrono::Timelike;
 use color_eyre::eyre::{Result, eyre};
@@ -56,18 +61,6 @@ pub async fn fetch_oanda(client: &oanda_client::OandaClient, instrument: &str) -
     Ok(bars)
 }
 
-/// Normalize a slice of core `BidAskCandle`s (TradeNation path) to [`Bar`]s.
-/// Separated from the fetch so it's unit-testable without a TN session.
-pub fn bars_from_bidask(candles: &[trade_control_core::broker::BidAskCandle]) -> Vec<Bar> {
-    candles
-        .iter()
-        .filter_map(|c| {
-            let hour = c.time.hour() as u8;
-            bar_from_closes(hour, c.c, c.bid_c, c.ask_c)
-        })
-        .collect()
-}
-
 // ---- minute-level path (bleed-resistant mask) ----
 
 /// Reduce one minute's mid/bid/ask closes to a [`MinuteBar`], stamping both its
@@ -79,7 +72,7 @@ pub fn bars_from_bidask(candles: &[trade_control_core::broker::BidAskCandle]) ->
 /// or fall-back overlap in the source zone can't produce a missing/ambiguous
 /// value here. The local hour is what the profile buckets on, making the mask
 /// DST-invariant.
-fn minute_bar_from_closes(
+pub(crate) fn minute_bar_from_closes(
     utc_ts: chrono::DateTime<chrono::Utc>,
     tz: chrono_tz::Tz,
     mid_close: f64,
@@ -159,19 +152,6 @@ pub async fn fetch_oanda_minutes(
         cursor = next.fixed_offset();
     }
     Ok(out)
-}
-
-/// Normalize core `BidAskCandle`s (TradeNation M1, from the paged adapter) to
-/// [`MinuteBar`]s, stamping each with its schedule-LOCAL hour via `tz`.
-/// Unit-testable without a TN session.
-pub fn minutes_from_bidask(
-    candles: &[trade_control_core::broker::BidAskCandle],
-    tz: chrono_tz::Tz,
-) -> Vec<MinuteBar> {
-    candles
-        .iter()
-        .filter_map(|c| minute_bar_from_closes(c.time, tz, c.c, c.bid_c, c.ask_c))
-        .collect()
 }
 
 #[cfg(test)]
