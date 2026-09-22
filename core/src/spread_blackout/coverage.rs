@@ -368,7 +368,14 @@ mod tests {
     ///
     /// This list is an inventory of known debt, not permission. Re-bake these
     /// rows and shrink it; a NEW name appearing here is a regression.
-    const UNREVIEWED_ROWS: &[&str] = &["EUR_TRY", "SUGAR_USD", "TRY_JPY", "UK10YB_GBP", "USD_TRY"];
+    /// **Empty as of the 2026-09-22 re-bake** — every row now carries a
+    /// forecast. The five that used to be here (`EUR_TRY`, `SUGAR_USD`,
+    /// `TRY_JPY`, `UK10YB_GBP`, `USD_TRY`) were profiled successfully once the
+    /// operator overlay stopped silently dropping `spread_schedule` to the
+    /// `none` sentinel, which had been making the generator skip assets
+    /// outright. Shrinking to empty is the expected direction; a NEW name
+    /// appearing here is a regression.
+    const UNREVIEWED_ROWS: &[&str] = &[];
 
     /// Whole-table invariant: the set of unreviewed-and-forecastless rows is
     /// exactly [`UNREVIEWED_ROWS`] — no more, and no fewer.
@@ -396,12 +403,28 @@ mod tests {
 
     /// Those rows must actually REFUSE, not merely be listed. Ties the
     /// inventory above to the predicate the arm gate branches on.
+    ///
+    /// [`UNREVIEWED_ROWS`] is currently empty, which would make the loop
+    /// vacuous, so the classifier is also exercised against a synthetic
+    /// unreviewed row. Without that, a change breaking `Unreviewed` detection
+    /// would leave this test green purely because there is nothing to iterate —
+    /// the same "green guard watching nothing" shape that let 35 stale rows
+    /// hide.
     #[test]
     fn the_unreviewed_rows_are_not_covered() {
         for sym in UNREVIEWED_ROWS {
             assert_eq!(coverage(sym), Coverage::Unreviewed, "{sym}");
             assert!(!coverage(sym).is_covered(), "{sym} must refuse at arm time");
         }
+        // The predicate still has teeth even when the inventory is empty.
+        let widen = [0.0_f64; 24];
+        let forecast = [0.0_f64; 24];
+        assert_eq!(
+            classify("ny", false, &widen, &forecast),
+            Coverage::Unreviewed,
+            "an unreviewed, forecastless row must still classify as Unreviewed",
+        );
+        assert!(!Coverage::Unreviewed.is_covered());
     }
 
     /// **No symbol may appear under two brokers.**
