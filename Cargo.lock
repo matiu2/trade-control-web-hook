@@ -3805,6 +3805,7 @@ dependencies = [
  "instrument-lookup",
  "oanda-client",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-error",

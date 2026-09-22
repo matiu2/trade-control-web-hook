@@ -12,8 +12,13 @@
 //! session for TN (operator-run, not CI).
 //!
 //! Usage:
-//!   generate --brokers oanda,tradenation --out spread_baseline_candle.rs
-//!   generate --brokers oanda --only EUR_USD,XAU_USD   # spot-check a few
+//!   generate --brokers oanda,tradenation                  # full bake -> live table
+//!   generate --brokers oanda --only EUR_USD --out /tmp/probe.rs   # spot-check
+//!
+//! ⚠️ **The table is REPLACED, never merged** — a run emits only the rows it
+//! profiled. So `--only` against the live table would un-bake every instrument
+//! it skipped; always pair it with a throwaway `--out`. The shrink guard
+//! refuses that write rather than trusting the operator to remember.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -25,6 +30,7 @@ use tracing::{info, warn};
 use spread_baseline_gen::compute::profile_from_minutes;
 use spread_baseline_gen::fetch::{fetch_oanda_minutes, minutes_from_bidask};
 use spread_baseline_gen::render::render_table;
+use spread_baseline_gen::shrink_guard::{self, ShrinkVerdict};
 use spread_baseline_gen::universe::{WorkItem, work_items};
 use spread_baseline_gen::{BaselineRow, Broker};
 
@@ -35,13 +41,24 @@ struct Args {
     #[arg(long, default_value = "oanda,tradenation")]
     brokers: String,
 
-    /// Output path for the generated table (relative to cwd).
-    #[arg(long, default_value = "spread_baseline_candle.rs")]
+    /// Output path for the generated table. Defaults to the **live** table, so
+    /// a full bake needs no path argument and cannot land in the cwd by
+    /// accident. A spot-check (`--only`) must redirect this somewhere else.
+    #[arg(long, default_value = "core/src/spread_baseline_candle.rs")]
     out: PathBuf,
 
     /// Restrict to these broker symbols (comma-separated) — for spot-checks.
+    ///
+    /// The table is REPLACED, not merged, so this must be paired with an
+    /// `--out` that is not the live table (the shrink guard enforces it).
     #[arg(long)]
     only: Option<String>,
+
+    /// Write the table even when it is drastically smaller than the one it
+    /// replaces. For a deliberate shrink (dropping a broker, narrowing the
+    /// universe) — never to silence a surprise.
+    #[arg(long)]
+    allow_shrink: bool,
 
     /// Include Stock-class instruments (deferred by default in Stage 1).
     #[arg(long)]
@@ -122,7 +139,19 @@ async fn main() -> Result<()> {
     };
 
     let mut rows: Vec<BaselineRow> = Vec::new();
-    for item in &items {
+    let total = items.len();
+    for (n, item) in items.iter().enumerate() {
+        // Progress on EVERY instrument, not just under `--verbose`. A bake is
+        // hours long and network-bound; without this the run is silent on
+        // success and its only output is failures, so "no news" is
+        // indistinguishable from "profiling nothing at all" — which is exactly
+        // how a run that skipped every instrument read as healthy.
+        info!(
+            "[{}/{total}] {} {}",
+            n + 1,
+            item.broker.as_str(),
+            item.symbol,
+        );
         match profile_one(item, args.days, oanda.as_ref(), tn.as_ref()).await {
             Ok(Some(row)) => {
                 if args.verbose {
@@ -154,8 +183,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Write the table.
+    // Write the table — but not if that would silently un-bake instruments.
+    // `render_table` emits only THIS run's rows, so a short run replacing a
+    // full table deletes every instrument it didn't profile.
     let table = render_table(&rows);
+    if !args.allow_shrink
+        && let ShrinkVerdict::Shrunk { old, new } = shrink_guard::check(&args.out, &table)
+    {
+        return Err(shrink_guard::refusal(&args.out, old, new));
+    }
     std::fs::write(&args.out, &table).wrap_err_with(|| format!("write {}", args.out.display()))?;
     info!("wrote {} rows to {}", rows.len(), args.out.display());
 

@@ -16,6 +16,7 @@
 pub mod compute;
 pub mod fetch;
 pub mod render;
+pub mod shrink_guard;
 pub mod universe;
 
 pub use compute::{
