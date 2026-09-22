@@ -3804,6 +3804,7 @@ dependencies = [
  "color-eyre",
  "instrument-lookup",
  "oanda-client",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-error",
