@@ -403,4 +403,51 @@ mod tests {
             assert!(!coverage(sym).is_covered(), "{sym} must refuse at arm time");
         }
     }
+
+    /// **No symbol may appear under two brokers.**
+    ///
+    /// Every lookup into the baked table — `coverage` here, plus
+    /// `baked_candle_row`, `baked_baseline` and `baked_forecast_row` in the
+    /// parent module — matches on the **symbol alone** and discards the broker
+    /// column (`.find(|(_broker, symbol, ..)| *symbol == instrument)`). That is
+    /// only correct while the two brokers' symbol namespaces are disjoint.
+    ///
+    /// Today they are, by naming convention rather than by construction: OANDA
+    /// writes `EUR_USD` and `BTC_USD` where TradeNation writes `EUR/USD` and
+    /// `Bitcoin`. Nothing enforces that. The day one instrument is listed
+    /// identically on both — a new asset class, a broker renaming a market, or
+    /// a hand-written `~/.config/instrument-lookup/mappings.toml` overlay entry
+    /// — `find` silently returns whichever row sorts first, and one broker's
+    /// leg is sized off the OTHER broker's spread profile. Same symbol, wrong
+    /// instrument, no error anywhere.
+    ///
+    /// That contradicts the identity rule this table is built on: a tradeable
+    /// instrument is `(broker, symbol)`, which is why the rows carry a broker
+    /// and are sorted by `(broker, symbol)` in the first place.
+    ///
+    /// This test is the tripwire. It does **not** fix the lookups — threading a
+    /// broker through ~83 call sites is a change of its own — it guarantees the
+    /// precondition that makes them safe is still true, so the ambiguity is
+    /// caught here at build time rather than in a mis-sized live stop. If it
+    /// goes red, key the four lookups on `(broker, symbol)` rather than
+    /// renaming the colliding instrument.
+    #[test]
+    fn no_symbol_is_baked_under_two_brokers() {
+        use std::collections::BTreeMap;
+
+        let mut by_symbol: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (broker, symbol) in baked_rows() {
+            by_symbol.entry(symbol).or_default().push(broker);
+        }
+        let collisions: Vec<_> = by_symbol
+            .iter()
+            .filter(|(_symbol, brokers)| brokers.len() > 1)
+            .collect();
+        assert!(
+            collisions.is_empty(),
+            "these symbols are baked under more than one broker, so every \
+             symbol-keyed lookup is ambiguous and may read the wrong broker's \
+             spread profile: {collisions:?}",
+        );
+    }
 }
