@@ -21,14 +21,23 @@
 //! through the retry gate and writes the `EntryAttempt` row that every
 //! attempt-keyed cron enumerates. See CLAUDE.md, "Manual entries".
 //!
-//! Because it reads a *drawing property* (the position tool's tick distances)
-//! rather than geometry a frozen spec could carry, this path is refused under
-//! `--spec-in` — see the guard in [`crate::pipeline`].
+//! # Two sources, one trade
+//!
+//! This path used to be live-chart only, because it read a *drawing property*
+//! (TradingView's tick distances) that no frozen spec could carry. Since
+//! 2026-09-24 a spec CAN carry the trade, as absolute prices — see
+//! [`crate::frozen_position`] for why local-chart's three-anchor tool has a
+//! frozen equivalent when TradingView's does not.
+//!
+//! [`PositionSource`] resolves either source to the same triple — levels,
+//! direction, trade-expiry — so everything below it is identical whichever
+//! the operator armed from. The refusal in [`crate::pipeline`] narrowed
+//! accordingly: a spec with no `position` still cannot use these flags.
 
 use std::fs;
 
 use chrono::{DateTime, Utc};
-use color_eyre::eyre::{Context, Result};
+use color_eyre::eyre::{Context, Result, eyre};
 use tracing::info;
 use trade_control_cli as cli;
 use trade_control_conventions::Broker;
@@ -37,12 +46,92 @@ use trade_control_core::sig::KEY_LEN;
 use crate::args::{Args, PositionEntry};
 use crate::broker_kind::broker_to_kind;
 use crate::calendar::read_trade_expiry;
+use crate::frozen_position::FrozenPosition;
 use crate::instrument_resolution::ResolvedInstrument;
 use crate::pipeline::arm_out_dir;
 use crate::plan_geometry::PlanGeometry;
-use crate::position_trade::{core_direction, resolve_levels};
+use crate::position_trade::{PositionLevels, core_direction, resolve_levels};
 use crate::register_post::post_intent_blocking;
-use crate::roles::Roles;
+use crate::roles::{PositionDirection, Roles};
+
+/// Where a position entry's numbers come from — a live TradingView drawing,
+/// or a frozen spec.
+///
+/// Both are resolved to the SAME triple up front ([`Self::pick`]), so no
+/// code below this point branches on the source. That is deliberate: the two
+/// differ only in how the prices are *recovered* (tick offsets × `tick_size`
+/// versus already-absolute), and letting that distinction travel any further
+/// would mean every later step had to know about it.
+///
+/// ⚠️ The conversion asymmetry is the whole hazard. Running
+/// [`resolve_levels`] on already-absolute prices — the "simplification" of
+/// treating both sources alike — turns the operator's 19670.6 ESPIX entry
+/// into 196.706, a plausible-looking number for a different instrument
+/// entirely. [`FrozenPosition::levels`] takes no `tick_size` argument
+/// precisely so that mistake cannot be written.
+#[derive(Debug)]
+pub(crate) struct PositionSource {
+    pub levels: PositionLevels,
+    pub direction: PositionDirection,
+    /// The `PlanGeometry` the trade-expiry is read from. A live arm derives
+    /// it from the drawings; a frozen arm already has it in the spec.
+    pub geom: PlanGeometry,
+}
+
+impl PositionSource {
+    /// Resolve whichever source is present.
+    ///
+    /// Prefers `roles` when both exist, which in practice never happens —
+    /// `roles` is `Some` only on the live-chart path and `frozen` only on a
+    /// spec path, and `SetupInputs` is built by exactly one of the two. The
+    /// preference is stated rather than left to chance so that if the two
+    /// ever DO meet, the live chart (the thing the operator is looking at)
+    /// wins rather than a file that may be stale — the hazard in
+    /// `[[arm-export-first-match-wins-is-a-hazard]]`.
+    ///
+    /// Having neither is the rejection, and it names both ways to fix it.
+    /// `geom` is the frozen spec's own geometry, used only for its
+    /// `trade_expiry_epoch` on the frozen branch — a static trade's spec
+    /// carries the drawn trade-expiry there, exactly as a pattern spec does.
+    /// Passing `PlanGeometry::default()` instead would drop it and make
+    /// every frozen position entry fail the expiry check that follows.
+    pub(crate) fn pick(
+        roles: Option<&Roles>,
+        frozen: Option<&FrozenPosition>,
+        geom: &PlanGeometry,
+        tick_size: f64,
+    ) -> Result<Self> {
+        if let Some(roles) = roles {
+            let pos = roles.position.as_ref().ok_or_else(|| {
+                eyre!(
+                    "--market-entry / --stop-entry / --limit-entry need a long/short \
+                     position tool drawn on the chart, and there is none"
+                )
+            })?;
+            return Ok(Self {
+                // Tick-distance SL/TP → absolute prices. `tick_size` is the
+                // per-broker catalog value (NOT pip_size — see
+                // `position_trade` docs).
+                levels: resolve_levels(pos, tick_size)?,
+                direction: pos.direction,
+                geom: PlanGeometry::from_roles(roles),
+            });
+        }
+        let frozen = frozen.ok_or_else(|| {
+            eyre!(
+                "--market-entry / --stop-entry / --limit-entry need a position to place, \
+                 from either a live chart with a position tool drawn on it or a frozen \
+                 setup carrying one"
+            )
+        })?;
+        // Already absolute — see the type doc. No tick conversion.
+        Ok(Self {
+            levels: frozen.levels(),
+            direction: frozen.direction(),
+            geom: geom.clone(),
+        })
+    }
+}
 
 /// Position-tool direct entry. Read the drawn long/short position tool,
 /// convert its tick-distance SL/TP to absolute prices via the catalog
@@ -55,28 +144,17 @@ pub(crate) fn run_position_entry(
     args: &Args,
     mode: PositionEntry,
     broker: Broker,
-    roles: &Roles,
+    source: PositionSource,
     resolved: &ResolvedInstrument,
     instrument: &str,
     account: &str,
     key: &[u8; KEY_LEN],
     now: DateTime<Utc>,
 ) -> Result<i32> {
-    let Some(pos) = roles.position.as_ref() else {
-        eprintln!(
-            "ERROR: --{}-entry was set but no long/short position tool is drawn on the chart.",
-            match mode {
-                PositionEntry::Market => "market",
-                PositionEntry::Stop => "stop",
-                PositionEntry::Limit => "limit",
-            }
-        );
-        return Ok(1);
-    };
-
-    // Tick-distance SL/TP → absolute prices. tick_size is the per-broker
-    // catalog value (NOT pip_size — see position_trade docs).
-    let levels = resolve_levels(pos, resolved.precision.tick_size)?;
+    // Already resolved to absolute prices by `PositionSource::pick`,
+    // whichever source they came from. See that type's doc for why the
+    // tick conversion lives there and not here.
+    let levels = source.levels;
 
     // Expiry: the drawn trade-expiry line, REQUIRED — no fallback.
     //
@@ -103,7 +181,7 @@ pub(crate) fn run_position_entry(
     //
     // `--expiry-hours` is consequently dead for this path; it is retained on
     // `Args` only so an existing invocation carrying it still parses.
-    let trade_expiry = read_trade_expiry(&PlanGeometry::from_roles(roles)).wrap_err(
+    let trade_expiry = read_trade_expiry(&source.geom).wrap_err(
         "draw a trade-expiry vertical on the chart before arming a manual entry. It is not \
          optional: the order sweep cancels this resting order when the expiry passes, so \
          guessing a default would silently cancel a live order at a time you never chose. \
@@ -115,7 +193,7 @@ pub(crate) fn run_position_entry(
         PositionEntry::Stop => cli::PositionEntryKind::Stop,
         PositionEntry::Limit => cli::PositionEntryKind::Limit,
     };
-    let direction = core_direction(pos.direction);
+    let direction = core_direction(source.direction);
 
     info!(
         instrument,
@@ -214,6 +292,71 @@ fn entry_confirmation(trade_id: &str, worker_response: &str, dry_run: bool) -> V
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::frozen_position::{FrozenDirection, FrozenPosition};
+
+    /// The operator's real ESPIX_EUR static trade, and the TradeNation tick
+    /// size for it (0.1, from the instrument-lookup catalog).
+    fn espix() -> FrozenPosition {
+        FrozenPosition {
+            direction: FrozenDirection::Long,
+            entry: 19670.6,
+            stop_loss: 19637.3,
+            take_profit: 19910.3,
+        }
+    }
+    const ESPIX_TICK: f64 = 0.1;
+
+    /// **The money test.** A frozen position's prices are ABSOLUTE and must
+    /// reach the order untouched.
+    ///
+    /// Found by mutation: making this branch multiply by `tick_size` — the
+    /// "simplification" of treating both sources alike, and the single most
+    /// likely future edit here — left all 523 tests green while turning a
+    /// 19670.6 entry into 1967.06. Plausible number, wrong instrument's
+    /// scale, no error anywhere.
+    ///
+    /// A non-1.0 tick is essential: with `tick_size == 1.0` the mutation is
+    /// invisible.
+    #[test]
+    fn a_frozen_position_is_never_tick_converted() {
+        assert_ne!(ESPIX_TICK, 1.0, "a 1.0 tick would hide the bug under test");
+        let source =
+            PositionSource::pick(None, Some(&espix()), &PlanGeometry::default(), ESPIX_TICK)
+                .expect("a frozen position is a valid source");
+        assert_eq!(source.levels.entry, 19670.6);
+        assert_eq!(source.levels.stop_loss, 19637.3);
+        assert_eq!(source.levels.take_profit, 19910.3);
+        assert_eq!(source.direction, PositionDirection::Long);
+    }
+
+    /// The spec's own geometry travels through, because its
+    /// `trade_expiry_epoch` is what the (mandatory, no-fallback) expiry
+    /// check reads. Passing a default `PlanGeometry` here would make every
+    /// frozen position entry fail that check.
+    #[test]
+    fn the_frozen_specs_trade_expiry_reaches_the_source() {
+        let geom = PlanGeometry {
+            trade_expiry_epoch: Some(1_790_424_000),
+            ..PlanGeometry::default()
+        };
+        let source =
+            PositionSource::pick(None, Some(&espix()), &geom, ESPIX_TICK).expect("valid source");
+        assert_eq!(source.geom.trade_expiry_epoch, Some(1_790_424_000));
+    }
+
+    /// Neither source is the rejection, and it must name both ways to fix it
+    /// rather than only the chart (which is how a spec-armed operator gets
+    /// sent hunting for TradingView).
+    #[test]
+    fn no_source_at_all_is_refused_naming_both_doors() {
+        let err = PositionSource::pick(None, None, &PlanGeometry::default(), ESPIX_TICK)
+            .expect_err("nothing to place")
+            .to_string();
+        assert!(err.contains("live chart"), "{err}");
+        assert!(err.contains("frozen setup"), "{err}");
+    }
+
     use super::entry_confirmation;
 
     /// The line the operator reads at placement time must not claim the order

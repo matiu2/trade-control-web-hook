@@ -29,12 +29,18 @@
 //!
 //! ## What is deliberately NOT here
 //!
-//! `Roles` — the raw `Drawing`s. Only the position-tool path still reads them
-//! (`--market-entry`/`--stop-entry`/`--limit-entry`), and that path is
-//! *inherently* live-chart: a position tool's SL/TP are TradingView drawing
-//! properties with no frozen equivalent. Keeping `Roles` out of this struct is
-//! what makes "a frozen arm cannot use the position tools" a **type** fact
-//! rather than a documented promise.
+//! `Roles` — the raw `Drawing`s. Keeping them out of this struct is what makes
+//! "a frozen arm cannot read a TradingView drawing" a **type** fact rather than
+//! a documented promise, and that property is unchanged.
+//!
+//! What HAS changed (2026-09-24) is the claim that used to follow from it: that
+//! the position-tool path is *inherently* live-chart. That was true of
+//! TradingView's tool, whose SL/TP are drawing properties expressed as tick
+//! offsets with no frozen equivalent. It is not true of local-chart's, whose
+//! three anchors are absolute prices. So [`SetupInputs::position`] carries a
+//! [`crate::frozen_position::FrozenPosition`] — **prices, not a `Drawing`** —
+//! and the refusal narrows from "no frozen arm may place a position" to "no
+//! frozen arm may place a position it does not carry the prices for".
 
 use trade_control_conventions::Broker;
 
@@ -75,6 +81,13 @@ pub struct SetupInputs {
     pub start: Option<i64>,
     /// The as-of instant elapsed control windows were pruned against.
     pub prune_as_of: AsOf,
+    /// A **static trade** frozen into the spec, when the producer wrote one.
+    ///
+    /// `None` on every live-chart arm (a TradingView position is read from
+    /// `Roles`, not from here) and on every pattern spec. `Some` only when a
+    /// spec carried absolute entry/SL/TP prices — see
+    /// [`crate::frozen_position`].
+    pub position: Option<crate::frozen_position::FrozenPosition>,
 }
 
 #[cfg(test)]
@@ -99,6 +112,7 @@ pub(crate) mod tests {
                 ..Default::default()
             },
             control: ControlWindows::empty(),
+            position: None,
             instrument: resolved.broker_symbol.clone(),
             resolved,
             broker: Broker::Oanda,

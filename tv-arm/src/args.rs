@@ -207,24 +207,30 @@ pub struct Args {
     pub entry_limit: bool,
 
     /// **Position-tool direct entry.** Read the long/short *position*
-    /// tool drawn on the chart and place a **market** order immediately
-    /// (worker fills at broker price on receipt), with the drawing's
-    /// entry / SL / TP. Mutually exclusive with `--stop-entry` /
-    /// `--limit-entry`. No pattern, preps, or geometry needed — just the
-    /// drawn position + a trade-expiry.
-    #[arg(long, conflicts_with_all = ["spec_in", "spec_url"])]
+    /// tool and place a **market** order immediately (worker fills at
+    /// broker price on receipt), with its entry / SL / TP. Mutually
+    /// exclusive with `--stop-entry` / `--limit-entry`. No pattern, preps,
+    /// or geometry needed — just the position + a trade-expiry.
+    ///
+    /// Source: a live chart's drawn position tool, **or** a frozen setup
+    /// that carries one (`--spec-in` / `--spec-url`). The clap conflict
+    /// with those two was lifted on 2026-09-24 — see
+    /// [`crate::frozen_position`] for why a frozen position became
+    /// possible. A spec WITHOUT a position is still refused, by
+    /// `setup_from_frozen`, naming the flag that was used.
+    #[arg(long)]
     pub market_entry: bool,
 
     /// **Position-tool direct entry.** Rest a **stop** order at the
-    /// drawn position's entry price. Mutually exclusive with
-    /// `--market-entry` / `--limit-entry`.
-    #[arg(long, conflicts_with_all = ["spec_in", "spec_url"])]
+    /// position's entry price. Mutually exclusive with `--market-entry` /
+    /// `--limit-entry`. Same two sources as [`Self::market_entry`].
+    #[arg(long)]
     pub stop_entry: bool,
 
     /// **Position-tool direct entry.** Rest a **limit** order at the
-    /// drawn position's entry price. Mutually exclusive with
-    /// `--market-entry` / `--stop-entry`.
-    #[arg(long, conflicts_with_all = ["spec_in", "spec_url"])]
+    /// position's entry price. Mutually exclusive with `--market-entry` /
+    /// `--stop-entry`. Same two sources as [`Self::market_entry`].
+    #[arg(long)]
     pub limit_entry: bool,
 
     /// Anchor SL to Pine's `recent_high` (shorts) / `recent_low`
@@ -621,9 +627,12 @@ pub struct Args {
     /// the file means a rewound chart or a stale drawing can't hand back a
     /// different pattern than the one that was confirmed.
     ///
-    /// Incompatible with the position-entry tools (`--market-entry` /
-    /// `--stop-entry` / `--limit-entry`): their SL/TP are TradingView drawing
-    /// properties with no frozen equivalent.
+    /// Usable with the position-entry tools (`--market-entry` /
+    /// `--stop-entry` / `--limit-entry`) **only when the spec carries a
+    /// `position`** — absolute entry/SL/TP prices, as local-chart's
+    /// `GET /arm-setup` writes for a drawn position tool. A pattern spec
+    /// still refuses them: a TradingView position's SL/TP are drawing
+    /// properties in tick offsets, with no frozen equivalent.
     #[arg(long, value_name = "FILE")]
     pub spec_in: Option<PathBuf>,
 
@@ -638,8 +647,8 @@ pub struct Args {
     ///
     /// Carries every restriction `--spec-in` does — it is the same frozen-spec
     /// arm, differing only in where the bytes come from. In particular the
-    /// position-entry tools are refused: their SL/TP are live-chart drawing
-    /// properties with no frozen equivalent.
+    /// position-entry tools work only when the fetched spec carries a
+    /// `position`, and a pattern spec refuses them.
     #[arg(long, value_name = "URL", conflicts_with = "spec_in")]
     pub spec_url: Option<String>,
 
@@ -1238,39 +1247,58 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    /// The position tools read the drawn position's SL/TP, which are TradingView
-    /// **drawing properties** — there is no frozen equivalent. Combining them
-    /// with `--spec-in` must fail at parse time, not arm some other trade.
+    /// The position tools now PARSE alongside `--spec-in` / `--spec-url`.
     ///
-    /// Checked at the clap layer *and* guarded again at runtime in
-    /// `read_setup_from_spec`: this catches the operator's typo with a good
-    /// message, that one keeps the invariant true for any future caller that
-    /// builds `Args` directly (every test in this crate does exactly that).
+    /// This asserted the opposite until 2026-09-24, and the reason it did was
+    /// sound: TradingView's position tool stores SL/TP as drawing properties
+    /// in tick offsets, so a frozen spec genuinely could not carry them.
+    /// local-chart's stores three absolute prices, so it can — see
+    /// `crate::frozen_position`.
+    ///
+    /// **The refusal did not disappear, it moved and narrowed.** A spec with
+    /// no `position` is still rejected, now by `setup_from_frozen` at
+    /// runtime, which can say WHICH spec and WHY — something a clap
+    /// `conflicts_with` cannot, since it fires before the file is read.
+    /// `spec_in_refuses_the_position_tools_even_when_clap_is_bypassed` and
+    /// its `--spec-url` twin pin that.
     #[test]
-    fn position_tools_conflict_with_spec_in() {
+    fn position_tools_parse_alongside_the_frozen_spec_flags() {
         for flag in ["--market-entry", "--stop-entry", "--limit-entry"] {
             // Each is fine on its own …
             Args::try_parse_from(["tv-arm", flag]).expect(flag);
             // … and fine with --spec-out (that's a live arm that also freezes).
             Args::try_parse_from(["tv-arm", flag, "--spec-out", "/tmp/s.json"])
                 .unwrap_or_else(|e| panic!("{flag} with --spec-out should parse: {e}"));
-            // … but not with --spec-in.
+            // … and now with --spec-in: whether it ARMS depends on whether
+            // that spec carries a position, which only reading it can tell.
+            Args::try_parse_from(["tv-arm", flag, "--spec-in", "/tmp/s.json"])
+                .unwrap_or_else(|e| panic!("{flag} with --spec-in should parse: {e}"));
+            // … and with --spec-url, the same frozen arm over HTTP.
+            Args::try_parse_from([
+                "tv-arm",
+                flag,
+                "--spec-url",
+                "http://127.0.0.1:8790/arm-setup",
+            ])
+            .unwrap_or_else(|e| panic!("{flag} with --spec-url should parse: {e}"));
+        }
+    }
+
+    /// The three position-entry flags stay mutually exclusive with each
+    /// other — that group is untouched by the frozen-spec change, and two
+    /// order kinds for one trade is incoherent however it was sourced.
+    #[test]
+    fn the_position_entry_flags_remain_mutually_exclusive() {
+        for pair in [
+            ["--market-entry", "--stop-entry"],
+            ["--market-entry", "--limit-entry"],
+            ["--stop-entry", "--limit-entry"],
+        ] {
             assert!(
-                Args::try_parse_from(["tv-arm", flag, "--spec-in", "/tmp/s.json"]).is_err(),
-                "{flag} must conflict with --spec-in"
-            );
-            // … nor with --spec-url, which is the same frozen arm over HTTP.
-            // Without this the position tools would slip through the one door
-            // that isn't a file path.
-            assert!(
-                Args::try_parse_from([
-                    "tv-arm",
-                    flag,
-                    "--spec-url",
-                    "http://127.0.0.1:8790/arm-setup"
-                ])
-                .is_err(),
-                "{flag} must conflict with --spec-url"
+                Args::try_parse_from(["tv-arm", pair[0], pair[1]]).is_err(),
+                "{} and {} must stay mutually exclusive",
+                pair[0],
+                pair[1]
             );
         }
     }
