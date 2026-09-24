@@ -28,6 +28,7 @@ mod calendar;
 mod clipboard;
 mod control_bundle;
 mod control_windows;
+mod frozen_position;
 mod frozen_setup;
 mod geometry;
 mod hs_resolve;

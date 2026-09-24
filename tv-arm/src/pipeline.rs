@@ -370,15 +370,41 @@ fn setup_from_frozen(
     frozen: crate::frozen_setup::FrozenSetup,
     source: &str,
 ) -> Result<SetupInputs> {
-    // The position tools need drawings this path doesn't have. Refuse up front,
-    // with the reason — arming them off a frozen spec would silently place a
-    // different trade.
-    if args.position_entry_mode().is_some() {
+    // The position tools need entry/SL/TP prices. A spec that CARRIES them
+    // (local-chart's `GET /arm-setup` writes absolute prices — see
+    // `crate::frozen_position`) satisfies the flags; one that does not still
+    // cannot, because there is nothing in it to place.
+    //
+    // The refusal narrowed here rather than being deleted: the original
+    // reason — "a position tool's SL/TP are TradingView drawing properties
+    // with no frozen equivalent" — is still exactly right for a PATTERN
+    // spec, and arming one of these flags off it would place a trade the
+    // spec never described.
+    if args.position_entry_mode().is_some() && frozen.position.is_none() {
+        // Name the flag the operator actually typed. `--spec-in` and
+        // `--spec-url` share this code, and "cannot be used with a frozen
+        // setup" sends someone hunting for a flag they did not use.
+        let door = if args.spec_url.is_some() {
+            "--spec-url"
+        } else {
+            "--spec-in"
+        };
         return Err(eyre!(
-            "--market-entry / --stop-entry / --limit-entry read the drawn position \
-             tool's SL/TP from the chart, so they cannot be used with a frozen setup \
-             (--spec-in / --spec-url): there are no drawings in one"
+            "--market-entry / --stop-entry / --limit-entry need a drawn position's \
+             entry/SL/TP, and the frozen setup given to {door} ({source}) carries \
+             none: it is a pattern spec. Either arm it without those flags, or \
+             export a spec from a chart with a position tool drawn on it \
+             (local-chart's GET /arm-setup emits one under \"position\")"
         ));
+    }
+
+    // Numbers that cannot be traded are refused HERE, at the edge, rather
+    // than deeper in order-building: this is the last point at which the
+    // error can name the file the operator just wrote.
+    if let Some(pos) = frozen.position.as_ref()
+        && let Err(why) = pos.validate()
+    {
+        return Err(eyre!("frozen setup {source}: {why}"));
     }
 
     let broker = resolve_broker(args, &frozen.chart_symbol)?;
@@ -443,6 +469,7 @@ fn setup_from_frozen(
     Ok(SetupInputs {
         geom: frozen.geom,
         control,
+        position: frozen.position,
         instrument,
         resolved,
         broker,
@@ -649,6 +676,10 @@ fn read_setup_from_chart(args: &Args) -> Result<(SetupInputs, Roles)> {
         SetupInputs {
             geom,
             control,
+            // A live arm reads its position tool from `roles` (TradingView
+            // drawing properties, tick offsets); `position` is the FROZEN
+            // price form and never exists here.
+            position: None,
             instrument,
             resolved,
             broker,
@@ -671,13 +702,18 @@ fn read_setup_from_chart(args: &Args) -> Result<(SetupInputs, Roles)> {
 ///
 /// `roles` is `Some` only on the live-chart path, and is used for exactly one
 /// thing: the position-entry tools (`--market-entry` / `--stop-entry` /
-/// `--limit-entry`), whose SL/TP are TradingView **drawing properties** with no
-/// frozen equivalent. A frozen arm passes `None`, and asking for a position
-/// entry there is a clean rejection rather than a silent wrong trade.
+/// `--limit-entry`) reading a **TradingView** position, whose SL/TP are
+/// drawing properties in tick offsets.
+///
+/// A frozen arm passes `None` — but since 2026-09-24 it may instead carry
+/// [`SetupInputs::position`], the same trade as absolute prices, written by a
+/// producer that has them (local-chart). So the position-entry flags are
+/// satisfied by **either** source, and refused only when neither is present.
 fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Result<i32> {
     let SetupInputs {
         geom,
         control,
+        position: frozen_position,
         instrument,
         resolved,
         broker,
@@ -713,22 +749,23 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
     //     signed enter straight to the worker (placed on receipt). This
     //     short-circuits the whole pattern flow below.
     if let Some(mode) = args.position_entry_mode() {
-        // The position tools read raw TradingView drawings (their SL/TP are
-        // drawing properties), so they exist only on the live-chart path. A
-        // frozen-spec arm has no `Roles` and must say so plainly rather than
-        // silently arming some other trade.
-        let roles = roles.ok_or_else(|| {
-            eyre!(
-                "--market-entry / --stop-entry / --limit-entry read the drawn position \
-                 tool from the chart, so they need a live TradingView session; they \
-                 cannot be used with a frozen setup"
-            )
-        })?;
+        // Two sources, one trade. A live chart supplies `Roles` (a
+        // TradingView drawing, SL/TP as tick offsets); a frozen spec may
+        // supply `frozen_position` (absolute prices). Neither is a
+        // fallback for the other — `PositionSource` resolves each to the
+        // same `(levels, direction, expiry)` triple, and having no source
+        // at all is the rejection.
+        let source = crate::position_entry::PositionSource::pick(
+            roles,
+            frozen_position.as_ref(),
+            &geom,
+            resolved.precision.tick_size,
+        )?;
         return run_position_entry(
             args,
             mode,
             broker,
-            roles,
+            source,
             &resolved,
             &instrument,
             &account,

@@ -1,5 +1,89 @@
 # Changelog
 
+## v148 — 2026-09-24 — a frozen setup can carry a static trade
+
+**Why.** The operator draws a long/short position tool on local-chart and wants
+to arm *that trade* — no pattern, no neckline, no fib. Every route was blocked:
+
+    tv-arm --spec-in espix.spec.json --stop-entry
+    error: the argument '--spec-in <FILE>' cannot be used with '--stop-entry'
+
+The refusal was deliberate and documented, and its reason was sound **for
+TradingView**: that position tool stores SL/TP as `stopLevel` / `profitLevel`
+in **tick offsets**, recoverable only by multiplying by `tick_size` at arm
+time. A frozen spec genuinely had nothing to recover them from.
+
+That premise is a fact about one chart backend, not about frozen specs.
+local-chart's position tool declares `requiredAnchors: 3` and reads
+`_anchors[0..2].price` directly — three **absolute prices**, on disk, the
+moment the trade is drawn. So a frozen equivalent does exist; it had nowhere
+to live.
+
+**What changed.**
+
+- New `tv-arm/src/frozen_position.rs`: `FrozenPosition { direction, entry,
+  stop_loss, take_profit }`, `deny_unknown_fields`, matching the shape
+  local-chart's `GET /arm-setup` emits under `"position"`.
+- `FrozenSetup` gains an optional `position`. FROZEN, not re-read: those three
+  numbers ARE the operator's decision, exactly as `PlanGeometry` is for a
+  pattern. `capture` (the live `--spec-out` freeze) always writes `None` — a
+  TradingView position's offsets must not be converted at freeze time against
+  a `tick_size` a later re-arm may read differently.
+- `SetupInputs` gains `position`. `Roles` still does NOT live there, so "a
+  frozen arm cannot read a TradingView drawing" remains a **type** fact.
+- New `PositionSource::pick` resolves *either* source to one
+  `(levels, direction, geom)` triple, so nothing below it branches on origin.
+- The clap `conflicts_with_all = ["spec_in", "spec_url"]` is lifted from the
+  three position-entry flags.
+
+**The refusal narrowed; it did not disappear.** A spec with **no** `position`
+still refuses those flags — now at runtime in `setup_from_frozen`, which can
+say *which* spec and *why*, and names the flag actually used (`--spec-in` vs
+`--spec-url`). A clap conflict could not: it fires before the file is read.
+Both belt-and-braces tests
+(`spec_{in,url}_refuses_the_position_tools_even_when_clap_is_bypassed`) still
+pass, unchanged in intent.
+
+**Config.** None. No new flags, no env, no schema version bump — `position` is
+`#[serde(default)]` + `skip_serializing_if`, so every spec written before this
+parses unchanged and every pattern spec serialises byte-identically (pinned by
+`a_pattern_spec_omits_the_position_key_entirely` and
+`a_spec_without_a_position_key_still_parses`).
+
+**Tests.** 526 pass. Two gaps were found by mutation rather than by reading:
+
+- `the_serialized_form_carries_every_field` — the guard whose whole job is
+  catching a new field — **passed** when `position` was added, because its
+  fixture left every `Option` at `None` and `skip_serializing_if` hid the key.
+  It now populates every optional field and asserts the fixture does so.
+- Making the frozen branch multiply by `tick_size` (the "simplification" of
+  treating both sources alike, and the most likely future edit here) left
+  **all 523 tests green** while turning the operator's 19670.6 ESPIX entry
+  into 1967.06 — a plausible number at the wrong scale, no error raised.
+  `a_frozen_position_is_never_tick_converted` now fails on it. A non-1.0 tick
+  is essential and is asserted; with `tick_size == 1.0` the bug is invisible.
+
+`FrozenPosition::validate` refuses, at parse time, a non-finite or
+non-positive price, a stop on the wrong side of entry (an instant exit, and it
+inverts the risk that sizes the position), and a target on the wrong side.
+Deliberately NOT refused: a poor R:R — a 0.2R trade is a bad trade, not an
+invalid one.
+
+**Verified end to end** on the operator's real ESPIX_EUR h1 TradeNation trade:
+
+    position-tool direct entry instrument="Spain 35" direction=Long mode=Stop
+      entry=19670.6 stop_loss=19637.3 take_profit=19910.3
+      tick_size=0.1 trade_expiry=2026-09-26T12:00:00+00:00
+
+producing a correctly signed `pos-spain-35-*-enter.yaml` with
+`max_retries: 1` + `entry_dedup: gate_owned` (the cron-managed resting-order
+path). `tick_size=0.1` is logged but NOT applied — which is the point.
+
+**Follow-up.** `position_entry.rs` passes `instrument` to `arm_out_dir` where
+the pattern path passes `raw_symbol`, so a manual entry lands in
+`/tmp/trade-control-arm/Spain 35-<date>/` (with a space) rather than
+`ESPIXEUR-<date>/`. Pre-existing, untouched here, cosmetic.
+
 ## v147 — 2026-09-17 — `register` arms a cursorless frozen setup at "now"
 
 **Why.** Exporting a setup from local-chart and arming it straight away failed:
