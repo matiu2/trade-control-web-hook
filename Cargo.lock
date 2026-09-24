@@ -441,7 +441,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "color-eyre",
- "instrument-lookup 0.6.0",
+ "instrument-lookup 0.7.0",
  "redb",
  "serde",
  "sqlx",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "instrument-lookup"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2150,7 +2150,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "crossterm",
- "instrument-lookup 0.6.0",
+ "instrument-lookup 0.7.0",
  "ratatui",
  "serde",
  "serde_json",
@@ -2238,7 +2238,7 @@ name = "local-chart-client"
 version = "0.1.0"
 dependencies = [
  "color-eyre",
- "instrument-lookup 0.6.0",
+ "instrument-lookup 0.7.0",
  "reqwest 0.12.23",
  "serde",
  "serde_json",
@@ -2290,7 +2290,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "color-eyre",
- "instrument-lookup 0.6.0",
+ "instrument-lookup 0.7.0",
  "oanda-client",
  "reqwest 0.12.23",
  "serde",
@@ -2467,7 +2467,7 @@ dependencies = [
  "color-eyre",
  "getrandom 0.4.2",
  "gloo-timers",
- "instrument-lookup 0.6.0",
+ "instrument-lookup 0.7.0",
  "reqwest 0.12.23",
  "serde",
  "serde_json",
@@ -3825,7 +3825,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "color-eyre",
- "instrument-lookup 0.6.0",
+ "instrument-lookup 0.7.0",
  "oanda-client",
  "tempfile",
  "tokio",
@@ -4661,7 +4661,7 @@ dependencies = [
  "forex-factory",
  "getrandom 0.4.2",
  "hex",
- "instrument-lookup 0.6.0",
+ "instrument-lookup 0.7.0",
  "news-sentiment-tv",
  "oanda-client",
  "reqwest 0.12.23",
@@ -4859,7 +4859,7 @@ dependencies = [
  "clap_complete",
  "color-eyre",
  "hex",
- "instrument-lookup 0.6.0",
+ "instrument-lookup 0.7.0",
  "local-chart-client",
  "news-sentiment-tv",
  "oanda-client",
@@ -4889,7 +4889,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "color-eyre",
- "instrument-lookup 0.6.0",
+ "instrument-lookup 0.7.0",
  "news-sentiment-tv",
  "tokio",
  "tracing",
