@@ -162,7 +162,8 @@ fn render_detail(f: &mut Frame, area: Rect, div: &Divergences) {
             ),
         ])));
     }
-    for (rule_id, live_ts, replay_ts) in &div.timing {
+    for delta in &div.timing {
+        let (rule_id, live_ts, replay_ts) = (&delta.rule_id, &delta.live_ts, &delta.replay_ts);
         items.push(ListItem::new(Line::from(vec![
             Span::styled(
                 "Δ timing ",
@@ -172,7 +173,7 @@ fn render_detail(f: &mut Frame, area: Rect, div: &Divergences) {
             ),
             Span::raw(rule_id.clone()),
             Span::styled(
-                format!("  live {live_ts}"),
+                format!("  live {live_ts}{}", observed(delta.lateness_secs)),
                 Style::default().fg(Color::Cyan),
             ),
             Span::styled(
@@ -193,6 +194,31 @@ fn render_detail(f: &mut Frame, area: Rect, div: &Divergences) {
 
     let list = List::new(items).block(crate::ui::titled_block("Divergence (replay vs live)"));
     f.render_widget(list, area);
+}
+
+/// How the cron's observation of the bar is annotated next to the live bar:
+/// `+14s` for ordinary jitter, `+3h30m` for a rule that fired deep inside its
+/// bar, and `-59m` when the tick landed BEFORE the bar closed — the
+/// forming-bar signature, the one case a same-bar match is still a divergence.
+/// Empty when the bundle carries no granularity to measure against.
+fn observed(lateness_secs: Option<i64>) -> String {
+    match lateness_secs {
+        None => String::new(),
+        Some(secs) => format!(" ({})", signed_duration(secs)),
+    }
+}
+
+/// `-59m39s`, `+3h30m`, `+14s` — sign always shown, units trimmed to the two
+/// most significant so the line stays narrow.
+fn signed_duration(secs: i64) -> String {
+    let sign = if secs < 0 { '-' } else { '+' };
+    let a = secs.unsigned_abs();
+    let (h, m, s) = (a / 3600, (a % 3600) / 60, a % 60);
+    match (h, m) {
+        (0, 0) => format!("{sign}{s}s"),
+        (0, _) => format!("{sign}{m}m{s}s"),
+        _ => format!("{sign}{h}h{m}m"),
+    }
 }
 
 /// A compact `rule_id (action)` label for a fire.
@@ -241,4 +267,35 @@ fn render_timeline(f: &mut Frame, app: &App, area: Rect) {
     };
     let list = List::new(items).block(crate::ui::titled_block("Live (recorded)"));
     f.render_widget(list, area);
+}
+
+#[cfg(test)]
+mod compare_tests {
+    use super::*;
+
+    #[test]
+    fn the_wall_clock_is_shown_next_to_the_live_bar() {
+        // The point of the annotation: you can always see WHEN the cron hit,
+        // even though the comparison itself is on bars.
+        assert_eq!(observed(Some(14)), " (+14s)");
+        assert_eq!(observed(Some(0)), " (+0s)");
+    }
+
+    #[test]
+    fn a_fire_before_its_bar_closed_reads_as_negative() {
+        // The forming-bar signature, as recorded on AUD/NZD: the cron ticked
+        // 21s into an H1 bar, i.e. 59m39s BEFORE it closed.
+        assert_eq!(observed(Some(-3579)), " (-59m39s)");
+    }
+
+    #[test]
+    fn a_long_lateness_is_trimmed_to_two_units() {
+        // A news rule firing 3.5h into its H4 bar must not widen the line.
+        assert_eq!(observed(Some(12633)), " (+3h30m)");
+    }
+
+    #[test]
+    fn nothing_is_shown_when_the_lateness_is_unmeasurable() {
+        assert_eq!(observed(None), "");
+    }
 }

@@ -100,6 +100,21 @@ pub struct FrozenSetup {
     /// disagrees with the original.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tv_arm_version: Option<String>,
+    /// A **static trade** — a drawn position tool as absolute entry/SL/TP
+    /// prices, rather than a pattern to derive a trade from.
+    ///
+    /// FROZEN, and it belongs in the frozen half without ambiguity: these
+    /// three numbers ARE the operator's decision, in exactly the way
+    /// [`PlanGeometry`] is for a pattern. Re-deriving them would be
+    /// re-deciding the trade.
+    ///
+    /// `None` is the ordinary pattern spec, and is what every spec written
+    /// before this field existed parses as. See [`crate::frozen_position`]
+    /// for why a local-chart position can be frozen when a TradingView one
+    /// cannot, and why the position-entry refusal narrows rather than
+    /// disappears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<crate::frozen_position::FrozenPosition>,
 }
 
 /// The current [`FrozenSetup::version`].
@@ -122,6 +137,15 @@ impl FrozenSetup {
             start,
             note,
             tv_arm_version: Some(env!("GIT_VERSION").to_string()),
+            // `capture` is the LIVE-CHART freeze (`--spec-out`), whose
+            // position tool is TradingView's: its SL/TP are tick offsets,
+            // not prices, and converting them here would freeze numbers
+            // derived from a `tick_size` that a later re-arm may read
+            // differently from the catalog. Static trades reach a spec by
+            // being WRITTEN as absolute prices by a producer that has them
+            // (local-chart's `GET /arm-setup`), never by being captured
+            // off a TradingView chart. See `crate::frozen_position`.
+            position: None,
         }
     }
 
@@ -235,7 +259,25 @@ mod tests {
     /// round-trip test missed `runup_start`.
     #[test]
     fn the_serialized_form_carries_every_field() {
-        let json = serde_json::to_value(setup()).expect("serialize");
+        // Every OPTIONAL field must be Some here, or `skip_serializing_if`
+        // omits it and this guard goes blind to it — which is exactly what
+        // happened when `position` was added: the test passed against a
+        // fixture whose `position` was None, so the new field slipped past
+        // the one check meant to catch new fields.
+        let full = FrozenSetup {
+            position: Some(crate::frozen_position::FrozenPosition {
+                direction: crate::frozen_position::FrozenDirection::Long,
+                entry: 1.1000,
+                stop_loss: 1.0950,
+                take_profit: 1.1200,
+            }),
+            ..setup()
+        };
+        assert!(
+            full.start.is_some() && full.note.is_some() && full.tv_arm_version.is_some(),
+            "the fixture must populate every Option, or skip_serializing_if hides it"
+        );
+        let json = serde_json::to_value(&full).expect("serialize");
         let obj = json.as_object().expect("an object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -245,6 +287,7 @@ mod tests {
                 "chart_symbol",
                 "geom",
                 "note",
+                "position",
                 "resolution",
                 "start",
                 "tv_arm_version",
@@ -253,6 +296,53 @@ mod tests {
             "a field was added or removed — if added, decide FREEZE vs RE-READ \
              (see the module doc) before updating this list"
         );
+    }
+
+    /// A pattern spec must serialize WITHOUT a `position` key, not with a
+    /// null one. Producers (local-chart included) are `deny_unknown_fields`
+    /// in both directions, and a `"position": null` would also change the
+    /// bytes of every spec written before this field existed.
+    #[test]
+    fn a_pattern_spec_omits_the_position_key_entirely() {
+        let json = serde_json::to_value(setup()).expect("serialize");
+        assert!(
+            !json
+                .as_object()
+                .expect("an object")
+                .contains_key("position"),
+            "a pattern spec grew a null position key: {json}"
+        );
+    }
+
+    /// A spec written before `position` existed must still parse — the
+    /// field is `#[serde(default)]`, and every corpus fixture on disk
+    /// predates it.
+    #[test]
+    fn a_spec_without_a_position_key_still_parses() {
+        let json = r#"{"version":1,"geom":{},"resolution":"60",
+                       "chart_symbol":"OANDA:EURUSD"}"#;
+        let got = FrozenSetup::parse(json, "test").expect("an old spec parses");
+        assert_eq!(got.position, None);
+    }
+
+    /// The operator's real local-chart export, verbatim, parses into the
+    /// static trade it describes.
+    #[test]
+    fn the_real_local_chart_static_trade_export_parses() {
+        let json = r#"{
+            "version": 1,
+            "geom": { "trade_expiry_epoch": 1790424000 },
+            "resolution": "60",
+            "chart_symbol": "TRADENATION:ESPIXEUR",
+            "position": { "direction": "long", "entry": 19670.6,
+                          "stop_loss": 19637.3, "take_profit": 19910.3 }
+        }"#;
+        let got = FrozenSetup::parse(json, "arm-setup").expect("parses");
+        let pos = got.position.expect("a static trade");
+        assert_eq!(pos.entry, 19670.6);
+        assert_eq!(pos.stop_loss, 19637.3);
+        assert_eq!(pos.take_profit, 19910.3);
+        assert_eq!(got.geom.trade_expiry_epoch, Some(1790424000));
     }
 
     /// The resolution is not recoverable from the geometry, which is exactly why

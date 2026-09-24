@@ -1,0 +1,185 @@
+//! Refuse to replace a healthy baked table with a drastically smaller one.
+//!
+//! # Why this exists
+//!
+//! [`render_table`](crate::render::render_table) emits **only the rows from the
+//! current run** — it does not merge with what is already on disk. That makes
+//! `--only "Bitcoin" --out core/src/spread_baseline_candle.rs` look like an
+//! incremental top-up while actually replacing all ~193 rows with one, silently
+//! un-baking every other instrument. Each un-baked instrument then reads as
+//! `Coverage::Missing` at arm time, and (before the arm-time gate existed) would
+//! have sized stops with a zero spread forecast.
+//!
+//! That is not hypothetical. It happened twice in one morning:
+//!
+//! 1. A `--only` run whose output went to the cwd default rather than the real
+//!    table — 1 row instead of 193, caught only because the path differed.
+//! 2. A full run that wrote **zero** rows, because a user-overlay edit had
+//!    dropped `spread_schedule` to the `none` sentinel and the generator skips
+//!    scheduleless assets. Nothing in the output said "you are about to delete
+//!    193 rows"; it just said `wrote 0 rows`.
+//!
+//! # What it does
+//!
+//! Before writing, compare the new row count against the rows already in the
+//! destination file. Refuse when the new table is below [`SHRINK_FLOOR`] of the
+//! old, which catches both the truncating `--only` run and the
+//! everything-skipped run while leaving normal growth and small churn alone.
+//!
+//! The check is **advisory and overridable** (`--allow-shrink`), because
+//! deliberately shrinking the table is legitimate — dropping a broker, or
+//! re-baking a narrowed universe. The point is to make it a decision rather
+//! than an accident.
+
+use std::path::Path;
+
+use color_eyre::eyre::eyre;
+
+/// Minimum fraction of the existing row count a new table may have before the
+/// write is refused. 0.9 permits ordinary churn (a handful of instruments
+/// failing to fetch on a flaky night) while catching the catastrophic cases,
+/// which are off by an order of magnitude rather than a few percent.
+pub const SHRINK_FLOOR: f64 = 0.9;
+
+/// Count the data rows in an already-generated table.
+///
+/// Rows are the indented `("broker", "symbol", …)` tuple lines; the header is
+/// comments plus the `pub static …= &[` opener, so a simple prefix test is
+/// enough and avoids depending on the rendered column layout.
+pub fn count_rows(table: &str) -> usize {
+    table
+        .lines()
+        .filter(|l| l.trim_start().starts_with("(\""))
+        .count()
+}
+
+/// The outcome of comparing a new table against what is on disk.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ShrinkVerdict {
+    /// No existing table (first bake), or the new one is not a large shrink.
+    Ok,
+    /// The new table is below [`SHRINK_FLOOR`] of the existing row count.
+    Shrunk { old: usize, new: usize },
+}
+
+/// Compare `new_table` against whatever is already at `dest`.
+///
+/// A missing or unreadable destination is [`ShrinkVerdict::Ok`] — a first bake
+/// must not be blocked by the absence of a predecessor. An existing file with
+/// zero rows is likewise `Ok`: there is nothing to protect.
+pub fn check(dest: &Path, new_table: &str) -> ShrinkVerdict {
+    let Ok(existing) = std::fs::read_to_string(dest) else {
+        return ShrinkVerdict::Ok;
+    };
+    let old = count_rows(&existing);
+    let new = count_rows(new_table);
+    if old == 0 {
+        return ShrinkVerdict::Ok;
+    }
+    if (new as f64) < (old as f64) * SHRINK_FLOOR {
+        return ShrinkVerdict::Shrunk { old, new };
+    }
+    ShrinkVerdict::Ok
+}
+
+/// Turn a [`ShrinkVerdict::Shrunk`] into the operator-facing refusal.
+///
+/// Names the likely causes in the order they actually bit us, so the reader can
+/// check the cheap one (`--only`) before the subtle one (overlay schedules).
+pub fn refusal(dest: &Path, old: usize, new: usize) -> color_eyre::Report {
+    eyre!(
+        "refusing to write {}: it has {old} rows and this run produced only {new}.\n  \
+         The generator REPLACES the table, it does not merge — writing this would \
+         un-bake {} instrument(s), and each one then refuses to arm.\n  \
+         Likely causes:\n    \
+         - `--only` was passed (a spot-check run must NOT target the live table; \
+         use `--out /tmp/probe.rs`)\n    \
+         - instruments were skipped as `schedule 'none'` (check \
+         `~/.config/instrument-lookup/mappings.toml` — an overlay block REPLACES \
+         the baseline asset, so an omitted `spread_schedule` silently becomes the \
+         `none` sentinel)\n  \
+         If the shrink is intended, re-run with `--allow-shrink`.",
+        dest.display(),
+        old.saturating_sub(new),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use color_eyre::eyre::Result;
+
+    use super::*;
+
+    /// A minimal table with `n` rows, shaped like the real rendered output.
+    fn table_with(n: usize) -> String {
+        let mut s = String::from(
+            "// @generated by spread-baseline-gen. Do not edit.\n\
+             pub static SPREAD_BASELINE_CANDLE: &[(&str, &str)] = &[\n",
+        );
+        for i in 0..n {
+            s.push_str(&format!("    (\"oanda\", \"SYM_{i}\"),\n"));
+        }
+        s.push_str("];\n");
+        s
+    }
+
+    #[test]
+    fn counts_only_data_rows_not_header_lines() {
+        assert_eq!(count_rows(&table_with(0)), 0);
+        assert_eq!(count_rows(&table_with(193)), 193);
+    }
+
+    /// The `--only "Bitcoin"` case: 193 rows replaced by 1.
+    #[test]
+    fn refuses_a_truncating_only_run() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("spread_baseline_candle.rs");
+        std::fs::write(&dest, table_with(193))?;
+        assert_eq!(
+            check(&dest, &table_with(1)),
+            ShrinkVerdict::Shrunk { old: 193, new: 1 },
+        );
+        Ok(())
+    }
+
+    /// The overlay-schedule case: everything skipped, zero rows rendered.
+    #[test]
+    fn refuses_an_everything_skipped_run() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("spread_baseline_candle.rs");
+        std::fs::write(&dest, table_with(193))?;
+        assert_eq!(
+            check(&dest, &table_with(0)),
+            ShrinkVerdict::Shrunk { old: 193, new: 0 },
+        );
+        Ok(())
+    }
+
+    /// Growth is the normal healthy case — adding Bitcoin to 193 rows.
+    #[test]
+    fn allows_a_table_that_grows() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("spread_baseline_candle.rs");
+        std::fs::write(&dest, table_with(193))?;
+        assert_eq!(check(&dest, &table_with(194)), ShrinkVerdict::Ok);
+        Ok(())
+    }
+
+    /// A few instruments failing to fetch on a flaky night must not block the
+    /// write — that would make the guard itself the outage.
+    #[test]
+    fn allows_small_churn_within_the_floor() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("spread_baseline_candle.rs");
+        std::fs::write(&dest, table_with(193))?;
+        assert_eq!(check(&dest, &table_with(180)), ShrinkVerdict::Ok);
+        Ok(())
+    }
+
+    /// First bake: nothing to compare against, so nothing to refuse.
+    #[test]
+    fn allows_writing_when_no_table_exists_yet() {
+        let missing = Path::new("/nonexistent/spread_baseline_candle.rs");
+        assert_eq!(check(missing, &table_with(1)), ShrinkVerdict::Ok);
+    }
+}

@@ -368,7 +368,14 @@ mod tests {
     ///
     /// This list is an inventory of known debt, not permission. Re-bake these
     /// rows and shrink it; a NEW name appearing here is a regression.
-    const UNREVIEWED_ROWS: &[&str] = &["EUR_TRY", "SUGAR_USD", "TRY_JPY", "UK10YB_GBP", "USD_TRY"];
+    /// **Empty as of the 2026-09-22 re-bake** — every row now carries a
+    /// forecast. The five that used to be here (`EUR_TRY`, `SUGAR_USD`,
+    /// `TRY_JPY`, `UK10YB_GBP`, `USD_TRY`) were profiled successfully once the
+    /// operator overlay stopped silently dropping `spread_schedule` to the
+    /// `none` sentinel, which had been making the generator skip assets
+    /// outright. Shrinking to empty is the expected direction; a NEW name
+    /// appearing here is a regression.
+    const UNREVIEWED_ROWS: &[&str] = &[];
 
     /// Whole-table invariant: the set of unreviewed-and-forecastless rows is
     /// exactly [`UNREVIEWED_ROWS`] — no more, and no fewer.
@@ -396,11 +403,74 @@ mod tests {
 
     /// Those rows must actually REFUSE, not merely be listed. Ties the
     /// inventory above to the predicate the arm gate branches on.
+    ///
+    /// [`UNREVIEWED_ROWS`] is currently empty, which would make the loop
+    /// vacuous, so the classifier is also exercised against a synthetic
+    /// unreviewed row. Without that, a change breaking `Unreviewed` detection
+    /// would leave this test green purely because there is nothing to iterate —
+    /// the same "green guard watching nothing" shape that let 35 stale rows
+    /// hide.
     #[test]
     fn the_unreviewed_rows_are_not_covered() {
         for sym in UNREVIEWED_ROWS {
             assert_eq!(coverage(sym), Coverage::Unreviewed, "{sym}");
             assert!(!coverage(sym).is_covered(), "{sym} must refuse at arm time");
         }
+        // The predicate still has teeth even when the inventory is empty.
+        let widen = [0.0_f64; 24];
+        let forecast = [0.0_f64; 24];
+        assert_eq!(
+            classify("ny", false, &widen, &forecast),
+            Coverage::Unreviewed,
+            "an unreviewed, forecastless row must still classify as Unreviewed",
+        );
+        assert!(!Coverage::Unreviewed.is_covered());
+    }
+
+    /// **No symbol may appear under two brokers.**
+    ///
+    /// Every lookup into the baked table — `coverage` here, plus
+    /// `baked_candle_row`, `baked_baseline` and `baked_forecast_row` in the
+    /// parent module — matches on the **symbol alone** and discards the broker
+    /// column (`.find(|(_broker, symbol, ..)| *symbol == instrument)`). That is
+    /// only correct while the two brokers' symbol namespaces are disjoint.
+    ///
+    /// Today they are, by naming convention rather than by construction: OANDA
+    /// writes `EUR_USD` and `BTC_USD` where TradeNation writes `EUR/USD` and
+    /// `Bitcoin`. Nothing enforces that. The day one instrument is listed
+    /// identically on both — a new asset class, a broker renaming a market, or
+    /// a hand-written `~/.config/instrument-lookup/mappings.toml` overlay entry
+    /// — `find` silently returns whichever row sorts first, and one broker's
+    /// leg is sized off the OTHER broker's spread profile. Same symbol, wrong
+    /// instrument, no error anywhere.
+    ///
+    /// That contradicts the identity rule this table is built on: a tradeable
+    /// instrument is `(broker, symbol)`, which is why the rows carry a broker
+    /// and are sorted by `(broker, symbol)` in the first place.
+    ///
+    /// This test is the tripwire. It does **not** fix the lookups — threading a
+    /// broker through ~83 call sites is a change of its own — it guarantees the
+    /// precondition that makes them safe is still true, so the ambiguity is
+    /// caught here at build time rather than in a mis-sized live stop. If it
+    /// goes red, key the four lookups on `(broker, symbol)` rather than
+    /// renaming the colliding instrument.
+    #[test]
+    fn no_symbol_is_baked_under_two_brokers() {
+        use std::collections::BTreeMap;
+
+        let mut by_symbol: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (broker, symbol) in baked_rows() {
+            by_symbol.entry(symbol).or_default().push(broker);
+        }
+        let collisions: Vec<_> = by_symbol
+            .iter()
+            .filter(|(_symbol, brokers)| brokers.len() > 1)
+            .collect();
+        assert!(
+            collisions.is_empty(),
+            "these symbols are baked under more than one broker, so every \
+             symbol-keyed lookup is ambiguous and may read the wrong broker's \
+             spread profile: {collisions:?}",
+        );
     }
 }

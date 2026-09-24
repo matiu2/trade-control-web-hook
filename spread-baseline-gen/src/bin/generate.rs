@@ -8,12 +8,25 @@
 //! **Stage 1 does NOT swap the live gate** — it only produces + validates the
 //! table. The `core/build.rs` gate-swap is a later stage.
 //!
-//! Auth: `OANDA_TOKEN` (practice) for OANDA; the default TradeNation demo
-//! session for TN (operator-run, not CI).
+//! Candles come from **candle-cache**, not straight from the brokers, so a run
+//! is served from the warm per-broker table, only fetches the sub-ranges the
+//! cache is missing, backs off on rate limits, and leaves everything it pulled
+//! cached for the next run (and for replays). A run interrupted partway is
+//! therefore resumable — re-running it re-fetches only what it never got.
+//!
+//! Auth: `OANDA_TOKEN` (or `OANDA_API_KEY`) for OANDA; the default TradeNation
+//! demo session for TN (operator-run, not CI). The cache needs a reachable
+//! PostgreSQL (`DATABASE_URL`, default
+//! `postgresql://candle_cache@localhost:5432/candle_cache`).
 //!
 //! Usage:
-//!   generate --brokers oanda,tradenation --out spread_baseline_candle.rs
-//!   generate --brokers oanda --only EUR_USD,XAU_USD   # spot-check a few
+//!   generate --brokers oanda,tradenation                  # full bake -> live table
+//!   generate --brokers oanda --only EUR_USD --out /tmp/probe.rs   # spot-check
+//!
+//! ⚠️ **The table is REPLACED, never merged** — a run emits only the rows it
+//! profiled. So `--only` against the live table would un-bake every instrument
+//! it skipped; always pair it with a throwaway `--out`. The shrink guard
+//! refuses that write rather than trusting the operator to remember.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -22,9 +35,10 @@ use clap::Parser;
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use tracing::{info, warn};
 
+use spread_baseline_gen::cache::CachedSource;
 use spread_baseline_gen::compute::profile_from_minutes;
-use spread_baseline_gen::fetch::{fetch_oanda_minutes, minutes_from_bidask};
 use spread_baseline_gen::render::render_table;
+use spread_baseline_gen::shrink_guard::{self, ShrinkVerdict};
 use spread_baseline_gen::universe::{WorkItem, work_items};
 use spread_baseline_gen::{BaselineRow, Broker};
 
@@ -35,13 +49,24 @@ struct Args {
     #[arg(long, default_value = "oanda,tradenation")]
     brokers: String,
 
-    /// Output path for the generated table (relative to cwd).
-    #[arg(long, default_value = "spread_baseline_candle.rs")]
+    /// Output path for the generated table. Defaults to the **live** table, so
+    /// a full bake needs no path argument and cannot land in the cwd by
+    /// accident. A spot-check (`--only`) must redirect this somewhere else.
+    #[arg(long, default_value = "core/src/spread_baseline_candle.rs")]
     out: PathBuf,
 
     /// Restrict to these broker symbols (comma-separated) — for spot-checks.
+    ///
+    /// The table is REPLACED, not merged, so this must be paired with an
+    /// `--out` that is not the live table (the shrink guard enforces it).
     #[arg(long)]
     only: Option<String>,
+
+    /// Write the table even when it is drastically smaller than the one it
+    /// replaces. For a deliberate shrink (dropping a broker, narrowing the
+    /// universe) — never to silence a surprise.
+    #[arg(long)]
+    allow_shrink: bool,
 
     /// Include Stock-class instruments (deferred by default in Stage 1).
     #[arg(long)]
@@ -54,6 +79,14 @@ struct Args {
     /// preferable for stable buckets). Default 90d.
     #[arg(long, default_value_t = 90)]
     days: i64,
+
+    /// Override the candle-cache directory. Defaults to the per-broker
+    /// `~/.cache/candle_cache_{oanda,tradenation}` the strategy crates and the
+    /// replay already share — under `postgres-storage` the final path component
+    /// IS the table name, so overriding this points the run at a different
+    /// (cold) table.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
 
     /// Print the per-hour ratio table for each instrument (verbose).
     #[arg(long)]
@@ -107,22 +140,43 @@ async fn main() -> Result<()> {
         brokers
     );
 
-    // Build clients once.
+    // Build one cache-backed source per broker, reused for every instrument so
+    // the connection pool and the broker-call semaphore are shared across the
+    // whole run (that shared semaphore is what actually bounds concurrent
+    // broker calls and makes the rate-limit backoff effective).
     let oanda = if brokers.contains(&Broker::Oanda) {
-        let token = std::env::var("OANDA_TOKEN")
-            .wrap_err("OANDA_TOKEN env var required for OANDA fetch")?;
-        Some(oanda_client::OandaClient::new(token))
+        Some(
+            CachedSource::open(Broker::Oanda, args.cache_dir.clone())
+                .await
+                .wrap_err("open the OANDA candle cache")?,
+        )
     } else {
         None
     };
     let tn = if brokers.contains(&Broker::TradeNation) {
-        Some(acquire_tn().await?)
+        Some(
+            CachedSource::open(Broker::TradeNation, args.cache_dir.clone())
+                .await
+                .wrap_err("open the TradeNation candle cache")?,
+        )
     } else {
         None
     };
 
     let mut rows: Vec<BaselineRow> = Vec::new();
-    for item in &items {
+    let total = items.len();
+    for (n, item) in items.iter().enumerate() {
+        // Progress on EVERY instrument, not just under `--verbose`. A bake is
+        // hours long and network-bound; without this the run is silent on
+        // success and its only output is failures, so "no news" is
+        // indistinguishable from "profiling nothing at all" — which is exactly
+        // how a run that skipped every instrument read as healthy.
+        info!(
+            "[{}/{total}] {} {}",
+            n + 1,
+            item.broker.as_str(),
+            item.symbol,
+        );
         match profile_one(item, args.days, oanda.as_ref(), tn.as_ref()).await {
             Ok(Some(row)) => {
                 if args.verbose {
@@ -154,8 +208,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Write the table.
+    // Write the table — but not if that would silently un-bake instruments.
+    // `render_table` emits only THIS run's rows, so a short run replacing a
+    // full table deletes every instrument it didn't profile.
     let table = render_table(&rows);
+    if !args.allow_shrink
+        && let ShrinkVerdict::Shrunk { old, new } = shrink_guard::check(&args.out, &table)
+    {
+        return Err(shrink_guard::refusal(&args.out, old, new));
+    }
     std::fs::write(&args.out, &table).wrap_err_with(|| format!("write {}", args.out.display()))?;
     info!("wrote {} rows to {}", rows.len(), args.out.display());
 
@@ -198,11 +259,9 @@ fn resolve_tz(item: &WorkItem) -> Option<chrono_tz::Tz> {
 async fn profile_one(
     item: &WorkItem,
     days: i64,
-    oanda: Option<&oanda_client::OandaClient>,
-    tn: Option<&broker_tradenation_adapter::TradeNationAdapter>,
+    oanda: Option<&CachedSource>,
+    tn: Option<&CachedSource>,
 ) -> Result<Option<BaselineRow>> {
-    use trade_control_core::broker::{Broker as _, Granularity};
-
     let Some(tz) = resolve_tz(item) else {
         info!(
             "{} {}: schedule '{}' has no spread hour — skipped",
@@ -213,24 +272,16 @@ async fn profile_one(
         return Ok(None);
     };
 
-    let bars = match item.broker {
-        Broker::Oanda => {
-            let client = oanda.ok_or_else(|| eyre!("OANDA client not built"))?;
-            fetch_oanda_minutes(client, &item.symbol, days, tz).await?
-        }
-        Broker::TradeNation => {
-            let broker = tn.ok_or_else(|| eyre!("TN broker not built"))?;
-            let now = chrono::Utc::now();
-            let since = now - chrono::Duration::days(days);
-            // The adapter now pages M1 in ≤1000-bar chunks, so a multi-day
-            // window returns full history (was capped at ~1 day).
-            let candles = broker
-                .get_bidask_candles(&item.symbol, Granularity::M1, since, now)
-                .await
-                .map_err(|e| eyre!("tn get_bidask_candles({}): {e:?}", item.symbol))?;
-            minutes_from_bidask(&candles, tz)
-        }
+    // Both brokers now go through candle-cache, which does the gap analysis,
+    // the paging and the rate-limit backoff — so this is one call either way
+    // and a re-run only fetches what the cache is missing.
+    let source = match item.broker {
+        Broker::Oanda => oanda.ok_or_else(|| eyre!("OANDA cache source not built"))?,
+        Broker::TradeNation => tn.ok_or_else(|| eyre!("TradeNation cache source not built"))?,
     };
+    let now = chrono::Utc::now();
+    let since = now - chrono::Duration::days(days);
+    let bars = source.minutes(&item.symbol, since, now, tz).await?;
 
     if bars.is_empty() {
         return Ok(None);
@@ -246,19 +297,6 @@ async fn profile_one(
         spread_schedule: item.spread_schedule.clone(),
         profile,
     }))
-}
-
-/// Acquire the default TradeNation demo broker (spread profiles are
-/// market-wide, not account-specific, so the default demo session is fine).
-async fn acquire_tn() -> Result<broker_tradenation_adapter::TradeNationAdapter> {
-    let session = tradenation_api::login_demo()
-        .await
-        .map_err(|e| eyre!("TN login_demo: {e}"))?;
-    let session_json = serde_json::to_string(&session).wrap_err("serialize TN session")?;
-    let broker = broker_tradenation::login(&session_json)
-        .await
-        .ok_or_else(|| eyre!("broker_tradenation::login returned None"))?;
-    Ok(broker_tradenation_adapter::TradeNationAdapter(broker))
 }
 
 /// Print the full per-UTC-hour `p90(spread/mid)` and `ratio` table for one
