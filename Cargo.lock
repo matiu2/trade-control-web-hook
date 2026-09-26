@@ -1306,8 +1306,8 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "forex-factory"
-version = "0.2.0"
-source = "git+https://github.com/matiu2/forex-factory.git#dd491d7aab51d6be074bdffd01e94cd8d356434c"
+version = "0.3.0"
+source = "git+https://github.com/matiu2/forex-factory.git#5e23b56ee6076f68640cfce335f7e0ade2109a0a"
 dependencies = [
  "chrono",
  "iana-time-zone",

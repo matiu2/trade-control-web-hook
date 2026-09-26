@@ -511,6 +511,8 @@ mod tests {
             actual: None,
             forecast: None,
             previous: None,
+            // forex-factory 0.3.0 added this; a test event has no upstream id.
+            event_id: None,
         }
     }
 
