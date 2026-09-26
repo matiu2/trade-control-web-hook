@@ -33,7 +33,11 @@
 # members), so one `cargo build --release` produces every binary into the
 # shared ./target/release/.
 
-set -euo pipefail
+# `-E` makes the ERR trap inherited by shell functions. Without it the trap
+# `deploy_env` sets is silently ignored, a failed build falls through to the
+# success path, and a HALF-deploy gets journalled as `ok` — the precise
+# opposite of what the record is for. Verified by test, not by reading.
+set -Eeuo pipefail
 
 # Resolve repo root from this lib's location, regardless of caller cwd.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -137,6 +141,18 @@ deploy_env() {
 
   cd "$REPO_ROOT"
 
+  # 0. Record this deploy in the bug journal, whatever happens. The trap fires
+  #    on any non-zero exit (the script is `set -e`) so a HALF-deploy — some
+  #    binaries installed, others not — is written down as FAILED rather than
+  #    leaving no trace at all. That window is exactly when "which version was
+  #    running?" is hardest to answer after the fact, so it is the one that most
+  #    needs a page. Cleared on the success path below.
+  #
+  #    The recorder never fails a deploy (`record-deploy.sh` is not `set -e` and
+  #    always exits 0) — a journalling step that can abort a deploy would be
+  #    worse than no journalling.
+  trap 'record_deploy_safely "$env_name" "$suffix" failed' ERR
+
   echo "==> [$env_name] target worker URL: $webhook"
 
   # 1. Branch guard — each branch owns one environment, so deploying from the
@@ -195,9 +211,30 @@ deploy_env() {
   #    staging isolated (see WORKER_BIN_DIR above).
   roll_native_worker "$env_name" "$suffix"
 
+  # 5. Record the successful deploy. Clear the ERR trap first so the failure
+  #    path cannot also fire and write a second, contradictory page.
+  trap - ERR
+  record_deploy_safely "$env_name" "$suffix" ok
+
   echo "==> [$env_name] done. Shell commands now available:"
   for bin in "${CLI_BINARIES[@]}"; do
     echo "      ${bin}-${suffix}"
   done
   echo "    (Run 'exec zsh' or open a new shell to pick up completions.)"
+}
+
+# record_deploy_safely <env-name> <suffix> <ok|failed>
+#
+# Call the deploy recorder without ever letting it affect the deploy's own
+# exit status. Missing script, broken python, unreachable journal — all of it
+# degrades to a warning. The deploy is the thing that matters; the page is
+# bookkeeping about it.
+record_deploy_safely() {
+  local recorder="$REPO_ROOT/record-deploy.sh"
+  if [[ ! -x "$recorder" ]]; then
+    echo "==> [$1] no record-deploy.sh — deploy NOT journalled" >&2
+    return 0
+  fi
+  "$recorder" "$1" "$2" "$3" || echo "==> [$1] deploy recorder failed — deploy NOT journalled" >&2
+  return 0
 }
