@@ -527,8 +527,28 @@ impl App {
     /// rather than quietly arming something plausible.
     fn spec_url_for(&self, trade_id: &str) -> Option<String> {
         let row = self.plans.iter().find(|p| p.trade_id == trade_id)?;
+        // The broker comes from the fetched DETAIL, exactly as
+        // `start_load_tv` sources it — `PlanRow` (the list row) has no broker
+        // field, and the broker selects which per-broker drawings file
+        // `/arm-setup` classifies. Both callers of this reach it only after
+        // the detail is loaded (the replay needs `armed_at` from the same
+        // struct), so in practice this is present; `None` falls back to the
+        // live-chart arm rather than sending a guessed broker, which is the
+        // one thing worse than no URL.
+        let broker = self
+            .data
+            .get(trade_id)
+            .and_then(|d| d.detail.as_ref())
+            .map(|detail| detail.broker.as_str())
+            // `PlanDetail::broker` is "" when no rule intent carried one (see
+            // its doc comment) — NOT a missing field. Sending `&broker=` empty
+            // is worse than sending nothing: `ChartBroker::parse("")` is
+            // `None`, so `/arm-setup` answers 400 and the replay dies, where
+            // omitting the param at least falls back to local-chart's own
+            // default. Treated as "unknown" and folded into the `None` below.
+            .filter(|broker| !broker.is_empty())?;
         self.chart_backend
-            .spec_url(&row.instrument, &row.granularity)
+            .spec_url(&row.instrument, broker, &row.granularity)
     }
 
     /// Add a job to the in-flight set. Returns `false` if it was already there
@@ -1323,12 +1343,66 @@ mod tests {
         app.chart_backend = crate::tv::ChartBackend::LocalChart {
             base_url: "http://127.0.0.1:8790".to_string(),
         };
+        with_detail(&mut app, "ihs-eur-cad-636ca2ba", "oanda");
         // `row()` is AUD_CAD/h1 — the URL must carry the plan's own values.
         assert_eq!(
             app.spec_url_for_test("ihs-eur-cad-636ca2ba").as_deref(),
-            Some("http://127.0.0.1:8790/arm-setup?instrument=AUD_CAD&tf=h1"),
+            Some("http://127.0.0.1:8790/arm-setup?instrument=AUD_CAD&tf=h1&broker=oanda"),
             "the replay must arm from local-chart, not a stale TradingView tab"
         );
+    }
+
+    /// ENTRY-POINT test for the broker fix: the plan's OWN broker reaches the
+    /// arm URL, so a TradeNation plan classifies TradeNation's drawings.
+    ///
+    /// Asserted here rather than only at `ChartBackend::spec_url` for the same
+    /// reason the test above is: the broker is threaded from `PlanDetail`,
+    /// which only this layer can see, so a mutation dropping it is invisible
+    /// one level down.
+    #[test]
+    fn the_plans_own_broker_reaches_the_arm_url() {
+        let mut app = App::from_rows(vec![row("hs-eu50-eur-4f2142a7")]);
+        app.chart_backend = crate::tv::ChartBackend::LocalChart {
+            base_url: "http://127.0.0.1:8790".to_string(),
+        };
+        with_detail(&mut app, "hs-eu50-eur-4f2142a7", "tradenation");
+        assert_eq!(
+            app.spec_url_for_test("hs-eu50-eur-4f2142a7").as_deref(),
+            Some("http://127.0.0.1:8790/arm-setup?instrument=AUD_CAD&tf=h1&broker=tradenation"),
+            "a TradeNation plan must arm off TradeNation's drawings"
+        );
+    }
+
+    /// No detail fetched yet ⇒ no URL, rather than a URL with a GUESSED broker.
+    ///
+    /// The caller falls back to the live-chart arm, which fails visibly at
+    /// tv-arm's own geometry guards. Sending `broker=oanda` on a hunch is the
+    /// worse failure: it would classify the wrong broker's drawings and hand
+    /// back a setup that looks entirely valid.
+    #[test]
+    fn without_a_detail_there_is_no_arm_url_rather_than_a_guessed_broker() {
+        let mut app = App::from_rows(vec![row("t1")]);
+        app.chart_backend = crate::tv::ChartBackend::LocalChart {
+            base_url: "http://127.0.0.1:8790".to_string(),
+        };
+        // No `with_detail` call — the Timeline job has not landed yet.
+        assert_eq!(app.spec_url_for_test("t1"), None);
+    }
+
+    /// An EMPTY broker is treated as unknown, not sent as `&broker=`.
+    ///
+    /// `PlanDetail::broker` is `""` when no rule intent carried one (see its
+    /// doc comment). `ChartBroker::parse("")` is `None`, so an empty param
+    /// makes `/arm-setup` answer 400 and kills the replay — strictly worse
+    /// than omitting it and letting local-chart apply its own default.
+    #[test]
+    fn an_empty_broker_is_omitted_rather_than_sent_as_a_blank_param() {
+        let mut app = App::from_rows(vec![row("t1")]);
+        app.chart_backend = crate::tv::ChartBackend::LocalChart {
+            base_url: "http://127.0.0.1:8790".to_string(),
+        };
+        with_detail(&mut app, "t1", "");
+        assert_eq!(app.spec_url_for_test("t1"), None);
     }
 
     /// The default path is untouched: on TradingView there is no spec-url, so
@@ -1393,6 +1467,34 @@ mod tests {
             archived_at: None,
             watermark: None,
         }
+    }
+
+    /// A `PlanDetail` for `row()`'s plan, carrying `broker`. The broker is the
+    /// one field `spec_url_for` cannot get from the list row — `PlanRow` has
+    /// none — so a fixture without a detail exercises the fallback, not the
+    /// happy path.
+    fn detail_with_broker(trade_id: &str, broker: &str) -> crate::plan::PlanDetail {
+        crate::plan::PlanDetail {
+            trade_id: trade_id.to_string(),
+            instrument: "AUD_CAD".into(),
+            direction: "short".into(),
+            granularity: "h1".into(),
+            armed_at: Some("2026-09-02T11:19:54Z".into()),
+            entry_mode: crate::plan::EntryMode::Normal,
+            order_types: Vec::new(),
+            bcr_preps: crate::plan::BcrPreps {
+                break_and_close: true,
+                retest: true,
+            },
+            broker: broker.to_string(),
+            screenshot_url: None,
+        }
+    }
+
+    /// Seed `app.data[trade_id].detail`, the way a finished Timeline job does.
+    fn with_detail(app: &mut App, trade_id: &str, broker: &str) {
+        app.data.entry(trade_id.to_string()).or_default().detail =
+            Some(detail_with_broker(trade_id, broker));
     }
 
     #[test]
