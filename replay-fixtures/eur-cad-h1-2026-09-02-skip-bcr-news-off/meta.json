@@ -4,7 +4,7 @@
   "source": "tradenation",
   "start": "2026-09-02T01:00:00Z",
   "end": "2026-09-07T01:00:00Z",
-  "message": "skip bcr lost money",
+  "message": "may be a repeat",
   "arm": {
     "entry_rule": "skip-bcr",
     "skip_calendar_bars": true,
@@ -12,7 +12,7 @@
     "skip_reversals": false,
     "candle_source": "tradenation",
     "chart_symbol": "TRADENATION:EURCAD",
-    "tv_arm_version": "v144-82-gdb50fb62",
-    "engine_version": "v144-82-gdb50fb62"
+    "tv_arm_version": "v147-56-g5762247f-dirty",
+    "engine_version": "v147-56-g5762247f-dirty"
   }
 }

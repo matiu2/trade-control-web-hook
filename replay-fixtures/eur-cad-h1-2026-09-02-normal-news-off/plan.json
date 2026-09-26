@@ -1,5 +1,5 @@
 {
-  "trade_id": "ihs-eur-cad-0e2b30bb",
+  "trade_id": "ihs-eur-cad-9e2fcb38",
   "instrument": "EUR/CAD",
   "direction": "long",
   "granularity": "h1",
@@ -16,7 +16,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-cad-0e2b30bb-too-low",
+        "id": "ihs-eur-cad-9e2fcb38-too-low",
         "not_after": "2026-09-07T01:30:00Z",
         "action": "veto",
         "instrument": "EUR/CAD",
@@ -25,7 +25,7 @@
         "name": "too-low",
         "ttl_hours": 121,
         "level": "close-positions",
-        "trade_id": "ihs-eur-cad-0e2b30bb"
+        "trade_id": "ihs-eur-cad-9e2fcb38"
       },
       "kind": "setup_invalidation"
     },
@@ -40,7 +40,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-cad-0e2b30bb-too-high",
+        "id": "ihs-eur-cad-9e2fcb38-too-high",
         "not_after": "2026-09-07T01:30:00Z",
         "action": "veto",
         "instrument": "EUR/CAD",
@@ -49,7 +49,7 @@
         "name": "too-high",
         "ttl_hours": 121,
         "level": "stop-next-entry",
-        "trade_id": "ihs-eur-cad-0e2b30bb"
+        "trade_id": "ihs-eur-cad-9e2fcb38"
       },
       "kind": "setup_invalidation"
     },
@@ -62,7 +62,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-cad-0e2b30bb-trade-expiry",
+        "id": "ihs-eur-cad-9e2fcb38-trade-expiry",
         "not_before": "2026-09-07T01:00:00Z",
         "not_after": "2026-09-07T01:30:00Z",
         "action": "veto",
@@ -72,7 +72,7 @@
         "name": "trade-expiry",
         "ttl_hours": 121,
         "level": "close-positions",
-        "trade_id": "ihs-eur-cad-0e2b30bb"
+        "trade_id": "ihs-eur-cad-9e2fcb38"
       },
       "kind": "setup_invalidation"
     },
@@ -96,7 +96,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-cad-0e2b30bb-break-and-close",
+        "id": "ihs-eur-cad-9e2fcb38-break-and-close",
         "not_after": "2026-09-07T01:00:00Z",
         "action": "prep",
         "instrument": "EUR/CAD",
@@ -107,7 +107,7 @@
         "clears": [
           "retest"
         ],
-        "trade_id": "ihs-eur-cad-0e2b30bb"
+        "trade_id": "ihs-eur-cad-9e2fcb38"
       },
       "kind": "prep_break_and_close"
     },
@@ -131,7 +131,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-cad-0e2b30bb-retest",
+        "id": "ihs-eur-cad-9e2fcb38-retest",
         "not_after": "2026-09-07T01:00:00Z",
         "action": "prep",
         "instrument": "EUR/CAD",
@@ -139,7 +139,7 @@
         "account": "reversals",
         "step": "retest",
         "ttl_hours": 876000,
-        "trade_id": "ihs-eur-cad-0e2b30bb"
+        "trade_id": "ihs-eur-cad-9e2fcb38"
       },
       "kind": "prep_retest"
     },
@@ -152,7 +152,7 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-cad-0e2b30bb-enter",
+        "id": "ihs-eur-cad-9e2fcb38-enter",
         "not_after": "2026-09-06T01:00:00Z",
         "action": "enter",
         "instrument": "EUR/CAD",
@@ -200,7 +200,7 @@
         "breakeven": {
           "threshold": 0.5
         },
-        "trade_id": "ihs-eur-cad-0e2b30bb",
+        "trade_id": "ihs-eur-cad-9e2fcb38",
         "max_retries": 5,
         "entry_dedup": "gate_owned",
         "needs_golden": true,
@@ -219,13 +219,13 @@
       "fire_mode": "once",
       "intent": {
         "v": 1,
-        "id": "ihs-eur-cad-0e2b30bb-close-on-sr-reversal",
+        "id": "ihs-eur-cad-9e2fcb38-close-on-sr-reversal",
         "not_after": "2026-09-07T01:00:00Z",
         "action": "close",
         "instrument": "EUR/CAD",
         "broker": "tradenation",
         "account": "reversals",
-        "trade_id": "ihs-eur-cad-0e2b30bb",
+        "trade_id": "ihs-eur-cad-9e2fcb38",
         "needs_golden": true,
         "inside_window": [
           "price"
