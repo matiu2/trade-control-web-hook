@@ -75,6 +75,7 @@ mod tests {
             actual: Some(actual.to_string()),
             forecast: Some(forecast.to_string()),
             previous: None,
+            event_id: None,
         }
     }
 
