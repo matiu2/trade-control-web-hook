@@ -57,9 +57,20 @@ than one that says no. Pinned by
   by the time drawing runs. A chart that cannot be drawn on is a missing
   picture, not a wrong answer — so it warns and returns `Ok` rather than
   turning a successful arm into a non-zero exit.
-- **`--new-tv` does not disturb `--annotate`.** Both run, so one replay paints
-  both charts while the new path is compared against the old. Pinned by
-  `new_tv_does_not_disturb_the_tradingview_annotate_default`.
+- **`--new-tv` means local-chart only.** ~~Both run, so one replay paints both
+  charts while the new path is compared against the old.~~ **Revised
+  2026-09-26.** Injecting the `--annotate true` default alongside
+  `--positions` made the replacement hostage to the bridge it replaces:
+  `replay-candles` propagates the annotate error, so a dead tv-mcp CDP
+  connection (`CDP connection failed after 5 attempts: fetch failed`) exited
+  non-zero and `tv-arm` never reached `draw_positions_on_local_chart` — the
+  local-chart picture was lost *because TradingView was unreachable*. The
+  side-by-side comparison has served its purpose; `--new-tv` now suppresses
+  the default, and an explicit `--annotate true` in the passthrough still
+  paints both. Pinned by
+  `new_tv_does_not_inject_the_tradingview_annotate_default`,
+  `new_tv_still_honours_an_explicit_annotate_in_the_passthrough` and
+  `without_new_tv_the_annotate_default_is_untouched`.
 - **An unknown direction is refused, not guessed.** Defaulting to long would
   draw a coherent bracket for the opposite trade.
 
@@ -73,6 +84,8 @@ makes running a replay on a working chart safe.
 
 ## Stage 3 — the deprecation (weeks away)
 
+- [x] `--new-tv` stops implying `--annotate` (2026-09-26 — see stage 2's
+      revised note; the first half of "becomes the default")
 - [ ] `--new-tv` becomes the **default**
 - [ ] delete `cli/src/bin/replay_candles/annotate.rs`
 - [ ] drop `--annotate` / `--annotate-unfilled` / `--tv-mcp-root`

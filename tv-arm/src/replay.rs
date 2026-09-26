@@ -9,6 +9,9 @@
 //! it against the SHARED [`ReplayArgs`] clap definition, then shells out to the
 //! environment-matched `replay-candles-<suffix>` binary.
 //!
+//! Under `--new-tv` the `--annotate true` default is dropped: local-chart is
+//! the chart, and `replay-candles` is asked for a `--positions` file instead.
+//!
 //! Sharing `ReplayArgs` (from `trade-control-cli`) is what keeps this honest:
 //! the same struct the standalone binary parses is what we validate against
 //! here, so a passthrough flag that `replay-candles` wouldn't accept fails
@@ -230,7 +233,15 @@ fn build_argv(
         argv.push("--positions".to_string());
         argv.push(path.display().to_string());
     }
-    if !sets_flag(passthrough, "--annotate") {
+    // `--annotate true` is the default only for the TradingView-only path.
+    // Under `--new-tv` (⇒ `positions_out` is set) local-chart is the chart, and
+    // injecting the TradingView default would make the new path depend on the
+    // old bridge being alive: `replay-candles` propagates the annotate error,
+    // so a dead tv-mcp CDP connection exits non-zero and we never reach
+    // `draw_positions_on_local_chart`. An explicit `--annotate` in the
+    // passthrough still wins — asking for both charts is still possible, it is
+    // just no longer automatic.
+    if positions_out.is_none() && !sets_flag(passthrough, "--annotate") {
         argv.push("--annotate".to_string());
         argv.push("true".to_string());
     }
@@ -273,9 +284,10 @@ pub fn run_replay(
     broker: Broker,
     passthrough: &[String],
     arm: ArmContext<'_>,
-    // `--new-tv [URL]`: also draw the replayed positions on local-chart. The
-    // TradingView `--annotate` path is untouched and still runs, so a single
-    // replay can paint both charts while the new one is compared to the old.
+    // `--new-tv [URL]`: draw the replayed positions on local-chart INSTEAD of
+    // TradingView. Passing it suppresses the `--annotate true` default, so a
+    // failure in the tv-mcp bridge can no longer abort the replay before the
+    // local-chart drawing runs. An explicit `--annotate` still paints both.
     new_tv: Option<&str>,
 ) -> Result<()> {
     let bin = replay_binary();
@@ -1001,13 +1013,18 @@ mod tests {
         );
     }
 
-    /// `--new-tv` and `--annotate` are INDEPENDENT: the TradingView default
-    /// must survive, so one replay can paint both charts while the new path is
-    /// compared against the old. If enabling local-chart silently turned off
-    /// the TradingView drawing, the comparison this flag exists for would be
-    /// impossible.
+    /// `--new-tv` means **local-chart only**: the `--annotate true` default is
+    /// NOT injected.
+    ///
+    /// It used to be, so one replay could paint both charts while the new path
+    /// was compared against the old. That coupling made the replacement
+    /// hostage to the bridge it replaces: `annotate::annotate` propagates its
+    /// error, so a dead tv-mcp CDP connection exits `replay-candles` non-zero
+    /// **before** the positions file is drawn — losing the local-chart picture
+    /// because TradingView was unreachable. The comparison is over; the new
+    /// path stands alone.
     #[test]
-    fn new_tv_does_not_disturb_the_tradingview_annotate_default() {
+    fn new_tv_does_not_inject_the_tradingview_annotate_default() {
         let plan = PathBuf::from("/tmp/p.json");
         let out = PathBuf::from("/tmp/positions.json");
         let argv = build_argv(
@@ -1018,8 +1035,59 @@ mod tests {
             ArmContext::default(),
             Some(&out),
         );
+        assert!(
+            !argv.contains(&"--annotate".to_string()),
+            "--new-tv ⇒ no --annotate default: {argv:?}"
+        );
         let parsed = ReplayArgs::try_parse_from(&argv).expect("must parse");
-        assert!(parsed.annotate, "--annotate true still injected");
-        assert!(parsed.positions.is_some(), "and --positions alongside it");
+        assert!(!parsed.annotate, "TradingView is not drawn on");
+        assert!(
+            parsed.positions.is_some(),
+            "local-chart's positions file is"
+        );
+    }
+
+    /// Dropping the default must not take the *explicit* flag with it: an
+    /// operator who wants both charts on one replay still says so, and the
+    /// passthrough is forwarded untouched.
+    #[test]
+    fn new_tv_still_honours_an_explicit_annotate_in_the_passthrough() {
+        let plan = PathBuf::from("/tmp/p.json");
+        let out = PathBuf::from("/tmp/positions.json");
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &["--annotate".to_string(), "true".to_string()],
+            ArmContext::default(),
+            Some(&out),
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--annotate").count(),
+            1,
+            "exactly one --annotate — ArgAction::Set rejects a repeat: {argv:?}"
+        );
+        let parsed = ReplayArgs::try_parse_from(&argv).expect("must parse");
+        assert!(parsed.annotate, "the operator asked for TradingView too");
+        assert!(parsed.positions.is_some(), "and local-chart alongside it");
+    }
+
+    /// Without `--new-tv` nothing changes: `--annotate true` is still the
+    /// default, so every existing TradingView-only invocation is
+    /// byte-identical to before.
+    #[test]
+    fn without_new_tv_the_annotate_default_is_untouched() {
+        let plan = PathBuf::from("/tmp/p.json");
+        let argv = build_argv(
+            "replay-candles",
+            &plan,
+            CandleSource::TradeNation,
+            &[],
+            ArmContext::default(),
+            None,
+        );
+        let parsed = ReplayArgs::try_parse_from(&argv).expect("must parse");
+        assert!(parsed.annotate, "no --new-tv ⇒ TradingView default stands");
+        assert_eq!(parsed.positions, None);
     }
 }
