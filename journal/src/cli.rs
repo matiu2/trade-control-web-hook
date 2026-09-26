@@ -110,6 +110,52 @@ pub fn plan_export_json(trade_id: &str) -> Result<String> {
     run_trade_control(&["plan", "export", trade_id])
 }
 
+/// Redraw a plan's arm geometry on local-chart, recovered from the stored
+/// plan's own rule triggers.
+///
+/// The point: a chart whose drawings have been moved or deleted answers
+/// `/arm-setup` with `422 missing required roles` even though every level is
+/// still in the plan — as an executable rule trigger, which is the copy the live
+/// engine actually fired on. `local_chart_client::recover_from_plan` reads them
+/// back and `draw_plan_roles` paints them into a `plan-<trade_id>` group.
+///
+/// Returns a one-line summary for the status bar: what was drawn, and what (if
+/// anything) the operator still has to draw by hand.
+pub fn draw_plan_geometry(
+    trade_id: &str,
+    instrument: &str,
+    granularity: &str,
+    base_url: &str,
+) -> Result<String> {
+    let json = plan_export_json(trade_id)?;
+    let roles = local_chart_client::recover_from_plan(&json)
+        .map_err(|e| eyre!("parse the plan export for {trade_id}: {e}"))?;
+    let drawn =
+        local_chart_client::draw_plan_roles(base_url, instrument, granularity, trade_id, &roles)?;
+    if drawn.is_empty() {
+        return Err(eyre!(
+            "{trade_id}: the plan carries no arm geometry to redraw — nothing was changed"
+        ));
+    }
+    let missing = local_chart_client::still_missing(&roles);
+    let group = local_chart_client::group_for(trade_id);
+    info!(?drawn, ?missing, %group, "redrew a plan's arm geometry");
+    Ok(if missing.is_empty() {
+        format!(
+            "drew {} role(s) into {group} — chart is armable",
+            drawn.len()
+        )
+    } else {
+        // Named, not just counted: the operator otherwise reads a 422 and has to
+        // guess which of the four the reconstruction could not cover.
+        format!(
+            "drew {} role(s) into {group} — still to draw by hand: {}",
+            drawn.len(),
+            missing.join(", ")
+        )
+    })
+}
+
 /// `plan delete <id>` → deletes the plan + engine state. Idempotent.
 pub fn plan_delete(trade_id: &str) -> Result<String> {
     run_trade_control(&["plan", "delete", trade_id])

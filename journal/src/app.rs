@@ -705,6 +705,12 @@ impl App {
                 self.show_report(&trade_id, ReportKind::RawReplay);
                 self.status = Status::info(format!("{trade_id}: raw replay done (stored plan)"));
             }
+            // The summary IS the result — it names what was drawn and what the
+            // operator still has to draw by hand, so it goes straight to the
+            // status line rather than into a report screen.
+            JobOutcome::DrawGeometry(summary) => {
+                self.status = Status::info(format!("{trade_id}: {summary}"));
+            }
             JobOutcome::Failed(msg) => {
                 self.status = Status::error(format!("{trade_id} {}: {msg}", kind.verb()));
             }
@@ -998,6 +1004,40 @@ impl App {
             broker,
             armed_at,
             self.chart_backend.local_chart_url().map(str::to_string),
+        );
+    }
+
+    /// The `a` key: redraw this plan's arm geometry on local-chart, recovered
+    /// from the stored plan's own rule triggers.
+    ///
+    /// local-chart only. On TradingView this says so rather than doing nothing:
+    /// the geometry is written through local-chart's drawings API, and there is
+    /// no tv-mcp equivalent — a silent no-op would read as a broken key.
+    ///
+    /// Needs the granularity (which chart file to write) and the instrument,
+    /// both of which the list row carries, so unlike the replays this does not
+    /// have to wait for the plan detail to land.
+    pub fn draw_geometry_current(&mut self) {
+        let Some(row) = self.current_plan().cloned() else {
+            return;
+        };
+        let Some(base_url) = self.chart_backend.local_chart_url().map(str::to_string) else {
+            self.status = Status::error(
+                "drawing plan geometry needs local-chart — restart with `--new-tv`".to_string(),
+            );
+            return;
+        };
+        let trade_id = row.trade_id.clone();
+        if !self.mark_in_flight(&trade_id, JobKind::DrawGeometry) {
+            return;
+        }
+        self.status = Status::info(format!("{trade_id}: redrawing the plan's geometry…"));
+        jobs::spawn_draw_geometry(
+            self.job_tx.clone(),
+            trade_id,
+            row.instrument.clone(),
+            row.granularity.clone(),
+            base_url,
         );
     }
 
@@ -1404,6 +1444,40 @@ mod tests {
         };
         with_detail(&mut app, "t1", "");
         assert_eq!(app.spec_url_for_test("t1"), None);
+    }
+
+    /// On TradingView, `a` says WHY it cannot run rather than doing nothing. A
+    /// silent no-op reads as a broken key, and the geometry is written through
+    /// local-chart's drawings API — there is no tv-mcp equivalent to fall back
+    /// to.
+    #[test]
+    fn drawing_geometry_on_tradingview_explains_itself_instead_of_no_opping() {
+        let mut app = App::from_rows(vec![row("t1")]);
+        app.chart_backend = crate::tv::ChartBackend::TradingView;
+        app.draw_geometry_current();
+        assert!(app.status.is_error, "must report, not sit silent");
+        assert!(
+            app.status.text.contains("--new-tv"),
+            "must name the fix: {}",
+            app.status.text
+        );
+        assert_eq!(app.in_flight_len(), 0, "and must not spawn a job");
+    }
+
+    /// On local-chart it spawns the job. The `a` key needs only the list row
+    /// (instrument + granularity), so unlike the replays it does NOT have to
+    /// wait for the plan detail to land — pinned because adding a detail
+    /// requirement later would silently make the key do nothing on first press.
+    #[test]
+    fn drawing_geometry_on_local_chart_spawns_without_waiting_for_detail() {
+        let mut app = App::from_rows(vec![row("t1")]);
+        app.chart_backend = crate::tv::ChartBackend::LocalChart {
+            base_url: "http://127.0.0.1:8790".to_string(),
+        };
+        // No `with_detail` call — nothing has fetched the plan export yet.
+        app.draw_geometry_current();
+        assert!(!app.status.is_error, "{}", app.status.text);
+        assert_eq!(app.in_flight_len(), 1, "the job must be in flight");
     }
 
     /// The default path is untouched: on TradingView there is no spec-url, so

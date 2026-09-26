@@ -32,6 +32,7 @@ pub enum JobKind {
     /// `replay-candles --plan <FILE>` — replay the STORED plan as-is, with no
     /// chart read and no re-arm.
     RawReplay,
+    DrawGeometry,
 }
 
 impl JobKind {
@@ -44,6 +45,7 @@ impl JobKind {
             JobKind::SaveFixture => "saving fixtures",
             JobKind::Rebless => "re-blessing fixtures",
             JobKind::RawReplay => "running raw replay",
+            JobKind::DrawGeometry => "drawing plan geometry",
         }
     }
 }
@@ -82,6 +84,8 @@ pub enum JobOutcome {
     },
     /// The raw (stored-plan) replay's report text.
     RawReplay(String),
+    /// The status line for a finished geometry redraw.
+    DrawGeometry(String),
     /// The job failed; the string is the error to surface in the footer.
     Failed(String),
 }
@@ -226,6 +230,22 @@ pub fn spawn_raw_replay(
             local_chart_url.as_deref(),
         )?;
         Ok(JobOutcome::RawReplay(report))
+    });
+}
+
+/// Redraw this plan's arm geometry on local-chart, recovered from the stored
+/// plan. local-chart only — there is no TradingView equivalent, and the caller
+/// does not offer the key on that backend.
+pub fn spawn_draw_geometry(
+    tx: Sender<JobResult>,
+    trade_id: String,
+    instrument: String,
+    granularity: String,
+    base_url: String,
+) {
+    spawn(tx, trade_id.clone(), JobKind::DrawGeometry, move || {
+        let summary = cli::draw_plan_geometry(&trade_id, &instrument, &granularity, &base_url)?;
+        Ok(JobOutcome::DrawGeometry(summary))
     });
 }
 

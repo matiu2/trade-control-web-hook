@@ -33,6 +33,11 @@ pub enum Action {
     /// by the fixture status the info bar is already showing, so the key does
     /// what the operator just read.
     FixtureKey,
+    /// The `a` key: redraw this plan's ARM geometry on local-chart, recovered
+    /// from the stored plan's own rule triggers. For a chart whose drawings are
+    /// gone, so `/arm-setup` answers `422 missing required roles` even though
+    /// every level is still in the plan.
+    DrawGeometry,
     /// The `R` key: replay the STORED plan as-is (`replay-candles --plan`),
     /// with no chart read and no tv-arm re-arm. Capital-R deliberately: it is
     /// a different question from `r`, not a variation of it.
@@ -178,6 +183,7 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
             KeyCode::Char('l') => Action::LoadTv,
             KeyCode::Char('r') => Action::Replay,
             KeyCode::Char('R') => Action::RawReplay,
+            KeyCode::Char('a') => Action::DrawGeometry,
             KeyCode::Char('f') | KeyCode::Char('F') => Action::FixtureKey,
             KeyCode::Char('s') | KeyCode::Char('S') => Action::SaveFixture,
             KeyCode::Char('c') => Action::Copy,
@@ -209,6 +215,7 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
         KeyCode::Char('c') => Action::Copy,
         KeyCode::Char('o') => Action::OpenScreenshot,
         KeyCode::Char('i') => Action::TogglePopup,
+        KeyCode::Char('a') => Action::DrawGeometry,
         KeyCode::Char('d') | KeyCode::Char('x') => Action::RequestDelete,
         _ => Action::None,
     }
@@ -227,6 +234,7 @@ pub fn apply(app: &mut App, action: Action) {
         Action::SaveFixture => app.save_fixture_current(),
         Action::FixtureKey => app.fixture_key(),
         Action::RawReplay => app.raw_replay_current(),
+        Action::DrawGeometry => app.draw_geometry_current(),
         Action::PromptPush(c) => app.prompt_push(c),
         Action::PromptPop => app.prompt_pop(),
         Action::PromptAccept => app.prompt_accept(),
@@ -367,6 +375,48 @@ mod tests {
         // Ctrl-C still escapes — a text field must never trap the operator.
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(map_key(&app, ctrl_c), Action::Quit);
+    }
+
+    /// `a` (draw arm geometry) works on BOTH screens, for the same reason `f`
+    /// and `R` do: the Replay screen rebinds most letters for scrolling, so a
+    /// binding added only to the list would be dead exactly where the operator
+    /// has just read a replay and wants the chart redrawn.
+    #[test]
+    fn the_draw_geometry_key_works_on_both_screens() {
+        let mut app = app_with_one_plan();
+        app.screen = crate::screen::Screen::List;
+        assert_eq!(map_key(&app, press('a')), Action::DrawGeometry, "list");
+        app.screen = crate::screen::Screen::Replay;
+        assert_eq!(map_key(&app, press('a')), Action::DrawGeometry, "replay");
+    }
+
+    /// `a` must not have stolen a scroll key. The Replay screen binds
+    /// `j/k/u/d/g/G` and space to scrolling, and `g` was the first choice for
+    /// "geometry" — the compiler caught it as an unreachable arm, and this keeps
+    /// it caught if someone moves the binding back.
+    #[test]
+    fn the_replay_screens_scroll_keys_are_untouched() {
+        let mut app = app_with_one_plan();
+        app.screen = crate::screen::Screen::Replay;
+        assert_eq!(map_key(&app, press('g')), Action::ReplayHome, "g scrolls");
+        assert_eq!(map_key(&app, press('G')), Action::ReplayEnd, "G scrolls");
+        assert_eq!(map_key(&app, press('j')), Action::ReplayScroll(1));
+        assert_eq!(map_key(&app, press('k')), Action::ReplayScroll(-1));
+    }
+
+    /// `a` is not one shift-press away from a destructive key. `d`/`x` delete,
+    /// so `D` was rejected as the binding — pinned so a future rename does not
+    /// quietly put "draw" next to "delete".
+    #[test]
+    fn the_draw_geometry_key_is_not_adjacent_to_delete() {
+        let mut app = app_with_one_plan();
+        app.screen = crate::screen::Screen::List;
+        assert_eq!(map_key(&app, press('d')), Action::RequestDelete);
+        assert_ne!(
+            map_key(&app, press('A')),
+            Action::RequestDelete,
+            "shift-a must not delete"
+        );
     }
 
     /// `f` and `R` work on BOTH the list and the Replay screen — the Replay
