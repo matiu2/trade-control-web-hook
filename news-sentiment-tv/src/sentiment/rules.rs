@@ -212,6 +212,7 @@ mod tests {
             actual: actual.map(String::from),
             forecast: forecast.map(String::from),
             previous: previous.map(String::from),
+            event_id: None,
         }
     }
 

@@ -25,7 +25,7 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 clap_complete = "4.6.5"
 color-eyre = "0.6.5"
 dialoguer = { version = "0.12.0", default-features = false, features = ["fuzzy-select", "password"] }
-forex-factory = { git = "https://github.com/matiu2/forex-factory.git", version = "0.2.0", default-features = false, features = ["native-tls", "brotli", "http2"] }
+forex-factory = { git = "https://github.com/matiu2/forex-factory.git", version = "0.3.0", default-features = false, features = ["native-tls", "brotli", "http2"] }
 getrandom = "0.4.2"
 hex = "0.4.3"
 instrument-lookup = { version = "0.7.0", path = "../../instrument-lookup" }
