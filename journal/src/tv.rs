@@ -82,6 +82,19 @@ impl ChartBackend {
         }
     }
 
+    /// The local-chart base URL when that backend is active, else `None`.
+    ///
+    /// Used by the RAW replay (`R`), which drives `replay-candles` directly on
+    /// the stored plan and so has no tv-arm to route through — it needs the URL
+    /// itself to draw the positions file `replay-candles` writes. `None` keeps
+    /// that path on TradingView's `--annotate`, byte-identical to before.
+    pub fn local_chart_url(&self) -> Option<&str> {
+        match self {
+            ChartBackend::TradingView => None,
+            ChartBackend::LocalChart { base_url } => Some(base_url),
+        }
+    }
+
     /// The `--spec-url` tv-arm should arm from for a plan on this backend, or
     /// `None` when it must read the live TradingView chart instead.
     ///
@@ -101,11 +114,11 @@ impl ChartBackend {
     /// `None` for TradingView is not a gap — tv-arm reading the live chart IS
     /// that backend's arm path, and passing no `--spec-url` is exactly today's
     /// behaviour, byte-identical.
-    pub fn spec_url(&self, instrument: &str, granularity: &str) -> Option<String> {
+    pub fn spec_url(&self, instrument: &str, broker: &str, granularity: &str) -> Option<String> {
         match self {
             ChartBackend::TradingView => None,
             ChartBackend::LocalChart { base_url } => {
-                arm_setup_url(base_url, instrument, granularity)
+                arm_setup_url(base_url, instrument, broker, granularity)
             }
         }
     }
@@ -134,7 +147,7 @@ pub fn load_chart_backend(
         // there). Ignored rather than faked.
         ChartBackend::TradingView => load_chart(instrument, broker, granularity),
         ChartBackend::LocalChart { base_url } => {
-            load_chart_local(base_url, instrument, granularity, goto)
+            load_chart_local(base_url, instrument, broker, granularity, goto)
         }
     }
 }
@@ -493,7 +506,7 @@ mod tests {
     #[test]
     fn tradingview_backend_has_no_spec_url() {
         assert_eq!(
-            ChartBackend::TradingView.spec_url("EUR/CAD", "h1"),
+            ChartBackend::TradingView.spec_url("EUR/CAD", "oanda", "h1"),
             None,
             "TradingView must keep reading the live chart"
         );
@@ -508,8 +521,8 @@ mod tests {
             base_url: "http://127.0.0.1:8790".to_string(),
         };
         assert_eq!(
-            backend.spec_url("EUR/CAD", "h1").as_deref(),
-            Some("http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1")
+            backend.spec_url("EUR/CAD", "oanda", "h1").as_deref(),
+            Some("http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1&broker=oanda")
         );
     }
 
@@ -527,6 +540,40 @@ mod tests {
             load_chart_backend;
     }
 
+    /// The raw replay's chart URL: present on local-chart, absent on
+    /// TradingView.
+    ///
+    /// `R` drives `replay-candles` directly on the stored plan, so it has no
+    /// tv-arm to route through and needs the URL itself. A mutation returning
+    /// `None` unconditionally would silently put the local-chart backend back
+    /// on TradingView's `--annotate` — the exact coupling this closes.
+    #[test]
+    fn only_the_local_chart_backend_yields_a_raw_replay_url() {
+        assert_eq!(ChartBackend::TradingView.local_chart_url(), None);
+        let local = ChartBackend::LocalChart {
+            base_url: "http://127.0.0.1:8790".to_string(),
+        };
+        assert_eq!(local.local_chart_url(), Some("http://127.0.0.1:8790"));
+    }
+
+    /// The broker reaches the arm URL through the dispatch, and CHANGES it.
+    ///
+    /// The regression this pins: `spec_url` used to take only
+    /// instrument+granularity, so a TradeNation plan armed off OANDA's
+    /// drawings — local-chart keys drawings per broker and defaults a missing
+    /// `broker=` to OANDA. The symptom was a `422` listing all four required
+    /// roles, which reads as "nothing is drawn" rather than "wrong broker".
+    #[test]
+    fn the_broker_reaches_the_local_chart_arm_url() {
+        let backend = ChartBackend::LocalChart {
+            base_url: "http://127.0.0.1:8790".to_string(),
+        };
+        let oanda = backend.spec_url("EU50_EUR", "oanda", "h1");
+        let tn = backend.spec_url("EU50_EUR", "tradenation", "h1");
+        assert_ne!(oanda, tn, "the broker must change the arm URL");
+        assert!(tn.unwrap_or_default().contains("broker=tradenation"));
+    }
+
     /// The two backends must not agree: a mutation collapsing the match arms
     /// (either direction) is what this catches — the exact shape of the bug.
     #[test]
@@ -535,8 +582,8 @@ mod tests {
             base_url: "http://127.0.0.1:8790".to_string(),
         };
         assert_ne!(
-            ChartBackend::TradingView.spec_url("EUR/CAD", "h1"),
-            local.spec_url("EUR/CAD", "h1"),
+            ChartBackend::TradingView.spec_url("EUR/CAD", "oanda", "h1"),
+            local.spec_url("EUR/CAD", "oanda", "h1"),
             "the backends must arm from different chart sources"
         );
     }

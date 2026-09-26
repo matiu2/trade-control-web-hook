@@ -2151,6 +2151,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "instrument-lookup 0.7.0",
+ "local-chart-client",
  "ratatui",
  "serde",
  "serde_json",
@@ -2235,7 +2236,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "local-chart-client"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "color-eyre",
  "instrument-lookup 0.7.0",

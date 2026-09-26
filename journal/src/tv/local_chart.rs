@@ -52,10 +52,18 @@ pub const DEFAULT_LOCAL_CHART_URL: &str = "http://127.0.0.1:8790";
 pub fn load_chart_local(
     base_url: &str,
     instrument: &str,
+    broker: &str,
     granularity: &str,
     goto: Option<&str>,
 ) -> Result<bool> {
-    load_chart_local_with(base_url, instrument, granularity, goto, crate::opener::open)
+    load_chart_local_with(
+        base_url,
+        instrument,
+        broker,
+        granularity,
+        goto,
+        crate::opener::open,
+    )
 }
 
 /// [`load_chart_local`] with the actual browser-open call injected, so a test
@@ -67,12 +75,13 @@ pub fn load_chart_local(
 fn load_chart_local_with(
     base_url: &str,
     instrument: &str,
+    broker: &str,
     granularity: &str,
     goto: Option<&str>,
     opener: impl FnOnce(&str) -> Result<&'static str>,
 ) -> Result<bool> {
     let symbol = local_chart_symbol(instrument);
-    let url = build_url(base_url, &symbol, granularity, goto);
+    let url = build_url(base_url, &symbol, broker, granularity, goto);
     opener(&url)?;
     Ok(false)
 }
@@ -131,7 +140,13 @@ fn local_chart_tf(granularity: &str) -> Option<String> {
 /// instant carries `:` throughout and may carry `+` in its offset, and a raw
 /// `+` in a query string decodes to a SPACE — which would silently corrupt
 /// the timestamp rather than fail.
-fn build_url(base_url: &str, symbol: &str, granularity: &str, goto: Option<&str>) -> String {
+fn build_url(
+    base_url: &str,
+    symbol: &str,
+    broker: &str,
+    granularity: &str,
+    goto: Option<&str>,
+) -> String {
     let base = base_url.trim_end_matches('/');
     let mut url = match local_chart_tf(granularity) {
         Some(tf) => format!("{base}/?instrument={symbol}&tf={tf}"),
@@ -143,6 +158,15 @@ fn build_url(base_url: &str, symbol: &str, granularity: &str, goto: Option<&str>
             format!("{base}/?instrument={symbol}")
         }
     };
+    // Candles AND drawings are both per-broker, so a link naming only the
+    // instrument reopens against whichever broker this browser last had
+    // selected — different bars and different drawings than the plan's own.
+    // local-chart's bootstrap already honours `&broker=`; journal just never
+    // sent it. Appended unvalidated: the server owns the alias set and its
+    // bootstrap ignores one it cannot read, which is the same fail-open
+    // direction as `tf` above.
+    url.push_str("&broker=");
+    url.push_str(&percent_encode_query(broker));
     if let Some(instant) = goto {
         url.push_str("&goto=");
         url.push_str(&percent_encode_query(instant));
@@ -192,7 +216,12 @@ fn percent_encode_query(value: &str) -> String {
 /// setup that looks perfectly valid at the WRONG granularity, which is then
 /// frozen into a replay or a fixture. So this returns `None` and the caller
 /// falls back to the live-chart arm rather than silently arming off-timeframe.
-pub fn arm_setup_url(base_url: &str, instrument: &str, granularity: &str) -> Option<String> {
+pub fn arm_setup_url(
+    base_url: &str,
+    instrument: &str,
+    broker: &str,
+    granularity: &str,
+) -> Option<String> {
     let symbol = local_chart_symbol(instrument);
     let tf = local_chart_tf(granularity).or_else(|| {
         warn!(
@@ -203,7 +232,16 @@ pub fn arm_setup_url(base_url: &str, instrument: &str, granularity: &str) -> Opt
         None
     })?;
     let base = base_url.trim_end_matches('/');
-    Some(format!("{base}/arm-setup?instrument={symbol}&tf={tf}"))
+    // `broker` is part of the DRAWINGS' identity, not just the price feed's:
+    // local-chart keys them `drawings/<broker>/<symbol>-<tf>.json` and
+    // `/arm-setup` defaults a missing `broker=` to OANDA. Omitting it armed a
+    // TradeNation plan off OANDA's drawings — a `422 missing required roles`
+    // listing all four, which reads as "you forgot the neckline" when the
+    // neckline is sitting on the TradeNation chart.
+    Some(format!(
+        "{base}/arm-setup?instrument={symbol}&tf={tf}&broker={}",
+        percent_encode_query(broker)
+    ))
 }
 
 #[cfg(test)]
@@ -215,16 +253,17 @@ mod tests {
     /// `l` key just loaded, not a differently-derived one.
     #[test]
     fn arm_setup_url_matches_the_navigation_mapping() {
-        let url = arm_setup_url("http://127.0.0.1:8790", "EUR/CAD", "h1");
+        let url = arm_setup_url("http://127.0.0.1:8790", "EUR/CAD", "oanda", "h1");
         assert_eq!(
             url.as_deref(),
-            Some("http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1")
+            Some("http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1&broker=oanda")
         );
         // Same symbol resolution as the navigation path, for the same input.
         assert!(
             build_url(
                 "http://127.0.0.1:8790",
                 &local_chart_symbol("EUR/CAD"),
+                "oanda",
                 "h1",
                 None
             )
@@ -235,8 +274,8 @@ mod tests {
     /// Composite-key pair, half one: instrument varies, timeframe fixed.
     #[test]
     fn arm_setup_url_varies_with_instrument_granularity_fixed() {
-        let eur = arm_setup_url("http://127.0.0.1:8790", "EUR_USD", "h4");
-        let gbp = arm_setup_url("http://127.0.0.1:8790", "GBP_USD", "h4");
+        let eur = arm_setup_url("http://127.0.0.1:8790", "EUR_USD", "oanda", "h4");
+        let gbp = arm_setup_url("http://127.0.0.1:8790", "GBP_USD", "oanda", "h4");
         assert_ne!(eur, gbp, "different instrument must change the URL");
         assert!(eur.unwrap_or_default().contains("tf=h4"));
     }
@@ -246,11 +285,75 @@ mod tests {
     /// see. See the repo memory `composite_key_tests_must_vary_each_half`.
     #[test]
     fn arm_setup_url_varies_with_granularity_instrument_fixed() {
-        let h4 = arm_setup_url("http://127.0.0.1:8790", "EUR_USD", "h4");
-        let m15 = arm_setup_url("http://127.0.0.1:8790", "EUR_USD", "m15");
+        let h4 = arm_setup_url("http://127.0.0.1:8790", "EUR_USD", "oanda", "h4");
+        let m15 = arm_setup_url("http://127.0.0.1:8790", "EUR_USD", "oanda", "m15");
         assert_ne!(h4, m15, "different granularity must change the URL");
         assert!(h4.unwrap_or_default().contains("tf=h4"));
         assert!(m15.unwrap_or_default().contains("tf=m15"));
+    }
+
+    /// Composite-key pair, half three: **broker** varies, instrument+timeframe
+    /// fixed.
+    ///
+    /// The broker is part of the drawings' IDENTITY, not just the price feed's
+    /// — local-chart stores them per broker (`drawings/<broker>/<sym>-<tf>.json`)
+    /// and `/arm-setup` defaults a missing `broker=` to OANDA
+    /// (`ChartBroker::from_param`). So a URL without it armed a TradeNation plan
+    /// off OANDA's drawings: in practice a `422 missing required roles` naming
+    /// all four at once (the OANDA file does not exist), which reads as "you
+    /// forgot to draw a neckline" when the neckline is right there on the
+    /// TradeNation chart. Reported for `EU50_EUR h1`.
+    #[test]
+    fn arm_setup_url_varies_with_broker_instrument_and_tf_fixed() {
+        let oanda = arm_setup_url("http://127.0.0.1:8790", "EU50_EUR", "oanda", "h1");
+        let tn = arm_setup_url("http://127.0.0.1:8790", "EU50_EUR", "tradenation", "h1");
+        assert_ne!(oanda, tn, "different broker must change the URL");
+        assert!(oanda.unwrap_or_default().contains("broker=oanda"));
+        assert!(tn.unwrap_or_default().contains("broker=tradenation"));
+    }
+
+    /// The broker reaches the NAVIGATION url too, for the same reason: without
+    /// it the chart reopens on whichever broker that browser last had selected,
+    /// showing different candles AND different drawings than the plan's own.
+    /// local-chart's bootstrap already honours `&broker=`; journal simply never
+    /// sent it.
+    #[test]
+    fn the_navigation_url_carries_the_broker_too() {
+        let url = build_url(
+            "http://127.0.0.1:8790",
+            "EU50_EUR",
+            "tradenation",
+            "h1",
+            None,
+        );
+        assert!(url.contains("broker=tradenation"), "{url}");
+        assert!(url.contains("instrument=EU50_EUR"), "{url}");
+        assert!(url.contains("tf=h1"), "{url}");
+    }
+
+    /// An unrecognised broker is passed through rather than dropped or
+    /// defaulted. The SERVER owns the alias set (`ChartBroker::parse` takes
+    /// `tn` and `trade-nation` too) and answers an unknown one with a 400
+    /// naming the accepted values — far better than journal silently sending
+    /// OANDA's drawings for a broker it did not recognise, which is exactly
+    /// the class of bug this whole change closes.
+    #[test]
+    fn an_unknown_broker_is_forwarded_for_the_server_to_judge() {
+        let url =
+            arm_setup_url("http://127.0.0.1:8790", "EUR_USD", "ibkr", "h1").unwrap_or_default();
+        assert!(url.contains("broker=ibkr"), "{url}");
+    }
+
+    /// A broker value is percent-encoded like every other query value. Nothing
+    /// in the catalog needs it today, but the encoding is what keeps a future
+    /// caller from producing a malformed URL — the same reason `goto` is
+    /// encoded.
+    #[test]
+    fn a_broker_value_is_percent_encoded() {
+        let url = arm_setup_url("http://127.0.0.1:8790", "EUR_USD", "trade nation", "h1")
+            .unwrap_or_default();
+        assert!(url.contains("broker=trade%20nation"), "{url}");
+        assert!(!url.contains("broker=trade nation"), "{url}");
     }
 
     /// The deliberate asymmetry from [`build_url`]: navigation drops a bad `tf`
@@ -260,21 +363,27 @@ mod tests {
     #[test]
     fn arm_setup_url_refuses_an_unknown_granularity_rather_than_dropping_tf() {
         assert_eq!(
-            arm_setup_url("http://127.0.0.1:8790", "EUR_USD", "not-a-tf"),
+            arm_setup_url("http://127.0.0.1:8790", "EUR_USD", "oanda", "not-a-tf"),
             None
         );
         // Contrast: the navigation URL still opens, minus the tf param.
         assert_eq!(
-            build_url("http://127.0.0.1:8790", "EUR_USD", "not-a-tf", None),
-            "http://127.0.0.1:8790/?instrument=EUR_USD"
+            build_url(
+                "http://127.0.0.1:8790",
+                "EUR_USD",
+                "oanda",
+                "not-a-tf",
+                None
+            ),
+            "http://127.0.0.1:8790/?instrument=EUR_USD&broker=oanda"
         );
     }
 
     #[test]
     fn arm_setup_url_strips_a_trailing_slash_from_the_base_url() {
         assert_eq!(
-            arm_setup_url("http://127.0.0.1:8790/", "EUR_USD", "h1").as_deref(),
-            Some("http://127.0.0.1:8790/arm-setup?instrument=EUR_USD&tf=h1")
+            arm_setup_url("http://127.0.0.1:8790/", "EUR_USD", "oanda", "h1").as_deref(),
+            Some("http://127.0.0.1:8790/arm-setup?instrument=EUR_USD&tf=h1&broker=oanda")
         );
     }
 
@@ -306,8 +415,11 @@ mod tests {
 
     #[test]
     fn builds_url_with_both_params_when_granularity_is_known() {
-        let url = build_url("http://127.0.0.1:8790", "EURUSD", "h4", None);
-        assert_eq!(url, "http://127.0.0.1:8790/?instrument=EURUSD&tf=h4");
+        let url = build_url("http://127.0.0.1:8790", "EURUSD", "oanda", "h4", None);
+        assert_eq!(
+            url,
+            "http://127.0.0.1:8790/?instrument=EURUSD&tf=h4&broker=oanda"
+        );
     }
 
     /// Composite-key trap: this test varies ONLY the instrument while the
@@ -317,8 +429,8 @@ mod tests {
     /// varies the granularity, so BOTH halves are independently exercised.
     #[test]
     fn url_varies_with_instrument_granularity_fixed() {
-        let eur = build_url("http://127.0.0.1:8790", "EURUSD", "h4", None);
-        let gbp = build_url("http://127.0.0.1:8790", "GBPUSD", "h4", None);
+        let eur = build_url("http://127.0.0.1:8790", "EURUSD", "oanda", "h4", None);
+        let gbp = build_url("http://127.0.0.1:8790", "GBPUSD", "oanda", "h4", None);
         assert_ne!(
             eur, gbp,
             "different instrument must produce a different URL"
@@ -335,9 +447,9 @@ mod tests {
     /// `composite_key_tests_must_vary_each_half`.
     #[test]
     fn url_varies_with_granularity_instrument_fixed() {
-        let h4 = build_url("http://127.0.0.1:8790", "EURUSD", "h4", None);
-        let m15 = build_url("http://127.0.0.1:8790", "EURUSD", "m15", None);
-        let d = build_url("http://127.0.0.1:8790", "EURUSD", "d", None);
+        let h4 = build_url("http://127.0.0.1:8790", "EURUSD", "oanda", "h4", None);
+        let m15 = build_url("http://127.0.0.1:8790", "EURUSD", "oanda", "m15", None);
+        let d = build_url("http://127.0.0.1:8790", "EURUSD", "oanda", "d", None);
         assert_ne!(
             h4, m15,
             "different granularity must produce a different URL"
@@ -349,8 +461,17 @@ mod tests {
 
     #[test]
     fn drops_only_the_tf_param_on_an_unknown_granularity() {
-        let url = build_url("http://127.0.0.1:8790", "EURUSD", "not-a-real-tf", None);
-        assert_eq!(url, "http://127.0.0.1:8790/?instrument=EURUSD");
+        let url = build_url(
+            "http://127.0.0.1:8790",
+            "EURUSD",
+            "oanda",
+            "not-a-real-tf",
+            None,
+        );
+        // ONLY `tf` is dropped — `broker` survives, which is what the test's
+        // name claims. A bad timeframe is no reason to also lose the broker
+        // and reopen on whichever one the browser last had selected.
+        assert_eq!(url, "http://127.0.0.1:8790/?instrument=EURUSD&broker=oanda");
         assert!(
             !url.contains("tf="),
             "unknown granularity must not leak through"
@@ -359,8 +480,11 @@ mod tests {
 
     #[test]
     fn strips_a_trailing_slash_from_the_base_url() {
-        let url = build_url("http://127.0.0.1:8790/", "EURUSD", "h4", None);
-        assert_eq!(url, "http://127.0.0.1:8790/?instrument=EURUSD&tf=h4");
+        let url = build_url("http://127.0.0.1:8790/", "EURUSD", "oanda", "h4", None);
+        assert_eq!(
+            url,
+            "http://127.0.0.1:8790/?instrument=EURUSD&tf=h4&broker=oanda"
+        );
     }
 
     /// THE central contract this module exists to document: unlike the
@@ -372,14 +496,21 @@ mod tests {
     #[test]
     fn a_successful_open_is_always_ok_false_never_already_there() {
         let opened = std::cell::RefCell::new(None);
-        let result = load_chart_local_with("http://127.0.0.1:8790", "EUR_USD", "h4", None, |url| {
-            *opened.borrow_mut() = Some(url.to_string());
-            Ok("xdg-open")
-        });
+        let result = load_chart_local_with(
+            "http://127.0.0.1:8790",
+            "EUR_USD",
+            "oanda",
+            "h4",
+            None,
+            |url| {
+                *opened.borrow_mut() = Some(url.to_string());
+                Ok("xdg-open")
+            },
+        );
         assert!(!result.unwrap(), "must NEVER report already-there");
         assert_eq!(
             opened.into_inner().as_deref(),
-            Some("http://127.0.0.1:8790/?instrument=EUR_USD&tf=h4")
+            Some("http://127.0.0.1:8790/?instrument=EUR_USD&tf=h4&broker=oanda")
         );
     }
 
@@ -408,7 +539,7 @@ mod tests {
             .expect("set LOCAL_CHART_E2E_URL to a throwaway local-chart instance, e.g. :8824");
 
         let mut captured_url = None;
-        let result = load_chart_local_with(&base_url, "AUD/CHF", "h4", None, |url| {
+        let result = load_chart_local_with(&base_url, "AUD/CHF", "oanda", "h4", None, |url| {
             captured_url = Some(url.to_string());
             Ok("test-capture")
         });
@@ -455,19 +586,28 @@ mod tests {
     /// above) — only a total inability to launch anything is an error.
     #[test]
     fn only_a_launch_failure_is_an_error() {
-        let result =
-            load_chart_local_with("http://127.0.0.1:8790", "EUR_USD", "h4", None, |_url| {
-                Err(color_eyre::eyre::eyre!("no opener on this system"))
-            });
+        let result = load_chart_local_with(
+            "http://127.0.0.1:8790",
+            "EUR_USD",
+            "oanda",
+            "h4",
+            None,
+            |_url| Err(color_eyre::eyre::eyre!("no opener on this system")),
+        );
         assert!(result.is_err());
     }
 
     /// Pins the public wrapper's signature — the one `tv::load_chart_backend`
     /// actually calls — so a refactor of the injectable-opener seam cannot
     /// silently change what callers see.
+    ///
+    /// Now `(base_url, instrument, broker, granularity, goto)`: the broker was
+    /// added because local-chart keys both its candle cache and its drawings
+    /// per broker, so navigating without it lands the operator on whichever
+    /// broker the browser last had selected.
     #[test]
     fn public_wrapper_has_the_documented_signature() {
-        let _: fn(&str, &str, &str, Option<&str>) -> Result<bool> = load_chart_local;
+        let _: fn(&str, &str, &str, &str, Option<&str>) -> Result<bool> = load_chart_local;
     }
 
     /// A plan's `armed_at` rides along as `&goto=`, so the chart CENTRES on
@@ -477,6 +617,7 @@ mod tests {
         let url = build_url(
             "http://127.0.0.1:8790",
             "EUR_CAD",
+            "oanda",
             "h1",
             Some("2026-09-02T11:19:54Z"),
         );
@@ -496,6 +637,7 @@ mod tests {
         let url = build_url(
             "http://127.0.0.1:8790",
             "EUR_CAD",
+            "oanda",
             "h1",
             Some("2026-09-02T11:19:54Z"),
         );
@@ -508,6 +650,7 @@ mod tests {
         let nanos = build_url(
             "http://127.0.0.1:8790",
             "EUR_CAD",
+            "oanda",
             "h1",
             Some("2026-09-02T11:19:54.201124894Z"),
         );
@@ -523,6 +666,7 @@ mod tests {
         let url = build_url(
             "http://127.0.0.1:8790",
             "EUR_CAD",
+            "oanda",
             "h1",
             Some("2026-09-02T21:19:54+10:00"),
         );
@@ -530,12 +674,17 @@ mod tests {
         assert!(!url.contains('+'), "a raw + leaked: {url}");
     }
 
-    /// No `armed_at` (or the TradingView backend) means no param at all —
-    /// every pre-existing link is byte-identical to before goto existed.
+    /// No `armed_at` means no `goto` param at all. The exact-URL assertion is
+    /// what pins the param ORDER (`instrument`, `tf`, `broker`) — the `goto`
+    /// tests below assert `ends_with("&goto=…")`, which only holds while
+    /// `broker` is appended ahead of it.
     #[test]
     fn no_goto_leaves_the_url_exactly_as_it_was() {
-        let url = build_url("http://127.0.0.1:8790", "EUR_CAD", "h1", None);
-        assert_eq!(url, "http://127.0.0.1:8790/?instrument=EUR_CAD&tf=h1");
+        let url = build_url("http://127.0.0.1:8790", "EUR_CAD", "oanda", "h1", None);
+        assert_eq!(
+            url,
+            "http://127.0.0.1:8790/?instrument=EUR_CAD&tf=h1&broker=oanda"
+        );
         assert!(!url.contains("goto"), "{url}");
     }
 
@@ -548,6 +697,7 @@ mod tests {
         let url = build_url(
             "http://127.0.0.1:8790",
             "EUR_CAD",
+            "oanda",
             "not-a-tf",
             Some("2026-09-02T11:19:54Z"),
         );

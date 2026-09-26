@@ -372,7 +372,7 @@ pub fn run_replay(
 /// The one thing it must not do is fail *silently*, hence the warning naming
 /// the cause.
 fn draw_positions_on_local_chart(url: &str, path: &Path) -> Result<()> {
-    let doc = match crate::replay_positions::read(path) {
+    let doc = match local_chart_client::read_positions(path) {
         Ok(doc) => doc,
         Err(err) => {
             warn!(%err, path = %path.display(), "could not read the replay's positions");
@@ -382,7 +382,7 @@ fn draw_positions_on_local_chart(url: &str, path: &Path) -> Result<()> {
     // Draw the not-taken brackets too: on local-chart they are cheap (muted
     // grey) and the operator asked for a replay precisely to see what the plan
     // would have done, including the entries it never got.
-    match crate::replay_positions::draw(&doc, url, true) {
+    match local_chart_client::draw_positions(&doc, url, true) {
         Ok(drawn) => {
             info!(drawn, url, "drew replay positions on local-chart");
             println!("drew {drawn} position(s) on local-chart");

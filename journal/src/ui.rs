@@ -80,19 +80,29 @@ fn render_body(f: &mut Frame, app: &App, area: Rect) {
 /// `App::chart_backend`.
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let load_hint = load_hint(&app.chart_backend);
+    // `a` (redraw the plan's arm geometry) is local-chart-only — it writes
+    // through local-chart's drawings API and has no tv-mcp equivalent. Shown
+    // only on that backend, for the same reason `load_hint` names the active
+    // one: a hint for a key that answers "restart with --new-tv" is worse than
+    // no hint. These footers are already full, so it earns its space only where
+    // it works.
+    let arm_hint = if app.chart_backend.local_chart_url().is_some() {
+        "  a arm-geom"
+    } else {
+        ""
+    };
     let hints = match app.screen {
         Screen::List => {
-            "↑↓ move  →/n open  / search  f fixture  s fixtures  c copy  q quit".to_string()
+            format!("↑↓ move  →/n open  / search  f fixture  s fixtures  c copy{arm_hint}  q quit")
         }
-        Screen::Replay => {
-            "↑↓/jk scroll  ←/→ nav  r replay  R raw  f fixture  c copy  o shot  i detail  x del  q quit"
-                .to_string()
-        }
+        Screen::Replay => format!(
+            "↑↓/jk scroll  ←/→ nav  r replay  R raw  f fixture  c copy  o shot  i detail{arm_hint}  x del  q quit"
+        ),
         Screen::Compare => format!(
-            "← back  l {load_hint}  r replay  R raw  f fixture  c copy  o shot  i detail  d/x delete  q quit"
+            "← back  l {load_hint}  r replay  R raw  f fixture  c copy  o shot  i detail{arm_hint}  d/x delete  q quit"
         ),
         _ => format!(
-            "← back  →/n deeper  l {load_hint}  r replay  R raw  f fixture  c copy  o shot  i detail  d/x del  q quit"
+            "← back  →/n deeper  l {load_hint}  r replay  R raw  f fixture  c copy  o shot  i detail{arm_hint}  d/x del  q quit"
         ),
     };
     let status_style = if app.status.is_error {
