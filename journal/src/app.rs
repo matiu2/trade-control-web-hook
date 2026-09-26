@@ -997,6 +997,7 @@ impl App {
             row.instrument.clone(),
             broker,
             armed_at,
+            self.chart_backend.local_chart_url().map(str::to_string),
         );
     }
 

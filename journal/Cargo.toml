@@ -9,6 +9,7 @@ clap = { version = "4.6.4", features = ["derive"] }
 color-eyre = "0.6.5"
 crossterm = "0.28"
 instrument-lookup = { version = "0.7.0", path = "../../instrument-lookup" }
+local-chart-client = { version = "0.2.0", path = "../../local-chart-client" }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

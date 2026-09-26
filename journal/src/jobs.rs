@@ -212,9 +212,19 @@ pub fn spawn_raw_replay(
     instrument: String,
     broker: String,
     armed_at: String,
+    // The local-chart base URL when that backend is active, so the raw replay
+    // paints its positions there instead of shelling out to tv-mcp. `None` on
+    // TradingView keeps the `--annotate` path.
+    local_chart_url: Option<String>,
 ) {
     spawn(tx, trade_id.clone(), JobKind::RawReplay, move || {
-        let report = cli::raw_replay(&trade_id, &instrument, &broker, &armed_at)?;
+        let report = cli::raw_replay(
+            &trade_id,
+            &instrument,
+            &broker,
+            &armed_at,
+            local_chart_url.as_deref(),
+        )?;
         Ok(JobOutcome::RawReplay(report))
     });
 }

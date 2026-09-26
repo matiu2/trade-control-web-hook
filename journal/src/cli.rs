@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use color_eyre::eyre::{Result, eyre};
+use tracing::{info, warn};
 
 /// This environment's CLI suffix, baked at compile time (`dev` / `staging`,
 /// empty for a plain `cargo build`). See `build.rs`.
@@ -207,6 +208,10 @@ fn raw_replay_args(
     instrument: &str,
     broker: &str,
     armed_at: &str,
+    // Where `replay-candles` should write its positions, on the local-chart
+    // backend. `None` is the TradingView backend, whose argv is byte-identical
+    // to before this existed.
+    positions_out: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
         "--plan".to_string(),
@@ -220,8 +225,25 @@ fn raw_replay_args(
         args.push("--source".to_string());
         args.push(broker.to_string());
     }
-    args.push("--annotate".to_string());
-    args.push("true".to_string());
+    // The chart backend decides where the result is painted — and the two are
+    // EXCLUSIVE here, unlike the flags above which every backend needs.
+    //
+    // `--annotate true` reaches out to the tv-mcp bridge from inside
+    // `replay-candles`, and that block runs BEFORE the `--positions` emit while
+    // propagating its error. Injecting both would make the local-chart picture
+    // hostage to TradingView being alive: a dead CDP connection exits non-zero
+    // and the positions file is never written. Same fix as `tv-arm`'s chained
+    // replay (see `tv-arm/src/replay.rs`'s `build_argv`).
+    match positions_out {
+        Some(path) => {
+            args.push("--positions".to_string());
+            args.push(path.display().to_string());
+        }
+        None => {
+            args.push("--annotate".to_string());
+            args.push("true".to_string());
+        }
+    }
     args
 }
 
@@ -237,14 +259,55 @@ pub fn raw_replay(
     instrument: &str,
     broker: &str,
     armed_at: &str,
+    // The chart to paint the result on. `None` keeps the TradingView
+    // `--annotate` path; `Some(base_url)` asks for a positions file and draws
+    // it on local-chart instead.
+    local_chart_url: Option<&str>,
 ) -> Result<String> {
     let plan_json = plan_export_json(trade_id)?;
     let plan_file = std::env::temp_dir().join(format!("journal-raw-replay-{trade_id}.json"));
     std::fs::write(&plan_file, plan_json)
         .map_err(|e| eyre!("write plan to {}: {e}", plan_file.display()))?;
+    // A temp file keyed on the trade id: an intermediate between two processes
+    // in one run, not an artefact the operator keeps. Same shape as tv-arm's.
+    let positions_out = local_chart_url
+        .map(|_| std::env::temp_dir().join(format!("journal-raw-positions-{trade_id}.json")));
     let program = bin("replay-candles");
-    let args = raw_replay_args(&plan_file, instrument, broker, armed_at);
-    run_replay_candles(&program, &args)
+    let args = raw_replay_args(
+        &plan_file,
+        instrument,
+        broker,
+        armed_at,
+        positions_out.as_deref(),
+    );
+    let report = run_replay_candles(&program, &args)?;
+    if let (Some(url), Some(path)) = (local_chart_url, positions_out.as_deref()) {
+        draw_raw_positions(url, path);
+    }
+    Ok(report)
+}
+
+/// Draw the positions the raw replay just recorded onto local-chart.
+///
+/// **Fail-soft**, like tv-arm's equivalent: the replay has already produced the
+/// report the operator asked for by the time this runs, and that report is the
+/// answer. A chart that could not be drawn on is a missing picture, not a wrong
+/// one — so this warns and returns rather than turning a good replay into an
+/// error. It must not fail *silently*, hence the warning naming the cause.
+fn draw_raw_positions(url: &str, path: &Path) {
+    match local_chart_client::read_positions(path) {
+        // Draw the not-taken brackets too (`true`): a raw replay is run
+        // precisely to see what the stored plan would have done, the entries it
+        // never got included.
+        Ok(doc) => match local_chart_client::draw_positions(&doc, url, true) {
+            Ok(drawn) => info!(drawn, url, "drew raw-replay positions on local-chart"),
+            Err(err) => warn!(%err, url, "could not draw raw-replay positions"),
+        },
+        Err(err) => {
+            warn!(%err, path = %path.display(), "could not read the raw replay's positions")
+        }
+    }
+    std::fs::remove_file(path).ok();
 }
 
 /// Run `replay-candles-<env>` with `args`, returning ANSI-stripped stdout.
@@ -752,7 +815,7 @@ mod tests {
     /// simply impossible without this flag.
     #[test]
     fn raw_replay_always_names_the_start() {
-        let args = raw_replay_args(Path::new("/tmp/p.json"), "AUD/NZD", "tradenation", TS);
+        let args = raw_replay_args(Path::new("/tmp/p.json"), "AUD/NZD", "tradenation", TS, None);
         let i = args
             .iter()
             .position(|a| a == "--start")
@@ -766,7 +829,7 @@ mod tests {
     /// silently — a plausible 0R under a banner naming the right instrument.
     #[test]
     fn raw_replay_always_names_the_instrument() {
-        let args = raw_replay_args(Path::new("/tmp/p.json"), "AUD/NZD", "tradenation", TS);
+        let args = raw_replay_args(Path::new("/tmp/p.json"), "AUD/NZD", "tradenation", TS, None);
         let i = args
             .iter()
             .position(|a| a == "--instrument")
@@ -784,6 +847,7 @@ mod tests {
             "EUR_CAD",
             "oanda",
             TS,
+            None,
         );
         let p = args.iter().position(|a| a == "--plan").unwrap_or_default();
         assert_eq!(
@@ -803,7 +867,7 @@ mod tests {
     /// `--spec-url` document on the tv-arm paths.
     #[test]
     fn raw_replay_omits_an_unknown_source() {
-        let args = raw_replay_args(Path::new("/tmp/p.json"), "AUD/NZD", "", TS);
+        let args = raw_replay_args(Path::new("/tmp/p.json"), "AUD/NZD", "", TS, None);
         assert!(!args.iter().any(|a| a == "--source"), "{args:?}");
         // The instrument is still named — it is the flag that must never drop.
         assert!(args.iter().any(|a| a == "--instrument"), "{args:?}");
@@ -811,14 +875,94 @@ mod tests {
 
     /// `--annotate` is `ArgAction::Set`, not a bare switch: the value must be
     /// spelled out or clap consumes the next token as its value.
+    ///
+    /// Only on the TradingView backend now — `positions_out: None`.
     #[test]
     fn raw_replay_spells_out_the_annotate_value() {
-        let args = raw_replay_args(Path::new("/tmp/p.json"), "AUD/NZD", "tradenation", TS);
+        let args = raw_replay_args(Path::new("/tmp/p.json"), "AUD/NZD", "tradenation", TS, None);
         let i = args
             .iter()
             .position(|a| a == "--annotate")
             .unwrap_or_default();
         assert_eq!(args.get(i + 1).map(String::as_str), Some("true"));
+    }
+
+    /// On local-chart the raw replay asks for a `--positions` FILE and does
+    /// NOT inject `--annotate true`.
+    ///
+    /// Same fix as `tv-arm`'s chained replay: `replay-candles` propagates the
+    /// annotate error, and the annotate block runs BEFORE the `--positions`
+    /// emit — so a dead tv-mcp CDP connection exits non-zero and the positions
+    /// file is never written. Keeping both would make the local-chart picture
+    /// depend on the TradingView bridge being alive, on the very backend chosen
+    /// to stop depending on it.
+    #[test]
+    fn a_local_chart_raw_replay_asks_for_positions_and_skips_annotate() {
+        let out = PathBuf::from("/tmp/positions.json");
+        let args = raw_replay_args(
+            Path::new("/tmp/p.json"),
+            "AUD/NZD",
+            "tradenation",
+            TS,
+            Some(&out),
+        );
+        assert!(
+            !args.iter().any(|a| a == "--annotate"),
+            "local-chart ⇒ no --annotate: {args:?}"
+        );
+        let i = args
+            .iter()
+            .position(|a| a == "--positions")
+            .expect("--positions must be named");
+        assert_eq!(
+            args.get(i + 1).map(String::as_str),
+            Some("/tmp/positions.json")
+        );
+    }
+
+    /// The TradingView path is byte-identical to before: no `--positions`, and
+    /// the `--annotate true` default still stands. Every existing `R` on the
+    /// default backend behaves exactly as it did.
+    #[test]
+    fn a_tradingview_raw_replay_is_unchanged() {
+        let args = raw_replay_args(Path::new("/tmp/p.json"), "AUD/NZD", "tradenation", TS, None);
+        assert!(!args.iter().any(|a| a == "--positions"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--annotate"), "{args:?}");
+    }
+
+    /// The two backends must not produce the same argv — a mutation collapsing
+    /// the branch (either direction) is what this catches.
+    #[test]
+    fn the_two_backends_do_not_produce_the_same_raw_replay_argv() {
+        let out = PathBuf::from("/tmp/positions.json");
+        let tv = raw_replay_args(Path::new("/tmp/p.json"), "AUD/NZD", "tradenation", TS, None);
+        let lc = raw_replay_args(
+            Path::new("/tmp/p.json"),
+            "AUD/NZD",
+            "tradenation",
+            TS,
+            Some(&out),
+        );
+        assert_ne!(tv, lc, "the chart backend must change the replay argv");
+    }
+
+    /// The plan-driven flags survive the local-chart branch. `--plan`,
+    /// `--instrument`, `--start` and `--source` are what make the raw replay
+    /// read the STORED plan over the right candles; the backend only decides
+    /// where the result is painted.
+    #[test]
+    fn the_local_chart_branch_keeps_every_plan_driven_flag() {
+        let out = PathBuf::from("/tmp/positions.json");
+        let args = raw_replay_args(
+            Path::new("/tmp/p.json"),
+            "AUD/NZD",
+            "tradenation",
+            TS,
+            Some(&out),
+        );
+        for flag in ["--plan", "--instrument", "--start", "--source"] {
+            assert!(args.iter().any(|a| a == flag), "{flag} missing: {args:?}");
+        }
     }
 
     #[test]

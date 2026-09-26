@@ -82,6 +82,19 @@ impl ChartBackend {
         }
     }
 
+    /// The local-chart base URL when that backend is active, else `None`.
+    ///
+    /// Used by the RAW replay (`R`), which drives `replay-candles` directly on
+    /// the stored plan and so has no tv-arm to route through — it needs the URL
+    /// itself to draw the positions file `replay-candles` writes. `None` keeps
+    /// that path on TradingView's `--annotate`, byte-identical to before.
+    pub fn local_chart_url(&self) -> Option<&str> {
+        match self {
+            ChartBackend::TradingView => None,
+            ChartBackend::LocalChart { base_url } => Some(base_url),
+        }
+    }
+
     /// The `--spec-url` tv-arm should arm from for a plan on this backend, or
     /// `None` when it must read the live TradingView chart instead.
     ///
@@ -525,6 +538,22 @@ mod tests {
     fn load_chart_backend_accepts_a_goto_for_local_chart() {
         let _: fn(&ChartBackend, &str, &str, &str, Option<&str>) -> Result<bool> =
             load_chart_backend;
+    }
+
+    /// The raw replay's chart URL: present on local-chart, absent on
+    /// TradingView.
+    ///
+    /// `R` drives `replay-candles` directly on the stored plan, so it has no
+    /// tv-arm to route through and needs the URL itself. A mutation returning
+    /// `None` unconditionally would silently put the local-chart backend back
+    /// on TradingView's `--annotate` — the exact coupling this closes.
+    #[test]
+    fn only_the_local_chart_backend_yields_a_raw_replay_url() {
+        assert_eq!(ChartBackend::TradingView.local_chart_url(), None);
+        let local = ChartBackend::LocalChart {
+            base_url: "http://127.0.0.1:8790".to_string(),
+        };
+        assert_eq!(local.local_chart_url(), Some("http://127.0.0.1:8790"));
     }
 
     /// The broker reaches the arm URL through the dispatch, and CHANGES it.
