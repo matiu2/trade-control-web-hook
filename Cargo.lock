@@ -4881,6 +4881,7 @@ dependencies = [
  "trade-control-core",
  "tradenation-api",
  "trading-view",
+ "url",
 ]
 
 [[package]]

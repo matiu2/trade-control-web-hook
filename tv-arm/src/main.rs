@@ -55,6 +55,7 @@ mod sentiment;
 mod setup_inputs;
 mod sl_anchor;
 mod sl_note;
+mod spec_url;
 mod spread;
 mod start_note;
 #[cfg(test)]

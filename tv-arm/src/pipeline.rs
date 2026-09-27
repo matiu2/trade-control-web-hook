@@ -324,6 +324,12 @@ fn read_setup_from_spec(args: &Args, path: &Path) -> Result<SetupInputs> {
 /// Points at local-chart's `GET /arm-setup`, which already emits this crate's
 /// own `FrozenSetup` shape, so the body is parsed as-is with no translation.
 ///
+/// The URL itself may need one, though: an operator pastes what the browser's
+/// address bar shows, and [`crate::spec_url::normalise`] takes that to the
+/// endpoint. Normalising HERE, before anything else touches `url`, is what
+/// makes every error below (and the arm log line) name the URL actually
+/// fetched rather than the one typed.
+///
 /// A non-2xx response is an error carrying the **body**, not just the status:
 /// local-chart answers an unarmable chart with a structured 422 naming what is
 /// missing (a required role, a stale or ambiguous invalidation line). That text
@@ -334,6 +340,7 @@ fn read_setup_from_spec(args: &Args, path: &Path) -> Result<SetupInputs> {
 /// (`calendar.rs`, `broker_read.rs`, `register_post.rs`): a local runtime for
 /// the duration of the request.
 fn read_setup_from_url(args: &Args, url: &str) -> Result<SetupInputs> {
+    let url = &crate::spec_url::normalise(url)?;
     let runtime = tokio::runtime::Runtime::new()
         .wrap_err("starting tokio runtime to fetch the frozen setup")?;
     let body = runtime.block_on(async {
@@ -1933,6 +1940,34 @@ mod tests {
         assert!(
             err.contains("position") && err.contains("--spec-url"),
             "the error must name the flag the operator actually used: {err}"
+        );
+    }
+
+    /// The pasted-chart-URL conversion happens **at the seam**, not merely in
+    /// `spec_url::normalise`'s own tests.
+    ///
+    /// This is the shape of bug that ships: a helper that converts correctly,
+    /// with a caller that never calls it. So this drives `read_setup_from_url`
+    /// itself, at a port nothing listens on — the fetch fails, which is fine;
+    /// the assertion is on WHICH url it tried, because that error is raised
+    /// after normalisation and quotes the converted string.
+    #[test]
+    fn read_setup_from_url_converts_a_pasted_chart_url_before_fetching() {
+        let args = mw_args(&[]);
+        // :1 is privileged and unbound: the connection refusal is immediate,
+        // so this stays a unit test with no server and no timeout.
+        let err = read_setup_from_url(
+            &args,
+            "http://127.0.0.1:1/?instrument=GBP_JPY&tf=h4&broker=tradenation\
+             &goto=2026-08-24T08%3A17%3A35Z",
+        )
+        .expect_err("nothing is listening on :1")
+        .to_string();
+        assert!(
+            err.contains(
+                "http://127.0.0.1:1/arm-setup?instrument=GBP_JPY&tf=h4&broker=tradenation"
+            ),
+            "the fetch must target the CONVERTED url: {err}"
         );
     }
 

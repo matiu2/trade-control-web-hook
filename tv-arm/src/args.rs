@@ -645,6 +645,15 @@ pub struct Args {
     /// so nothing is translated on the way in; the browser's "Download spec"
     /// button remains the offline path and is unaffected.
     ///
+    /// **A pasted chart URL works too.** Whatever the browser's address bar
+    /// shows for the chart you are looking at —
+    /// `'http://127.0.0.1:8790/?instrument=GBP_JPY&tf=h4&broker=tradenation&goto=…'`
+    /// — is taken to the endpoint above by [`crate::spec_url::normalise`]:
+    /// same host and port, path to `/arm-setup`, `instrument`/`tf`/`broker`
+    /// kept, `goto` dropped (it says where to scroll, not which chart). Saves
+    /// a hand-edit whose slip — losing `broker=` — arms a TradeNation plan off
+    /// OANDA's drawings.
+    ///
     /// Carries every restriction `--spec-in` does — it is the same frozen-spec
     /// arm, differing only in where the bytes come from. In particular the
     /// position-entry tools work only when the fetched spec carries a
