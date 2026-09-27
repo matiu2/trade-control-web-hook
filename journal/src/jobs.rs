@@ -241,10 +241,14 @@ pub fn spawn_draw_geometry(
     trade_id: String,
     instrument: String,
     granularity: String,
+    // Which broker's chart to draw on. Required, not optional: drawings are
+    // stored per broker and a missing one silently means OANDA server-side.
+    broker: String,
     base_url: String,
 ) {
     spawn(tx, trade_id.clone(), JobKind::DrawGeometry, move || {
-        let summary = cli::draw_plan_geometry(&trade_id, &instrument, &granularity, &base_url)?;
+        let summary =
+            cli::draw_plan_geometry(&trade_id, &instrument, &granularity, &broker, &base_url)?;
         Ok(JobOutcome::DrawGeometry(summary))
     });
 }

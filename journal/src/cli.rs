@@ -125,13 +125,23 @@ pub fn draw_plan_geometry(
     trade_id: &str,
     instrument: &str,
     granularity: &str,
+    // The plan's own broker. Decides WHICH per-broker drawings file is written,
+    // so it is threaded from `PlanDetail` rather than defaulted — see
+    // `App::geometry_broker`.
+    broker: &str,
     base_url: &str,
 ) -> Result<String> {
     let json = plan_export_json(trade_id)?;
     let roles = local_chart_client::recover_from_plan(&json)
         .map_err(|e| eyre!("parse the plan export for {trade_id}: {e}"))?;
-    let drawn =
-        local_chart_client::draw_plan_roles(base_url, instrument, granularity, trade_id, &roles)?;
+    let drawn = local_chart_client::draw_plan_roles(
+        base_url,
+        instrument,
+        granularity,
+        Some(broker.to_string()),
+        trade_id,
+        &roles,
+    )?;
     if drawn.is_empty() {
         return Err(eyre!(
             "{trade_id}: the plan carries no arm geometry to redraw — nothing was changed"

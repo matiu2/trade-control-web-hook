@@ -146,6 +146,12 @@ pub struct App {
     /// with the request is what stops a chart load from silently dropping the
     /// note the operator just wrote — and `--rebless` can never add it later.
     save_fixture_pending: Option<Option<String>>,
+    /// A geometry redraw (`a`) was **requested** but the plan detail — which
+    /// carries the broker deciding WHICH chart is drawn on — wasn't fetched
+    /// yet, so it's parked until the timeline job lands. Sibling of
+    /// [`Self::tv_load_pending`]; drawing on a guessed broker is the one thing
+    /// worse than waiting, because it succeeds silently on the wrong chart.
+    draw_geometry_pending: bool,
     /// Every fixture cell found under `replay-fixtures/`, scanned once at
     /// startup and re-scanned when a capture completes. Held on the app rather
     /// than read per-frame because the info bar draws many times a second and
@@ -189,6 +195,7 @@ impl App {
             search: SearchState::default(),
             prompt: None,
             tv_load_pending: false,
+            draw_geometry_pending: false,
             save_fixture_pending: None,
             fixtures: crate::fixtures::scan(&crate::fixtures::default_dir()),
             chart_backend,
@@ -606,6 +613,12 @@ impl App {
                         self.tv_load_pending = false;
                         self.start_load_tv(&trade_id);
                     }
+                    // Likewise a parked `a`: the detail it was waiting for (the
+                    // plan's broker) has just arrived.
+                    if self.draw_geometry_pending {
+                        self.draw_geometry_pending = false;
+                        self.draw_geometry_current();
+                    }
                     if matches!(self.screen, Screen::Replay | Screen::Compare) {
                         self.start_replay(&trade_id);
                     }
@@ -1017,6 +1030,24 @@ impl App {
     /// Needs the granularity (which chart file to write) and the instrument,
     /// both of which the list row carries, so unlike the replays this does not
     /// have to wait for the plan detail to land.
+    /// The broker whose chart this plan's geometry belongs on.
+    ///
+    /// Sourced from the fetched `PlanDetail`, exactly as [`Self::start_load_tv`]
+    /// and [`Self::spec_url_for`] do — `PlanRow` (the list row) has no broker
+    /// field, and drawings are stored per broker
+    /// (`drawings/<broker>/<instrument>-<tf>.json`). `None` means "not knowable
+    /// yet"; the caller parks rather than guessing.
+    fn geometry_broker(&self, trade_id: &str) -> Option<String> {
+        self.data
+            .get(trade_id)
+            .and_then(|d| d.detail.as_ref())
+            // `PlanDetail::broker` is `""` when no rule intent carried one (see
+            // its doc comment) — a real value meaning "unknown", not a missing
+            // field. Folded into `None` so the caller treats it the same way.
+            .map(|detail| detail.broker.clone())
+            .filter(|broker| !broker.is_empty())
+    }
+
     pub fn draw_geometry_current(&mut self) {
         let Some(row) = self.current_plan().cloned() else {
             return;
@@ -1028,6 +1059,20 @@ impl App {
             return;
         };
         let trade_id = row.trade_id.clone();
+        // The BROKER decides which chart is drawn on, and it lives only in the
+        // detail. Without it local-chart applies its own default (OANDA), so a
+        // TradeNation plan's roles land in `drawings/oanda/` and the operator
+        // watches an empty chart while every write answers 201 — the incident
+        // this guard exists for. Park and fetch, exactly as `start_load_tv`
+        // does, rather than drawing somewhere nobody is looking.
+        let Some(broker) = self.geometry_broker(&trade_id) else {
+            self.draw_geometry_pending = true;
+            self.status = Status::info(format!(
+                "{trade_id}: fetching the plan first (for its broker)…"
+            ));
+            self.start_timeline(&trade_id);
+            return;
+        };
         if !self.mark_in_flight(&trade_id, JobKind::DrawGeometry) {
             return;
         }
@@ -1037,6 +1082,7 @@ impl App {
             trade_id,
             row.instrument.clone(),
             row.granularity.clone(),
+            broker,
             base_url,
         );
     }
@@ -1290,6 +1336,7 @@ impl App {
             search: SearchState::default(),
             prompt: None,
             tv_load_pending: false,
+            draw_geometry_pending: false,
             save_fixture_pending: None,
             // Render tests must not depend on whatever is on the developer's
             // disk; a test that wants a corpus sets `fixtures` explicitly.
@@ -1358,6 +1405,11 @@ impl App {
     /// down; a mutation that made this method return `None` unconditionally
     /// survived all of them, because nothing exercised the caller. See the repo
     /// memory `mutation_test_the_entry_point_not_just_the_layer_below`.
+    /// Whether a geometry redraw is parked waiting for the plan detail.
+    pub fn draw_geometry_pending_test(&self) -> bool {
+        self.draw_geometry_pending
+    }
+
     pub fn spec_url_for_test(&self, trade_id: &str) -> Option<String> {
         self.spec_url_for(trade_id)
     }
@@ -1428,6 +1480,76 @@ mod tests {
         };
         // No `with_detail` call — the Timeline job has not landed yet.
         assert_eq!(app.spec_url_for_test("t1"), None);
+    }
+
+    /// Pressing `a` before the detail is fetched must PARK and fetch, not draw.
+    ///
+    /// The whole hazard is that drawing on the wrong broker succeeds: local-chart
+    /// answers 201 and files the roles under `drawings/oanda/`. So the absence of
+    /// a broker has to block the draw, exactly as it blocks a TV load.
+    #[test]
+    fn pressing_a_before_the_detail_lands_parks_instead_of_drawing() {
+        let mut app = App::from_rows(vec![row("t1")]);
+        app.chart_backend = crate::tv::ChartBackend::LocalChart {
+            base_url: "http://127.0.0.1:8790".to_string(),
+        };
+        // No `with_detail` — the timeline job has not landed.
+        app.draw_geometry_current();
+
+        assert!(
+            app.draw_geometry_pending_test(),
+            "the redraw must be parked until the broker is known"
+        );
+        assert_eq!(
+            app.in_flight_len(),
+            1,
+            "and a fetch must be in flight — parking without fetching would hang"
+        );
+        assert!(
+            !app.in_flight_test("t1", JobKind::DrawGeometry),
+            "NO draw job may be running yet: it would pick local-chart's default \
+             broker and file the roles on a chart nobody is looking at"
+        );
+    }
+
+    /// ENTRY-POINT test for the drawing-broker fix: the plan's own broker is
+    /// what `a` draws with, so a TradeNation plan's roles land on TradeNation's
+    /// chart.
+    ///
+    /// Asserted at [`App::geometry_broker`] — the layer that can see
+    /// `PlanDetail` — because `PlanRow` has no broker field at all, which is
+    /// precisely how the bug happened: `draw_geometry_current` passed only the
+    /// row's instrument + granularity, so no broker reached local-chart and it
+    /// applied its default (OANDA). Every write answered 201 while the operator
+    /// watched an empty TradeNation chart.
+    #[test]
+    fn the_plans_own_broker_is_what_the_geometry_is_drawn_with() {
+        let mut app = App::from_rows(vec![row("hs-gbp-jpy-cd0d04e7")]);
+        with_detail(&mut app, "hs-gbp-jpy-cd0d04e7", "tradenation");
+        assert_eq!(
+            app.geometry_broker("hs-gbp-jpy-cd0d04e7").as_deref(),
+            Some("tradenation"),
+            "a TradeNation plan's roles must be drawn on TradeNation's chart"
+        );
+    }
+
+    /// No detail fetched yet ⇒ no broker, so the caller parks and fetches
+    /// rather than drawing on a guess. Drawing on the wrong broker SUCCEEDS
+    /// (201), which is why this must not fall back to a default.
+    #[test]
+    fn without_a_detail_there_is_no_geometry_broker_rather_than_a_guess() {
+        let app = App::from_rows(vec![row("t1")]);
+        assert_eq!(app.geometry_broker("t1"), None);
+    }
+
+    /// `PlanDetail::broker` is `""` when no rule intent carried one — a real
+    /// value meaning "unknown". Folded into `None` so it parks rather than
+    /// drawing on local-chart's default.
+    #[test]
+    fn an_empty_broker_is_not_a_broker_to_draw_with() {
+        let mut app = App::from_rows(vec![row("t1")]);
+        with_detail(&mut app, "t1", "");
+        assert_eq!(app.geometry_broker("t1"), None);
     }
 
     /// An EMPTY broker is treated as unknown, not sent as `&broker=`.
