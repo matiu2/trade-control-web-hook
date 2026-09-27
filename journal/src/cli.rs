@@ -402,10 +402,24 @@ fn replay_args<'a>(
     armed_at: &'a str,
     skip_flags: &[&'a str],
     spec_url: Option<&'a str>,
+    // The local-chart BASE url (`http://127.0.0.1:8790`), not the `/arm-setup`
+    // one. `Some` ⇒ tv-arm writes a positions file and draws the replay's
+    // resolved long/short brackets on local-chart; `None` is the TradingView
+    // path, where tv-arm keeps its own `--annotate true` default instead.
+    //
+    // These are two different seams on purpose: `--spec-url` says where the
+    // geometry is READ from, `--new-tv` where the result is DRAWN.
+    local_chart_url: Option<&'a str>,
 ) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(url) = spec_url {
         args.push("--spec-url".to_string());
+        args.push(url.to_string());
+    }
+    // Before the `replay` subcommand: `replay` is `trailing_var_arg`, so a flag
+    // after it is collected for `replay-candles` rather than read by tv-arm.
+    if let Some(url) = local_chart_url {
+        args.push("--new-tv".to_string());
         args.push(url.to_string());
     }
     args.push("--start".to_string());
@@ -461,9 +475,10 @@ pub fn replay_via_tv_arm(
     armed_at: &str,
     skip_flags: &[&str],
     spec_url: Option<&str>,
+    local_chart_url: Option<&str>,
 ) -> Result<String> {
     let program = bin("tv-arm");
-    let args = replay_args(armed_at, skip_flags, spec_url);
+    let args = replay_args(armed_at, skip_flags, spec_url, local_chart_url);
     let mut cmd = Command::new(&program);
     cmd.args(&args);
     // tv-arm logs its pipeline at INFO on **stdout** (mixed into the report we
@@ -728,7 +743,7 @@ mod tests {
     /// the whole point of `None` being the TradingView answer.
     #[test]
     fn replay_without_a_spec_url_is_the_original_argv() {
-        let args = replay_args("2026-07-22T20:58:53Z", &["--skip-retest"], None);
+        let args = replay_args("2026-07-22T20:58:53Z", &["--skip-retest"], None, None);
         assert_eq!(
             args,
             vec!["--start", "2026-07-22T20:58:53Z", "--skip-retest", "replay"]
@@ -743,7 +758,7 @@ mod tests {
     #[test]
     fn replay_passes_the_spec_url_before_the_replay_subcommand() {
         let url = "http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1";
-        let args = replay_args("2026-07-22T20:58:53Z", &[], Some(url));
+        let args = replay_args("2026-07-22T20:58:53Z", &[], Some(url), None);
         let at = args.iter().position(|a| a == "--spec-url");
         assert!(at.is_some(), "--spec-url forwarded: {args:?}");
         let at = at.unwrap_or_default();
@@ -757,6 +772,55 @@ mod tests {
         assert!(args.iter().any(|a| a == "--start"), "{args:?}");
     }
 
+    /// `--new-tv <URL>`: the replay must DRAW its resolved positions on
+    /// local-chart.
+    ///
+    /// Without it `tv-arm` sets no `positions_out`, so nothing writes a
+    /// positions file, nothing is drawn — and worse, `tv-arm` then injects its
+    /// TradingView default `--annotate true`, making a local-chart replay reach
+    /// for the tv-mcp bridge and die on `CDP connection failed` when it is not
+    /// running. The operator gets no long/short brackets and a confusing error
+    /// about a chart they are not using.
+    #[test]
+    fn a_local_chart_replay_asks_tv_arm_to_draw_its_positions() {
+        let args = replay_args(
+            "2026-07-22T20:58:53Z",
+            &[],
+            Some("http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1"),
+            Some("http://127.0.0.1:8790"),
+        );
+        let at = args.iter().position(|a| a == "--new-tv");
+        assert!(at.is_some(), "--new-tv forwarded: {args:?}");
+        let at = at.unwrap_or_default();
+        assert_eq!(
+            args.get(at + 1).map(String::as_str),
+            Some("http://127.0.0.1:8790"),
+            "carrying the base url, not the /arm-setup url"
+        );
+        // A tv-arm flag, NOT a `replay` passthrough one: `replay` is
+        // `trailing_var_arg`, so a `--new-tv` after it is collected verbatim for
+        // `replay-candles` and never read by tv-arm. It must precede the
+        // subcommand. (tv-arm's `new_tv_url` does accept both, but emitting the
+        // position clap binds keeps this independent of that leniency.)
+        assert!(
+            Some(at) < args.iter().position(|a| a == "replay"),
+            "--new-tv before replay: {args:?}"
+        );
+    }
+
+    /// The TradingView path must be untouched: no `--new-tv`, so `tv-arm` keeps
+    /// its `--annotate true` default and draws on TradingView as before.
+    #[test]
+    fn a_tradingview_replay_asks_for_no_new_tv() {
+        let args = replay_args("2026-07-22T20:58:53Z", &[], None, None);
+        assert!(!args.iter().any(|a| a == "--new-tv"), "{args:?}");
+        assert_eq!(
+            args,
+            vec!["--start", "2026-07-22T20:58:53Z", "replay"],
+            "byte-identical to the pre-parameter argv"
+        );
+    }
+
     /// The skip flags still reach a spec-url arm. `--spec-url` changes only
     /// WHERE the geometry comes from; the prep set still has to reproduce the
     /// original plan's or the replay diverges for the other reason.
@@ -766,6 +830,7 @@ mod tests {
             "2026-07-22T20:58:53Z",
             &["--skip-break-and-close", "--skip-retest"],
             Some("http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&tf=h1"),
+            Some("http://127.0.0.1:8790"),
         );
         let replay_at = args.iter().position(|a| a == "replay");
         for flag in ["--skip-break-and-close", "--skip-retest"] {
@@ -798,7 +863,7 @@ mod tests {
     /// would reject as a missing value (the same trap `--message` documents).
     #[test]
     fn no_spec_url_emits_no_flag_on_either_path() {
-        let replay = replay_args("2026-07-22T20:58:53Z", &[], None);
+        let replay = replay_args("2026-07-22T20:58:53Z", &[], None, None);
         assert!(!replay.iter().any(|a| a == "--spec-url"), "{replay:?}");
         let fixture = save_fixture_args("2026-07-22T20:58:53Z", &[], "t", None, None);
         assert!(!fixture.iter().any(|a| a == "--spec-url"), "{fixture:?}");

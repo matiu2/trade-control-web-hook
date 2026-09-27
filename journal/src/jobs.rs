@@ -120,10 +120,18 @@ pub fn spawn_replay(
     armed_at: String,
     skip_flags: Vec<String>,
     spec_url: Option<String>,
+    // local-chart's BASE url, when that is the active backend — so tv-arm draws
+    // the replay's resolved positions there instead of reaching for tv-mcp.
+    local_chart_url: Option<String>,
 ) {
     spawn(tx, trade_id, JobKind::Replay, move || {
         let flags: Vec<&str> = skip_flags.iter().map(String::as_str).collect();
-        let report = cli::replay_via_tv_arm(&armed_at, &flags, spec_url.as_deref())?;
+        let report = cli::replay_via_tv_arm(
+            &armed_at,
+            &flags,
+            spec_url.as_deref(),
+            local_chart_url.as_deref(),
+        )?;
         Ok(JobOutcome::Replay(report))
     });
 }

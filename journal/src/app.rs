@@ -505,6 +505,7 @@ impl App {
             })
             .unwrap_or_default();
         let spec_url = self.spec_url_for(trade_id);
+        let local_chart_url = self.replay_draw_url();
         self.status = Status::info(format!("{trade_id}: running replay…"));
         jobs::spawn_replay(
             self.job_tx.clone(),
@@ -512,7 +513,23 @@ impl App {
             armed_at,
             skip_flags,
             spec_url,
+            local_chart_url,
         );
+    }
+
+    /// Where a replay should DRAW its resolved positions — local-chart's base
+    /// url, or `None` on TradingView.
+    ///
+    /// Deliberately separate from [`Self::spec_url_for`]: that one says where
+    /// the geometry is READ from, this one where the result is PAINTED. Both are
+    /// `None` on TradingView, which is exactly the behaviour there before
+    /// `--new-tv` existed.
+    ///
+    /// Not plan-specific — unlike the spec url it needs no instrument, broker or
+    /// granularity, because `tv-arm` derives the chart from the plan it just
+    /// armed and the positions file names its own instrument and broker.
+    fn replay_draw_url(&self) -> Option<String> {
+        self.chart_backend.local_chart_url().map(str::to_string)
     }
 
     /// The `--spec-url` tv-arm should arm this plan from, for the active chart
@@ -1410,6 +1427,11 @@ impl App {
         self.draw_geometry_pending
     }
 
+    /// Where a replay would draw its positions (test helper).
+    pub fn replay_draw_url_test(&self) -> Option<String> {
+        self.replay_draw_url()
+    }
+
     pub fn spec_url_for_test(&self, trade_id: &str) -> Option<String> {
         self.spec_url_for(trade_id)
     }
@@ -1510,6 +1532,35 @@ mod tests {
             "NO draw job may be running yet: it would pick local-chart's default \
              broker and file the roles on a chart nobody is looking at"
         );
+    }
+
+    /// ENTRY-POINT test: under `--new-tv` the app must hand the replay job
+    /// local-chart's url, so tv-arm draws the replay's long/short brackets there.
+    ///
+    /// Asserted at the APP layer, not at `replay_args`. That distinction is the
+    /// whole bug: `replay_args` grew a `--new-tv` parameter and its own unit test
+    /// passed, while the caller kept passing nothing — so no positions were ever
+    /// drawn and tv-arm fell back to its TradingView `--annotate true` default,
+    /// failing on `CDP connection failed` for a chart nobody was using.
+    #[test]
+    fn new_tv_hands_the_replay_job_a_url_to_draw_positions_on() {
+        let mut app = App::from_rows(vec![row("t1")]);
+        app.chart_backend = crate::tv::ChartBackend::LocalChart {
+            base_url: "http://127.0.0.1:8790".to_string(),
+        };
+        assert_eq!(
+            app.replay_draw_url_test().as_deref(),
+            Some("http://127.0.0.1:8790"),
+            "the replay must be told where to paint its positions"
+        );
+    }
+
+    /// On TradingView there is nothing to hand it — tv-arm keeps its own
+    /// `--annotate true` default and draws there, exactly as before.
+    #[test]
+    fn a_tradingview_replay_is_given_no_draw_url() {
+        let app = App::from_rows(vec![row("t1")]);
+        assert_eq!(app.replay_draw_url_test(), None);
     }
 
     /// ENTRY-POINT test for the drawing-broker fix: the plan's own broker is
