@@ -45,8 +45,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let scroll = app.replay_scroll.min(max_scroll);
 
     // The title names WHICH report is on screen. Three different runs land in
-    // this one pane — the re-armed replay (`r`), the stored-plan raw replay
-    // (`R`) and a re-bless (`f`) — and they answer different questions, so a
+    // this one pane — the re-armed replay (`R`), the stored-plan raw replay
+    // (`r`) and a re-bless (`f`) — and they answer different questions, so a
     // generic "Replay report" would let an operator read a raw-replay number
     // as a re-armed one.
     let title = if max_scroll == 0 {

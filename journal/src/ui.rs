@@ -96,13 +96,13 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             format!("↑↓ move  →/n open  / search  f fixture  s fixtures  c copy{arm_hint}  q quit")
         }
         Screen::Replay => format!(
-            "↑↓/jk scroll  ←/→ nav  r replay  R raw  f fixture  c copy  o shot  i detail{arm_hint}  x del  q quit"
+            "↑↓/jk scroll  ←/→ nav  r replay  R re-arm  f fixture  c copy  o shot  i detail{arm_hint}  x del  q quit"
         ),
         Screen::Compare => format!(
-            "← back  l {load_hint}  r replay  R raw  f fixture  c copy  o shot  i detail{arm_hint}  d/x delete  q quit"
+            "← back  l {load_hint}  r replay  R re-arm  f fixture  c copy  o shot  i detail{arm_hint}  d/x delete  q quit"
         ),
         _ => format!(
-            "← back  →/n deeper  l {load_hint}  r replay  R raw  f fixture  c copy  o shot  i detail{arm_hint}  d/x del  q quit"
+            "← back  →/n deeper  l {load_hint}  r replay  R re-arm  f fixture  c copy  o shot  i detail{arm_hint}  d/x del  q quit"
         ),
     };
     let status_style = if app.status.is_error {

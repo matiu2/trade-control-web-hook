@@ -17,6 +17,13 @@ pub enum Action {
     /// Pop one screen shallower.
     Shallower,
     LoadTv,
+    /// The `R` key: re-arm from the CHART's drawings and replay that
+    /// (`tv-arm --spec-url … replay`).
+    ///
+    /// Capital-R since 2026-09-27, swapped with [`Self::RawReplay`]: this one
+    /// answers "does the geometry currently on the chart still produce this
+    /// trade?", which is the narrower question and the one that fails when the
+    /// drawings are missing.
     Replay,
     /// Capture the fixture-grid corpus for the current trade — the `s` key.
     /// Runs `tv-arm --save-fixture … replay`, which writes JSON fixtures under
@@ -38,9 +45,15 @@ pub enum Action {
     /// gone, so `/arm-setup` answers `422 missing required roles` even though
     /// every level is still in the plan.
     DrawGeometry,
-    /// The `R` key: replay the STORED plan as-is (`replay-candles --plan`),
-    /// with no chart read and no tv-arm re-arm. Capital-R deliberately: it is
-    /// a different question from `r`, not a variation of it.
+    /// The `r` key: replay the STORED plan as-is (`replay-candles --plan`),
+    /// with no chart read and no tv-arm re-arm.
+    ///
+    /// Lower-case `r` since 2026-09-27: the plan is the source of truth for a
+    /// replay, and re-arming off the chart's drawings is the special case. It
+    /// also cannot fail for a reason that has nothing to do with the plan —
+    /// `R` answers `422 missing required roles` whenever the chart's drawings
+    /// are gone, which is most of the time now that the journal draws them
+    /// from the plan (`a`) rather than the operator drawing them by hand.
     RawReplay,
     /// Type a character into the open one-line prompt.
     PromptPush(char),
@@ -181,8 +194,8 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
             KeyCode::Right | KeyCode::Enter | KeyCode::Char('n') => Action::Deeper,
             KeyCode::Left => Action::Shallower,
             KeyCode::Char('l') => Action::LoadTv,
-            KeyCode::Char('r') => Action::Replay,
-            KeyCode::Char('R') => Action::RawReplay,
+            KeyCode::Char('r') => Action::RawReplay,
+            KeyCode::Char('R') => Action::Replay,
             KeyCode::Char('a') => Action::DrawGeometry,
             KeyCode::Char('f') | KeyCode::Char('F') => Action::FixtureKey,
             KeyCode::Char('s') | KeyCode::Char('S') => Action::SaveFixture,
@@ -208,8 +221,8 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
         KeyCode::Right | KeyCode::Enter | KeyCode::Char('n') => Action::Deeper,
         KeyCode::Left => Action::Shallower,
         KeyCode::Char('l') => Action::LoadTv,
-        KeyCode::Char('r') => Action::Replay,
-        KeyCode::Char('R') => Action::RawReplay,
+        KeyCode::Char('r') => Action::RawReplay,
+        KeyCode::Char('R') => Action::Replay,
         KeyCode::Char('f') | KeyCode::Char('F') => Action::FixtureKey,
         KeyCode::Char('s') | KeyCode::Char('S') => Action::SaveFixture,
         KeyCode::Char('c') => Action::Copy,
@@ -425,24 +438,51 @@ mod tests {
     #[test]
     fn the_fixture_and_raw_replay_keys_work_on_both_screens() {
         let mut app = app_with_one_plan();
-        for (upper, action) in [('F', Action::FixtureKey), ('R', Action::RawReplay)] {
+        for (upper, action) in [('F', Action::FixtureKey), ('R', Action::Replay)] {
             let lower = upper.to_ascii_lowercase();
             app.screen = crate::screen::Screen::List;
             assert_eq!(map_key(&app, press(upper)), action, "list, '{upper}'");
             app.screen = crate::screen::Screen::Replay;
             assert_eq!(map_key(&app, press(upper)), action, "replay, '{upper}'");
-            // `f` is case-insensitive; `r`/`R` are NOT — lowercase r is the
-            // re-arm replay and must stay that way on both screens.
+            // `f` is case-insensitive; `r`/`R` are NOT — since 2026-09-27
+            // lowercase `r` is the PLAN-driven raw replay and `R` the chart
+            // re-arm, and that must hold on both screens.
             if upper == 'F' {
                 assert_eq!(map_key(&app, press(lower)), action, "replay, '{lower}'");
             } else {
-                assert_eq!(map_key(&app, press(lower)), Action::Replay, "'{lower}'");
+                assert_eq!(map_key(&app, press(lower)), Action::RawReplay, "'{lower}'");
             }
         }
     }
 
-    /// `R` (raw) and `r` (re-arm) are different questions, so they must never
-    /// collapse onto one action — on either screen.
+    /// WHICH letter does which, pinned by name.
+    ///
+    /// Swapped 2026-09-27 at the operator's request: `r` is the plan-driven
+    /// replay and `R` the chart re-arm. The plan is the source of truth, so the
+    /// unshifted key is the one that reads it; the re-arm is the special case,
+    /// and the one that fails with `422 missing required roles` when the chart's
+    /// drawings are gone. Asserted separately from the both-screens test above
+    /// because a swap-back would keep that one passing.
+    #[test]
+    fn lowercase_r_is_the_plan_driven_replay_and_capital_r_the_chart_re_arm() {
+        let mut app = app_with_one_plan();
+        for screen in [crate::screen::Screen::List, crate::screen::Screen::Replay] {
+            app.screen = screen;
+            assert_eq!(
+                map_key(&app, press('r')),
+                Action::RawReplay,
+                "`r` replays the STORED PLAN, {screen:?}"
+            );
+            assert_eq!(
+                map_key(&app, press('R')),
+                Action::Replay,
+                "`R` re-arms from the CHART, {screen:?}"
+            );
+        }
+    }
+
+    /// `r` (plan-driven raw) and `R` (chart re-arm) are different questions, so
+    /// they must never collapse onto one action — on either screen.
     #[test]
     fn capital_r_is_not_the_same_action_as_lowercase_r() {
         let mut app = app_with_one_plan();
@@ -472,7 +512,7 @@ mod tests {
         let app = app_with_one_plan();
         assert_eq!(map_key(&app, press('q')), Action::Quit);
         assert_eq!(map_key(&app, press('j')), Action::SelectNext);
-        assert_eq!(map_key(&app, press('r')), Action::Replay);
+        assert_eq!(map_key(&app, press('r')), Action::RawReplay);
         assert_eq!(map_key(&app, press('d')), Action::RequestDelete);
     }
 }
