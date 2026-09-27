@@ -88,6 +88,16 @@ pub struct PositionsFile {
     pub instrument: String,
     /// Bar size as the replay was given it (`1h`, `4h`, `1d`…).
     pub granularity: String,
+    /// Which broker's candles this replay ran on (`oanda` / `tradenation`),
+    /// from `--source`.
+    ///
+    /// Unlike `instrument` above this is NOT a backend convention the consumer
+    /// could resolve for itself — it is a fact about the run, and the consumer
+    /// cannot recover it. local-chart stores drawings per broker
+    /// (`drawings/<broker>/<instrument>-<tf>.json`) and defaults a missing
+    /// broker to OANDA, so omitting it silently files a TradeNation replay's
+    /// positions on the OANDA chart, with a 201 for every write.
+    pub broker: String,
     pub positions: Vec<PositionRow>,
 }
 
@@ -130,11 +140,17 @@ impl PositionRow {
 }
 
 impl PositionsFile {
-    pub fn new(instrument: &str, granularity: &str, fires: &[FireResult]) -> Self {
+    pub fn new(
+        instrument: &str,
+        granularity: &str,
+        broker: &str,
+        fires: &[FireResult],
+    ) -> Self {
         Self {
             version: POSITIONS_VERSION,
             instrument: instrument.to_string(),
             granularity: granularity.to_string(),
+            broker: broker.to_string(),
             positions: fires.iter().map(PositionRow::from_fire).collect(),
         }
     }
@@ -253,9 +269,25 @@ mod tests {
     /// wants `EUR_USD`, TradingView wants `OANDA:EURUSD`.
     #[test]
     fn the_instrument_is_carried_verbatim_not_resolved_to_a_broker() {
-        let doc = PositionsFile::new("eur/cad", "1h", &[]);
+        let doc = PositionsFile::new("eur/cad", "1h", "oanda", &[]);
         assert_eq!(doc.instrument, "eur/cad", "exactly as the replay got it");
         assert_eq!(doc.granularity, "1h");
+    }
+
+    /// The BROKER must cross too, and unlike the instrument it is not something
+    /// the consumer could work out. local-chart files drawings per broker and
+    /// defaults a missing one to OANDA, so a TradeNation replay whose positions
+    /// carry no broker lands on the OANDA chart — successfully, which is what
+    /// makes it hard to notice.
+    #[test]
+    fn the_broker_the_replay_ran_on_is_carried() {
+        let doc = PositionsFile::new("GBP_JPY", "4h", "tradenation", &[]);
+        assert_eq!(doc.broker, "tradenation");
+        let json = serde_json::to_string(&doc).expect("serialises");
+        assert!(
+            json.contains(r#""broker":"tradenation""#),
+            "the consumer reads this off the wire: {json}"
+        );
     }
 
     #[test]
@@ -263,6 +295,7 @@ mod tests {
         let doc = PositionsFile::new(
             "EUR_USD",
             "4h",
+            "tradenation",
             &[
                 fire(FillKind::TookProfit, Direction::Long),
                 fire(FillKind::NeverFilled, Direction::Short),
@@ -279,7 +312,7 @@ mod tests {
     fn writing_creates_missing_parent_directories() {
         let dir = std::env::temp_dir().join(format!("rc-positions-{}", std::process::id()));
         let path = dir.join("nested").join("positions.json");
-        let doc = PositionsFile::new("EUR_USD", "1h", &[fire(FillKind::Open, Direction::Long)]);
+        let doc = PositionsFile::new("EUR_USD", "1h", "oanda", &[fire(FillKind::Open, Direction::Long)]);
 
         doc.write(&path).expect("writes through missing dirs");
         let text = std::fs::read_to_string(&path).expect("file is there");

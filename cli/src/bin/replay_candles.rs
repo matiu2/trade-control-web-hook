@@ -455,6 +455,9 @@ async fn run() -> Result<()> {
         let doc = positions_out::PositionsFile::new(
             raw_instrument,
             granularity::engine_label(gran.engine()),
+            // The broker this replay actually ran against — it decides which
+            // chart the consumer draws the positions on.
+            args.source.as_str(),
             &fires,
         );
         doc.write(path)?;
@@ -2228,6 +2231,7 @@ mod tests {
         let doc = positions_out::PositionsFile::new(
             &inputs.meta.instrument,
             granularity::engine_label(inputs.meta.granularity),
+            inputs.meta.source.as_str(),
             &fires,
         );
 
