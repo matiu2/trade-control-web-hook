@@ -9,7 +9,7 @@ no rule (not even `trade-expiry`) ever fired.
 - [x] `handle_register` takes the resolved account and 400s a mismatch (names the rules)
 - [x] worker `http.rs`: resolve the named account before register; unknown account → 400
 - [x] tests, clippy, fmt
-- [ ] deploy staging; verify re-registering the AUD plan 400s
+- [x] deploy staging; verified: re-registering the AUD plan 400s naming all 10 OANDA rules
 - [ ] follow-up (separate): `MarketUnavailable` is permanent, not `Transient`
 - [ ] follow-up (separate): time rules / expiry can't fire on a plan that never seeded
 
