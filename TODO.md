@@ -1,3 +1,18 @@
+# TODO — register rejects a plan whose broker disagrees with its account (2026-09-28)
+
+`hs-aud-usd-d6ca1271` / `hs-btc-usd-755e77b3` were armed `broker: oanda` on the
+TradeNation `experimental` account. Register said 200; the engine then fetched
+`AUD_USD` from TradeNation every 15s, failed "transient", never seeded state, and
+no rule (not even `trade-expiry`) ever fired.
+
+- [x] `trade_plan::broker_check`: pure check — every rule's `intent.broker` == the account's broker
+- [x] `handle_register` takes the resolved account and 400s a mismatch (names the rules)
+- [x] worker `http.rs`: resolve the named account before register; unknown account → 400
+- [x] tests, clippy, fmt
+- [ ] deploy staging; verify re-registering the AUD plan 400s
+- [ ] follow-up (separate): `MarketUnavailable` is permanent, not `Transient`
+- [ ] follow-up (separate): time rules / expiry can't fire on a plan that never seeded
+
 # TODO — journal timing diff stamps the firing bar (2026-09-21)
 
 - [x] `live_fires` stamps each fire with `fired[].candle.time`, not the cron's `tick_ts`

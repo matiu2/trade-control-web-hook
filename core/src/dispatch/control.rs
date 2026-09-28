@@ -23,12 +23,14 @@ use serde::Serialize;
 use super::control_result::ControlResult;
 use super::shared::{record_control_event_for, resolve_phase1_u32};
 use super::veto::format_veto_set_outcome;
+use crate::account::{MetadataError, MetadataStore};
 use crate::control_event::ControlKind;
 use crate::incoming::{self, Verified};
 use crate::state::{
     ArchivedPlan, PrepStamp, StateError, StateStore, StoredPlan, clear_named_preps,
     clear_named_vetos, veto_ttl_seconds,
 };
+use crate::trade_plan::check_plan_broker;
 
 /// Response body for the `unlock` action. Serialised as YAML.
 #[derive(Serialize)]
@@ -654,8 +656,15 @@ pub async fn handle_news_end<S: StateStore>(
 /// evaluate on each cron tick. A control action — no broker work; idempotent
 /// (re-registering refreshes the row), so it marks-seen on every completion
 /// like the other control handlers.
-pub async fn handle_register<S: StateStore>(
+///
+/// A plan scoped to a named account is checked against the `accounts` index
+/// first: the account must exist, and every rule must route to its broker. The
+/// engine ticks a plan through the *account's* broker, so a mismatch (an
+/// OANDA-armed plan on a TradeNation account) can never fetch a candle and
+/// would sit dead forever behind a `200 ok`. Reject it here, at arm time.
+pub async fn handle_register<S: StateStore, M: MetadataStore>(
     store: &S,
+    accounts: &M,
     verified: &Verified,
     now: DateTime<Utc>,
 ) -> ControlResult {
@@ -671,6 +680,11 @@ pub async fn handle_register<S: StateStore>(
             "register: intent trade_id does not match plan trade_id",
             400,
         );
+    }
+    if let Some(name) = verified.intent.account.as_deref()
+        && let Err(rejection) = check_register_account(accounts, name, plan).await
+    {
+        return rejection;
     }
     // Persist the plan for the cron engine to evaluate. No TTL: a registered
     // plan never times out (the carrier intent's `not_after` is a control TTL,
@@ -698,6 +712,29 @@ pub async fn handle_register<S: StateStore>(
     );
     record_seen(store, verified, now, &outcome).await;
     ControlResult::ok("ok")
+}
+
+/// Arm-time account checks for [`handle_register`]: the named account must be
+/// in the index and every rule must route to its broker.
+async fn check_register_account<M: MetadataStore>(
+    accounts: &M,
+    name: &str,
+    plan: &crate::trade_plan::TradePlan,
+) -> Result<(), ControlResult> {
+    let meta = accounts.get(name).await.map_err(|err| match err {
+        MetadataError::NotFound(_) => {
+            tracing::error!("register: trade_id={} {err}", plan.trade_id);
+            ControlResult::error(format!("register: unknown account '{name}'"), 400)
+        }
+        other => {
+            tracing::error!("register: account lookup failed: {other}");
+            ControlResult::error("state error", 500)
+        }
+    })?;
+    check_plan_broker(plan, name, meta.broker).map_err(|mismatch| {
+        tracing::error!("trade_id={} {mismatch}", plan.trade_id);
+        ControlResult::error(mismatch.to_string(), 400)
+    })
 }
 
 /// A compact, operator-facing view of one registered plan + its current engine
@@ -1052,6 +1089,9 @@ pub async fn handle_plan_delete<S: StateStore>(
     record_seen(store, verified, now, &outcome).await;
     ControlResult::ok(outcome)
 }
+
+#[cfg(test)]
+mod register_tests;
 
 #[cfg(test)]
 mod plan_show_tests {
