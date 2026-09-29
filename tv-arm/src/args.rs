@@ -654,6 +654,13 @@ pub struct Args {
     /// a hand-edit whose slip — losing `broker=` — arms a TradeNation plan off
     /// OANDA's drawings.
     ///
+    /// **The subcommand picks which spec is fetched.** `/arm-setup` needs a
+    /// `mode`, and tv-arm adds it: `register` asks for `mode=register` (the
+    /// chart's newest drawings, no `start`), `replay` and `plan-out` for
+    /// `mode=replay` (the drawings at the chart's `start` note). With no
+    /// subcommand `--spec-url` is an error, and an `/arm-setup` URL that
+    /// already names the other mode is refused rather than overridden.
+    ///
     /// Carries every restriction `--spec-in` does — it is the same frozen-spec
     /// arm, differing only in where the bytes come from. In particular the
     /// position-entry tools work only when the fetched spec carries a

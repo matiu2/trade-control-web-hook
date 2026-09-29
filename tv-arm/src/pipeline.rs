@@ -330,6 +330,12 @@ fn read_setup_from_spec(args: &Args, path: &Path) -> Result<SetupInputs> {
 /// makes every error below (and the arm log line) name the URL actually
 /// fetched rather than the one typed.
 ///
+/// The subcommand picks the spec's `mode` ([`crate::spec_url::SpecMode`]):
+/// `register` fetches the chart's newest drawings, `replay` / `plan-out` the
+/// ones at its `start` note. local-chart refuses to guess between them, and so
+/// does this — a bare invocation with `--spec-url` is an error before any
+/// fetch.
+///
 /// A non-2xx response is an error carrying the **body**, not just the status:
 /// local-chart answers an unarmable chart with a structured 422 naming what is
 /// missing (a required role, a stale or ambiguous invalidation line). That text
@@ -340,7 +346,8 @@ fn read_setup_from_spec(args: &Args, path: &Path) -> Result<SetupInputs> {
 /// (`calendar.rs`, `broker_read.rs`, `register_post.rs`): a local runtime for
 /// the duration of the request.
 fn read_setup_from_url(args: &Args, url: &str) -> Result<SetupInputs> {
-    let url = &crate::spec_url::normalise(url)?;
+    let mode = crate::spec_url::SpecMode::for_command(args.command.as_ref())?;
+    let url = &crate::spec_url::normalise(url, mode)?;
     let runtime = tokio::runtime::Runtime::new()
         .wrap_err("starting tokio runtime to fetch the frozen setup")?;
     let body = runtime.block_on(async {
@@ -1953,7 +1960,7 @@ mod tests {
     /// after normalisation and quotes the converted string.
     #[test]
     fn read_setup_from_url_converts_a_pasted_chart_url_before_fetching() {
-        let args = mw_args(&[]);
+        let args = mw_args(&["register"]);
         // :1 is privileged and unbound: the connection refusal is immediate,
         // so this stays a unit test with no server and no timeout.
         let err = read_setup_from_url(
@@ -1965,9 +1972,45 @@ mod tests {
         .to_string();
         assert!(
             err.contains(
-                "http://127.0.0.1:1/arm-setup?instrument=GBP_JPY&tf=h4&broker=tradenation"
+                "http://127.0.0.1:1/arm-setup?instrument=GBP_JPY&tf=h4&broker=tradenation\
+                 &mode=register"
             ),
             "the fetch must target the CONVERTED url: {err}"
+        );
+    }
+
+    /// The subcommand's mode reaches the fetch — for journal's ready-made
+    /// `/arm-setup` URL too, which carries none. Same unbound-port trick as
+    /// above: the error quotes the URL actually tried.
+    #[test]
+    fn read_setup_from_url_asks_for_the_subcommands_mode() {
+        let err = read_setup_from_url(
+            &mw_args(&["replay"]),
+            "http://127.0.0.1:1/arm-setup?instrument=EUR_CAD&tf=h1&broker=oanda",
+        )
+        .expect_err("nothing is listening on :1")
+        .to_string();
+        assert!(
+            err.contains(
+                "http://127.0.0.1:1/arm-setup?instrument=EUR_CAD&tf=h1&broker=oanda&mode=replay"
+            ),
+            "a replay must fetch the replay spec: {err}"
+        );
+    }
+
+    /// With no subcommand there is no mode to ask for, and the refusal comes
+    /// BEFORE the fetch — the error is ours, not a connection failure.
+    #[test]
+    fn read_setup_from_url_without_a_subcommand_refuses_before_fetching() {
+        let err = read_setup_from_url(
+            &mw_args(&[]),
+            "http://127.0.0.1:1/arm-setup?instrument=EUR_CAD&tf=h1",
+        )
+        .expect_err("no subcommand, no mode")
+        .to_string();
+        assert!(
+            err.contains("needs a subcommand") && !err.contains("fetch frozen setup"),
+            "must refuse before fetching: {err}"
         );
     }
 
