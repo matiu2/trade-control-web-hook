@@ -348,6 +348,7 @@ fn read_setup_from_spec(args: &Args, path: &Path) -> Result<SetupInputs> {
 fn read_setup_from_url(args: &Args, url: &str) -> Result<SetupInputs> {
     let mode = crate::spec_url::SpecMode::for_command(args.command.as_ref())?;
     let url = &crate::spec_url::normalise(url, mode)?;
+    let url = &crate::spec_url::with_start(url, mode, parse_start(args)?)?;
     let runtime = tokio::runtime::Runtime::new()
         .wrap_err("starting tokio runtime to fetch the frozen setup")?;
     let body = runtime.block_on(async {
@@ -1995,6 +1996,40 @@ mod tests {
                 "http://127.0.0.1:1/arm-setup?instrument=EUR_CAD&tf=h1&broker=oanda&mode=replay"
             ),
             "a replay must fetch the replay spec: {err}"
+        );
+    }
+
+    /// A replay's `--start` reaches the fetch as `start=<epoch>` — journal
+    /// draws no `start` note, and local-chart 422s a replay without one.
+    #[test]
+    fn read_setup_from_url_forwards_a_replays_start() {
+        let err = read_setup_from_url(
+            &mw_args(&["--start", "2026-06-20T17:00:00Z", "replay"]),
+            "http://127.0.0.1:1/arm-setup?instrument=EUR_CAD&tf=h1&broker=oanda",
+        )
+        .expect_err("nothing is listening on :1")
+        .to_string();
+        assert!(
+            err.contains(
+                "http://127.0.0.1:1/arm-setup?instrument=EUR_CAD&tf=h1&broker=oanda\
+                 &mode=replay&start=1781974800"
+            ),
+            "a replay must forward --start: {err}"
+        );
+    }
+
+    /// `register` never forwards `--start`: a register spec has no start.
+    #[test]
+    fn read_setup_from_url_never_sends_start_on_register() {
+        let err = read_setup_from_url(
+            &mw_args(&["--start", "2026-06-20T17:00:00Z", "register"]),
+            "http://127.0.0.1:1/arm-setup?instrument=EUR_CAD&tf=h1",
+        )
+        .expect_err("nothing is listening on :1")
+        .to_string();
+        assert!(
+            err.contains("tf=h1&mode=register") && !err.contains("start="),
+            "{err}"
         );
     }
 
