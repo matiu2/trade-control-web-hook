@@ -1,5 +1,42 @@
 # Changelog
 
+## v149 — 2026-09-29 — `--spec-url` asks /arm-setup for the subcommand's mode
+
+**Why.** local-chart's `GET /arm-setup` now requires `mode=register|replay`
+(400 without it): the two return different specs from the same chart. The
+bug behind it: a live `register` armed off a spec chosen the replay way (stale
+`trade-expiry` + stale `start` note), so the plan expired on its first tick.
+Without this change every `--spec-url` arm would 400 once that server lands.
+
+**What changed.**
+
+- `tv-arm/src/spec_url.rs`: new `SpecMode { Register, Replay }`.
+  `SpecMode::for_command` maps `register` → `Register`, `replay` and
+  `plan-out` → `Replay` (plan-out feeds the offline replay harness and, like
+  replay, needs a cursor). No subcommand is an error, not a guess.
+- `normalise(raw, mode)` appends `mode` to both input forms: a pasted chart URL
+  (allow-listed identity params, then `mode`) and a ready-made `/arm-setup`
+  URL (params kept as given, `mode` appended — so journal's `arm_setup_url`
+  needs no change). An `/arm-setup` URL already naming the same mode is kept
+  byte-identical; one naming another mode is refused, not overridden.
+- `pipeline.rs::read_setup_from_url` derives the mode from the subcommand
+  before fetching.
+
+**Breaking.** `tv-arm --spec-url …` with no subcommand is now an error. An
+`/arm-setup` URL carrying `mode=` for the other subcommand is refused.
+
+**Config.** None. Needs local-chart with the `mode` param
+(`fix/arm-mode-register-replay`); an older local-chart ignores the extra param.
+
+**Tests.** `spec_url`: register/replay on a pasted URL, mode appended to an
+`/arm-setup` URL with other params preserved, matching mode kept, conflicting
+and unknown mode refused, subcommand → mode mapping via clap, bare invocation
+refused. `pipeline`: the mode reaches the fetch URL; no subcommand refuses
+before fetching.
+
+**Follow-up.** `goto` / `from` / `to` are still not forwarded — a zero-width
+viewport would change the server's fib choice.
+
 ## v148 — 2026-09-24 — a frozen setup can carry a static trade
 
 **Why.** The operator draws a long/short position tool on local-chart and wants
