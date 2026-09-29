@@ -56,6 +56,17 @@
 //! without a mode). An `/arm-setup` URL that already names the *other* mode is
 //! refused rather than overridden: it is exactly the cross-wiring above,
 //! spelled out by the caller.
+//!
+//! ## `start` — a replay's `--start`, forwarded
+//!
+//! A replay spec needs a start instant. `/arm-setup` finds one from a `start`
+//! note on the chart, or — winning over the note — a `start=<epoch>` param. A
+//! journal replay (`tv-arm --spec-url <arm-setup url> --start <t> ... replay`)
+//! draws no note, so without the param it gets a 422; and a stale note left by
+//! another trade must not beat the instant the caller named. So in replay mode
+//! [`with_start`] forwards `--start` as `start=`, on both input forms. Register
+//! mode never sends one: a register spec carries no start by design, and
+//! local-chart answers a 400 to `mode=register&start=`.
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use url::Url;
@@ -76,6 +87,9 @@ const IDENTITY_PARAMS: [&str; 3] = ["instrument", "tf", "broker"];
 
 /// The query param naming which spec `/arm-setup` should export.
 const MODE_PARAM: &str = "mode";
+
+/// The query param carrying a replay's start instant, epoch seconds.
+const START_PARAM: &str = "start";
 
 /// Which spec `/arm-setup` exports: the latest drawings for a live arm, or the
 /// drawings at the chart's `start` note for a replay. See the module docs for
@@ -191,6 +205,43 @@ fn with_mode(raw: &str, mut parsed: Url, mode: SpecMode) -> Result<String> {
         return Ok(parsed.to_string());
     }
     Ok(raw.to_string())
+}
+
+/// A normalised `/arm-setup` URL with a replay's `--start` added as
+/// `start=<epoch>` (see the module docs). `start` is `--start` already parsed
+/// to epoch seconds (`pipeline::parse_start`).
+///
+/// Unchanged in register mode or without `--start`. A URL that already carries
+/// the same `start` is kept byte-identical; a different one is refused, for
+/// the same reason a conflicting `mode` is: two start instants for one replay
+/// is a cross-wiring the caller has to settle, not tv-arm.
+pub fn with_start(url: &str, mode: SpecMode, start: Option<i64>) -> Result<String> {
+    let Some(start) = start.filter(|_| mode == SpecMode::Replay) else {
+        return Ok(url.to_string());
+    };
+    let mut parsed = Url::parse(url).wrap_err_with(|| format!("spec URL {url:?} is not a URL"))?;
+    let given: Vec<String> = parsed
+        .query_pairs()
+        .filter(|(key, _)| key == START_PARAM)
+        .map(|(_, value)| value.into_owned())
+        .collect();
+    if let Some(other) = given
+        .iter()
+        .find(|value| value.parse::<i64>().ok() != Some(start))
+    {
+        return Err(eyre!(
+            "--spec-url {url:?} carries start={other}, but --start is {start} \
+             (epoch seconds). One replay has one start: drop `start` from the \
+             URL (tv-arm adds --start's) or make them agree"
+        ));
+    }
+    if given.is_empty() {
+        parsed
+            .query_pairs_mut()
+            .append_pair(START_PARAM, &start.to_string());
+        return Ok(parsed.to_string());
+    }
+    Ok(url.to_string())
 }
 
 /// The chart-identity params present in `url`, in [`IDENTITY_PARAMS`] order.
@@ -424,6 +475,84 @@ mod tests {
             register(sneaky).expect("converts"),
             "http://127.0.0.1:8790/arm-setup?instrument=GBP_JPY&tf=h4&broker=arm-setup\
              &mode=register"
+        );
+    }
+
+    const START: i64 = 1_790_300_000;
+
+    /// journal's replay: an `/arm-setup` URL plus `--start`, no note drawn.
+    #[test]
+    fn a_replay_forwards_start_on_an_arm_setup_url() {
+        let url = normalise(ARM_SETUP_URL, SpecMode::Replay).expect("mode");
+        assert_eq!(
+            with_start(&url, SpecMode::Replay, Some(START)).expect("start"),
+            format!("{ARM_SETUP_URL}&mode=replay&start={START}")
+        );
+    }
+
+    #[test]
+    fn a_replay_forwards_start_on_a_pasted_chart_url() {
+        let url = normalise(CHART_URL, SpecMode::Replay).expect("mode");
+        assert_eq!(
+            with_start(&url, SpecMode::Replay, Some(START)).expect("start"),
+            format!(
+                "http://127.0.0.1:8790/arm-setup?instrument=GBP_JPY&tf=h4&broker=tradenation\
+                 &mode=replay&start={START}"
+            )
+        );
+    }
+
+    /// A register spec carries no start by design; local-chart 400s one.
+    #[test]
+    fn a_register_never_sends_start() {
+        let url = register(ARM_SETUP_URL).expect("mode");
+        assert_eq!(
+            with_start(&url, SpecMode::Register, Some(START)).expect("unchanged"),
+            url
+        );
+    }
+
+    #[test]
+    fn no_start_leaves_the_url_alone() {
+        let url = normalise(ARM_SETUP_URL, SpecMode::Replay).expect("mode");
+        assert_eq!(
+            with_start(&url, SpecMode::Replay, None).expect("unchanged"),
+            url
+        );
+    }
+
+    #[test]
+    fn a_matching_start_is_kept_as_is() {
+        let url = format!("{ARM_SETUP_URL}&start={START}&mode=replay");
+        assert_eq!(
+            with_start(&url, SpecMode::Replay, Some(START)).expect("kept"),
+            url
+        );
+    }
+
+    /// Two start instants for one replay: refused, naming both.
+    #[test]
+    fn a_conflicting_start_is_refused() {
+        let url = format!("{ARM_SETUP_URL}&mode=replay&start=1700000000");
+        let err = with_start(&url, SpecMode::Replay, Some(START))
+            .expect_err("conflict")
+            .to_string();
+        assert!(
+            err.contains("start=1700000000") && err.contains(&START.to_string()),
+            "{err}"
+        );
+    }
+
+    /// The allow-list drops a `start` on a pasted chart URL, so `--start` is
+    /// the only one — no false conflict with view state.
+    #[test]
+    fn a_start_on_a_pasted_chart_url_is_not_a_conflict() {
+        let pasted = "http://127.0.0.1:8790/?instrument=GBP_JPY&tf=h4&start=1700000000";
+        let url = normalise(pasted, SpecMode::Replay).expect("mode");
+        assert!(
+            with_start(&url, SpecMode::Replay, Some(START))
+                .expect("start")
+                .ends_with(&format!("&mode=replay&start={START}"))
         );
     }
 

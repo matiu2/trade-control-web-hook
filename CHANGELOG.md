@@ -1,5 +1,38 @@
 # Changelog
 
+## v150 — 2026-09-29 — `--spec-url` forwards a replay's `--start` as `start=`
+
+**Why.** local-chart's `/arm-setup` needs a start instant for a replay spec
+and used to find it only from a `start` note drawn on the chart. Journal
+replays (`tv-arm --spec-url <arm-setup url> --start <armed_at> ... replay`)
+draw no note, so every one of them got `422 a replay spec needs a start note`.
+
+**What changed.**
+
+- `tv-arm/src/spec_url.rs`: new `with_start(url, mode, start)`, run after
+  `normalise`. In replay mode with `--start`, it appends `start=<epoch>` to
+  both input forms (pasted chart URL and ready-made `/arm-setup` URL). An
+  `/arm-setup` URL already carrying the same `start` is kept byte-identical;
+  a different one is refused, like a conflicting `mode`. Register mode never
+  sends `start` (a register spec carries none; local-chart 400s it).
+- `pipeline.rs::read_setup_from_url` parses `--start` with the existing
+  `parse_start` and passes the epoch to `with_start`.
+
+**Breaking.** An `/arm-setup` URL with a `start=` that differs from `--start`
+is now refused under `replay` / `plan-out`.
+
+**Config.** None. Needs local-chart v3 (`/arm-setup` accepts `start=`, which
+wins over the chart's note in replay mode).
+
+**Tests.** `spec_url.rs`: start forwarded on both URL forms, register never
+sends it, no `--start` leaves the URL alone, matching start kept, conflicting
+start refused, a `start` on a pasted chart URL is dropped by the allow-list
+(no false conflict). `pipeline.rs`: the fetched URL carries
+`mode=replay&start=<epoch>` for `replay`, and no `start` for `register`.
+
+**Follow-up.** None — journal needs no change: its URLs are the `/arm-setup`
+form with no `start`, and it already passes `--start <armed_at>`.
+
 ## v149 — 2026-09-29 — `--spec-url` asks /arm-setup for the subcommand's mode
 
 **Why.** local-chart's `GET /arm-setup` now requires `mode=register|replay`
