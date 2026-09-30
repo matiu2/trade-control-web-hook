@@ -113,9 +113,12 @@ fn local_chart_symbol(instrument: &str) -> String {
 }
 
 /// local-chart's accepted timeframe tokens (`local-chart/src/granularity.rs`
-/// `Timeframe::parse`) happen to be the SAME lowercase strings the plan's own
+/// `Timeframe::parse`) are mostly the SAME lowercase strings the plan's own
 /// `granularity` field already carries (`m15`/`h1`/`h4`/`d`/`w`/`m`) — no
-/// TradingView-style remapping needed, unlike [`super::tv_resolution`]. Still
+/// TradingView-style remapping needed, unlike [`super::tv_resolution`]. The
+/// exception is the daily/weekly aliases plans also carry (`d1`, `w1`, ...):
+/// [`super::tv_resolution`] accepts them, so they are folded onto `d`/`w`
+/// here rather than dropped. Still
 /// validated against the known set rather than passed through blind: an
 /// unrecognised token is dropped from the URL (loud in the log, and the chart
 /// falls back to its own default) rather than sent as-is to a query param
@@ -124,7 +127,11 @@ fn local_chart_symbol(instrument: &str) -> String {
 const LOCAL_CHART_TIMEFRAMES: &[&str] = &["m15", "h1", "h4", "d", "w", "m"];
 
 fn local_chart_tf(granularity: &str) -> Option<String> {
-    let g = granularity.to_ascii_lowercase();
+    let g = match granularity.to_ascii_lowercase().as_str() {
+        "d1" | "1d" => "d".to_string(),
+        "w1" | "1w" => "w".to_string(),
+        other => other.to_string(),
+    };
     LOCAL_CHART_TIMEFRAMES.contains(&g.as_str()).then_some(g)
 }
 
@@ -395,6 +402,17 @@ mod tests {
         assert_eq!(local_chart_tf("M15").as_deref(), Some("m15"));
         assert_eq!(local_chart_tf("d").as_deref(), Some("d"));
         assert_eq!(local_chart_tf("nonsense"), None);
+    }
+
+    /// Plans carry `d1` (e.g. the AMD daily H&S) — the same aliases
+    /// `tv_resolution` accepts must land on local-chart's own `d`/`w`, not be
+    /// dropped as unrecognised.
+    #[test]
+    fn maps_daily_and_weekly_aliases_to_local_chart_tokens() {
+        assert_eq!(local_chart_tf("d1").as_deref(), Some("d"));
+        assert_eq!(local_chart_tf("1D").as_deref(), Some("d"));
+        assert_eq!(local_chart_tf("w1").as_deref(), Some("w"));
+        assert_eq!(local_chart_tf("1w").as_deref(), Some("w"));
     }
 
     #[test]
