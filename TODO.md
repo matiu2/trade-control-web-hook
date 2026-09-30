@@ -1,3 +1,69 @@
+# TODO — reconcile widened to probe unresolved attempts too (2026-10-01)
+
+Deployed the fix below to staging (main + staging merged, parent gitlink
+bumped, `./deploy-staging.sh` run) — but plan `hs-aud-jpy-dd5db625` was still
+showing `phase: await_entry`, `entries_blocked: true` **6+ hours later**.
+
+## Why the deployed fix didn't clear the stuck plan
+
+The order→trade bridging fix only repairs *future* `lookup_attempt_state`
+calls — it does nothing for a row that's already stuck with
+`broker_trade_id: null` in Postgres (confirmed via direct query: `entry_id
+hs-aud-jpy-dd5db625` order `2494`, `broker_trade_id` empty). Nothing was
+going to re-probe it:
+
+- the `05-enter` window (`not_after: 2026-09-30T18:07:26Z`) had already
+  expired, so no future entry fire will trigger a fresh retry-gate lookup
+- `trade-control-cron::sweep`'s own `snapshot_broker_trade_id`
+  (`trade-control-cron/src/sweep.rs:276-296`) only writes `broker_trade_id`
+  on `AttemptState::OpenPosition` — but this attempt's trade (2495) is
+  already **closed**, so even with the bridging fix in place, every sweep
+  tick resolves `ClosedWin` and takes the `Ok(_) => return` branch, silently
+  doing nothing, forever
+- my first cut of `reconcile()` filtered on `broker_trade_id.is_some()`, so
+  it skipped this exact row too — the one thing designed to catch drift
+  couldn't see the one row that needed it
+
+Only `02-veto-trade-expiry` (scheduled ~9h out from when this was noticed)
+would eventually force the plan to a terminal phase — a real gap, not
+theoretical: it left a stale plan running for the better part of a day with
+no other exit.
+
+## Fix: `reconcile()` now covers BOTH groups
+
+- [x] Split attempts into **tracked** (`broker_trade_id.is_some()`, original
+      logic unchanged: cross-check against `list_open_positions`, resolve +
+      log a mismatch) and **unresolved** (`broker_trade_id.is_none()`, new).
+- [x] For unresolved attempts, call `lookup_attempt_state(order_id, None)`
+      directly (no `list_open_positions` pre-check — there's no known trade
+      id to check against) and log **only** `ClosedWin`/`ClosedLossOrBreakeven`
+      — the "it secretly filled and closed" surprise. `Pending`/`Cancelled`/
+      `Unknown`/`OpenPosition` are left silent: `Pending` is the ordinary
+      shape of most resting orders, `OpenPosition` is `sweep`'s job to
+      snapshot (not duplicated here), and `Cancelled`/`Unknown` are already
+      visible via the retry gate's own rejection logging — logging them here
+      too on every tick would just be noise.
+      - New tests (`trade-control-cron/src/reconcile.rs`):
+        - `unresolved_attempt_that_secretly_closed_is_probed_and_detected` —
+          the exact incident shape reproduced against the new path
+        - `unresolved_attempt_still_pending_is_probed_but_not_flagged` — the
+          ordinary case still gets probed (no cheaper way to tell them apart)
+          but doesn't warrant a warning
+        - `no_tracked_attempts_short_circuits_without_a_broker_call` upgraded
+          from a doc-only assertion to a real `CountingBroker` call-count
+          check (the old `StubBroker` was write-only; couldn't prove a call
+          *didn't* happen)
+      - 68/68 `trade-control-cron` tests pass, 33/33 `trade-control-worker`
+        tests pass, clippy + fmt clean on both.
+- [ ] Not yet re-deployed to staging — do that next, then confirm via
+      `journalctl` that a `reconcile:` WARN line fires for
+      `hs-aud-jpy-dd5db625` on the next tick, and via `trade-control-staging
+      plan show hs-aud-jpy-dd5db625` that the plan itself is still
+      `await_entry` afterward (this pass is still observation-only by
+      design — it logs, it does not retire the plan).
+
+---
+
 # TODO — OANDA order→trade id bridging + reconciliation cron (2026-09-30)
 
 ## Incident

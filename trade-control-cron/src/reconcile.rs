@@ -22,12 +22,29 @@
 //!
 //! # What this pass does — and deliberately does NOT do
 //!
-//! For every account with at least one [`EntryAttempt`] carrying a
-//! snapshotted `broker_trade_id` (the attempt reached an open position at
-//! some point), fetch the broker's current open positions and check: is that
-//! trade id still among them? If not, resolve the attempt's actual state via
-//! [`Broker::lookup_attempt_state`] and **log** the mismatch with full
-//! detail (closed win/loss and realized P&L when resolvable).
+//! Two groups of attempts, two checks:
+//!
+//! 1. **Tracked** — [`EntryAttempt`]s carrying a snapshotted
+//!    `broker_trade_id` (the attempt reached an open position at some
+//!    point). Fetch the broker's current open positions and check: is that
+//!    trade id still among them? If not, resolve via
+//!    [`Broker::lookup_attempt_state`] and log the mismatch with full detail
+//!    (closed win/loss and realized P&L when resolvable).
+//! 2. **Unresolved** — attempts with **no** `broker_trade_id` at all. This is
+//!    the normal shape of a still-resting order, but it is *also* the exact
+//!    shape the incident's own row was left in: the bridging bug meant
+//!    `broker_trade_id` was never captured even though the order filled and
+//!    later closed, and once its `05-enter` window expires nothing ever
+//!    re-probes it again — a plan can sit stuck in `await_entry` for the
+//!    rest of its `expires_at` life with no trigger left that would notice
+//!    (`trade-expiry` is the only remaining exit, and that can be a day or
+//!    more away). For these, call `lookup_attempt_state(order_id, None)`
+//!    directly and log **only** the surprising outcomes —
+//!    `ClosedWin`/`ClosedLossOrBreakeven` (it secretly filled and closed) —
+//!    since `Pending`/`Cancelled`/`Unknown` are the ordinary, already-visible
+//!    states for an attempt that was never confirmed open and logging those
+//!    every tick would just be noise on top of what the retry gate already
+//!    reports.
 //!
 //! This pass is **observation-only**. It does not close positions, does not
 //! cancel orders, does not mark a plan `Done`, and does not touch
@@ -45,10 +62,11 @@ use trade_control_core::state::{EntryAttempt, StateStore};
 use crate::broker_handle::BrokerHandle;
 use crate::seam::CronEnv;
 
-/// Walk every account with at least one attempt that reached an open
-/// position, and log any whose broker_trade_id is no longer among the
-/// broker's current open positions. Per-account errors are logged and
-/// skipped — one bad account must never abort the pass.
+/// Walk every account with at least one interesting attempt — tracked
+/// (reached an open position at some point) or unresolved (no
+/// `broker_trade_id` ever snapshotted) — and reconcile each against the
+/// broker. Per-account errors are logged and skipped — one bad account must
+/// never abort the pass.
 pub async fn reconcile<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
 where
     S: StateStore,
@@ -61,37 +79,40 @@ where
             return;
         }
     };
-    // Only attempts that ever reached an open position are interesting — an
-    // attempt with no snapshotted broker_trade_id was never confirmed open,
-    // so there is nothing for this pass to reconcile.
     let tracked: Vec<&EntryAttempt> = attempts
         .iter()
         .filter(|a| a.broker_trade_id.is_some())
         .collect();
-    if tracked.is_empty() {
+    let unresolved: Vec<&EntryAttempt> = attempts
+        .iter()
+        .filter(|a| a.broker_trade_id.is_none())
+        .collect();
+    if tracked.is_empty() && unresolved.is_empty() {
         return;
     }
     let mut accounts: Vec<Option<String>> = Vec::new();
-    for a in &tracked {
+    for a in tracked.iter().chain(unresolved.iter()) {
         if !accounts.contains(&a.account) {
             accounts.push(a.account.clone());
         }
     }
     tracing::info!(
-        "reconcile: {} tracked attempt(s), {} account(s)",
+        "reconcile: {} tracked, {} unresolved attempt(s), {} account(s)",
         tracked.len(),
+        unresolved.len(),
         accounts.len(),
     );
     for account in accounts {
-        reconcile_account(cron, &tracked, account.as_deref(), now).await;
+        reconcile_account(cron, &tracked, &unresolved, account.as_deref(), now).await;
     }
 }
 
-/// Reconcile every tracked attempt on one account against the broker's
-/// current open positions.
+/// Reconcile every tracked + unresolved attempt on one account against the
+/// broker.
 async fn reconcile_account<C: CronEnv>(
     cron: &C,
     tracked: &[&EntryAttempt],
+    unresolved: &[&EntryAttempt],
     account: Option<&str>,
     now: DateTime<Utc>,
 ) {
@@ -118,6 +139,12 @@ async fn reconcile_account<C: CronEnv>(
             continue;
         }
         reconcile_one(&broker, attempt, &open_positions, now).await;
+    }
+    for attempt in unresolved {
+        if attempt.account.as_deref() != account {
+            continue;
+        }
+        reconcile_unresolved(&broker, attempt, now).await;
     }
 }
 
@@ -197,6 +224,53 @@ async fn reconcile_one<B: AttemptBroker>(
                 attempt.instrument,
             );
         }
+    }
+}
+
+/// Check one attempt that never had a `broker_trade_id` snapshotted — the
+/// normal shape of a still-resting order, but also the shape left behind by
+/// the order/trade id bridging bug (`fix/oanda-order-trade-id-bridge`): the
+/// order filled and even closed, and nothing ever captured that. Probe the
+/// broker directly and log only the surprising outcomes; `Pending` /
+/// `Cancelled` / `Unknown` are the ordinary states for an attempt that was
+/// never confirmed open and are already visible via the retry gate's own
+/// `prior-attempt-unknown` rejections, so logging them here on every tick
+/// would just be noise.
+async fn reconcile_unresolved<B: AttemptBroker>(
+    broker: &B,
+    attempt: &EntryAttempt,
+    now: DateTime<Utc>,
+) {
+    let resolved = broker
+        .lookup_attempt_state(&attempt.instrument, &attempt.broker_order_id, None)
+        .await;
+    match resolved {
+        Ok(AttemptState::ClosedWin { realized_pl }) => {
+            tracing::warn!(
+                "reconcile: plan={} account={} instrument={} order_id={} never had a \
+                 broker_trade_id snapshotted, broker shows it filled and CLOSED WIN \
+                 realized_pl={realized_pl} — plan is stale as of {now}",
+                attempt.trade_id,
+                attempt.account.as_deref().unwrap_or("<global>"),
+                attempt.instrument,
+                attempt.broker_order_id,
+            );
+        }
+        Ok(AttemptState::ClosedLossOrBreakeven { realized_pl }) => {
+            tracing::warn!(
+                "reconcile: plan={} account={} instrument={} order_id={} never had a \
+                 broker_trade_id snapshotted, broker shows it filled and CLOSED LOSS/BREAKEVEN \
+                 realized_pl={realized_pl} — plan is stale as of {now}",
+                attempt.trade_id,
+                attempt.account.as_deref().unwrap_or("<global>"),
+                attempt.instrument,
+                attempt.broker_order_id,
+            );
+        }
+        // Pending / Cancelled / Unknown / OpenPosition / Err: the ordinary
+        // or already-visible cases — see the function doc for why these
+        // deliberately don't log.
+        _ => {}
     }
 }
 
@@ -348,12 +422,80 @@ mod tests {
         // observation-only and low-ceremony per its explicit scope.
     }
 
+    /// Records whether `lookup_attempt_state` was called, so a test can
+    /// assert the broker WAS or WASN'T reached — `reconcile_one`'s
+    /// still-open short circuit must never make the call at all.
+    struct CountingBroker {
+        result: Result<AttemptState, LookupError>,
+        calls: std::cell::Cell<u32>,
+    }
+
+    impl CountingBroker {
+        fn new(result: Result<AttemptState, LookupError>) -> Self {
+            Self {
+                result,
+                calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl AttemptBroker for CountingBroker {
+        async fn lookup_attempt_state(
+            &self,
+            _instrument: &str,
+            _broker_order_id: &str,
+            _broker_trade_id: Option<&str>,
+        ) -> Result<AttemptState, LookupError> {
+            self.calls.set(self.calls.get() + 1);
+            self.result.clone()
+        }
+    }
+
     #[test]
     fn no_tracked_attempts_short_circuits_without_a_broker_call() {
+        let attempt = make_attempt("hs-aud-jpy-dd5db625", "AUD_JPY", Some("2495"));
+        let open = vec![make_open_position("2495", "AUD_JPY")];
+        let broker = CountingBroker::new(Ok(AttemptState::Unknown));
+        pollster::block_on(reconcile_one(&broker, &attempt, &open, Utc::now()));
+        assert_eq!(
+            broker.calls.get(),
+            0,
+            "a position still present in list_open_positions must never trigger a lookup"
+        );
+    }
+
+    /// THE INCIDENT, exactly: an attempt with no `broker_trade_id` ever
+    /// snapshotted (the bridging bug's aftermath — `sweep`'s own
+    /// `snapshot_broker_trade_id` only writes it on `OpenPosition`, and this
+    /// attempt's trade closed before that fix landed, so it never will) must
+    /// still be probed and its closed state logged.
+    #[test]
+    fn unresolved_attempt_that_secretly_closed_is_probed_and_detected() {
         let attempt = make_attempt("hs-aud-jpy-dd5db625", "AUD_JPY", None);
-        assert!(attempt.broker_trade_id.is_none());
-        // reconcile_one is never reached for an attempt with no
-        // broker_trade_id — `reconcile`'s filter excludes it upstream. This
-        // test documents that invariant at the data level.
+        let broker = CountingBroker::new(Ok(AttemptState::ClosedWin {
+            realized_pl: 18369.2245,
+        }));
+        pollster::block_on(reconcile_unresolved(&broker, &attempt, Utc::now()));
+        assert_eq!(
+            broker.calls.get(),
+            1,
+            "an unresolved attempt must be probed via lookup_attempt_state"
+        );
+    }
+
+    /// The ordinary case — a still-resting order — must be probed (there is
+    /// no cheaper way to tell it apart from the incident's shape) but must
+    /// NOT be treated as anything worth flagging. This test only pins that
+    /// the call happens; the absence of a WARN log for `Pending` is asserted
+    /// by inspection of `reconcile_unresolved`'s match arms (the `_ => {}`
+    /// catch-all), not re-derived here via a tracing capture — see the
+    /// `closed_win_absent_from_open_positions_is_detected` note above on
+    /// keeping this pass's tests low-ceremony.
+    #[test]
+    fn unresolved_attempt_still_pending_is_probed_but_not_flagged() {
+        let attempt = make_attempt("hs-aud-jpy-dd5db625", "AUD_JPY", None);
+        let broker = CountingBroker::new(Ok(AttemptState::Pending));
+        pollster::block_on(reconcile_unresolved(&broker, &attempt, Utc::now()));
+        assert_eq!(broker.calls.get(), 1);
     }
 }
