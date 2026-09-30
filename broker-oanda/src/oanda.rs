@@ -392,19 +392,8 @@ pub async fn lookup_attempt_state(
     // Only fetch closed trades if we have a broker_trade_id to match —
     // step 3 only runs in that case, and the closed-trades request is
     // the most expensive of the three.
-    let closed = if broker_trade_id.is_some() {
-        let closed_params = TradeQueryParams::new()
-            .state(TradeState::Closed)
-            .instrument(instrument)
-            .count(CLOSED_TRADE_SCAN_COUNT);
-        let trades = client
-            .get_trades(account_id, Some(closed_params))
-            .await
-            .map_err(|err| {
-                tracing::error!("oanda lookup get_trades(Closed): {err:?}");
-                LookupError::Transient
-            })?;
-        Some(trades)
+    let mut closed = if broker_trade_id.is_some() {
+        Some(fetch_closed_trades(client, account_id, instrument).await?)
     } else {
         None
     };
@@ -426,6 +415,22 @@ pub async fn lookup_attempt_state(
     }
 
     let fate = fetch_order_fate(client, account_id, broker_order_id).await;
+
+    // The fate lookup can bridge a resting STOP/LIMIT order to the
+    // trade its fill created (`filled_trade_id`), which differs from
+    // `broker_order_id`. If we never had a reason to fetch closed
+    // trades before (no pre-snapshotted broker_trade_id) but now have a
+    // bridged id to check, fetch them now — step 2.5 in
+    // `compute_attempt_state` cannot match a closed trade it was never
+    // given.
+    if closed.is_none()
+        && let OrderFate::Live {
+            filled_trade_id: Some(_),
+        } = &fate
+    {
+        closed = Some(fetch_closed_trades(client, account_id, instrument).await?);
+    }
+
     Ok(compute_attempt_state(
         broker_order_id,
         broker_trade_id,
@@ -434,6 +439,28 @@ pub async fn lookup_attempt_state(
         closed.as_deref(),
         fate,
     ))
+}
+
+/// The closed-trades snapshot, most expensive of the three present-tense
+/// lookups. Split out so [`lookup_attempt_state`] can fetch it lazily,
+/// either up front (a `broker_trade_id` is already known) or on a second
+/// pass once the fate lookup bridges an order id to a trade id.
+async fn fetch_closed_trades(
+    client: &OandaClient,
+    account_id: &str,
+    instrument: &str,
+) -> Result<Vec<Trade>, LookupError> {
+    let closed_params = TradeQueryParams::new()
+        .state(TradeState::Closed)
+        .instrument(instrument)
+        .count(CLOSED_TRADE_SCAN_COUNT);
+    client
+        .get_trades(account_id, Some(closed_params))
+        .await
+        .map_err(|err| {
+            tracing::error!("oanda lookup get_trades(Closed): {err:?}");
+            LookupError::Transient
+        })
 }
 
 /// Ask the broker what became of `broker_order_id`, for an order that
@@ -453,11 +480,13 @@ async fn fetch_order_fate(
     match client.get_order(account_id, broker_order_id).await {
         Ok(record) if record.order.state.is_terminally_unfilled() => OrderFate::TerminallyUnfilled,
         Ok(record) => {
+            let filled_trade_id = record.order.filling_transaction_id.clone();
             tracing::info!(
-                "oanda get_order({broker_order_id}): state {:?} is not terminally unfilled",
+                "oanda get_order({broker_order_id}): state {:?} is not terminally unfilled, \
+                 filling_transaction_id={filled_trade_id:?}",
                 record.order.state
             );
-            OrderFate::Live
+            OrderFate::Live { filled_trade_id }
         }
         Err(err) => {
             // An unknown id (404 NO_SUCH_ORDER) and a transient 5xx are
@@ -667,15 +696,25 @@ fn oanda_order_to_pending(o: &PendingOrder) -> Option<CorePendingOrder> {
 /// Kept as data rather than an I/O call inside
 /// [`compute_attempt_state`], so that function stays pure and every
 /// branch stays unit-testable without a live client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderFate {
     /// The broker's record says the order reached a terminal state
     /// without filling (`CANCELLED`). This attempt is provably dead.
     TerminallyUnfilled,
     /// The broker answered, but not with a terminal-unfilled state —
     /// e.g. `PENDING` / `FILLED` / `TRIGGERED` while the snapshots
-    /// disagree. Genuinely ambiguous; must not be collapsed.
-    Live,
+    /// disagree. Genuinely ambiguous on its own; must not be collapsed.
+    ///
+    /// `filled_trade_id` carries the order record's
+    /// `filling_transaction_id` when `state == FILLED`. OANDA only
+    /// reuses the order id as the trade id for a market order filled
+    /// in the same request; a resting STOP/LIMIT order's fill is a
+    /// separate transaction with its own id, and this is that id. When
+    /// present, [`compute_attempt_state`] re-checks the open/closed
+    /// snapshots against it (step 2.5) before falling back to
+    /// `Unknown`. `None` for every other `state`, or when the field was
+    /// absent from the broker's response.
+    Live { filled_trade_id: Option<String> },
     /// We could not ask, or the answer did not arrive: no order id to
     /// look up, the request failed, the id is unknown to the broker.
     /// Deliberately **not** optimistic — see [`AttemptState::Unknown`].
@@ -714,10 +753,12 @@ pub fn compute_attempt_state(
     }
 
     // 2. Open trade whose originating order id matches → still open.
-    //    OANDA reuses the create-order transaction id as the trade id,
-    //    so trade.id == broker_order_id here. Matching on trade.id
-    //    keeps the structure parallel to the TN side (which has to
-    //    match an explicit originating field).
+    //    This only holds for a MARKET order, where the fill happens in
+    //    the same request/transaction as the order, so OANDA reuses the
+    //    create-order transaction id as the trade id. A resting
+    //    STOP/LIMIT order's fill is a separate, later transaction with
+    //    its own id (see `OrderFate::Live`'s `filled_trade_id`) — that
+    //    case is bridged in step 2.5 below, not here.
     if let Some(trade) = open.iter().find(|t| t.id == broker_order_id) {
         return AttemptState::OpenPosition {
             broker_trade_id: trade.id.clone(),
@@ -739,6 +780,50 @@ pub fn compute_attempt_state(
                 realized_pl: trade.realized_pl,
             }
         };
+    }
+
+    // 3.5. The broker's own order record can bridge a resting
+    //      STOP/LIMIT order to the trade its fill created
+    //      (`filling_transaction_id`), when that trade id differs from
+    //      the order id (steps 2/3 assumed they were equal, which is
+    //      only true for a market order). Re-run the open/closed check
+    //      against the bridged id before giving up.
+    if let OrderFate::Live {
+        filled_trade_id: Some(bridged),
+    } = &fate
+    {
+        if let Some(trade) = open.iter().find(|t| &t.id == bridged) {
+            tracing::info!(
+                "oanda lookup {broker_order_id}: bridged via filling_transaction_id={bridged} to \
+                 an open trade — OpenPosition"
+            );
+            return AttemptState::OpenPosition {
+                broker_trade_id: trade.id.clone(),
+            };
+        }
+        if let Some(closed_trades) = closed
+            && let Some(trade) = closed_trades.iter().find(|t| &t.id == bridged)
+        {
+            tracing::info!(
+                "oanda lookup {broker_order_id}: bridged via filling_transaction_id={bridged} to \
+                 a closed trade (realized_pl={}) — {}",
+                trade.realized_pl,
+                if trade.realized_pl > 0.0 {
+                    "ClosedWin"
+                } else {
+                    "ClosedLossOrBreakeven"
+                }
+            );
+            return if trade.realized_pl > 0.0 {
+                AttemptState::ClosedWin {
+                    realized_pl: trade.realized_pl,
+                }
+            } else {
+                AttemptState::ClosedLossOrBreakeven {
+                    realized_pl: trade.realized_pl,
+                }
+            };
+        }
     }
 
     // 4. Nowhere to be found in any present-tense snapshot.
@@ -763,9 +848,25 @@ pub fn compute_attempt_state(
             AttemptState::Cancelled
         }
         // Either we couldn't ask, or the broker's answer doesn't
-        // settle it. Fail SAFE: `Unknown` blocks re-entry rather than
-        // risking a duplicate stacked on a position we can't see.
-        OrderFate::Live | OrderFate::Unresolved => {
+        // settle it (including a Live fate whose bridged trade id, if
+        // any, matched nothing above — the closed-trade window may not
+        // have been fetched at all, see `lookup_attempt_state`'s
+        // second-pass fetch). Fail SAFE: `Unknown` blocks re-entry
+        // rather than risking a duplicate stacked on a position we
+        // can't see.
+        OrderFate::Live { filled_trade_id } => {
+            tracing::info!(
+                "oanda lookup {broker_order_id}: absent from pending/open/closed, fate=Live \
+                 filled_trade_id={filled_trade_id:?} (open={} closed={:?}) — Unknown",
+                open.iter()
+                    .map(|t| t.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                closed.map(|c| c.iter().map(|t| t.id.as_str()).collect::<Vec<_>>())
+            );
+            AttemptState::Unknown
+        }
+        OrderFate::Unresolved => {
             tracing::info!(
                 "oanda lookup {broker_order_id}: absent from pending/open/closed and fate \
                  {fate:?} — Unknown"
@@ -987,8 +1088,92 @@ mod attempt_state_tests {
     /// `Unknown` is for.
     #[test]
     fn live_fate_contradicting_the_snapshots_resolves_unknown() {
-        let s = compute_attempt_state("2318", None, &[], &[], None, OrderFate::Live);
+        let s = compute_attempt_state(
+            "2318",
+            None,
+            &[],
+            &[],
+            None,
+            OrderFate::Live {
+                filled_trade_id: None,
+            },
+        );
         assert_eq!(s, AttemptState::Unknown);
+    }
+
+    /// A `Live` fate WITH a bridged trade id, but that id matches nothing in
+    /// open or closed either (broker genuinely can't settle it) — must still
+    /// fail safe to `Unknown`, not be treated as evidence of anything.
+    #[test]
+    fn live_fate_with_bridged_id_matching_nothing_resolves_unknown() {
+        let s = compute_attempt_state(
+            "2494",
+            None,
+            &[],
+            &[],
+            Some(&[]),
+            OrderFate::Live {
+                filled_trade_id: Some("2495".into()),
+            },
+        );
+        assert_eq!(s, AttemptState::Unknown);
+    }
+
+    /// THE INCIDENT (OANDA practice 101-011-31142393-003, 2026-09-30, plan
+    /// hs-aud-jpy-dd5db625): a STOP order (id 2494) filled into a trade with
+    /// a DIFFERENT id (2495) — OANDA only reuses the order id as the trade id
+    /// for a market order; a resting order's fill is a separate transaction.
+    /// Steps 2/3 (which assume order id == trade id) correctly miss; the
+    /// bridge via `filled_trade_id` must catch it before falling through to
+    /// `Unknown`.
+    #[test]
+    fn bridged_trade_id_resolves_open_position_when_order_id_differs_from_trade_id() {
+        let open = vec![make_trade("2495", TradeState::Open, 0.0)];
+        let s = compute_attempt_state(
+            "2494",
+            None,
+            &[],
+            &open,
+            None,
+            OrderFate::Live {
+                filled_trade_id: Some("2495".into()),
+            },
+        );
+        assert_eq!(
+            s,
+            AttemptState::OpenPosition {
+                broker_trade_id: "2495".into()
+            },
+            "a stop/limit fill's trade id differs from the order id; the bridge must find it"
+        );
+    }
+
+    /// Same incident shape, but the trade has since closed (the exact
+    /// real-world sequence: order 2494 filled into trade 2495, which later
+    /// hit its TP and closed with realizedPL 18369.2245). `closed` was never
+    /// pre-fetched (no broker_trade_id was ever snapshotted, since step 2
+    /// never matched while the trade was open) — `lookup_attempt_state`'s
+    /// second-pass fetch is what supplies it here; this test exercises the
+    /// pure resolver with that second-pass data already in hand.
+    #[test]
+    fn bridged_trade_id_resolves_closed_win_when_order_id_differs_from_trade_id() {
+        let closed = vec![make_trade("2495", TradeState::Closed, 18369.2245)];
+        let s = compute_attempt_state(
+            "2494",
+            None,
+            &[],
+            &[],
+            Some(&closed),
+            OrderFate::Live {
+                filled_trade_id: Some("2495".into()),
+            },
+        );
+        assert_eq!(
+            s,
+            AttemptState::ClosedWin {
+                realized_pl: 18369.2245
+            }
+        );
     }
 
     /// The fate lookup is a fallback for step 4 only. An order still

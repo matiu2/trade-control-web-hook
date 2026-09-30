@@ -1,3 +1,125 @@
+# TODO — OANDA order→trade id bridging + reconciliation cron (2026-09-30)
+
+## Incident
+
+Plan `hs-aud-jpy-dd5db625` (account `m-and-w`, staging, OANDA practice
+`101-011-31142393-003`). `05-enter` placed a `STOP` order (id `2494`), which
+filled into trade `2495`, which later hit its TP and closed
+(`realizedPL: 18369.2245`, closed `2026-09-30T01:40:25Z`, confirmed via raw
+OANDA API). The system never noticed: a same-plan refire at 03:00 got
+`rejected: prior-attempt-unknown`, and the plan kept ticking pause/news/veto
+rules against a position that had already filled (and later closed) for over
+2 hours, with the account fully flat the whole time.
+
+## Root cause (confirmed against live OANDA data + code)
+
+`broker-oanda/src/oanda.rs` assumes, in (at least) two places, that **OANDA
+reuses the create-order transaction id as the trade id**. That's only true
+for a market order that fills immediately in the same request. For a
+resting `STOP`/`LIMIT` order, the fill is a *separate* transaction with its
+own id (`fillingTransactionID`), and the resulting trade gets that fill
+transaction's id — **not** the original order's id.
+
+Verified against real data for this incident:
+- order **2494** (STOP) → `fillingTransactionID: "2495"`, `tradeOpenedID: "2495"`
+- the trade's actual id is **2495**, not 2494
+
+Affected spots:
+1. `compute_attempt_state` step 2 (`oanda.rs:716-725`) — matches
+   `trade.id == broker_order_id`. Wrong for a stop/limit fill: the real
+   trade id is the *order's* `filling_transaction_id`, not the order id
+   itself. Comment at line 717-720 states the false assumption explicitly.
+2. `list_open_positions` (doc comment ~line 525) — "OANDA has no separate
+   originating-order id once a trade is open, so `order_id` and
+   `position_id` both carry the trade id." Same false assumption, second
+   location — check call sites before deciding whether it's a live bug or
+   just a stale comment.
+
+Knock-on effects of (1):
+- Step 2 never matches while the trade is genuinely open → `broker_trade_id`
+  is never snapshotted onto the `EntryAttempt` row
+  (`retry_gate.rs:275-287`, only set from `AttemptState::OpenPosition`)
+- Without a snapshotted `broker_trade_id`, step 3 (closed-trade check) is
+  skipped entirely (`oanda.rs:395`, "step 3 only runs in that case")
+- Falls through to the fate lookup (`fetch_order_fate`, already calls
+  `get_order` which *does* return `filling_transaction_id` — the bridge
+  data was one field away the whole time) → `Unresolved`/`Live` →
+  `AttemptState::Unknown`
+- Retry gate fail-safes on `Unknown` (correct behavior *given* the bad
+  input) → `prior-attempt-unknown`, and nothing downstream (sweep,
+  breakeven watch, blackout) can see this plan either, since all of them
+  are keyed off resolvable attempts.
+
+Distinct from `BUG-cancelled-limit-order-resolves-unknown-blocks-reentry.md`
+(a different case: order cancelled *before* ever filling — already fixed by
+the `OrderFate` fate-lookup step). This bug is about an order that *did*
+fill and later closed, misclassified because of the id-bridging assumption.
+
+## Plan (small, sequential changes — test each before moving on)
+
+- [x] **1. Logging** — `compute_attempt_state`'s fallthrough now logs the
+      actual `open`/`closed` trade ids seen alongside `broker_order_id` and
+      the fate's `filled_trade_id` whenever it resolves to `Unknown`, so a
+      future occurrence is diagnosable from worker logs alone (this incident
+      needed a raw OANDA API pull to diagnose — landed as part of item 2,
+      same commit, since the new bridging logic and its logging are one
+      change).
+- [x] **2. Fix the order→trade bridge** — `OrderFate::Live` now carries
+      `filled_trade_id: Option<String>`, populated from
+      `OrderDetails::filling_transaction_id` in `fetch_order_fate`.
+      `compute_attempt_state` gained step 2.5: when the fate bridges to a
+      trade id different from the order id, re-check `open`/`closed` against
+      it before falling through to `Unknown`. `lookup_attempt_state` fetches
+      closed trades on a second pass if the bridge reveals an id and none
+      were fetched yet (no pre-snapshotted `broker_trade_id`). Tests added
+      (`broker-oanda/src/oanda.rs`, `attempt_state_tests` module):
+      - `live_fate_with_bridged_id_matching_nothing_resolves_unknown` —
+        bridge present but matches nothing → still fail-safe `Unknown`
+      - `bridged_trade_id_resolves_open_position_when_order_id_differs_from_trade_id`
+      - `bridged_trade_id_resolves_closed_win_when_order_id_differs_from_trade_id`
+        — pinned to this incident's exact ids/P&L (2494→2495, +18369.2245)
+      - all pre-existing tests still pass unchanged (49/49 in `broker-oanda`)
+      - conformance suite (`cli/src/bin/replay_candles/attempt_state_conformance.rs`)
+        updated for the new `OrderFate::Live` field shape (`filled_trade_id: None`,
+        its existing fixtures don't exercise the bridge); 5/5 still pass
+      - `list_open_positions`'s doc-comment assumption ("no separate
+        originating-order id once a trade is open") is the SAME false
+        assumption in a second location — checked call sites, not fixed here:
+        that function only reports what's open *right now* (a live sweep),
+        it doesn't need to bridge order id → trade id for a *closed* trade,
+        so it's lower risk, but the comment is still wrong and worth a
+        follow-up pass if a similar bridging need surfaces there.
+      - cargo clippy + fmt clean on `broker-oanda` + `trade-control-cli`
+- [ ] **3. Reconciliation cron** — new async pass, ticking alongside
+      `sweep.rs`/`breakeven_watch.rs` in `trade-control-cron/`, using
+      `Broker::list_open_positions` (broker-truth-first, not attempt-keyed)
+      to detect: plan believes a position is open, broker shows flat →
+      retire/log. Must not block or slow the real trading path — runs
+      async, off to the side, logs findings; does not (yet) auto-archive a
+      plan (operator wants to observe behavior on the demo account first,
+      per 2026-09-30 conversation — leave the plan alive, just add
+      visibility).
+      - [ ] confirm `CronEnv` broker-acquisition seam
+            (`trade-control-cron/src/seam.rs`) supports this cleanly for
+            both wasm and native
+      - [ ] test: plan with open attempt + broker shows it closed → logs
+            reconciliation mismatch
+      - [ ] test: plan with open attempt + broker still shows it open →
+            no-op
+      - [ ] test: cron tick failure (broker error) does not propagate to
+            or block other cron passes
+
+## Notes
+
+- cargo clippy + cargo fmt gate before each commit, per repo conventions.
+- Each of the 3 items above should be its own commit; push after each
+  green + clippy/fmt-clean step per the commit-and-push policy.
+- This is a `fix/oanda-order-trade-id-bridge` worktree branched off `main`
+  (bug fix scope), sibling of the crates it path-deps on
+  (`oanda-client` at `../../oanda-client`).
+
+---
+
 # TODO — register rejects a plan whose broker disagrees with its account (2026-09-28)
 
 `hs-aud-usd-d6ca1271` / `hs-btc-usd-755e77b3` were armed `broker: oanda` on the

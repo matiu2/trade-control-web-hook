@@ -284,23 +284,31 @@ fn live_state(situation: Situation) -> AttemptState {
     let inputs = match situation {
         Situation::RestingUnfilled => LiveInputs {
             pending: vec![oanda_pending(ORDER_ID)],
-            ..LiveInputs::absent(OrderFate::Live)
+            ..LiveInputs::absent(OrderFate::Live {
+                filled_trade_id: None,
+            })
         },
         Situation::FilledStillOpen => LiveInputs {
             open: vec![oanda_trade(ORDER_ID, TradeState::Open, 0.0)],
-            ..LiveInputs::absent(OrderFate::Live)
+            ..LiveInputs::absent(OrderFate::Live {
+                filled_trade_id: None,
+            })
         },
         // Closed rows: the caller snapshotted the trade id while the position
         // was open, which is what makes the closed-trade scan correlatable.
         Situation::ClosedInProfit => LiveInputs {
             closed: Some(vec![oanda_trade(ORDER_ID, TradeState::Closed, 12.5)]),
             trade_id: Some(ORDER_ID),
-            ..LiveInputs::absent(OrderFate::Live)
+            ..LiveInputs::absent(OrderFate::Live {
+                filled_trade_id: None,
+            })
         },
         Situation::ClosedAtLoss => LiveInputs {
             closed: Some(vec![oanda_trade(ORDER_ID, TradeState::Closed, -5.0)]),
             trade_id: Some(ORDER_ID),
-            ..LiveInputs::absent(OrderFate::Live)
+            ..LiveInputs::absent(OrderFate::Live {
+                filled_trade_id: None,
+            })
         },
         // THE INCIDENT: absent everywhere, no trade id was ever snapshotted
         // (it never filled, so it never became a trade), and the order record
