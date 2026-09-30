@@ -90,24 +90,42 @@ fill and later closed, misclassified because of the id-bridging assumption.
         so it's lower risk, but the comment is still wrong and worth a
         follow-up pass if a similar bridging need surfaces there.
       - cargo clippy + fmt clean on `broker-oanda` + `trade-control-cli`
-- [ ] **3. Reconciliation cron** — new async pass, ticking alongside
-      `sweep.rs`/`breakeven_watch.rs` in `trade-control-cron/`, using
-      `Broker::list_open_positions` (broker-truth-first, not attempt-keyed)
-      to detect: plan believes a position is open, broker shows flat →
-      retire/log. Must not block or slow the real trading path — runs
-      async, off to the side, logs findings; does not (yet) auto-archive a
-      plan (operator wants to observe behavior on the demo account first,
-      per 2026-09-30 conversation — leave the plan alive, just add
-      visibility).
-      - [ ] confirm `CronEnv` broker-acquisition seam
-            (`trade-control-cron/src/seam.rs`) supports this cleanly for
-            both wasm and native
-      - [ ] test: plan with open attempt + broker shows it closed → logs
-            reconciliation mismatch
-      - [ ] test: plan with open attempt + broker still shows it open →
-            no-op
-      - [ ] test: cron tick failure (broker error) does not propagate to
-            or block other cron passes
+- [x] **3. Reconciliation cron** — new module
+      `trade-control-cron/src/reconcile.rs`, `pub async fn reconcile<S:
+      StateStore, C: CronEnv>`. Walks every `EntryAttempt` with a
+      snapshotted `broker_trade_id` (i.e. reached an open position at some
+      point), groups by account, fetches `Broker::list_open_positions` per
+      account (broker-truth, not attempt-keyed), and for any tracked trade
+      id absent from that snapshot, resolves the real state via
+      `Broker::lookup_attempt_state` and logs the mismatch (`ClosedWin` /
+      `ClosedLossOrBreakeven` with realized P&L, or any other
+      non-open-non-resolvable state) at `warn!`. **Observation-only** —
+      touches no `EntryAttempt`/plan state, never closes/cancels anything,
+      per the operator's explicit instruction (2026-09-30: "we should be
+      fine not marking it; I want to see what happens; it's just a demo
+      account" — watch behavior first before deciding whether/how to
+      auto-retire a plan).
+      - Wired into `worker/src/scheduler.rs` as its own `reconcile_loop`,
+        same `skip_interval` + `run_isolated` panic-containment pattern as
+        every other cron pass, on its own `upkeep_interval`-cadence timer —
+        fully independent of the engine tick/sweep/order-control passes, so
+        a broker error or slow tick here can never affect real trading.
+      - Tests (`trade-control-cron/src/reconcile.rs`, via a seamed
+        `AttemptBroker` trait mirroring `breakeven_watch`'s `PositionBroker`
+        pattern so the decision is testable without a live broker):
+        - `still_open_at_broker_is_a_noop` — position present in the
+          broker's open-positions snapshot → no broker lookup call at all
+        - `closed_win_absent_from_open_positions_is_detected` — exact
+          incident shape (absent from open, resolves `ClosedWin`)
+        - `no_tracked_attempts_short_circuits_without_a_broker_call` —
+          an attempt with no `broker_trade_id` is excluded upstream
+      - 66/66 `trade-control-cron` tests pass, 33/33 `trade-control-worker`
+        tests pass, clippy + fmt clean on both.
+      - Deliberately did NOT add a mismatch between `list_open_positions`
+        and a concurrent `lookup_attempt_state` race as a hard error — see
+        the `AttemptState::OpenPosition` arm in `reconcile_one`, logged at
+        `info!` and left to the next tick, since the two broker calls are
+        not atomic with each other.
 
 ## Notes
 

@@ -62,7 +62,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use trade_control_cron::{
-    apply_if_ny_close_edge, breakeven_watch, order_control_tick, run_engine_tick,
+    apply_if_ny_close_edge, breakeven_watch, order_control_tick, reconcile, run_engine_tick,
     sweep_pending_orders, watch_recovery, widen_open_stops_for_spread_hours,
 };
 
@@ -105,6 +105,10 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
     // housekeeping, hourly by default.
     let sweep_period = intervals.upkeep_interval();
     let order_control_period = intervals.upkeep_interval();
+    // Broker-truth reconciliation is purely observational (logs a mismatch,
+    // touches nothing) — the frequent upkeep cadence is generous for it, not
+    // load-bearing the way it is for the sweep/order-control passes.
+    let reconcile_period = intervals.upkeep_interval();
     let expiry_gc_period = intervals.expiry_sweep_interval();
 
     std::thread::Builder::new()
@@ -131,6 +135,7 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
                     blackout_apply_loop(state.clone(), cron.clone(), blackout_apply_period),
                     sweep_loop(state.clone(), cron.clone(), sweep_period),
                     order_control_loop(state.clone(), cron.clone(), order_control_period),
+                    reconcile_loop(state.clone(), cron.clone(), reconcile_period),
                     expiry_gc_loop(state, expiry_gc_period),
                 );
             });
@@ -347,6 +352,36 @@ async fn order_control_loop(state: Arc<AppState>, cron: NativeCronEnv, period: D
         let (state, cron) = (state.clone(), cron.clone());
         run_isolated("order_control", async move {
             order_control_tick(&state.store, &cron, now).await;
+        })
+        .await;
+    }
+}
+
+/// Broker-truth reconciliation: every `period` (the frequent upkeep cadence)
+/// check every account with a tracked open position against the broker's own
+/// current snapshot, and log (never act on) any mismatch — a plan whose
+/// records believe a position is open when the broker no longer shows it.
+///
+/// Runs fully independently of the real trading path (its own interval, its
+/// own `run_isolated` panic containment): a broker error or a slow tick here
+/// must never affect the engine tick, sweep, or order-control passes.
+/// Observation-only by design — see `trade_control_cron::reconcile`'s module
+/// docs for the incident that motivated this and why it does not (yet)
+/// auto-retire a plan.
+async fn reconcile_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Duration) {
+    let mut interval = skip_interval(period);
+
+    tracing::info!(
+        "scheduler: broker-truth reconciliation every {}s",
+        period.as_secs()
+    );
+
+    loop {
+        interval.tick().await;
+        let now = chrono::Utc::now();
+        let (state, cron) = (state.clone(), cron.clone());
+        run_isolated("reconcile", async move {
+            reconcile(&state.store, &cron, now).await;
         })
         .await;
     }
