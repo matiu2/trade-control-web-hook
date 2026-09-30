@@ -13,9 +13,10 @@
 //! live with their runtimes — never here.
 //!
 //! The engine tick, the break-even watcher, the daily market-hours blackout
-//! refresh, the **order sweep** (`sweep_pending_orders`), and the
+//! refresh, the **order sweep** (`sweep_pending_orders`), the
 //! **spread-blackout cluster** (NY-close apply + cancel + recovery watcher +
-//! restore) have moved here. The apply/cancel/restore jobs re-verify a *stored*
+//! restore), and the **broker-truth reconciliation pass** (`reconcile`) have
+//! moved here. The apply/cancel/restore jobs re-verify a *stored*
 //! signed body, so they use the [`CronEnv::signing_key`] seam — the same key the
 //! HTTP path verifies with. Only `session_refresh` stays wasm-only: it pre-warms
 //! the KV session cache, an optimization the native runtime doesn't need (it
@@ -30,6 +31,7 @@ mod broker_handle;
 mod constants;
 mod engine;
 mod order_control_tick;
+mod reconcile;
 mod seam;
 mod spread_lifecycle;
 mod sweep;
@@ -42,4 +44,5 @@ pub use blackout_apply::{apply_if_ny_close_edge, widen_open_stops_for_spread_hou
 pub use blackout_watch::watch_recovery;
 pub use breakeven_watch::watch as breakeven_watch;
 pub use order_control_tick::order_control_tick;
+pub use reconcile::reconcile;
 pub use sweep::sweep_pending_orders;
