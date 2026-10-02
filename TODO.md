@@ -1,3 +1,84 @@
+# TODO — reconcile findings visible in journal, as a proper 3rd event kind (2026-10-03)
+
+## Why
+
+`reconcile` (see below) only `tracing::warn!`s. Investigated whether that's
+visible in `journal`/`journal-staging` — it is not: journal only reads
+`request_records` (real inbound signed HTTP alerts) and `tick_bundles` (real
+cron-engine-evaluated ticks), both documented explicitly as meaning those
+specific things (`core/src/recording.rs:24-34`'s `PlanTimeline` doc:
+"inbound-HTTP RequestRecords and the cron-engine TickBundles"). Neither
+matches what `reconcile` produces — a broker-truth observation, not a real
+HTTP request or a real `evaluate_plan` tick — and faking either would corrupt
+data other tooling (the golden replay, the conformance suite) trusts as
+ground truth. Decided (operator, 2026-10-03): add a proper third event kind
+rather than stretch an existing one.
+
+## Scope
+
+- [x] Migration `0006_cron_notes.sql`, same append-only/no-TTL shape as
+      `0003_recordings.sql`: `cron_notes (id, ts, correlation_id, account,
+      source, severity, message, body jsonb)`. Indexes on `ts` and
+      `correlation_id`, mirroring `tick_bundles`'s.
+- [x] `core::recording::CronNote` type (ts, trade_id, account, source,
+      severity, message) — pure, wasm-safe, lives beside
+      `RequestRecord`/`TickBundle`. No `detail: serde_json::Value` field —
+      `core`'s default build deliberately keeps `serde_json` out entirely
+      (feature-gated behind `test-support`), so `message` carries the full
+      observation as a plain string instead, matching
+      `DispatchOutcome::outcome`'s precedent.
+- [x] `PlanTimeline` gains a third field, `notes: Vec<CronNote>`
+      (`#[serde(default)]` so an older worker's response without the key
+      still deserializes). `is_empty()` updated. Verified: `journal`'s loose
+      `serde_json::Value` parser degrades gracefully (test
+      `missing_notes_key_is_not_an_error`), and `trade-control-cli`'s typed
+      `PlanTimeline` deserialize also degrades via the same `#[serde(default)]`.
+- [x] `CronEnv::record_cron_note(&self, note: CronNote)` — new trait method,
+      same fire-and-forget `spawn_local` + fail-soft-log pattern as
+      `record_tick` (`worker/src/native_cron.rs`). Test-mock impls in
+      `engine.rs`/`sweep.rs` are no-ops (matching their existing
+      `record_tick` no-ops); `reconcile.rs`'s own tests got a dedicated
+      `RecordingCronEnv` stub that actually captures notes for assertions.
+- [x] `worker/src/recording_pg.rs`: `record_cron_note` (insert) +
+      `cron_notes_for_trade` (select), mirroring `record_tick`/
+      `tick_bundles_for_trade` exactly.
+- [x] `worker/src/http.rs::handle_plan_timeline`: fetch + include `notes`.
+- [x] `journal/src/timeline.rs::parse_events`: third marker `!` (reads as
+      "observation", distinct from `⊙` inbound / `•` fire) rendering
+      `source (severity): message` lines from `notes[]`. Also wired the
+      SAME notes section into `trade-control-cli`'s typed
+      `format_plan_timeline` (`cli/src/bin/trade_control.rs`) — a separate,
+      more "official" renderer than journal's; without this addition
+      `trade-control plan timeline` would silently omit reconcile findings
+      journal shows, an inconsistency not worth leaving.
+- [x] `trade-control-cron/src/reconcile.rs`: threaded `CronEnv` into
+      `reconcile_one`/`reconcile_unresolved` (via a small `note()` helper)
+      alongside the existing `tracing::warn!` for every finding that
+      already logs (`ClosedWin`/`ClosedLossOrBreakeven` on both paths).
+      Kept the `tracing` calls — journal is secondary visibility,
+      `journalctl` stays the live debugging tool. Did NOT write a note for
+      the `OpenPosition`-race `info!` arm or any of `reconcile_unresolved`'s
+      silent arms (`Pending`/`Cancelled`/`Unknown`) — same "not surprising
+      enough" reasoning as their logging already follows.
+- [x] Tests: `CronNote`/`CronNoteSeverity` serde round-trip +
+      `PlanTimeline` missing-`notes` default (`core/src/recording.rs`);
+      `record_cron_note`/`cron_notes_for_trade` mirror the
+      already-untested `record_tick`/`tick_bundles_for_trade` pair (neither
+      has a Postgres-backed round-trip test in this codebase — consistent,
+      not a new gap); `reconcile`'s 5 existing tests upgraded to assert on
+      `RecordingCronEnv.notes` instead of "doesn't panic"; `journal`'s
+      `timeline.rs` + `trade-control-cli`'s `format_plan_timeline` each got
+      2 new tests (renders correctly; absent key renders nothing extra).
+      68/68 cron, 34/34 worker, 24/24 journal, 24/24 cli, 8/8 core
+      recording tests pass.
+- [x] cargo clippy + fmt gate, clean on every touched crate (core, cron,
+      worker, journal, cli).
+- [ ] Deploy to staging and confirm end-to-end: trigger a reconciliation
+      finding (or wait for a real one), then `journal-staging`, open that
+      trade's timeline, confirm the note line appears.
+
+---
+
 # TODO — reconcile widened to probe unresolved attempts too (2026-10-01)
 
 Deployed the fix below to staging (main + staging merged, parent gitlink

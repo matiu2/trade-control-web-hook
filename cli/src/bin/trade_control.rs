@@ -1359,6 +1359,25 @@ fn format_plan_timeline(trade_id: &str, response: &str, verbose: bool) -> Result
         }
     }
 
+    // Cron-observation notes: a cron pass's finding that is neither a
+    // dispatched rule firing nor an inbound alert (e.g. `reconcile` catching
+    // a plan whose broker-truth position disagrees with what it believes).
+    if !timeline.notes.is_empty() {
+        out.push_str("\nCron notes:\n");
+        for note in &timeline.notes {
+            let ts = chrono::DateTime::parse_from_rfc3339(&note.ts)
+                .map(|dt| bne(dt.with_timezone(&Utc)))
+                .unwrap_or_else(|_| note.ts.clone());
+            let _ = writeln!(
+                out,
+                "  ! {ts}  {source} ({severity}): {message}",
+                source = note.source,
+                severity = note.severity,
+                message = note.message,
+            );
+        }
+    }
+
     // Inbound alerts, folded in by timestamp as their own `⊙` lines. These are
     // the signed POSTs (preps/vetoes/enters arriving over HTTP) that armed or
     // controlled the plan, distinct from the engine ticks that acted on them.
@@ -2510,6 +2529,39 @@ ticks:
         assert!(out.contains("blocked by veto too-high"));
         assert!(!out.contains("veto too-high set"));
         assert!(!out.contains("entry id=hs-nzd-chf-d12eb831-enter"));
+    }
+
+    /// THE INCIDENT, in the CLI's own terms: `reconcile` wrote a `CronNote`
+    /// for a plan that believed a position was open when the broker had
+    /// already closed it.
+    #[test]
+    fn plan_timeline_renders_cron_notes() {
+        let yaml = "\
+records: []
+ticks: []
+notes:
+- ts: '2026-09-30T01:40:25Z'
+  trade_id: hs-aud-jpy-dd5db625
+  account: m-and-w
+  source: reconcile
+  severity: warn
+  message: 'trade_id=2495 believed OPEN, broker shows CLOSED WIN realized_pl=18369.2245'
+";
+        let out = format_plan_timeline("hs-aud-jpy-dd5db625", yaml, false).unwrap();
+        assert!(out.contains("Cron notes:"), "got: {out}");
+        assert!(
+            out.contains("reconcile (warn): trade_id=2495 believed OPEN"),
+            "got: {out}"
+        );
+        assert!(out.contains("18369.2245"));
+    }
+
+    /// Records-only fixture (no `notes` key at all) must render exactly as it
+    /// did before this field existed — no empty "Cron notes:" header.
+    #[test]
+    fn plan_timeline_without_notes_shows_no_cron_notes_section() {
+        let out = format_plan_timeline("hs-nzd-chf-d12eb831", timeline_fixture(), false).unwrap();
+        assert!(!out.contains("Cron notes:"), "got: {out}");
     }
 
     #[test]

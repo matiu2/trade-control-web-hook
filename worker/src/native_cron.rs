@@ -134,6 +134,20 @@ impl CronEnv for NativeCronEnv {
         });
     }
 
+    fn record_cron_note(&self, note: trade_control_core::recording::CronNote) {
+        // Same fire-and-forget shape as `record_tick` — see its comment.
+        let state = self.state.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(err) = crate::recording_pg::record_cron_note(state.store.pool(), &note).await
+            {
+                tracing::error!(
+                    "recording: cron_notes insert failed (trade_id={}): {err}",
+                    note.trade_id
+                );
+            }
+        });
+    }
+
     fn signing_key(&self) -> Option<Vec<u8>> {
         // Decoded once at boot and held on `AppState` (the same key the HTTP
         // receiver verifies with). Always present here — `main` aborts if
