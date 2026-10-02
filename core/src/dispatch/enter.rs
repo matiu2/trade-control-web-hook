@@ -1259,6 +1259,18 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 outcome: format!("rejected: units-below-minimum{parked}"),
             }
         }
+        Err(err @ EntryError::AmbiguousSuccess(_)) => {
+            // NOT a Failed/Skip: the broker call succeeded and an order may
+            // already exist, so the id must be poisoned (Mark) to stop the
+            // next fire from placing a duplicate on top of it. This is the
+            // one outcome where "let the next bar retry" is the dangerous
+            // choice rather than the safe one. See EntryError::AmbiguousSuccess.
+            let outcome = recover_entry::outcome_for_entry_failure(&err, recover_skip_reason);
+            tracing::error!(
+                "entry outcome unknown, NOT retrying: {err} ({outcome}) — verify at the broker"
+            );
+            ActionResult::AmbiguousSuccess(outcome)
+        }
         Err(err) => {
             // Stays `ActionResult::Failed` (a Skip in `seen_decision`):
             // a too-close / broker failure must never poison the seen-id
@@ -2222,6 +2234,7 @@ mod gate_order_tests {
             } => {
                 format!("Rejected({status}, {outcome})")
             }
+            ActionResult::AmbiguousSuccess(o) => format!("AmbiguousSuccess({o})"),
         }
     }
 

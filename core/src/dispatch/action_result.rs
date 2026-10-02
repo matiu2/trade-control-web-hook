@@ -31,6 +31,15 @@ pub enum ActionResult {
         body: String,
         outcome: String,
     },
+    /// The broker call's outcome is **unknown**, not failed — the HTTP
+    /// request to the broker succeeded but its response could not be
+    /// read, so an order may or may not have actually been placed. This
+    /// is recorded against the seen id exactly like [`Self::Ok`] (a
+    /// retry could double an order that already filled — see
+    /// [`crate::broker::EntryError::AmbiguousSuccess`]), but is rendered
+    /// with its own distinct status/body so the caller is never told
+    /// "entered" or "failed" when the truth is "go check the broker".
+    AmbiguousSuccess(String),
 }
 
 impl ActionResult {
@@ -42,6 +51,7 @@ impl ActionResult {
             Self::Ok(s) => format!("Ok({s})"),
             Self::Failed(s) => format!("Failed({s})"),
             Self::Rejected { outcome, .. } => format!("Rejected({outcome})"),
+            Self::AmbiguousSuccess(s) => format!("AmbiguousSuccess({s})"),
         }
     }
 
@@ -59,7 +69,7 @@ impl ActionResult {
     /// record match what the replay already shows for the same reject.
     pub fn record_outcome(&self) -> &str {
         match self {
-            Self::Ok(s) | Self::Failed(s) => s,
+            Self::Ok(s) | Self::Failed(s) | Self::AmbiguousSuccess(s) => s,
             Self::Rejected { outcome, .. } => outcome,
         }
     }

@@ -16,3 +16,6 @@ default = []
 # suite in the `trade-control-cli` replay binary can drive the LIVE resolver
 # alongside the REPLAY one. Off by default — no runtime build enables it.
 test-support = []
+
+[dev-dependencies]
+color-eyre = "0.6.5"

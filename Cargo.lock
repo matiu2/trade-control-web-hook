@@ -361,6 +361,7 @@ name = "broker-oanda"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "color-eyre",
  "oanda-client",
  "tracing",
  "trade-control-core",

@@ -1347,6 +1347,22 @@ async fn dispatch_enter(
                 reason: format!("failed: {reason}"),
             }
         }
+        ActionResult::AmbiguousSuccess(reason) => {
+            // The ReplayBroker is a fake broker whose calls never return
+            // OANDA/TN's real transport layer, so it can never produce this
+            // outcome for real — reaching here means the abstraction leaked.
+            // Same "no-fill, wiring fault" treatment as `Failed`, but logged
+            // under its own name so it's never mistaken for an ordinary
+            // rejection during a replay investigation.
+            tracing::error!(
+                rule = %fired.rule_id,
+                %reason,
+                "tick: enter dispatch returned AmbiguousSuccess under ReplayBroker — this should be unreachable"
+            );
+            EnterGateOutcome::Rejected {
+                reason: format!("ambiguous-success: {reason}"),
+            }
+        }
     }
 }
 

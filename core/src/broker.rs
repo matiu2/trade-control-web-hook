@@ -261,6 +261,21 @@ pub enum EntryError {
     /// **not** the cause.
     EntryTooCloseToMarket,
     OrderRejected,
+    /// The broker confirmed the HTTP call succeeded but the response body
+    /// could not be parsed, so whether an order was actually placed is
+    /// **unknown** — unlike every other variant, this is NOT evidence the
+    /// entry failed. Distinct from [`Self::OrderRejected`] because the two
+    /// demand opposite handling: a rejection is safe to let the next fire
+    /// retry (nothing was placed), whereas retrying here risks placing a
+    /// second order on top of one that may have already filled. The
+    /// dispatcher must never let this outcome be treated as a plain
+    /// failure — see `ActionResult::AmbiguousSuccess`.
+    ///
+    /// Root incident: the AUD/SGD staging double-fill (2026-09-30), where
+    /// OANDA's fill response failed to parse (an unrelated field-rename
+    /// bug), was reported as `502`/`broker-rejected`, and the operator's
+    /// reasonable retry placed a second live order on top of the first.
+    AmbiguousSuccess(String),
 }
 
 impl core::fmt::Display for EntryError {
@@ -280,6 +295,12 @@ impl core::fmt::Display for EntryError {
                 f.write_str("entry trigger too close to (or wrong side of) the market price")
             }
             Self::OrderRejected => f.write_str("broker rejected the order"),
+            Self::AmbiguousSuccess(detail) => write!(
+                f,
+                "broker confirmed the request but the response could not be \
+                 read — an order may have been placed; check the broker \
+                 directly before retrying ({detail})"
+            ),
         }
     }
 }

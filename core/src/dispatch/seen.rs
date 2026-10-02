@@ -116,6 +116,10 @@ pub fn is_multishot_enter(intent: &Intent) -> bool {
 pub fn seen_decision(result: &ActionResult) -> SeenDecision<'_> {
     match result {
         ActionResult::Ok(outcome) => SeenDecision::Mark { outcome },
+        // Marked exactly like `Ok`: the broker call succeeded and an order
+        // may already exist, so the id must be poisoned to stop a retry
+        // from placing a second one. See `ActionResult::AmbiguousSuccess`.
+        ActionResult::AmbiguousSuccess(outcome) => SeenDecision::Mark { outcome },
         ActionResult::Failed(outcome) => SeenDecision::Skip {
             kind: "failed",
             outcome,
@@ -701,6 +705,23 @@ mod dispatcher_outcome_tests {
         );
     }
 
+    /// `AmbiguousSuccess` must classify as `Mark`, exactly like `Ok` — NOT
+    /// `Skip` like every other failure variant. This is the load-bearing
+    /// fix for the AUD/SGD staging double-fill (2026-09-30): the broker
+    /// call succeeded and an order may already exist, so the id must be
+    /// poisoned to stop a retry from placing a second one on top of it.
+    #[test]
+    fn ambiguous_success_outcome_classifies_as_mark_not_skip() {
+        let result = ActionResult::AmbiguousSuccess("entry-failed: ambiguous-success".into());
+        assert_eq!(
+            seen_decision(&result),
+            SeenDecision::Mark {
+                outcome: "entry-failed: ambiguous-success"
+            },
+            "AmbiguousSuccess must Mark — an order may already exist, so the next fire must NOT retry",
+        );
+    }
+
     #[test]
     fn failed_outcome_classifies_as_skip() {
         let result = ActionResult::Failed("entry-failed: broker 500".into());
@@ -746,6 +767,25 @@ mod dispatcher_outcome_tests {
             store.marks(),
             vec![("ok-id".into(), "entered: order=42".into())],
             "Ok must write to seen so duplicate alert bodies 409 on replay",
+        );
+    }
+
+    /// End-to-end: an `AmbiguousSuccess` outcome routed through the async
+    /// helper actually poisons the store, same as `Ok` — the store write
+    /// is what actually stops a retry from placing a duplicate order.
+    #[test]
+    fn ambiguous_success_outcome_writes_to_store_via_record_dispatcher_outcome() {
+        let store = SeenSpyStore::default();
+        let v = verified("ambiguous-id");
+        let result = ActionResult::AmbiguousSuccess("entry-failed: ambiguous-success".into());
+        run(record_dispatcher_outcome(&store, &v, now(), &result));
+        assert_eq!(
+            store.marks(),
+            vec![(
+                "ambiguous-id".into(),
+                "entry-failed: ambiguous-success".into()
+            )],
+            "AmbiguousSuccess must write to seen so a retry 409s instead of placing a duplicate order",
         );
     }
 

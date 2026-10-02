@@ -140,12 +140,7 @@ impl PositionRow {
 }
 
 impl PositionsFile {
-    pub fn new(
-        instrument: &str,
-        granularity: &str,
-        broker: &str,
-        fires: &[FireResult],
-    ) -> Self {
+    pub fn new(instrument: &str, granularity: &str, broker: &str, fires: &[FireResult]) -> Self {
         Self {
             version: POSITIONS_VERSION,
             instrument: instrument.to_string(),
@@ -312,7 +307,12 @@ mod tests {
     fn writing_creates_missing_parent_directories() {
         let dir = std::env::temp_dir().join(format!("rc-positions-{}", std::process::id()));
         let path = dir.join("nested").join("positions.json");
-        let doc = PositionsFile::new("EUR_USD", "1h", "oanda", &[fire(FillKind::Open, Direction::Long)]);
+        let doc = PositionsFile::new(
+            "EUR_USD",
+            "1h",
+            "oanda",
+            &[fire(FillKind::Open, Direction::Long)],
+        );
 
         doc.write(&path).expect("writes through missing dirs");
         let text = std::fs::read_to_string(&path).expect("file is there");

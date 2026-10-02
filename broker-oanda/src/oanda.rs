@@ -24,6 +24,58 @@ const CLOSED_TRADE_SCAN_COUNT: i32 = 50;
 
 pub const OANDA_ACCOUNT_ID: &str = "OANDA_ACCOUNT_ID";
 
+/// Classify a `place_order`-family error into the right [`EntryError`].
+/// `oanda-client` tags a 2xx response it failed to parse with the
+/// `ambiguous-success:` prefix (see `orders.rs::place_order`) — that is
+/// NOT a rejection, since the order may have already filled, and must
+/// never be treated like one (see `EntryError::AmbiguousSuccess`'s docs
+/// for the incident this fixes). Every other error here means the broker
+/// call itself did not go through as a confirmed success, so it stays a
+/// plain rejection.
+fn classify_order_placement_error(err: impl std::fmt::Display) -> EntryError {
+    let msg = err.to_string();
+    if msg.contains("ambiguous-success:") {
+        EntryError::AmbiguousSuccess(msg)
+    } else {
+        EntryError::OrderRejected
+    }
+}
+
+#[cfg(test)]
+mod classify_order_placement_error_tests {
+    use super::*;
+
+    /// The AUD/SGD staging incident (2026-09-30): a genuine fill whose
+    /// response failed to parse must classify as `AmbiguousSuccess`, never
+    /// `OrderRejected` — retrying an `OrderRejected` is safe (nothing was
+    /// placed); retrying this is how the position got doubled.
+    #[test]
+    fn ambiguous_success_tag_is_never_read_as_a_rejection() {
+        let err = color_eyre::eyre::eyre!(
+            "ambiguous-success: order response returned 200 OK but failed to \
+             parse (missing field `timestamp`): {{\"orderFillTransaction\":{{}}}}"
+        );
+        assert!(matches!(
+            classify_order_placement_error(err),
+            EntryError::AmbiguousSuccess(_)
+        ));
+    }
+
+    /// An ordinary transport/HTTP failure — nothing reached the broker as a
+    /// confirmed success — must stay a plain rejection so the next fire is
+    /// still allowed to retry.
+    #[test]
+    fn an_ordinary_broker_error_is_still_order_rejected() {
+        let err = color_eyre::eyre::eyre!(
+            "Order placement failed with status 400 Bad Request: {{\"errorMessage\":\"Invalid Instrument\"}}"
+        );
+        assert!(matches!(
+            classify_order_placement_error(err),
+            EntryError::OrderRejected
+        ));
+    }
+}
+
 /// Parse an `OANDA_LIVE`-style secret string into a live/practice flag.
 /// Absent / non-`true` → practice. Pure so the parsing is unit-testable.
 /// Retained for its unit tests; the native runtime derives live/practice from
@@ -278,7 +330,7 @@ pub async fn place_entry(
             .await
             .map_err(|err| {
                 tracing::error!("buy_with_stops: {err:?}");
-                EntryError::OrderRejected
+                classify_order_placement_error(err)
             })?,
         (ResolvedEntry::Market { .. }, Direction::Short) => client
             .sell_with_stops(
@@ -292,7 +344,7 @@ pub async fn place_entry(
             .await
             .map_err(|err| {
                 tracing::error!("sell_with_stops: {err:?}");
-                EntryError::OrderRejected
+                classify_order_placement_error(err)
             })?,
         (ResolvedEntry::Stop { trigger_price }, dir) => {
             let signed_units = match dir {
@@ -315,7 +367,7 @@ pub async fn place_entry(
                 .await
                 .map_err(|err| {
                     tracing::error!("place_stop_order: {err:?}");
-                    EntryError::OrderRejected
+                    classify_order_placement_error(err)
                 })?
         }
         (ResolvedEntry::Limit { trigger_price }, dir) => {
@@ -339,7 +391,7 @@ pub async fn place_entry(
                 .await
                 .map_err(|err| {
                     tracing::error!("place_limit_order: {err:?}");
-                    EntryError::OrderRejected
+                    classify_order_placement_error(err)
                 })?
         }
     };

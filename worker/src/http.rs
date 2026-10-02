@@ -550,6 +550,13 @@ fn control_to_parts(c: ControlResult) -> (StatusCode, String) {
 /// Map a broker [`ActionResult`] to an HTTP `(status, body)`, matching the wasm
 /// worker (`Ok` → 200 "ok", `Failed` → 502 "action failed", `Rejected` → its
 /// own status + body).
+///
+/// `AmbiguousSuccess` deliberately does NOT reuse `Failed`'s body. Both are
+/// 502s (neither is a confirmed success), but a caller that strips the status
+/// and greps the body — as a retry-on-failure script would — must not read
+/// "action failed" here: that reads as "nothing happened, safe to retry",
+/// which is exactly the AUD/SGD staging double-fill (2026-09-30, see
+/// `EntryError::AmbiguousSuccess`).
 fn action_to_parts(result: &ActionResult) -> (StatusCode, String) {
     match result {
         ActionResult::Ok(_) => (StatusCode::OK, "ok".to_string()),
@@ -557,6 +564,12 @@ fn action_to_parts(result: &ActionResult) -> (StatusCode, String) {
         ActionResult::Rejected { status, body, .. } => (
             StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             body.clone(),
+        ),
+        ActionResult::AmbiguousSuccess(_) => (
+            StatusCode::BAD_GATEWAY,
+            "ambiguous: broker call may have succeeded, response unreadable — \
+             check the broker before retrying"
+                .to_string(),
         ),
     }
 }
@@ -710,6 +723,20 @@ mod tests {
         });
         assert_eq!(s, StatusCode::PRECONDITION_FAILED);
         assert_eq!(b, "veto-active (reversal)");
+    }
+
+    /// `AmbiguousSuccess` is a 502 like `Failed`, but its body must NEVER
+    /// read "action failed" — a caller that greps the body (rather than
+    /// branching on the status) would read that as "nothing happened,
+    /// safe to retry", which is exactly the AUD/SGD staging double-fill.
+    #[test]
+    fn ambiguous_success_maps_to_a_distinct_body_not_action_failed() {
+        let (s, b) = action_to_parts(&ActionResult::AmbiguousSuccess(
+            "entry-failed: ambiguous-success".into(),
+        ));
+        assert_eq!(s, StatusCode::BAD_GATEWAY);
+        assert_ne!(b, "action failed");
+        assert!(b.contains("check the broker"), "{b}");
     }
 
     #[test]

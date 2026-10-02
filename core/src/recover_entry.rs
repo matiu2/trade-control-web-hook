@@ -50,6 +50,7 @@ fn failure_token(err: &EntryError) -> &'static str {
         EntryError::ContractSizeUnavailable => "contract-size-unavailable",
         EntryError::EntryTooCloseToMarket => "too-close-to-market",
         EntryError::OrderRejected => "broker-rejected",
+        EntryError::AmbiguousSuccess(_) => "ambiguous-success",
     }
 }
 
