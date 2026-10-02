@@ -411,8 +411,19 @@ async fn handle_plan_timeline(
             return ControlResult::error("state error", 500);
         }
     };
+    let notes = match crate::recording_pg::cron_notes_for_trade(store.pool(), target).await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!("plan-timeline: cron_notes_for_trade: {err}");
+            return ControlResult::error("state error", 500);
+        }
+    };
 
-    let timeline = trade_control_core::recording::PlanTimeline { records, ticks };
+    let timeline = trade_control_core::recording::PlanTimeline {
+        records,
+        ticks,
+        notes,
+    };
 
     if timeline.is_empty() {
         record_seen(

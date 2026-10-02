@@ -22,15 +22,21 @@ use serde::{Deserialize, Serialize};
 use crate::tick_bundle::TickBundle;
 
 /// The whole event history for one trade, as the worker returns it to
-/// `plan timeline`: the inbound-HTTP [`RequestRecord`]s **and** the cron-engine
-/// [`TickBundle`]s, each already filtered to the one `trade_id` and sorted
-/// oldest-first.
+/// `plan timeline`: the inbound-HTTP [`RequestRecord`]s, the cron-engine
+/// [`TickBundle`]s, and the cron-observation [`CronNote`]s, each already
+/// filtered to the one `trade_id` and sorted oldest-first.
 ///
-/// Two record streams because a trade's life spans two event sources: an
+/// Three record streams because a trade's life spans three event sources: an
 /// inbound signed alert becomes a `RequestRecord`; a cron-engine tick that
-/// evaluated the plan becomes a `TickBundle`. A veto or enter that fired on a
-/// cron tick (the common case now) shows up only in `ticks`, so a timeline that
-/// read `records` alone would miss it. The CLI renderer interleaves the two by
+/// evaluated the plan becomes a `TickBundle`; a cron pass that observed
+/// something about the trade WITHOUT evaluating the plan's rules (e.g.
+/// `trade-control-cron::reconcile` checking broker-truth against what the
+/// plan believes) becomes a `CronNote`. A `CronNote` is deliberately NOT a
+/// `TickBundle` — it isn't `evaluate_plan`'s output and fabricating one to
+/// fit would corrupt data the golden replay / conformance suite trust as a
+/// real engine evaluation. A veto or enter that fired on a cron tick (the
+/// common case now) shows up only in `ticks`, so a timeline that read
+/// `records` alone would miss it. The CLI renderer interleaves all three by
 /// timestamp.
 ///
 /// Lives in `core` so the worker (write side) and the CLI (render side) share
@@ -41,13 +47,19 @@ pub struct PlanTimeline {
     pub records: Vec<RequestRecord>,
     /// Cron-engine tick bundles that evaluated this trade's plan, oldest first.
     pub ticks: Vec<TickBundle>,
+    /// Cron-observation notes for this trade, oldest first. `#[serde(default)]`
+    /// so an older worker's `plan timeline` response (sent before this field
+    /// existed) still deserializes — an absent `notes` array is just "no notes
+    /// recorded", not a parse error.
+    #[serde(default)]
+    pub notes: Vec<CronNote>,
 }
 
 impl PlanTimeline {
-    /// True when neither event stream has anything — the worker maps this to a
+    /// True when no event stream has anything — the worker maps this to a
     /// 404 (no recorded events for the trade).
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty() && self.ticks.is_empty()
+        self.records.is_empty() && self.ticks.is_empty() && self.notes.is_empty()
     }
 }
 
@@ -110,6 +122,60 @@ impl RequestRecord {
             rid = self.request_id
         )
     }
+}
+
+/// Severity of a [`CronNote`], mirroring the `tracing` levels its source call
+/// site also logs at — a note is always paired with a `tracing::info!`/`warn!`
+/// at the same level, never a silent duplicate.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CronNoteSeverity {
+    Info,
+    Warn,
+    Error,
+}
+
+impl core::fmt::Display for CronNoteSeverity {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        })
+    }
+}
+
+/// A cron pass's observation about a trade that is NOT a dispatched-rule
+/// firing (that's a [`TickBundle`]) and NOT an inbound signed alert (that's a
+/// [`RequestRecord`]) — see [`PlanTimeline`]'s docs for why this is its own
+/// stream rather than stretched onto either.
+///
+/// The motivating case: `trade-control-cron::reconcile` checks the broker's
+/// own open-position snapshot against what a plan's `EntryAttempt` believes,
+/// and logs a mismatch. That's a genuine, timeline-worthy event — but it
+/// never evaluated `evaluate_plan` and never arrived as an HTTP request, so
+/// neither existing stream can honestly represent it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CronNote {
+    /// UTC RFC3339 — when the cron pass made the observation.
+    pub ts: String,
+    /// The trade id this note is about (the aggregate key, same as
+    /// `TickBundle::correlation_id` / `RequestRecord::trade_id`).
+    pub trade_id: String,
+    /// `None` for a globally-scoped plan; `Some(name)` for an account-scoped
+    /// one — same convention as `TickBundle::account`.
+    pub account: Option<String>,
+    /// Which cron pass wrote this, e.g. `"reconcile"`. Free text, not an enum —
+    /// new cron passes that want to leave a note shouldn't need a `core` change
+    /// to name themselves.
+    pub source: String,
+    pub severity: CronNoteSeverity,
+    /// The full observation, including whatever detail the source pass wants
+    /// to keep (e.g. the resolved `AttemptState`, the realized P&L) — a plain
+    /// string rather than structured `serde_json::Value`, matching
+    /// `DispatchOutcome::outcome`'s precedent (`core`'s default build keeps
+    /// `serde_json` out entirely; see its `Cargo.toml` feature comment).
+    pub message: String,
 }
 
 /// Mint a short request id. We have no RNG in the wasm worker
@@ -244,5 +310,49 @@ mod tests {
         assert_eq!(back.logs[0].level, "log");
         assert_eq!(back.logs[1].level, "error");
         assert_eq!(back.logs[1].msg, "boom");
+    }
+
+    #[test]
+    fn cron_note_round_trips_through_json() {
+        let note = CronNote {
+            ts: "2026-09-30T01:40:25.819608110Z".into(),
+            trade_id: "hs-aud-jpy-dd5db625".into(),
+            account: Some("m-and-w".into()),
+            source: "reconcile".into(),
+            severity: CronNoteSeverity::Warn,
+            message: "believed OPEN, broker shows CLOSED WIN realized_pl=18369.2245".into(),
+        };
+        let json = serde_json::to_string(&note).unwrap();
+        let back: CronNote = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.trade_id, "hs-aud-jpy-dd5db625");
+        assert_eq!(back.account.as_deref(), Some("m-and-w"));
+        assert_eq!(back.source, "reconcile");
+        assert_eq!(back.severity, CronNoteSeverity::Warn);
+    }
+
+    #[test]
+    fn cron_note_severity_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&CronNoteSeverity::Warn).unwrap(),
+            "\"warn\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CronNoteSeverity::Info).unwrap(),
+            "\"info\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CronNoteSeverity::Error).unwrap(),
+            "\"error\""
+        );
+    }
+
+    #[test]
+    fn plan_timeline_missing_notes_defaults_to_empty() {
+        // An older worker's `plan timeline` response, sent before CronNote
+        // existed — the wire JSON has no `notes` key at all.
+        let json = r#"{"records":[],"ticks":[]}"#;
+        let timeline: PlanTimeline = serde_json::from_str(json).unwrap();
+        assert!(timeline.notes.is_empty());
+        assert!(timeline.is_empty());
     }
 }
