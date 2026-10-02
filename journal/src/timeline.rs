@@ -14,7 +14,8 @@ use serde_json::Value;
 pub struct Event {
     /// Brisbane-formatted timestamp.
     pub ts: String,
-    /// `⊙` inbound signed alert, `•` engine fire.
+    /// `⊙` inbound signed alert, `•` engine fire, `!` cron observation (a
+    /// note that is neither — see `CronNote`'s docs in `core`).
     pub marker: char,
     pub text: String,
 }
@@ -35,7 +36,8 @@ pub(crate) fn ts_to_bne(raw: &str) -> String {
 }
 
 /// Extract an ordered list of events from the timeline JSON. Inbound `records`
-/// become `⊙` lines by `ts`; engine `ticks` that fired become `•` lines.
+/// become `⊙` lines by `ts`; engine `ticks` that fired become `•` lines;
+/// cron-observation `notes` become `!` lines.
 pub fn parse_events(json: &str) -> Vec<Event> {
     let Ok(v) = serde_json::from_str::<Value>(json) else {
         return Vec::new();
@@ -106,6 +108,28 @@ pub fn parse_events(json: &str) -> Vec<Event> {
                     });
                 }
             }
+        }
+    }
+
+    // Cron-observation notes: a cron pass's finding that is neither a
+    // dispatched rule firing nor an inbound alert (e.g. `reconcile` catching
+    // a plan whose broker-truth position disagrees with what it believes).
+    // Absent entirely on an older worker's response — `notes` just won't be
+    // a key in the JSON, and the loop below simply doesn't run.
+    if let Some(notes) = v.get("notes").and_then(|n| n.as_array()) {
+        for note in notes {
+            let ts = note.get("ts").and_then(|x| x.as_str()).unwrap_or("");
+            let source = note.get("source").and_then(|x| x.as_str()).unwrap_or("?");
+            let severity = note
+                .get("severity")
+                .and_then(|x| x.as_str())
+                .unwrap_or("info");
+            let message = note.get("message").and_then(|x| x.as_str()).unwrap_or("");
+            events.push(Event {
+                ts: ts_to_bne(ts),
+                marker: '!',
+                text: format!("{source} ({severity}): {message}"),
+            });
         }
     }
 
@@ -670,5 +694,40 @@ mod tests {
         let (text, ok) = derive_outcome(TIMELINE);
         assert!(!ok);
         assert_eq!(text, "no dispatch recorded");
+    }
+
+    /// THE INCIDENT, in journal's own terms: `reconcile` wrote a `CronNote`
+    /// for a plan that believed a position was open when the broker had
+    /// already closed it. The note must render as its own `!` line, distinct
+    /// from `⊙`/`•`, carrying the source and the message.
+    #[test]
+    fn cron_notes_render_as_their_own_marker() {
+        let json = serde_json::json!({
+            "records": [],
+            "ticks": [],
+            "notes": [{
+                "ts": "2026-09-30T01:40:25Z",
+                "trade_id": "hs-aud-jpy-dd5db625",
+                "account": "m-and-w",
+                "source": "reconcile",
+                "severity": "warn",
+                "message": "trade_id=2495 believed OPEN, broker shows CLOSED WIN realized_pl=18369.2245"
+            }]
+        })
+        .to_string();
+        let events = parse_events(&json);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].marker, '!');
+        assert!(events[0].text.starts_with("reconcile (warn):"));
+        assert!(events[0].text.contains("18369.2245"));
+    }
+
+    /// An older worker's response has no `notes` key at all — the parser
+    /// must not choke on its absence, just show nothing for that stream.
+    #[test]
+    fn missing_notes_key_is_not_an_error() {
+        let json = r#"{"records":[],"ticks":[]}"#;
+        let events = parse_events(json);
+        assert!(events.is_empty());
     }
 }

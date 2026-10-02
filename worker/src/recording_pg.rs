@@ -14,7 +14,7 @@
 //! request or a tick.
 
 use chrono::{DateTime, Utc};
-use trade_control_core::recording::RequestRecord;
+use trade_control_core::recording::{CronNote, RequestRecord};
 use trade_control_core::tick_bundle::TickBundle;
 
 /// Insert one webhook [`RequestRecord`] into `request_records`.
@@ -150,4 +150,68 @@ pub async fn record_tick(pool: &sqlx::PgPool, bundle: &TickBundle) -> Result<(),
     .execute(pool)
     .await
     .map(|_| ())
+}
+
+/// Insert one cron-observation [`CronNote`] into `cron_notes` — the write side
+/// of `reconcile` (and any future cron pass that wants to leave a timeline
+/// note that is neither a dispatched-rule firing nor an inbound alert).
+///
+/// `ts` is parsed the same lenient way as [`record_request`]: a malformed
+/// string (should never happen — it's minted from `Utc::now`) falls back to
+/// wall-clock `now()` rather than failing the insert.
+pub async fn record_cron_note(pool: &sqlx::PgPool, note: &CronNote) -> Result<(), sqlx::Error> {
+    let ts: DateTime<Utc> = match DateTime::parse_from_rfc3339(&note.ts) {
+        Ok(dt) => dt.with_timezone(&Utc),
+        Err(err) => {
+            tracing::warn!(
+                "recording: CronNote.ts {:?} not RFC3339 ({err}) — falling back to now()",
+                note.ts
+            );
+            Utc::now()
+        }
+    };
+    let body = serde_json::to_value(note).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+
+    sqlx::query(
+        "INSERT INTO cron_notes \
+         (ts, correlation_id, account, source, severity, message, body) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(ts)
+    .bind(&note.trade_id)
+    .bind(note.account.as_deref())
+    .bind(&note.source)
+    .bind(note.severity.to_string())
+    .bind(&note.message)
+    .bind(body)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Read every [`CronNote`] for one trade, oldest first — the read side of
+/// [`record_cron_note`], used by the `plan timeline` reconstruction. Mirrors
+/// [`tick_bundles_for_trade`] exactly, including the skip-and-warn behavior on
+/// a row whose `body` fails to deserialize.
+pub async fn cron_notes_for_trade(
+    pool: &sqlx::PgPool,
+    trade_id: &str,
+) -> Result<Vec<CronNote>, sqlx::Error> {
+    let rows: Vec<(serde_json::Value,)> =
+        sqlx::query_as("SELECT body FROM cron_notes WHERE correlation_id = $1 ORDER BY ts, id")
+            .bind(trade_id)
+            .fetch_all(pool)
+            .await?;
+
+    let notes = rows
+        .into_iter()
+        .filter_map(|(body,)| match serde_json::from_value::<CronNote>(body) {
+            Ok(note) => Some(note),
+            Err(err) => {
+                tracing::warn!("timeline: skipping cron_notes row for {trade_id}: {err}");
+                None
+            }
+        })
+        .collect();
+    Ok(notes)
 }

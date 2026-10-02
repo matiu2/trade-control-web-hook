@@ -553,6 +553,7 @@ mod tests {
             unreachable!("not used by the sweep")
         }
         fn record_tick(&self, _bundle: TickBundle) {}
+        fn record_cron_note(&self, _note: trade_control_core::recording::CronNote) {}
         fn signing_key(&self) -> Option<Vec<u8>> {
             None
         }

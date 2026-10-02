@@ -57,10 +57,36 @@
 
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{AttemptState, LookupError, OpenPosition};
+use trade_control_core::recording::{CronNote, CronNoteSeverity};
 use trade_control_core::state::{EntryAttempt, StateStore};
 
 use crate::broker_handle::BrokerHandle;
 use crate::seam::CronEnv;
+
+/// Who wrote this note, for `CronNote::source` — matched 1:1 against calls to
+/// `cron.record_cron_note`, so a reader grepping `source=reconcile` finds
+/// every note this pass ever wrote.
+const SOURCE: &str = "reconcile";
+
+/// Build + record a [`CronNote`] alongside the `tracing` call every finding
+/// already makes. `journal`'s secondary visibility, never a replacement for
+/// `journalctl` — see the module docs.
+fn note<C: CronEnv>(
+    cron: &C,
+    attempt: &EntryAttempt,
+    severity: CronNoteSeverity,
+    now: DateTime<Utc>,
+    message: String,
+) {
+    cron.record_cron_note(CronNote {
+        ts: now.to_rfc3339(),
+        trade_id: attempt.trade_id.clone(),
+        account: attempt.account.clone(),
+        source: SOURCE.to_string(),
+        severity,
+        message,
+    });
+}
 
 /// Walk every account with at least one interesting attempt — tracked
 /// (reached an open position at some point) or unresolved (no
@@ -138,19 +164,20 @@ async fn reconcile_account<C: CronEnv>(
         if attempt.account.as_deref() != account {
             continue;
         }
-        reconcile_one(&broker, attempt, &open_positions, now).await;
+        reconcile_one(cron, &broker, attempt, &open_positions, now).await;
     }
     for attempt in unresolved {
         if attempt.account.as_deref() != account {
             continue;
         }
-        reconcile_unresolved(&broker, attempt, now).await;
+        reconcile_unresolved(cron, &broker, attempt, now).await;
     }
 }
 
 /// Check one attempt's believed-open position against the broker's current
 /// snapshot; if absent, resolve + log what actually became of it.
-async fn reconcile_one<B: AttemptBroker>(
+async fn reconcile_one<C: CronEnv, B: AttemptBroker>(
+    cron: &C,
     broker: &B,
     attempt: &EntryAttempt,
     open_positions: &[OpenPosition],
@@ -172,29 +199,38 @@ async fn reconcile_one<B: AttemptBroker>(
         .await;
     match resolved {
         Ok(AttemptState::ClosedWin { realized_pl }) => {
+            let message = format!(
+                "trade_id={trade_id} believed OPEN, broker shows CLOSED WIN \
+                 realized_pl={realized_pl} — plan is stale as of {now}"
+            );
             tracing::warn!(
-                "reconcile: plan={} account={} instrument={} trade_id={trade_id} believed OPEN, \
-                 broker shows CLOSED WIN realized_pl={realized_pl} — plan is stale as of {now}",
+                "reconcile: plan={} account={} instrument={} {message}",
                 attempt.trade_id,
                 attempt.account.as_deref().unwrap_or("<global>"),
                 attempt.instrument,
             );
+            note(cron, attempt, CronNoteSeverity::Warn, now, message);
         }
         Ok(AttemptState::ClosedLossOrBreakeven { realized_pl }) => {
+            let message = format!(
+                "trade_id={trade_id} believed OPEN, broker shows CLOSED LOSS/BREAKEVEN \
+                 realized_pl={realized_pl} — plan is stale as of {now}"
+            );
             tracing::warn!(
-                "reconcile: plan={} account={} instrument={} trade_id={trade_id} believed OPEN, \
-                 broker shows CLOSED LOSS/BREAKEVEN realized_pl={realized_pl} — plan is stale as \
-                 of {now}",
+                "reconcile: plan={} account={} instrument={} {message}",
                 attempt.trade_id,
                 attempt.account.as_deref().unwrap_or("<global>"),
                 attempt.instrument,
             );
+            note(cron, attempt, CronNoteSeverity::Warn, now, message);
         }
         Ok(AttemptState::OpenPosition { .. }) => {
             // The broker-truth snapshot and the resolver disagree (a race
             // between the two calls, most likely a fill/close that happened
             // in between). Not evidence of anything on its own; log at INFO
-            // and let the next tick settle it.
+            // and let the next tick settle it. No CronNote — not surprising
+            // enough to put in front of the operator, same reasoning as
+            // `reconcile_unresolved`'s silent arms.
             tracing::info!(
                 "reconcile: plan={} account={} instrument={} trade_id={trade_id} was absent \
                  from list_open_positions but lookup_attempt_state still resolves OpenPosition \
@@ -205,14 +241,17 @@ async fn reconcile_one<B: AttemptBroker>(
             );
         }
         Ok(AttemptState::Pending | AttemptState::Cancelled | AttemptState::Unknown) => {
+            let message = format!(
+                "trade_id={trade_id} believed OPEN, broker shows neither open nor a resolvable \
+                 close ({resolved:?}) — plan is stale as of {now}"
+            );
             tracing::warn!(
-                "reconcile: plan={} account={} instrument={} trade_id={trade_id} believed OPEN, \
-                 broker shows neither open nor a resolvable close ({resolved:?}) — plan is stale \
-                 as of {now}",
+                "reconcile: plan={} account={} instrument={} {message}",
                 attempt.trade_id,
                 attempt.account.as_deref().unwrap_or("<global>"),
                 attempt.instrument,
             );
+            note(cron, attempt, CronNoteSeverity::Warn, now, message);
         }
         Err(err) => {
             tracing::error!(
@@ -236,7 +275,8 @@ async fn reconcile_one<B: AttemptBroker>(
 /// never confirmed open and are already visible via the retry gate's own
 /// `prior-attempt-unknown` rejections, so logging them here on every tick
 /// would just be noise.
-async fn reconcile_unresolved<B: AttemptBroker>(
+async fn reconcile_unresolved<C: CronEnv, B: AttemptBroker>(
+    cron: &C,
     broker: &B,
     attempt: &EntryAttempt,
     now: DateTime<Utc>,
@@ -246,30 +286,36 @@ async fn reconcile_unresolved<B: AttemptBroker>(
         .await;
     match resolved {
         Ok(AttemptState::ClosedWin { realized_pl }) => {
+            let message = format!(
+                "order_id={} never had a broker_trade_id snapshotted, broker shows it filled \
+                 and CLOSED WIN realized_pl={realized_pl} — plan is stale as of {now}",
+                attempt.broker_order_id,
+            );
             tracing::warn!(
-                "reconcile: plan={} account={} instrument={} order_id={} never had a \
-                 broker_trade_id snapshotted, broker shows it filled and CLOSED WIN \
-                 realized_pl={realized_pl} — plan is stale as of {now}",
+                "reconcile: plan={} account={} instrument={} {message}",
                 attempt.trade_id,
                 attempt.account.as_deref().unwrap_or("<global>"),
                 attempt.instrument,
-                attempt.broker_order_id,
             );
+            note(cron, attempt, CronNoteSeverity::Warn, now, message);
         }
         Ok(AttemptState::ClosedLossOrBreakeven { realized_pl }) => {
+            let message = format!(
+                "order_id={} never had a broker_trade_id snapshotted, broker shows it filled \
+                 and CLOSED LOSS/BREAKEVEN realized_pl={realized_pl} — plan is stale as of {now}",
+                attempt.broker_order_id,
+            );
             tracing::warn!(
-                "reconcile: plan={} account={} instrument={} order_id={} never had a \
-                 broker_trade_id snapshotted, broker shows it filled and CLOSED LOSS/BREAKEVEN \
-                 realized_pl={realized_pl} — plan is stale as of {now}",
+                "reconcile: plan={} account={} instrument={} {message}",
                 attempt.trade_id,
                 attempt.account.as_deref().unwrap_or("<global>"),
                 attempt.instrument,
-                attempt.broker_order_id,
             );
+            note(cron, attempt, CronNoteSeverity::Warn, now, message);
         }
         // Pending / Cancelled / Unknown / OpenPosition / Err: the ordinary
         // or already-visible cases — see the function doc for why these
-        // deliberately don't log.
+        // deliberately don't log, and therefore don't note either.
         _ => {}
     }
 }
@@ -384,6 +430,38 @@ mod tests {
         }
     }
 
+    /// A `CronEnv` that records every `CronNote` it's given, so a test can
+    /// assert whether `reconcile_one`/`reconcile_unresolved` actually wrote
+    /// one (and what it said) — not just that the function ran without
+    /// panicking. `acquire_broker`/`dispatch_config` panic: `reconcile_one`
+    /// and `reconcile_unresolved` never call either, so a reachable panic
+    /// there is itself a test failure.
+    #[derive(Default)]
+    struct RecordingCronEnv {
+        notes: std::cell::RefCell<Vec<CronNote>>,
+    }
+
+    impl CronEnv for RecordingCronEnv {
+        async fn acquire_broker(&self, _account: Option<&str>) -> Option<BrokerHandle> {
+            panic!("reconcile_one/reconcile_unresolved must never acquire a broker directly")
+        }
+        async fn dispatch_config(
+            &self,
+            _verified: &trade_control_core::incoming::Verified,
+        ) -> trade_control_core::dispatch_config::DispatchConfig {
+            unreachable!("not used by reconcile")
+        }
+        fn record_tick(&self, _bundle: trade_control_core::tick_bundle::TickBundle) {
+            unreachable!("reconcile never evaluates a plan tick")
+        }
+        fn record_cron_note(&self, note: CronNote) {
+            self.notes.borrow_mut().push(note);
+        }
+        fn signing_key(&self) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
     struct StubBroker(Result<AttemptState, LookupError>);
 
     impl AttemptBroker for StubBroker {
@@ -402,8 +480,10 @@ mod tests {
         let attempt = make_attempt("hs-aud-jpy-dd5db625", "AUD_JPY", Some("2495"));
         let open = vec![make_open_position("2495", "AUD_JPY")];
         let broker = StubBroker(Ok(AttemptState::Unknown)); // must never be called
-        pollster::block_on(reconcile_one(&broker, &attempt, &open, Utc::now()));
+        let cron = RecordingCronEnv::default();
+        pollster::block_on(reconcile_one(&cron, &broker, &attempt, &open, Utc::now()));
         // No panic, no broker call needed — the position is in `open`.
+        assert!(cron.notes.borrow().is_empty());
     }
 
     #[test]
@@ -412,14 +492,24 @@ mod tests {
         let broker = StubBroker(Ok(AttemptState::ClosedWin {
             realized_pl: 18369.2245,
         }));
+        let cron = RecordingCronEnv::default();
         // Broker's open-positions snapshot no longer contains 2495 — the
         // exact shape of the incident.
-        pollster::block_on(reconcile_one(&broker, &attempt, &[], Utc::now()));
-        // Behavior is logging-only; this test pins that it does not panic and
-        // reaches the ClosedWin arm (traced via `cargo test -- --nocapture`
-        // during development). A stronger assertion would need a tracing
-        // subscriber capture, deliberately not added here to keep this pass
-        // observation-only and low-ceremony per its explicit scope.
+        pollster::block_on(reconcile_one(&cron, &broker, &attempt, &[], Utc::now()));
+        let notes = cron.notes.borrow();
+        assert_eq!(
+            notes.len(),
+            1,
+            "a closed-win mismatch must write exactly one note"
+        );
+        assert_eq!(notes[0].trade_id, "hs-aud-jpy-dd5db625");
+        assert_eq!(notes[0].source, "reconcile");
+        assert_eq!(notes[0].severity, CronNoteSeverity::Warn);
+        assert!(
+            notes[0].message.contains("18369.2245"),
+            "message must carry the realized P&L: {:?}",
+            notes[0].message
+        );
     }
 
     /// Records whether `lookup_attempt_state` was called, so a test can
@@ -456,12 +546,14 @@ mod tests {
         let attempt = make_attempt("hs-aud-jpy-dd5db625", "AUD_JPY", Some("2495"));
         let open = vec![make_open_position("2495", "AUD_JPY")];
         let broker = CountingBroker::new(Ok(AttemptState::Unknown));
-        pollster::block_on(reconcile_one(&broker, &attempt, &open, Utc::now()));
+        let cron = RecordingCronEnv::default();
+        pollster::block_on(reconcile_one(&cron, &broker, &attempt, &open, Utc::now()));
         assert_eq!(
             broker.calls.get(),
             0,
             "a position still present in list_open_positions must never trigger a lookup"
         );
+        assert!(cron.notes.borrow().is_empty());
     }
 
     /// THE INCIDENT, exactly: an attempt with no `broker_trade_id` ever
@@ -475,12 +567,17 @@ mod tests {
         let broker = CountingBroker::new(Ok(AttemptState::ClosedWin {
             realized_pl: 18369.2245,
         }));
-        pollster::block_on(reconcile_unresolved(&broker, &attempt, Utc::now()));
+        let cron = RecordingCronEnv::default();
+        pollster::block_on(reconcile_unresolved(&cron, &broker, &attempt, Utc::now()));
         assert_eq!(
             broker.calls.get(),
             1,
             "an unresolved attempt must be probed via lookup_attempt_state"
         );
+        let notes = cron.notes.borrow();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].severity, CronNoteSeverity::Warn);
+        assert!(notes[0].message.contains("18369.2245"));
     }
 
     /// The ordinary case — a still-resting order — must be probed (there is
@@ -495,7 +592,12 @@ mod tests {
     fn unresolved_attempt_still_pending_is_probed_but_not_flagged() {
         let attempt = make_attempt("hs-aud-jpy-dd5db625", "AUD_JPY", None);
         let broker = CountingBroker::new(Ok(AttemptState::Pending));
-        pollster::block_on(reconcile_unresolved(&broker, &attempt, Utc::now()));
+        let cron = RecordingCronEnv::default();
+        pollster::block_on(reconcile_unresolved(&cron, &broker, &attempt, Utc::now()));
         assert_eq!(broker.calls.get(), 1);
+        assert!(
+            cron.notes.borrow().is_empty(),
+            "Pending must not write a note — see the function doc for why"
+        );
     }
 }

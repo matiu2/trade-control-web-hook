@@ -3,7 +3,7 @@
 //! (`PgStateStore` + the native broker factory), without the engine logic
 //! forking.
 //!
-//! The engine's `&Env` hid exactly three backend-specific operations:
+//! The engine's `&Env` hid several backend-specific operations:
 //!
 //! 1. **Broker acquisition** — pick a broker for a plan's account. On wasm
 //!    that's the KV account index + `Env` secrets; on native it's the Postgres
@@ -15,8 +15,13 @@
 //! 3. **Tick recording** — write the per-`(tick, plan)` [`TickBundle`] to a
 //!    sink. wasm writes R2; native writes Postgres (Task #6 — a drop stub for
 //!    now).
+//! 4. **Cron-note recording** — write a [`CronNote`], a cron pass's
+//!    observation about a trade that is neither a dispatched-rule firing nor
+//!    an inbound alert (e.g. `reconcile`'s broker-truth mismatches). Same
+//!    fire-and-forget shape as tick recording, a separate method because it's
+//!    a separate event stream (`PlanTimeline::notes`, not `::ticks`).
 //!
-//! Rather than three separate generic params threaded through every engine
+//! Rather than separate generic params threaded through every engine
 //! function, these travel together as one bundled trait, [`CronEnv`]: the
 //! engine took a single `&Env`, so it now takes a single `&impl CronEnv`. The
 //! trait is used **generically** (`<C: CronEnv>`), never as `dyn` — matching
@@ -35,6 +40,7 @@
 
 use trade_control_core::dispatch_config::DispatchConfig;
 use trade_control_core::incoming::Verified;
+use trade_control_core::recording::CronNote;
 use trade_control_core::tick_bundle::TickBundle;
 
 use crate::broker_handle::BrokerHandle;
@@ -67,6 +73,11 @@ pub trait CronEnv {
     /// fail-soft — recording must never break trading. wasm writes R2; native
     /// writes Postgres (Task #6).
     fn record_tick(&self, bundle: TickBundle);
+
+    /// Record one [`CronNote`] — a cron pass's observation about a trade that
+    /// is neither a dispatched-rule firing (`record_tick`) nor an inbound
+    /// alert. Same fire-and-forget, fail-soft contract as `record_tick`.
+    fn record_cron_note(&self, note: CronNote);
 
     /// The HMAC signing key (raw bytes, hex already decoded), or `None` if it
     /// can't be resolved. The spread-blackout restore / cancel jobs re-verify a
