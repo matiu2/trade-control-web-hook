@@ -30,6 +30,7 @@ mod breakeven_watch;
 mod broker_handle;
 mod constants;
 mod engine;
+mod exit_reporting;
 mod order_control_tick;
 mod reconcile;
 mod seam;

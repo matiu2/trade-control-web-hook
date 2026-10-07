@@ -497,6 +497,19 @@ pub trait Broker {
         broker_trade_id: Option<&str>,
     ) -> impl Future<Output = Result<AttemptState, LookupError>>;
 
+    /// Read the broker's actual closing transaction and the TP/SL order it
+    /// filled. None means this broker cannot resolve an exit, never "still
+    /// open" or permission to place. This is reporting only.
+    fn lookup_trade_exit(
+        &self,
+        _instrument: &str,
+        _broker_order_id: &str,
+        _broker_trade_id: Option<&str>,
+    ) -> impl Future<Output = Result<Option<crate::broker_exit::BrokerTradeExit>, LookupError>>
+    {
+        async { Ok(None) }
+    }
+
     /// Cancel a specific pending order by broker id. Used by the
     /// `max_retries` retry gate's "replace pending" branch — when a
     /// new entry message arrives and the previous attempt's stop /

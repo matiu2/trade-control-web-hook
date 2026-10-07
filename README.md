@@ -3758,8 +3758,32 @@ replay; the crucial difference is *where the numbers come from*:
   which bar (from the cron-engine `tick_bundles`), the engine's phase transition
   (from each bundle's `prior_state → new_state`), and the **real dispatch
   outcome** (`dispatch: Ok(entered)   [recorded]` / `rejected:
-  trade-already-open` / …). There is deliberately **no** `order:`/`fill:`/`be:`/
-  `exit:` line — those weren't recorded, so inventing them would be fiction.
+  trade-already-open` / …). Broker-confirmed exits are recorded separately as
+  structured `broker-exit` notes; they are never inferred from replay candles.
+
+`journal-staging` shows a confirmed closure as `✓ hit take profit` or
+`✓ hit stop loss`, at the broker's closure time. Its detail lines include the
+entry order ID, broker trade ID, closing transaction, expected exit trigger,
+actual fill, realised P&L and execution slippage. Positive slippage is an
+adverse cost; negative slippage is a favourable bonus, for either direction.
+OANDA's expected trigger comes from the TP/SL order that actually filled, so a
+stop amendment is not confused with slippage. Cash slippage is quoted in the
+instrument's quote currency (CAD for AUD/CAD); realised P&L retains the
+broker's account currency. Neither includes an invented FX conversion.
+
+Exit notes are durable and unique per account, plan and entry order. Once
+recorded, reconciliation skips that closed attempt, and the journal replaces
+its old repeated stale warnings with the exit event. The original warning rows
+remain in the audit history. Entry attempts remain in the retry ledger and a
+multi-shot plan continues watching for new signals. Recording or broker errors
+are retried without changing trading state.
+
+Missing broker details remain unavailable. Manual exits are labelled as broker
+closes, and a profitable stop is still labelled as a stop. OANDA trades with
+multiple partial exits do not compare an average exit against the final stop.
+TradeNation closes are matched by the exact PositionID in activity history;
+when that history supplies no explicit TP/SL reason or attributable P&L, the
+journal reports the closure and fill without guessing those fields.
 
 The engine leg is load-bearing: since the move to the cron engine a veto or
 enter usually fires on a `*/15` tick, **not** an inbound POST — so the fire

@@ -155,4 +155,29 @@ impl CronEnv for NativeCronEnv {
         // wasm side, so clone the bytes.
         Some(self.state.signing_key.clone())
     }
+
+    async fn broker_exit_recorded(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        broker_order_id: &str,
+    ) -> Result<bool, String> {
+        crate::recording_pg::broker_exit_recorded(
+            self.state.store.pool(),
+            account,
+            trade_id,
+            broker_order_id,
+        )
+        .await
+        .map_err(|err| err.to_string())
+    }
+
+    async fn record_broker_exit(
+        &self,
+        note: trade_control_core::recording::CronNote,
+    ) -> Result<(), String> {
+        crate::recording_pg::record_cron_note(self.state.store.pool(), &note)
+            .await
+            .map_err(|err| err.to_string())
+    }
 }

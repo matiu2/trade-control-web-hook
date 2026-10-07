@@ -1,59 +1,19 @@
-//! Broker-truth reconciliation — catches a plan whose OWN records believe a
-//! position is still open when the broker no longer shows it.
+//! Reconcile attempts against broker truth and journal confirmed exits once.
 //!
-//! Every other cron pass (`sweep`, `breakeven_watch`, `blackout_apply`,
-//! `order_control_tick`) reaches the broker only *via* a resolvable
-//! [`EntryAttempt`] row — they walk attempts, join to a broker position, and
-//! act. None of them ever asks the broker "what is actually open right now,
-//! independent of what we think we know" and compares that against what our
-//! own attempts believe. A plan whose attempt never resolved cleanly (see
-//! `BUG-oanda-order-trade-id-bridge`, fixed in `broker-oanda`, or any future
-//! case where `lookup_attempt_state` still can't settle it) is invisible to
-//! every one of them — it just keeps ticking its rules (pause/news/veto)
-//! against a position that may have closed hours ago.
+//! A snapshotted broker trade ID is a historical link, not evidence that a
+//! position is still open. Missing open positions are resolved against closing
+//! transactions. A confirmed close becomes a durable broker-exit note with the
+//! broker's exit reason, timestamp, trigger and actual execution price. Once
+//! that note is stored the attempt is skipped, including after a restart.
 //!
-//! # Incident
+//! Attempts without a snapshotted trade ID are still probed: an order may have
+//! filled and closed between observations. The broker resolves order and trade
+//! IDs independently. Unknown outcomes remain warnings, never inferred closes.
 //!
-//! Plan `hs-aud-jpy-dd5db625` (2026-09-30): a filled order's trade id
-//! differed from the order id (the bridging bug), the retry gate correctly
-//! failed safe (`prior-attempt-unknown`), and the plan sat ticking for over
-//! 2 hours against a position that had already hit TP and closed at the
-//! broker, +18369.22 AUD, with the account fully flat the whole time.
-//!
-//! # What this pass does — and deliberately does NOT do
-//!
-//! Two groups of attempts, two checks:
-//!
-//! 1. **Tracked** — [`EntryAttempt`]s carrying a snapshotted
-//!    `broker_trade_id` (the attempt reached an open position at some
-//!    point). Fetch the broker's current open positions and check: is that
-//!    trade id still among them? If not, resolve via
-//!    [`Broker::lookup_attempt_state`] and log the mismatch with full detail
-//!    (closed win/loss and realized P&L when resolvable).
-//! 2. **Unresolved** — attempts with **no** `broker_trade_id` at all. This is
-//!    the normal shape of a still-resting order, but it is *also* the exact
-//!    shape the incident's own row was left in: the bridging bug meant
-//!    `broker_trade_id` was never captured even though the order filled and
-//!    later closed, and once its `05-enter` window expires nothing ever
-//!    re-probes it again — a plan can sit stuck in `await_entry` for the
-//!    rest of its `expires_at` life with no trigger left that would notice
-//!    (`trade-expiry` is the only remaining exit, and that can be a day or
-//!    more away). For these, call `lookup_attempt_state(order_id, None)`
-//!    directly and log **only** the surprising outcomes —
-//!    `ClosedWin`/`ClosedLossOrBreakeven` (it secretly filled and closed) —
-//!    since `Pending`/`Cancelled`/`Unknown` are the ordinary, already-visible
-//!    states for an attempt that was never confirmed open and logging those
-//!    every tick would just be noise on top of what the retry gate already
-//!    reports.
-//!
-//! This pass is **observation-only**. It does not close positions, does not
-//! cancel orders, does not mark a plan `Done`, and does not touch
-//! `EntryAttempt` or plan state at all. Per the operator (2026-09-30): watch
-//! behavior on the demo account first before deciding whether/how to
-//! auto-retire a plan. Fail-soft per account (logs + skips), same discipline
-//! as every other pass in this crate — a broker error here must never affect
-//! the real trading path, which is why it runs on its own cron interval,
-//! entirely independent of the engine tick, sweep, and breakeven watch.
+//! This is reporting only. Attempts remain in the retry ledger, plan state is
+//! untouched, and no orders are cancelled or placed. A multi-shot plan already
+//! watches for its next signal; closure reporting does not re-arm or retire it.
+//! Broker and recording failures are retried independently of the trading path.
 
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{AttemptState, LookupError, OpenPosition};
@@ -61,6 +21,7 @@ use trade_control_core::recording::{CronNote, CronNoteSeverity};
 use trade_control_core::state::{EntryAttempt, StateStore};
 
 use crate::broker_handle::BrokerHandle;
+use crate::exit_reporting;
 use crate::seam::CronEnv;
 
 /// Who wrote this note, for `CronNote::source` — matched 1:1 against calls to
@@ -85,6 +46,7 @@ fn note<C: CronEnv>(
         source: SOURCE.to_string(),
         severity,
         message,
+        broker_exit: None,
     });
 }
 
@@ -105,6 +67,16 @@ where
             return;
         }
     };
+    // A trade ID is a historical link, not a belief that the position is
+    // still open. Confirmed exits remain in the retry ledger, but no longer
+    // require broker calls or stale-plan warnings.
+    let mut unreported = Vec::new();
+    for attempt in attempts {
+        if !exit_reporting::already_recorded(cron, &attempt).await {
+            unreported.push(attempt);
+        }
+    }
+    let attempts = unreported;
     let tracked: Vec<&EntryAttempt> = attempts
         .iter()
         .filter(|a| a.broker_trade_id.is_some())
@@ -183,12 +155,36 @@ async fn reconcile_one<C: CronEnv, B: AttemptBroker>(
     open_positions: &[OpenPosition],
     now: DateTime<Utc>,
 ) {
+    if exit_reporting::already_recorded(cron, attempt).await {
+        return;
+    }
     let Some(trade_id) = attempt.broker_trade_id.as_deref() else {
         return;
     };
     if open_positions.iter().any(|p| p.position_id == trade_id) {
         // Still open per the broker — nothing to reconcile.
         return;
+    }
+    match broker
+        .lookup_trade_exit(
+            &attempt.instrument,
+            &attempt.broker_order_id,
+            Some(trade_id),
+        )
+        .await
+    {
+        Ok(Some(execution)) => {
+            exit_reporting::record(cron, attempt, execution, now).await;
+            return;
+        }
+        Err(err) => {
+            tracing::error!(
+                "reconcile: plan={} closing transaction lookup failed: {err:?}; will retry",
+                attempt.trade_id
+            );
+            return;
+        }
+        Ok(None) => {}
     }
     let resolved = broker
         .lookup_attempt_state(
@@ -198,31 +194,17 @@ async fn reconcile_one<C: CronEnv, B: AttemptBroker>(
         )
         .await;
     match resolved {
-        Ok(AttemptState::ClosedWin { realized_pl }) => {
-            let message = format!(
-                "trade_id={trade_id} believed OPEN, broker shows CLOSED WIN \
-                 realized_pl={realized_pl} — plan is stale as of {now}"
-            );
-            tracing::warn!(
-                "reconcile: plan={} account={} instrument={} {message}",
-                attempt.trade_id,
-                attempt.account.as_deref().unwrap_or("<global>"),
-                attempt.instrument,
-            );
-            note(cron, attempt, CronNoteSeverity::Warn, now, message);
-        }
-        Ok(AttemptState::ClosedLossOrBreakeven { realized_pl }) => {
-            let message = format!(
-                "trade_id={trade_id} believed OPEN, broker shows CLOSED LOSS/BREAKEVEN \
-                 realized_pl={realized_pl} — plan is stale as of {now}"
-            );
-            tracing::warn!(
-                "reconcile: plan={} account={} instrument={} {message}",
-                attempt.trade_id,
-                attempt.account.as_deref().unwrap_or("<global>"),
-                attempt.instrument,
-            );
-            note(cron, attempt, CronNoteSeverity::Warn, now, message);
+        Ok(
+            AttemptState::ClosedWin { realized_pl }
+            | AttemptState::ClosedLossOrBreakeven { realized_pl },
+        ) => {
+            exit_reporting::record(
+                cron,
+                attempt,
+                exit_reporting::without_details(attempt, realized_pl),
+                now,
+            )
+            .await;
         }
         Ok(AttemptState::OpenPosition { .. }) => {
             // The broker-truth snapshot and the resolver disagree (a race
@@ -281,42 +263,36 @@ async fn reconcile_unresolved<C: CronEnv, B: AttemptBroker>(
     attempt: &EntryAttempt,
     now: DateTime<Utc>,
 ) {
+    if exit_reporting::already_recorded(cron, attempt).await {
+        return;
+    }
     let resolved = broker
         .lookup_attempt_state(&attempt.instrument, &attempt.broker_order_id, None)
         .await;
-    match resolved {
-        Ok(AttemptState::ClosedWin { realized_pl }) => {
-            let message = format!(
-                "order_id={} never had a broker_trade_id snapshotted, broker shows it filled \
-                 and CLOSED WIN realized_pl={realized_pl} — plan is stale as of {now}",
-                attempt.broker_order_id,
-            );
-            tracing::warn!(
-                "reconcile: plan={} account={} instrument={} {message}",
-                attempt.trade_id,
-                attempt.account.as_deref().unwrap_or("<global>"),
-                attempt.instrument,
-            );
-            note(cron, attempt, CronNoteSeverity::Warn, now, message);
+    if let Ok(
+        AttemptState::ClosedWin { realized_pl }
+        | AttemptState::ClosedLossOrBreakeven { realized_pl },
+    ) = resolved
+    {
+        match broker
+            .lookup_trade_exit(&attempt.instrument, &attempt.broker_order_id, None)
+            .await
+        {
+            Ok(execution) => {
+                exit_reporting::record(
+                    cron,
+                    attempt,
+                    execution
+                        .unwrap_or_else(|| exit_reporting::without_details(attempt, realized_pl)),
+                    now,
+                )
+                .await
+            }
+            Err(err) => tracing::error!(
+                "reconcile: plan={} closing transaction lookup failed: {err:?}; will retry",
+                attempt.trade_id
+            ),
         }
-        Ok(AttemptState::ClosedLossOrBreakeven { realized_pl }) => {
-            let message = format!(
-                "order_id={} never had a broker_trade_id snapshotted, broker shows it filled \
-                 and CLOSED LOSS/BREAKEVEN realized_pl={realized_pl} — plan is stale as of {now}",
-                attempt.broker_order_id,
-            );
-            tracing::warn!(
-                "reconcile: plan={} account={} instrument={} {message}",
-                attempt.trade_id,
-                attempt.account.as_deref().unwrap_or("<global>"),
-                attempt.instrument,
-            );
-            note(cron, attempt, CronNoteSeverity::Warn, now, message);
-        }
-        // Pending / Cancelled / Unknown / OpenPosition / Err: the ordinary
-        // or already-visible cases — see the function doc for why these
-        // deliberately don't log, and therefore don't note either.
-        _ => {}
     }
 }
 
@@ -325,6 +301,15 @@ async fn reconcile_unresolved<C: CronEnv, B: AttemptBroker>(
 /// `PositionBroker`.
 #[allow(async_fn_in_trait)]
 trait AttemptBroker {
+    async fn lookup_trade_exit(
+        &self,
+        _instrument: &str,
+        _broker_order_id: &str,
+        _broker_trade_id: Option<&str>,
+    ) -> Result<Option<trade_control_core::broker_exit::BrokerTradeExit>, LookupError> {
+        Ok(None)
+    }
+
     async fn lookup_attempt_state(
         &self,
         instrument: &str,
@@ -334,6 +319,29 @@ trait AttemptBroker {
 }
 
 impl AttemptBroker for BrokerHandle {
+    async fn lookup_trade_exit(
+        &self,
+        instrument: &str,
+        broker_order_id: &str,
+        broker_trade_id: Option<&str>,
+    ) -> Result<Option<trade_control_core::broker_exit::BrokerTradeExit>, LookupError> {
+        use trade_control_core::broker::Broker;
+        match self {
+            BrokerHandle::Oanda(b) => {
+                b.lookup_trade_exit(instrument, broker_order_id, broker_trade_id)
+                    .await
+            }
+            BrokerHandle::TradeNation(b) => {
+                b.lookup_trade_exit(instrument, broker_order_id, broker_trade_id)
+                    .await
+            }
+            BrokerHandle::Ibkr(b) => {
+                b.lookup_trade_exit(instrument, broker_order_id, broker_trade_id)
+                    .await
+            }
+        }
+    }
+
     async fn lookup_attempt_state(
         &self,
         instrument: &str,
@@ -439,6 +447,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingCronEnv {
         notes: std::cell::RefCell<Vec<CronNote>>,
+        fail_writes: std::cell::Cell<bool>,
     }
 
     impl CronEnv for RecordingCronEnv {
@@ -456,6 +465,27 @@ mod tests {
         }
         fn record_cron_note(&self, note: CronNote) {
             self.notes.borrow_mut().push(note);
+        }
+        async fn broker_exit_recorded(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            order_id: &str,
+        ) -> Result<bool, String> {
+            Ok(self.notes.borrow().iter().any(|n| {
+                n.account.as_deref() == account
+                    && n.trade_id == trade_id
+                    && n.broker_exit
+                        .as_ref()
+                        .is_some_and(|e| e.broker_order_id == order_id)
+            }))
+        }
+        async fn record_broker_exit(&self, note: CronNote) -> Result<(), String> {
+            if self.fail_writes.get() {
+                return Err("database unavailable".into());
+            }
+            self.record_cron_note(note);
+            Ok(())
         }
         fn signing_key(&self) -> Option<Vec<u8>> {
             None
@@ -503,12 +533,11 @@ mod tests {
             "a closed-win mismatch must write exactly one note"
         );
         assert_eq!(notes[0].trade_id, "hs-aud-jpy-dd5db625");
-        assert_eq!(notes[0].source, "reconcile");
-        assert_eq!(notes[0].severity, CronNoteSeverity::Warn);
-        assert!(
-            notes[0].message.contains("18369.2245"),
-            "message must carry the realized P&L: {:?}",
-            notes[0].message
+        assert_eq!(notes[0].source, "broker-exit");
+        assert_eq!(notes[0].severity, CronNoteSeverity::Info);
+        assert_eq!(
+            notes[0].broker_exit.as_ref().unwrap().execution.realized_pl,
+            Some(18369.2245)
         );
     }
 
@@ -576,8 +605,11 @@ mod tests {
         );
         let notes = cron.notes.borrow();
         assert_eq!(notes.len(), 1);
-        assert_eq!(notes[0].severity, CronNoteSeverity::Warn);
-        assert!(notes[0].message.contains("18369.2245"));
+        assert_eq!(notes[0].severity, CronNoteSeverity::Info);
+        assert_eq!(
+            notes[0].broker_exit.as_ref().unwrap().execution.realized_pl,
+            Some(18369.2245)
+        );
     }
 
     /// The ordinary case — a still-resting order — must be probed (there is
@@ -599,5 +631,132 @@ mod tests {
             cron.notes.borrow().is_empty(),
             "Pending must not write a note — see the function doc for why"
         );
+    }
+
+    struct ExitBroker {
+        exit: Result<Option<trade_control_core::broker_exit::BrokerTradeExit>, LookupError>,
+        calls: std::cell::Cell<u32>,
+    }
+
+    impl AttemptBroker for ExitBroker {
+        async fn lookup_attempt_state(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<AttemptState, LookupError> {
+            panic!("a confirmed exit should not require another state lookup")
+        }
+        async fn lookup_trade_exit(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<Option<trade_control_core::broker_exit::BrokerTradeExit>, LookupError> {
+            self.calls.set(self.calls.get() + 1);
+            self.exit.clone()
+        }
+    }
+
+    fn exit_broker() -> ExitBroker {
+        let mut execution = exit_reporting::without_details(
+            &make_attempt("live", "AUD_CAD", Some("2526")),
+            -6169.1689,
+        );
+        execution.closed_at = Some(ts("2026-10-07T17:10:00Z"));
+        execution.reason = trade_control_core::broker_exit::ExitReason::StopLoss;
+        execution.expected_price = Some(0.99324);
+        execution.exit_price = Some(0.99308);
+        ExitBroker {
+            exit: Ok(Some(execution)),
+            calls: std::cell::Cell::new(0),
+        }
+    }
+
+    #[test]
+    fn closure_is_recorded_at_broker_time_and_never_reprobed() {
+        let mut attempt = make_attempt("live", "AUD_CAD", Some("2526"));
+        attempt.broker_order_id = "2525".into();
+        attempt.pip_size = Some(0.0001);
+        let broker = exit_broker();
+        let cron = RecordingCronEnv::default();
+        for _ in 0..3 {
+            pollster::block_on(reconcile_one(&cron, &broker, &attempt, &[], Utc::now()));
+        }
+        assert_eq!(broker.calls.get(), 1);
+        let notes = cron.notes.borrow();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].ts, "2026-10-07T17:10:00+00:00");
+        assert_eq!(notes[0].severity, CronNoteSeverity::Info);
+        assert!(notes[0].message.contains("hit stop loss"));
+        assert!(notes[0].message.contains("-1.60 pips"));
+        assert!(!notes[0].message.contains("stale"));
+    }
+
+    #[test]
+    fn failed_exit_write_is_retried_without_losing_the_event() {
+        let attempt = make_attempt("live", "AUD_CAD", Some("2526"));
+        let broker = exit_broker();
+        let cron = RecordingCronEnv::default();
+        cron.fail_writes.set(true);
+        pollster::block_on(reconcile_one(&cron, &broker, &attempt, &[], Utc::now()));
+        assert!(cron.notes.borrow().is_empty());
+        cron.fail_writes.set(false);
+        pollster::block_on(reconcile_one(&cron, &broker, &attempt, &[], Utc::now()));
+        assert_eq!(broker.calls.get(), 2);
+        assert_eq!(cron.notes.borrow().len(), 1);
+    }
+
+    #[test]
+    fn next_entry_order_still_gets_its_own_exit_event() {
+        let mut attempt = make_attempt("live", "AUD_CAD", Some("2526"));
+        let broker = exit_broker();
+        let cron = RecordingCronEnv::default();
+        pollster::block_on(reconcile_one(&cron, &broker, &attempt, &[], Utc::now()));
+        attempt.attempt_no = 2;
+        attempt.broker_order_id = "next-order".into();
+        pollster::block_on(reconcile_one(&cron, &broker, &attempt, &[], Utc::now()));
+        assert_eq!(broker.calls.get(), 2);
+        assert_eq!(cron.notes.borrow().len(), 2);
+    }
+
+    #[test]
+    fn failed_broker_exit_lookup_is_not_recorded_as_a_closure() {
+        let attempt = make_attempt("live", "AUD_CAD", Some("2526"));
+        let broker = ExitBroker {
+            exit: Err(LookupError::Transient),
+            calls: std::cell::Cell::new(0),
+        };
+        let cron = RecordingCronEnv::default();
+        pollster::block_on(reconcile_one(&cron, &broker, &attempt, &[], Utc::now()));
+        assert!(cron.notes.borrow().is_empty());
+    }
+
+    #[test]
+    fn unknown_trade_is_still_warned_rather_than_claimed_closed() {
+        let attempt = make_attempt("live", "AUD_CAD", Some("2526"));
+        let broker = CountingBroker::new(Ok(AttemptState::Unknown));
+        let cron = RecordingCronEnv::default();
+        pollster::block_on(reconcile_one(&cron, &broker, &attempt, &[], Utc::now()));
+        let notes = cron.notes.borrow();
+        assert_eq!(notes[0].severity, CronNoteSeverity::Warn);
+        assert!(notes[0].broker_exit.is_none());
+    }
+
+    #[test]
+    fn reported_attempt_stays_in_retry_ledger_and_needs_no_broker_acquisition() {
+        let attempt = make_attempt("live", "AUD_CAD", Some("2526"));
+        let cron = RecordingCronEnv::default();
+        let store = trade_control_core::state::MemStateStore::new();
+        pollster::block_on(async {
+            store.record_entry_attempt(attempt.clone()).await.unwrap();
+            reconcile_one(&cron, &exit_broker(), &attempt, &[], Utc::now()).await;
+            reconcile(&store, &cron, Utc::now()).await;
+            assert_eq!(
+                store.list_all_entry_attempts().await.unwrap(),
+                vec![attempt]
+            );
+        });
+        assert_eq!(cron.notes.borrow().len(), 1);
     }
 }

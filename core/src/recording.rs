@@ -176,6 +176,9 @@ pub struct CronNote {
     /// `DispatchOutcome::outcome`'s precedent (`core`'s default build keeps
     /// `serde_json` out entirely; see its `Cargo.toml` feature comment).
     pub message: String,
+    /// Broker-confirmed closure, recorded once per originating entry order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_exit: Option<crate::broker_exit::BrokerExit>,
 }
 
 /// Mint a short request id. We have no RNG in the wasm worker
@@ -321,6 +324,7 @@ mod tests {
             source: "reconcile".into(),
             severity: CronNoteSeverity::Warn,
             message: "believed OPEN, broker shows CLOSED WIN realized_pl=18369.2245".into(),
+            broker_exit: None,
         };
         let json = serde_json::to_string(&note).unwrap();
         let back: CronNote = serde_json::from_str(&json).unwrap();

@@ -60,6 +60,25 @@ pub async fn record_request(
     .map(|_| ())
 }
 
+/// Stop re-probing a closed attempt only after its exit note is durably stored.
+pub async fn broker_exit_recorded(
+    pool: &sqlx::PgPool,
+    account: Option<&str>,
+    trade_id: &str,
+    broker_order_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM cron_notes
+         WHERE account IS NOT DISTINCT FROM $1 AND correlation_id = $2
+         AND body->'broker_exit'->>'broker_order_id' = $3)",
+    )
+    .bind(account)
+    .bind(trade_id)
+    .bind(broker_order_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Read every [`RequestRecord`] for one trade, oldest first — the read side of
 /// [`record_request`], used by the `plan timeline` reconstruction.
 ///
@@ -175,7 +194,7 @@ pub async fn record_cron_note(pool: &sqlx::PgPool, note: &CronNote) -> Result<()
     sqlx::query(
         "INSERT INTO cron_notes \
          (ts, correlation_id, account, source, severity, message, body) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
     )
     .bind(ts)
     .bind(&note.trade_id)

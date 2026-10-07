@@ -25,14 +25,20 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 events
                     .iter()
                     .map(|e| {
-                        let marker_style = if e.marker == '•' {
+                        let marker_style = if e.marker == '✓' {
+                            Style::default().fg(Color::Green)
+                        } else if e.marker == '•' {
                             Style::default().fg(Color::Yellow)
                         } else {
                             Style::default().fg(Color::Cyan)
                         };
                         ListItem::new(Line::from(vec![
                             Span::styled(
-                                format!("{} ", e.ts),
+                                if e.marker == ' ' {
+                                    "                 ".to_string()
+                                } else {
+                                    format!("{} ", e.ts)
+                                },
                                 Style::default().fg(Color::DarkGray),
                             ),
                             Span::styled(format!("{} ", e.marker), marker_style),
