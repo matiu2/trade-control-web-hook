@@ -50,9 +50,9 @@ cut a fresh `staging` from `main` carrying the week's accumulated changes.
 | part | version | deployed (Brisbane) | notes |
 |---|---|---|---|
 | pine | `v2.5` (study title `Candle Signals v25`) | — | manual republish; sends `open` for M/W body logic. `tv-arm-dev` bakes this study title (`ENV_PINE_NAME`) — rename the chart study to match. |
-| tv-arm | `v148-41-g75dd82a6` | 2026-10-07 14:34 | installed as `tv-arm-dev`; `--spec-in` and `--spec-url` now imply `--new-tv` for replay output. URL specs use their source origin; file specs default to port 8790. Explicit `--new-tv` overrides are preserved. |
-| trade-control | `v148-41-g75dd82a6` | 2026-10-07 14:34 | installed as `trade-control-dev` with `http://127.0.0.1:8787` baked in. The deployment also rebuilt and installed the matching `tv-news`, `replay-candles`, and `journal` CLIs and the shared worker operator tools. |
-| backend | `main` @ `75dd82a6` | 2026-10-07 14:34 | rebuilt and installed `trade-control-worker-dev`; the matching systemd user service restarted successfully and is active. `GET /health` on port 8787 returned HTTP 200. Both environments carry identical source code for this deploy. No worker code or wire-format change in this fix. |
+| tv-arm | `v148-47-g47183b36` | 2026-10-08 09:47 | installed as `tv-arm-dev`; built from the merged broker-exit reporting revision. |
+| trade-control | `v148-47-g47183b36` | 2026-10-08 09:47 | installed as `trade-control-dev` with `http://127.0.0.1:8787` baked in. Matching `tv-news`, `replay-candles`, `journal`, and shared worker operator tools rebuilt and installed. `journal-dev` displays broker-confirmed exit reasons and signed exit slippage. |
+| backend | `main` @ `47183b36` | 2026-10-08 09:47 | rebuilt and installed `trade-control-worker-dev`; service active and `GET /health` returned HTTP 200. Migration 7 applied. Broker exits recorded once per account/plan/entry order; later reconcile passes skip reported exits. |
 | contract | `v3` | — | unchanged by v24/v25 (`open` is optional) |
 
 ### staging
@@ -60,9 +60,9 @@ cut a fresh `staging` from `main` carrying the week's accumulated changes.
 | part | version | deployed (Brisbane) | notes |
 |---|---|---|---|
 | pine | `v2.4` (study title `Candle Signals v24`) | — | pinned to the pre-`open` version; chart **unchanged** this deploy. v25 worker degrades gracefully when `open` is absent (rides baked geometry). `tv-arm-staging` bakes this study title. |
-| tv-arm | `v148-42-g00dc4ede` | 2026-10-07 14:35 | installed as `tv-arm-staging`; `--spec-in` and `--spec-url` now imply `--new-tv` for replay output. URL specs use their source origin; file specs default to port 8790. Explicit `--new-tv` overrides are preserved. |
-| trade-control | `v148-42-g00dc4ede` | 2026-10-07 14:35 | installed as `trade-control-staging` with `http://127.0.0.1:8788` baked in. The deployment also rebuilt and installed the matching `tv-news`, `replay-candles`, and `journal` CLIs and the shared worker operator tools. |
-| backend | `staging` @ `00dc4ede` | 2026-10-07 14:35 | rebuilt and installed `trade-control-worker-staging`; the matching systemd user service restarted successfully and is active. `GET /health` on port 8788 returned HTTP 200. Both environments carry identical source code for this deploy. No worker code or wire-format change in this fix. |
+| tv-arm | `v148-47-g47183b36` | 2026-10-08 09:48 | installed as `tv-arm-staging`; built from the same merged revision as dev. |
+| trade-control | `v148-47-g47183b36` | 2026-10-08 09:48 | installed as `trade-control-staging` with `http://127.0.0.1:8788` baked in. Matching `tv-news`, `replay-candles`, `journal`, and shared worker operator tools rebuilt and installed. `journal-staging` displays broker-confirmed exit reasons and signed exit slippage. |
+| backend | `staging` @ `47183b36` | 2026-10-08 09:48 | rebuilt and installed `trade-control-worker-staging`; service active and `GET /health` returned HTTP 200. Migration 7 applied. Verified one stop-loss report for order 2525 / trade 2526, no later reconcile warnings by insertion order, and the plan still in `await_entry`. |
 | contract | `v3` | — | unchanged by v23 (recording is observe-only) |
 
 ### prod
