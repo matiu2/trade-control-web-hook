@@ -34,6 +34,9 @@
 //! on the chart, and the arm cursor comes from `--start` / the spec, never
 //! from where the operator happened to be looking.
 //!
+//! `from` and `to` carry the visible time range, including zoom. They survive
+//! conversion so off-screen position tools cannot hijack the intended export.
+//!
 //! ## `mode` — which spec, decided by the subcommand
 //!
 //! `/arm-setup` requires `mode=register` or `mode=replay` and answers a 400
@@ -143,8 +146,7 @@ impl SpecMode {
 /// none; one naming a different mode is an error. Anything else keeps the
 /// scheme, host and port, takes the path to `/arm-setup`, and keeps only the
 /// chart-identity params (see [`IDENTITY_PARAMS`]) in that fixed order, then
-/// `mode` — so the same chart always produces the same URL regardless of how
-/// the browser happened to order them.
+/// the explicit viewport and `mode`.
 pub fn normalise(raw: &str, mode: SpecMode) -> Result<String> {
     let parsed = Url::parse(raw).wrap_err_with(|| format!("--spec-url {raw:?} is not a URL"))?;
     if parsed.path() == ARM_SETUP_PATH {
@@ -163,14 +165,16 @@ pub fn normalise(raw: &str, mode: SpecMode) -> Result<String> {
 
     let mut converted = parsed.clone();
     converted.set_path(ARM_SETUP_PATH);
-    // Replace the query wholesale rather than removing `goto` by name: an
-    // allow-list means a param local-chart adds later cannot leak into an arm
-    // URL and change what is fetched.
+    // Preserve the explicit viewport, not a guessed window around `goto`.
+    let viewport = parsed
+        .query_pairs()
+        .filter(|(key, _)| matches!(key.as_ref(), "from" | "to"));
     converted.set_fragment(None);
     converted
         .query_pairs_mut()
         .clear()
         .extend_pairs(identity)
+        .extend_pairs(viewport)
         .append_pair(MODE_PARAM, mode.as_param());
     Ok(converted.to_string())
 }
