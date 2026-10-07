@@ -118,6 +118,13 @@ pub fn parse_events(json: &str) -> Vec<Event> {
     // a key in the JSON, and the loop below simply doesn't run.
     if let Some(notes) = v.get("notes").and_then(|n| n.as_array()) {
         for note in notes {
+            if superseded_reconcile_warning(note, notes) {
+                continue;
+            }
+            if let Some(exit_events) = broker_exit_events(note) {
+                events.extend(exit_events);
+                continue;
+            }
             let ts = note.get("ts").and_then(|x| x.as_str()).unwrap_or("");
             let source = note.get("source").and_then(|x| x.as_str()).unwrap_or("?");
             let severity = note
@@ -135,6 +142,54 @@ pub fn parse_events(json: &str) -> Vec<Event> {
 
     events.sort_by(|a, b| a.ts.cmp(&b.ts));
     events
+}
+
+/// Display one broker event with readable detail lines, rather than burying
+/// the exit in the generic warning stream or clipping a single long line.
+fn broker_exit_events(note: &Value) -> Option<Vec<Event>> {
+    let exit: trade_control_core::broker_exit::BrokerExit =
+        serde_json::from_value(note.get("broker_exit")?.clone()).ok()?;
+    let ts = ts_to_bne(note.get("ts")?.as_str()?);
+    Some(
+        exit.summary_lines()
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| Event {
+                ts: ts.clone(),
+                marker: if i == 0 { '✓' } else { ' ' },
+                text,
+            })
+            .collect(),
+    )
+}
+
+/// The old reconciler repeatedly mislabelled a retained closed attempt as
+/// stale. Preserve the raw audit notes, but replace that obsolete display
+/// noise with the broker-confirmed exit for the exact same order/trade.
+fn superseded_reconcile_warning(note: &Value, notes: &[Value]) -> bool {
+    if note.get("source").and_then(Value::as_str) != Some("reconcile") {
+        return false;
+    }
+    let message = note
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !message.contains("broker shows CLOSED") && !message.contains("and CLOSED") {
+        return false;
+    }
+    let reference = message.split_whitespace().next().unwrap_or_default();
+    notes
+        .iter()
+        .filter_map(|n| n.get("broker_exit"))
+        .any(|exit| {
+            let order = exit.get("broker_order_id").and_then(Value::as_str);
+            let trade = exit
+                .get("execution")
+                .and_then(|e| e.get("broker_trade_id"))
+                .and_then(Value::as_str);
+            order.is_some_and(|id| reference == format!("order_id={id}"))
+                || trade.is_some_and(|id| reference == format!("trade_id={id}"))
+        })
 }
 
 /// Render the broker's settlement, if the plan has been archived with one, as
@@ -346,6 +401,42 @@ pub fn derive_outcome(json: &str) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confirmed_broker_exit_replaces_only_its_obsolete_warnings() {
+        let json = serde_json::json!({"notes": [
+            {"ts":"2026-10-07T17:20:00Z", "source":"reconcile", "message":"trade_id=2526 believed OPEN, broker shows CLOSED LOSS/BREAKEVEN realized_pl=-6169"},
+            {"ts":"2026-10-07T17:35:00Z", "source":"reconcile", "message":"trade_id=25260 believed OPEN, broker shows CLOSED LOSS/BREAKEVEN realized_pl=-20"},
+            {"ts":"2026-10-07T17:40:00Z", "source":"reconcile", "message":"trade_id=2526 believed OPEN, broker shows neither open nor a resolvable close"},
+            {"ts":"2026-10-07T17:10:00Z", "source":"broker-exit", "broker_exit": {
+                "broker_order_id":"2525", "attempt_no":1, "direction":"short", "pip_size":0.0001,
+                "execution": {"broker_trade_id":"2526", "closed_at":"2026-10-07T17:10:00Z",
+                    "reason":"stop_loss", "exit_price":0.99308, "expected_price":0.99324,
+                    "realized_pl":-6169.1689, "account_currency":"AUD", "units":2416783, "quote_currency":"CAD"}
+            }}
+        ]});
+        let events = parse_events(&json.to_string());
+        assert_eq!(events[0].ts, "2026-10-08 03:10");
+        assert_eq!(events[0].marker, '✓');
+        assert!(events[0].text.contains("hit stop loss"));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.text.contains("-1.60 pips") && e.text.contains("bonus"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.text.contains("25260 believed OPEN"))
+        );
+        assert!(events.iter().any(|e| e.text.contains("neither open")));
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.text.contains("2526 believed OPEN, broker shows CLOSED"))
+        );
+        assert!(events[1].text.contains("order=2525 trade=2526"));
+    }
 
     const TIMELINE: &str = include_str!("../tests/fixtures/plan_timeline.json");
 

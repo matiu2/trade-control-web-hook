@@ -14,6 +14,109 @@ use trade_control_core::recording::RequestRecord;
 use trade_control_core::tick_bundle::TickBundle;
 use trade_control_worker::PgStateStore;
 
+#[tokio::test]
+async fn broker_exit_is_durable_and_unique_per_account_plan_and_entry_order() {
+    use trade_control_core::broker_exit::{BrokerExit, BrokerTradeExit, ExitReason};
+    use trade_control_core::intent::Direction;
+    use trade_control_core::recording::{CronNote, CronNoteSeverity};
+    use trade_control_worker::recording_pg::{
+        broker_exit_recorded, cron_notes_for_trade, record_cron_note,
+    };
+
+    let store = store().await;
+    let trade_id = format!(
+        "test-broker-exit-{}",
+        Utc::now().timestamp_nanos_opt().unwrap()
+    );
+    let execution = BrokerTradeExit {
+        broker_trade_id: "2526".into(),
+        exit_order_id: Some("2528".into()),
+        transaction_id: Some("2540".into()),
+        closed_at: Some("2026-10-07T17:10:00Z".parse().unwrap()),
+        reason: ExitReason::StopLoss,
+        broker_reason: Some("STOP_LOSS_ORDER".into()),
+        entry_price: Some(0.99078),
+        exit_price: Some(0.99308),
+        expected_price: Some(0.99324),
+        realized_pl: Some(-6169.1689),
+        account_currency: Some("AUD".into()),
+        units: Some(2416783.0),
+        quote_currency: Some("CAD".into()),
+    };
+    let exit = BrokerExit {
+        broker_order_id: "2525".into(),
+        attempt_no: 1,
+        direction: Direction::Short,
+        pip_size: Some(0.0001),
+        execution,
+    };
+    let mut note = CronNote {
+        ts: "2026-10-07T17:10:00Z".into(),
+        trade_id: trade_id.clone(),
+        account: Some("test-a".into()),
+        source: "broker-exit".into(),
+        severity: CronNoteSeverity::Info,
+        message: exit.summary_lines().join("\n"),
+        broker_exit: Some(exit),
+    };
+    assert!(
+        !broker_exit_recorded(store.pool(), Some("test-a"), &trade_id, "2525")
+            .await
+            .unwrap()
+    );
+    let (a, b) = tokio::join!(
+        record_cron_note(store.pool(), &note),
+        record_cron_note(store.pool(), &note)
+    );
+    a.unwrap();
+    b.unwrap();
+    let reopened = PgStateStore::connect(&test_db_url()).await.unwrap();
+    assert!(
+        broker_exit_recorded(reopened.pool(), Some("test-a"), &trade_id, "2525")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !broker_exit_recorded(reopened.pool(), Some("test-b"), &trade_id, "2525")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        cron_notes_for_trade(reopened.pool(), &trade_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    note.account = Some("test-b".into());
+    record_cron_note(store.pool(), &note).await.unwrap();
+    note.account = Some("test-a".into());
+    note.broker_exit.as_mut().unwrap().broker_order_id = "next-order".into();
+    record_cron_note(store.pool(), &note).await.unwrap();
+    note.broker_exit = None;
+    note.source = "reconcile".into();
+    note.severity = CronNoteSeverity::Warn;
+    record_cron_note(store.pool(), &note).await.unwrap();
+    record_cron_note(store.pool(), &note).await.unwrap();
+    let notes = cron_notes_for_trade(store.pool(), &trade_id).await.unwrap();
+    assert_eq!(
+        notes.len(),
+        5,
+        "only broker exits are deduplicated; accounts and re-entries are independent"
+    );
+    assert_eq!(
+        notes[0].broker_exit.as_ref().unwrap().execution.realized_pl,
+        Some(-6169.1689)
+    );
+
+    sqlx::query("DELETE FROM cron_notes WHERE correlation_id = $1")
+        .bind(trade_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+}
+
 fn test_db_url() -> String {
     std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
         "postgresql://candle_cache:candle_cache@localhost:5432/trade_control_dev".to_string()

@@ -18,6 +18,7 @@ use trade_control_core::settlement::Settlement;
 use tradenation_api::ohlcv::PriceType;
 use tradenation_api::{OpeningOrder, Position, TransactionRecord};
 
+mod exit;
 mod session_anchor;
 mod settlement;
 use session_anchor::session_anchor;
@@ -33,6 +34,28 @@ const CLOSED_TRADE_HISTORY_DAYS: u32 = 90;
 pub struct TradeNationAdapter(pub TradeNationBroker);
 
 impl Broker for TradeNationAdapter {
+    async fn lookup_trade_exit(
+        &self,
+        instrument: &str,
+        _broker_order_id: &str,
+        broker_trade_id: Option<&str>,
+    ) -> Result<Option<trade_control_core::broker_exit::BrokerTradeExit>, LookupError> {
+        let Some(trade_id) = broker_trade_id else {
+            return Ok(None);
+        };
+        let activity = tradenation_api::get_all_activity(
+            self.0.client(),
+            self.0.session(),
+            CLOSED_TRADE_HISTORY_DAYS,
+        )
+        .await
+        .map_err(|err| {
+            tracing::error!("tn exit activity lookup: {err:?}");
+            LookupError::Transient
+        })?;
+        Ok(exit::from_activity(instrument, trade_id, &activity))
+    }
+
     async fn place_entry(
         &self,
         max_risk_pct: f64,

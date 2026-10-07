@@ -11,6 +11,7 @@ pub mod allow_entry_gate;
 pub mod blackout_recreate;
 pub mod blackout_widen;
 pub mod broker;
+pub mod broker_exit;
 pub mod candle_gate;
 pub mod contract_calendar;
 pub mod control_event;

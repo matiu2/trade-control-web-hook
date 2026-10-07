@@ -79,6 +79,24 @@ pub trait CronEnv {
     /// alert. Same fire-and-forget, fail-soft contract as `record_tick`.
     fn record_cron_note(&self, note: CronNote);
 
+    /// Durable confirmation that this entry order's closure is already in the
+    /// journal. Reporting failures must not be mistaken for a recorded exit.
+    async fn broker_exit_recorded(
+        &self,
+        _account: Option<&str>,
+        _trade_id: &str,
+        _broker_order_id: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Await the exit's durable write so a failed insert can be retried. Native
+    /// storage deduplicates by account, plan and originating entry order.
+    async fn record_broker_exit(&self, note: CronNote) -> Result<(), String> {
+        self.record_cron_note(note);
+        Ok(())
+    }
+
     /// The HMAC signing key (raw bytes, hex already decoded), or `None` if it
     /// can't be resolved. The spread-blackout restore / cancel jobs re-verify a
     /// *stored* signed body via `incoming::parse_and_verify` before re-driving

@@ -7,6 +7,7 @@
 //! environment.
 
 mod candles;
+mod exit;
 mod fx;
 mod oanda;
 mod risk;
@@ -70,6 +71,22 @@ impl OandaBroker {
 }
 
 impl Broker for OandaBroker {
+    async fn lookup_trade_exit(
+        &self,
+        instrument: &str,
+        broker_order_id: &str,
+        broker_trade_id: Option<&str>,
+    ) -> Result<Option<trade_control_core::broker_exit::BrokerTradeExit>, LookupError> {
+        exit::lookup(
+            &self.client,
+            &self.account_id,
+            instrument,
+            broker_order_id,
+            broker_trade_id,
+        )
+        .await
+    }
+
     async fn place_entry(
         &self,
         max_risk_pct: f64,

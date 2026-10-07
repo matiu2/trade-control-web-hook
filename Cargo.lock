@@ -363,6 +363,7 @@ dependencies = [
  "chrono",
  "color-eyre",
  "oanda-client",
+ "serde_json",
  "tracing",
  "trade-control-core",
 ]
@@ -388,6 +389,7 @@ dependencies = [
  "broker-tradenation",
  "candle-model",
  "chrono",
+ "serde_json",
  "tracing",
  "trade-control-core",
  "tradenation-api",
