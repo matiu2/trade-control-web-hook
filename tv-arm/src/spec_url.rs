@@ -319,6 +319,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn copied_chart_viewport_survives_for_replay_and_register() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_error::ErrorLayer::default())
+            .try_init()
+            .ok();
+        let raw = format!("{CHART_URL}&from=1790700000&to=1791000000&debug=1");
+        for mode in [SpecMode::Replay, SpecMode::Register] {
+            let converted = normalise(&raw, mode).expect("chart URL converts");
+            assert_eq!(
+                converted,
+                format!(
+                    "http://127.0.0.1:8790/arm-setup?instrument=GBP_JPY&tf=h4&broker=tradenation\
+                     &from=1790700000&to=1791000000&mode={}",
+                    mode.as_param()
+                )
+            );
+        }
+        let half = format!("{CHART_URL}&from=1790700000");
+        assert!(
+            normalise(&half, SpecMode::Replay)
+                .expect("server validates half a range")
+                .contains("&from=1790700000&mode=replay")
+        );
+    }
+
     /// The load-bearing one. `broker` is part of the DRAWINGS' identity —
     /// local-chart keys them `drawings/<broker>/<symbol>-<tf>.json` — so
     /// losing it in translation arms a TradeNation plan off OANDA's chart.
