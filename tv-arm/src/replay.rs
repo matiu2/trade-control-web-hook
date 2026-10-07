@@ -398,6 +398,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn frozen_spec_inputs_write_positions_without_enabling_tradingview_annotation() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer())
+            .with(tracing_error::ErrorLayer::default())
+            .try_init()
+            .ok();
+        [
+            ("--spec-in", "trade.spec.json"),
+            ("--spec-url", "http://127.0.0.1:9999/arm-setup"),
+        ]
+        .into_iter()
+        .for_each(|(flag, source)| {
+            let args = crate::args::Args::try_parse_from([
+                "tv-arm-staging",
+                flag,
+                source,
+                "replay",
+                "--warmup-bars",
+                "400",
+            ])
+            .expect("frozen replay command")
+            .apply_aliases();
+            let plan = PathBuf::from("/tmp/plan.json");
+            let positions = PathBuf::from("/tmp/positions.json");
+            let positions_out = args.new_tv_url().map(|_| positions.as_path());
+            let argv = build_argv(
+                "replay-candles",
+                &plan,
+                CandleSource::Oanda,
+                &args.replay_args(),
+                ArmContext::default(),
+                positions_out,
+            );
+            let parsed = ReplayArgs::try_parse_from(&argv).expect("chained replay arguments");
+            assert_eq!(parsed.positions.as_deref(), Some(positions.as_path()));
+            assert!(
+                !parsed.annotate,
+                "local-chart output needs no TradingView bridge"
+            );
+            assert_eq!(parsed.warmup_bars, 400);
+        });
+    }
+
+    #[test]
     fn binary_name_respects_suffix() {
         // The resolved name is exactly what the baked suffix dictates: empty
         // suffix → the plain `replay-candles`; a `staging`/`dev` bake →
