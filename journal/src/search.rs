@@ -13,7 +13,7 @@
 //!   is the whole reason for not doing a plain `haystack.contains(query)`: the
 //!   columns you want to combine aren't adjacent in the row.
 //! * The haystack is the same text the list row shows (`trade_id`, instrument,
-//!   granularity, phase) plus `account`, so what you see is what you can search.
+//!   direction, granularity, phase) plus `account`, so what you see is what you can search.
 //!   Separators are normalised (`_`/`/` → `-`) so `audcad`, `aud-cad`, `AUD_CAD`
 //!   all match one another.
 //!
@@ -93,9 +93,10 @@ pub fn matching(rows: &[PlanRow], query: &str) -> Vec<usize> {
 /// Lower-cased and separator-normalised so `AUD_CAD` matches `aud-cad`.
 fn haystack(row: &PlanRow) -> String {
     let joined = format!(
-        "{} {} {} {} {} {}",
+        "{} {} {} {} {} {} {}",
         row.trade_id,
         row.instrument,
+        row.direction.as_deref().unwrap_or(""),
         row.granularity,
         row.phase.as_deref().unwrap_or(""),
         row.account,
@@ -119,6 +120,7 @@ mod tests {
             trade_id: trade_id.to_string(),
             account: "demo".into(),
             instrument: instrument.to_string(),
+            direction: None,
             granularity: granularity.to_string(),
             phase: Some(phase.to_string()),
             shadow: false,
@@ -181,6 +183,17 @@ mod tests {
     #[test]
     fn no_match_yields_empty() {
         assert!(matching(&fixture(), "zzz").is_empty());
+    }
+
+    #[test]
+    fn direction_can_be_combined_with_instrument() {
+        let mut rows = fixture();
+        rows[0].direction = Some("short".into());
+        rows[1].direction = Some("short".into());
+        rows[2].direction = Some("long".into());
+        assert_eq!(matching(&rows, "eur short"), vec![0]);
+        assert_eq!(matching(&rows, "LONG eur"), vec![2]);
+        assert_eq!(matching(&rows, "aud short"), vec![1]);
     }
 
     /// `archived` is searchable so the operator can isolate terminated plans.

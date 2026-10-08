@@ -284,6 +284,7 @@ mod tests {
             trade_id: "hs-eur-usd-1".into(),
             account: "demo".into(),
             instrument: "EUR_USD".into(),
+            direction: None,
             granularity: "h1".into(),
             phase: Some("done".into()),
             shadow: false,

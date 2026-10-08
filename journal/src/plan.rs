@@ -22,6 +22,10 @@ pub struct PlanRow {
     pub account: String,
     #[serde(default)]
     pub instrument: String,
+    /// Trade direction, when supplied by the list response. Older workers omit
+    /// it; the journal fills it from the stored plan export in the background.
+    #[serde(default)]
+    pub direction: Option<String>,
     #[serde(default)]
     pub granularity: String,
     #[serde(default)]
@@ -361,6 +365,16 @@ mod tests {
     fn empty_list_is_ok() {
         assert!(parse_plan_list("").unwrap().is_empty());
         assert!(parse_plan_list("no registered plans\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_direction_is_optional_for_older_workers() {
+        let rows = parse_plan_list(
+            "- trade_id: custom-long\n  direction: long\n- trade_id: custom-short\n  direction: short\n- trade_id: hs-legacy\n",
+        ).unwrap();
+        assert_eq!(rows[0].direction.as_deref(), Some("long"));
+        assert_eq!(rows[1].direction.as_deref(), Some("short"));
+        assert_eq!(rows[2].direction, None, "never guess direction from the trade ID");
     }
 
     #[test]

@@ -176,7 +176,7 @@ impl App {
     pub fn new(chart_backend: crate::tv::ChartBackend) -> Result<Self> {
         let plans = fetch_plans()?;
         let (job_tx, job_rx) = channel();
-        Ok(Self {
+        let mut app = Self {
             plans,
             selected: 0,
             screen: Screen::List,
@@ -199,7 +199,40 @@ impl App {
             save_fixture_pending: None,
             fixtures: crate::fixtures::scan(&crate::fixtures::default_dir()),
             chart_backend,
-        })
+        };
+        app.start_directions();
+        Ok(app)
+    }
+
+    /// A single background reader fills older workers' missing list directions.
+    fn start_directions(&mut self) {
+        let trade_ids: Vec<String> = self
+            .plans
+            .iter()
+            .filter(|row| row.direction.is_none())
+            .map(|row| row.trade_id.clone())
+            .collect();
+        let trade_ids = trade_ids
+            .into_iter()
+            .filter(|id| self.mark_in_flight(id, JobKind::Direction))
+            .collect();
+        crate::directions::spawn(self.job_tx.clone(), trade_ids);
+    }
+
+    /// Keep the highlighted trade stable if a direction filter gains a row.
+    fn set_direction(&mut self, trade_id: &str, direction: String) {
+        let keep = self.current_plan().map(|row| row.trade_id.clone());
+        if let Some(row) = self.plans.iter_mut().find(|row| row.trade_id == trade_id) {
+            row.direction = Some(direction);
+        }
+        if let Some(index) = keep.and_then(|id| {
+            self.visible_plans()
+                .iter()
+                .position(|row| row.trade_id == id)
+        }) {
+            self.selected = index;
+        }
+        self.clamp_selection();
     }
 
     /// The fixture-corpus status for the currently-selected plan: which saved
@@ -603,11 +636,15 @@ impl App {
             outcome,
         } = result;
         match outcome {
+            JobOutcome::Direction(direction) => self.set_direction(&trade_id, direction),
             JobOutcome::Timeline {
                 export_json,
                 timeline_json,
             } => {
                 let detail = parse_plan_export(&export_json).ok();
+                if let Some(detail) = &detail {
+                    self.set_direction(&trade_id, detail.direction.clone());
+                }
                 let entry = self.data.entry(trade_id.clone()).or_default();
                 entry.export_json = Some(export_json);
                 entry.detail = detail;
@@ -1190,8 +1227,16 @@ impl App {
                 self.data.remove(&confirm.trade_id);
                 self.screen = Screen::List;
                 match fetch_plans() {
-                    Ok(plans) => {
+                    Ok(mut plans) => {
+                        for row in &mut plans {
+                            if row.direction.is_none() {
+                                row.direction = self.plans.iter()
+                                    .find(|old| old.trade_id == row.trade_id)
+                                    .and_then(|old| old.direction.clone());
+                            }
+                        }
                         self.plans = plans;
+                        self.start_directions();
                         // The deleted row leaves the (possibly filtered) list, so
                         // re-clamp against the VISIBLE count, not `plans.len()`.
                         self.clamp_selection();
@@ -1704,11 +1749,36 @@ mod tests {
         assert_eq!(chart_goto_for(&detail), None);
     }
 
+    #[test]
+    fn background_direction_keeps_selection_when_filter_gains_a_row() {
+        let mut first = row("first");
+        first.direction = Some("long".into());
+        let mut second = row("second");
+        second.direction = Some("short".into());
+        let mut app = App::from_rows(vec![first, second]);
+        app.search.query = "short".into();
+        app.mark_in_flight_test("first", JobKind::Direction);
+        app.job_tx.send(JobResult {
+            trade_id: "first".into(),
+            kind: JobKind::Direction,
+            outcome: JobOutcome::Direction("short".into()),
+        }).unwrap();
+        assert!(app.drain_jobs());
+        assert_eq!(app.current_plan().unwrap().trade_id, "second");
+        assert_eq!(app.visible().len(), 2);
+        assert!(!app.in_flight_test("first", JobKind::Direction));
+        app.set_direction("second", "long".into());
+        assert_eq!(app.current_plan().unwrap().trade_id, "first");
+        app.set_direction("deleted-plan", "short".into());
+        assert_eq!(app.plans.len(), 2, "late results cannot resurrect deleted plans");
+    }
+
     fn row(trade_id: &str) -> PlanRow {
         PlanRow {
             trade_id: trade_id.to_string(),
             account: "acct".into(),
             instrument: "AUD_CAD".into(),
+            direction: None,
             granularity: "h1".into(),
             phase: Some("await_entry".into()),
             shadow: false,

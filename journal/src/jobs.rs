@@ -18,6 +18,8 @@ use crate::cli;
 /// can show "loading…" and we don't double-spawn) and to route the result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobKind {
+    /// Read a missing list direction from the stored plan.
+    Direction,
     /// `plan export` + `plan timeline` — fills detail + timeline for a plan.
     Timeline,
     /// `replay-candles --plan` — the ~25s replay run.
@@ -39,6 +41,7 @@ impl JobKind {
     /// A human label for the "loading…" line.
     pub fn verb(self) -> &'static str {
         match self {
+            JobKind::Direction => "loading direction",
             JobKind::Timeline => "loading timeline",
             JobKind::Replay => "running replay",
             JobKind::LoadTv => "loading TradingView",
@@ -61,6 +64,7 @@ pub struct JobResult {
 /// The payload of a finished job — the loaded data or an error message.
 #[derive(Debug)]
 pub enum JobOutcome {
+    Direction(String),
     /// `plan export` JSON + `plan timeline` JSON (in that order).
     Timeline {
         export_json: String,

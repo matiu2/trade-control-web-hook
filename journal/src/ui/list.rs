@@ -38,6 +38,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             let marker = if visited(&p.trade_id) { "· " } else { "  " };
             let phase = p.phase.as_deref().unwrap_or("-");
             let archived = if p.is_archived() { "  ARCHIVED" } else { "" };
+            let (direction, color) = match p.direction.as_deref() {
+                Some("short") => ("Short", Color::Red),
+                Some("long") => ("Long", Color::Green),
+                _ => ("-", Color::DarkGray),
+            };
             // Last-event time (Brisbane, compact) — the list's sort key, shown
             // so the oldest-first ordering is visible.
             let last_event = p
@@ -55,6 +60,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                     format!("{:16} ", p.instrument),
                     Style::default().fg(Color::Cyan),
                 ),
+                Span::styled(format!("{direction:10} "), Style::default().fg(color)),
                 Span::styled(
                     format!("{:5} ", p.granularity),
                     Style::default().fg(Color::Blue),
@@ -77,8 +83,19 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     } else {
         format!("Plans ({}) — oldest event first", app.plans.len())
     };
+    let block = crate::ui::titled_block(&title);
+    let inner = block.inner(list_area);
+    f.render_widget(block, list_area);
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    let header = format!(
+        "    {:11} {:32} {:16} {:10} {:5} {}",
+        "Last event", "Trade", "Instrument", "Short/Long", "TF", "Phase"
+    );
+    f.render_widget(
+        Paragraph::new(header).style(Style::default().fg(Color::DarkGray)),
+        chunks[0],
+    );
     let list = List::new(items)
-        .block(crate::ui::titled_block(&title))
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -90,7 +107,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     if !rows.is_empty() {
         state.select(Some(app.selected));
     }
-    f.render_stateful_widget(list, list_area, &mut state);
+    f.render_stateful_widget(list, chunks[1], &mut state);
 
     if let Some(search_area) = search_area {
         render_search_bar(f, app, search_area, rows.is_empty());

@@ -203,6 +203,7 @@ mod tests {
             trade_id: "t-1".into(),
             account: "demo".into(),
             instrument: "EUR_USD".into(),
+            direction: None,
             granularity: "h1".into(),
             phase: None,
             shadow: false,
