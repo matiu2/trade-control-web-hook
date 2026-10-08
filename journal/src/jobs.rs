@@ -75,7 +75,9 @@ pub enum JobOutcome {
     /// TradingView chart is on this plan. `already_there` is true when the chart
     /// was **already** on the right symbol+timeframe and nothing was changed —
     /// worth telling the operator, since it means their scroll position survived.
-    LoadTv { already_there: bool },
+    LoadTv {
+        already_there: bool,
+    },
     /// The fixture-capture report text (tv-arm's per-cell summary).
     SaveFixture(String),
     /// A re-bless run: the per-cell report, and how many of the attempted cells

@@ -374,7 +374,10 @@ mod tests {
         ).unwrap();
         assert_eq!(rows[0].direction.as_deref(), Some("long"));
         assert_eq!(rows[1].direction.as_deref(), Some("short"));
-        assert_eq!(rows[2].direction, None, "never guess direction from the trade ID");
+        assert_eq!(
+            rows[2].direction, None,
+            "never guess direction from the trade ID"
+        );
     }
 
     #[test]

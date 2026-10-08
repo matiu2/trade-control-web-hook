@@ -206,14 +206,31 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
         term.draw(|f| super::render(f, &app)).unwrap();
         let buffer = term.backend().buffer();
-        let lines: Vec<String> = (0..12).map(|y| {
-            (0..120).map(|x| buffer[(x, y)].symbol()).collect()
-        }).collect();
-        let header_y = lines.iter().position(|line| line.contains("Short/Long")).unwrap();
-        let x = lines[header_y].find("Short/Long").unwrap() as u16;
-        let short_y = lines.iter().position(|line| line.contains("arbitrary-1")).unwrap();
-        let long_y = lines.iter().position(|line| line.contains("arbitrary-2")).unwrap();
-        let unknown_y = lines.iter().position(|line| line.contains("hs-legacy")).unwrap();
+        let lines: Vec<String> = (0..12)
+            .map(|y| (0..120).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let header_y = lines
+            .iter()
+            .position(|line| line.contains("Short/Long"))
+            .unwrap();
+        let x = lines[header_y]
+            .split_once("Short/Long")
+            .unwrap()
+            .0
+            .chars()
+            .count() as u16;
+        let short_y = lines
+            .iter()
+            .position(|line| line.contains("arbitrary-1"))
+            .unwrap();
+        let long_y = lines
+            .iter()
+            .position(|line| line.contains("arbitrary-2"))
+            .unwrap();
+        let unknown_y = lines
+            .iter()
+            .position(|line| line.contains("hs-legacy"))
+            .unwrap();
         assert_eq!(buffer[(x, short_y as u16)].symbol(), "S");
         assert_eq!(buffer[(x, short_y as u16)].fg, ratatui::style::Color::Red);
         assert_eq!(buffer[(x, long_y as u16)].symbol(), "L");

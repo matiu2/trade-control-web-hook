@@ -1230,7 +1230,9 @@ impl App {
                     Ok(mut plans) => {
                         for row in &mut plans {
                             if row.direction.is_none() {
-                                row.direction = self.plans.iter()
+                                row.direction = self
+                                    .plans
+                                    .iter()
                                     .find(|old| old.trade_id == row.trade_id)
                                     .and_then(|old| old.direction.clone());
                             }
@@ -1758,11 +1760,13 @@ mod tests {
         let mut app = App::from_rows(vec![first, second]);
         app.search.query = "short".into();
         app.mark_in_flight_test("first", JobKind::Direction);
-        app.job_tx.send(JobResult {
-            trade_id: "first".into(),
-            kind: JobKind::Direction,
-            outcome: JobOutcome::Direction("short".into()),
-        }).unwrap();
+        app.job_tx
+            .send(JobResult {
+                trade_id: "first".into(),
+                kind: JobKind::Direction,
+                outcome: JobOutcome::Direction("short".into()),
+            })
+            .unwrap();
         assert!(app.drain_jobs());
         assert_eq!(app.current_plan().unwrap().trade_id, "second");
         assert_eq!(app.visible().len(), 2);
@@ -1770,7 +1774,11 @@ mod tests {
         app.set_direction("second", "long".into());
         assert_eq!(app.current_plan().unwrap().trade_id, "first");
         app.set_direction("deleted-plan", "short".into());
-        assert_eq!(app.plans.len(), 2, "late results cannot resurrect deleted plans");
+        assert_eq!(
+            app.plans.len(),
+            2,
+            "late results cannot resurrect deleted plans"
+        );
     }
 
     fn row(trade_id: &str) -> PlanRow {
