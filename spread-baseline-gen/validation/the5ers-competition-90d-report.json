@@ -1,0 +1,705 @@
+{
+  "schema_version": 1,
+  "feed": "mt5-the5ers-competition",
+  "login": 12577408,
+  "server": "FivePercentOnline-Experience",
+  "from_utc": "2026-07-11T15:14:00Z",
+  "to_utc": "2026-10-09T15:14:00Z",
+  "requested_symbols": [
+    "EURUSD",
+    "GBPUSD",
+    "USDCHF",
+    "USDJPY",
+    "USDCAD",
+    "AUDUSD",
+    "AUDNZD",
+    "AUDCAD",
+    "AUDCHF",
+    "AUDJPY",
+    "CHFJPY",
+    "EURGBP",
+    "EURAUD",
+    "EURCHF",
+    "EURJPY",
+    "EURNZD",
+    "EURCAD",
+    "GBPCHF",
+    "GBPJPY",
+    "CADCHF",
+    "CADJPY",
+    "GBPAUD",
+    "GBPCAD",
+    "GBPNZD",
+    "NZDCAD",
+    "NZDCHF",
+    "NZDJPY",
+    "NZDUSD",
+    "GBPUSD*t",
+    "EURUSD*t",
+    "NZDUSD*t",
+    "DAX40",
+    "JPN225",
+    "NAS100",
+    "SP500",
+    "UK100",
+    "US30",
+    "XAGUSD",
+    "XAUUSD",
+    "BTCUSD",
+    "ETHUSD",
+    "XTIUSD",
+    "XBRUSD"
+  ],
+  "complete": false,
+  "instruments": [
+    {
+      "symbol": "EURUSD",
+      "pip_size": 0.0001,
+      "schedule": "ny",
+      "timezone": "America/New_York",
+      "first_minute_utc": "2026-07-12T21:05:00Z",
+      "last_minute_utc": "2026-10-09T15:13:00Z",
+      "elevated_local_hours": [
+        17
+      ],
+      "profile": {
+        "elevated_hours": 131072,
+        "hour_widen_frac": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0005185376539831269,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "vol": 0.0002779938823773017,
+        "median_ratio": 0.06187489571173076,
+        "hour_p90_frac": [
+          0.000017546199142923436,
+          0.00001760132643654676,
+          0.00001736925294835164,
+          0.000017543397980675055,
+          0.00001746834735516826,
+          0.00001744836809779285,
+          0.000017386617520415346,
+          0.0000173926050163836,
+          0.00001743350860003462,
+          0.000017431077521334688,
+          0.000017426536261158762,
+          0.00001738601295269355,
+          0.000017574383578611116,
+          0.000017561143511847893,
+          0.000017585679629406547,
+          0.000017588138559470794,
+          0.000034324157341971577,
+          0.0005185376539831269,
+          0.000017548801022278735,
+          0.000017567761050558876,
+          0.00001756851721706692,
+          0.000017533770043154644,
+          0.000017528944670000986,
+          0.00001753739850242106
+        ],
+        "hour_ratio": [
+          0.061895323467303635,
+          0.061968362272753735,
+          0.0617322761162685,
+          0.06197957324140151,
+          0.0618450429478404,
+          0.06184424549898275,
+          0.0618399928209521,
+          0.06177110103183482,
+          0.061870838083110426,
+          0.061788475412605764,
+          0.061780649100513646,
+          0.061858602654613445,
+          0.06191037029468647,
+          0.06188733697326591,
+          0.061893726003734044,
+          0.061945552471997456,
+          0.06216823044094097,
+          1.3632570008255365,
+          0.06188361064832364,
+          0.06187882031911339,
+          0.06188374372466062,
+          0.06173028980671948,
+          0.06176460472645464,
+          0.06187097110434813
+        ],
+        "review": "Reviewed",
+        "n_bars": 92569,
+        "baseline_low_pips": 0.0,
+        "baseline_high_pips": 0.2999999999997449,
+        "baseline_median_pips": 0.09999999999843467
+      }
+    },
+    {
+      "symbol": "GBPUSD",
+      "pip_size": 0.0001,
+      "schedule": "ny",
+      "timezone": "America/New_York",
+      "first_minute_utc": "2026-07-12T21:05:00Z",
+      "last_minute_utc": "2026-10-09T15:13:00Z",
+      "elevated_local_hours": [
+        17
+      ],
+      "profile": {
+        "elevated_hours": 131072,
+        "hour_widen_frac": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.001022197193578084,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "vol": 0.0003110304736491349,
+        "median_ratio": 0.047823439870565414,
+        "hour_p90_frac": [
+          0.000029435356278222994,
+          0.000029437522538132633,
+          0.000022572684045473466,
+          0.000029313521321836603,
+          0.00002266948272016752,
+          0.00002255159240596534,
+          0.00002250775392132075,
+          0.000022423787153393277,
+          0.000029334330700606494,
+          0.000022715003200745413,
+          0.000022662256796447524,
+          0.000022659295663774447,
+          0.000029518356359055418,
+          0.000029517898915984687,
+          0.00002952487101324929,
+          0.000029533612573667105,
+          0.000045267508348865354,
+          0.001022197193578084,
+          0.000029419984995837072,
+          0.00002941784295154714,
+          0.000029422408695365738,
+          0.000029428448039465653,
+          0.00002942955227410943,
+          0.00002942368562572969
+        ],
+        "hour_ratio": [
+          0.04777675850335498,
+          0.04782197270454574,
+          0.04778838700656987,
+          0.04832567212860343,
+          0.047847148509071305,
+          0.04775812921226243,
+          0.047676597765278404,
+          0.04766325705828093,
+          0.04791471120100234,
+          0.04803201588714016,
+          0.04783273366536467,
+          0.04782490703658509,
+          0.04832149583532696,
+          0.048027442225787614,
+          0.047893298678629716,
+          0.04808868195578391,
+          0.0483924087228792,
+          2.425072966459945,
+          0.04764056850799878,
+          0.047696047930147,
+          0.04769251035622412,
+          0.047671737702944125,
+          0.04761349414114755,
+          0.047642333378765715
+        ],
+        "review": "Reviewed",
+        "n_bars": 92566,
+        "baseline_low_pips": 0.0,
+        "baseline_high_pips": 0.40000000000040004,
+        "baseline_median_pips": 0.10000000000065512
+      }
+    },
+    {
+      "symbol": "USDCHF",
+      "pip_size": 0.0001,
+      "schedule": "ny",
+      "timezone": "America/New_York",
+      "first_minute_utc": "2026-07-12T21:05:00Z",
+      "last_minute_utc": "2026-10-09T15:13:00Z",
+      "elevated_local_hours": [
+        17
+      ],
+      "profile": {
+        "elevated_hours": 131072,
+        "hour_widen_frac": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0020891322855469594,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "vol": 0.0004054228542508282,
+        "median_ratio": 0.0920885298142974,
+        "hour_p90_frac": [
+          0.000049437096856639606,
+          0.000049427872377282954,
+          0.000049471275740572636,
+          0.00004952155983070049,
+          0.000049453538400722025,
+          0.0000494455913075145,
+          0.00004942139898245449,
+          0.000049448647579538155,
+          0.00004969129284312332,
+          0.00004955714496405569,
+          0.00004950372515523005,
+          0.000049466809627343457,
+          0.00004948351580384735,
+          0.000049449320010754095,
+          0.00004950249987629326,
+          0.000049432820180181045,
+          0.00006124771709444688,
+          0.0020891322855469594,
+          0.00004943031561247742,
+          0.00004943642475767374,
+          0.00004944681377084984,
+          0.00004943153732086011,
+          0.00004941504935332996,
+          0.00004943398091853281
+        ],
+        "hour_ratio": [
+          0.09207305831473807,
+          0.09164883996197291,
+          0.09157256684648338,
+          0.12124302410841102,
+          0.0917096090397681,
+          0.09171245071817505,
+          0.09165536737765224,
+          0.09167609088882674,
+          0.12030131923511157,
+          0.09160912805572423,
+          0.09155075736717441,
+          0.09148567401397951,
+          0.12029545263974714,
+          0.12029728551226647,
+          0.12048091071840229,
+          0.09954067328861271,
+          0.12175923361332518,
+          4.006423273205666,
+          0.09236295854218035,
+          0.09278597513137929,
+          0.09275253768802492,
+          0.09187072398236802,
+          0.09149387507880702,
+          0.09210400131385672
+        ],
+        "review": "Reviewed",
+        "n_bars": 92567,
+        "baseline_low_pips": 0.0999999999995449,
+        "baseline_high_pips": 0.40000000000040004,
+        "baseline_median_pips": 0.20000000000020002
+      }
+    },
+    {
+      "symbol": "USDJPY",
+      "pip_size": 0.01,
+      "schedule": "ny",
+      "timezone": "America/New_York",
+      "first_minute_utc": "2026-07-12T21:05:00Z",
+      "last_minute_utc": "2026-10-09T15:13:00Z",
+      "elevated_local_hours": [
+        17
+      ],
+      "profile": {
+        "elevated_hours": 131072,
+        "hour_widen_frac": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0006650055278500918,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "vol": 0.0003626769696745433,
+        "median_ratio": 0.0354240774331128,
+        "hour_p90_frac": [
+          0.000025160714061006412,
+          0.000025159653728451266,
+          0.000025025510379673086,
+          0.000025155650587954707,
+          0.000025101929527029284,
+          0.00002505392858262819,
+          0.00002505090029807313,
+          0.000025085809146810885,
+          0.000025121525379140965,
+          0.00002509430754544283,
+          0.000025047072868029155,
+          0.000019464354090367218,
+          0.000025114900670687768,
+          0.00002510671924853619,
+          0.000025093158350317286,
+          0.00002509600791532915,
+          0.000050624036167515335,
+          0.0006650055278500918,
+          0.000025098369923649824,
+          0.000025445393138430018,
+          0.000025364053615391606,
+          0.00002502372562411407,
+          0.00002509877938792901,
+          0.00002508654859258616
+        ],
+        "hour_ratio": [
+          0.03531645211580131,
+          0.035730976747943954,
+          0.03498147206575775,
+          0.035942788087108865,
+          0.035464538374614225,
+          0.035014623444608386,
+          0.03513391620299815,
+          0.035668922774348404,
+          0.03579905590828445,
+          0.03543946590134707,
+          0.03526368136799442,
+          0.03487142551237715,
+          0.03573543391087238,
+          0.03548530340762689,
+          0.03545570069242325,
+          0.03540868896487853,
+          0.05233451805505075,
+          1.3479917198207314,
+          0.03503503293696874,
+          0.0353942008484101,
+          0.03545279445147302,
+          0.0346505006789666,
+          0.03496511426050823,
+          0.034968329165081295
+        ],
+        "review": "Reviewed",
+        "n_bars": 92569,
+        "baseline_low_pips": 0.0,
+        "baseline_high_pips": 0.49999999999954525,
+        "baseline_median_pips": 0.10000000000047748
+      }
+    },
+    {
+      "symbol": "USDCAD",
+      "pip_size": 0.0001,
+      "schedule": "ny",
+      "timezone": "America/New_York",
+      "first_minute_utc": "2026-07-12T21:05:00Z",
+      "last_minute_utc": "2026-10-09T15:13:00Z",
+      "elevated_local_hours": [
+        17
+      ],
+      "profile": {
+        "elevated_hours": 131072,
+        "hour_widen_frac": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0007560215226227049,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "vol": 0.00025250721250053145,
+        "median_ratio": 0.08598014050163386,
+        "hour_p90_frac": [
+          0.000028856510281377933,
+          0.000028874403563130276,
+          0.000028844025212710263,
+          0.000028936441107137174,
+          0.000028864610544110867,
+          0.00002888774942769036,
+          0.0000288777597213207,
+          0.00002886067437311182,
+          0.00002893426433721439,
+          0.00002884165427740582,
+          0.000028860716021179967,
+          0.000028842112020160403,
+          0.000028905932147824944,
+          0.000028910528419575657,
+          0.000028912513659841397,
+          0.0000289136630793688,
+          0.00003614987153956553,
+          0.0007560215226227049,
+          0.000028890044490537037,
+          0.000028891296496959192,
+          0.000028882555586447795,
+          0.000028869631241002737,
+          0.000028841175972297044,
+          0.0000288457724751624
+        ],
+        "hour_ratio": [
+          0.08611744442593548,
+          0.08608000775567543,
+          0.0845308181049961,
+          0.1128125029672915,
+          0.08550941260262006,
+          0.08569830894556313,
+          0.08555420838570264,
+          0.0855498960412153,
+          0.08574469144879705,
+          0.08484911434416742,
+          0.08484002585120756,
+          0.08464871156901639,
+          0.11237056707206391,
+          0.11220918481790026,
+          0.11216389817165469,
+          0.11217660652239882,
+          0.11307764193437765,
+          2.0836306532823445,
+          0.11217442207068132,
+          0.11230305243034429,
+          0.11217104626489362,
+          0.08588027324759227,
+          0.0857597005119829,
+          0.08565351197836425
+        ],
+        "review": "Reviewed",
+        "n_bars": 92569,
+        "baseline_low_pips": 0.10000000000065512,
+        "baseline_high_pips": 0.40000000000040004,
+        "baseline_median_pips": 0.20000000000131024
+      }
+    }
+  ],
+  "failures": [
+    {
+      "symbol": "AUDUSD",
+      "error": "MT5 AUDUSD [2026-08-04 15:14:00 UTC, 2026-08-06 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "AUDNZD",
+      "error": "MT5 AUDNZD [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "AUDCAD",
+      "error": "MT5 AUDCAD [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "AUDCHF",
+      "error": "MT5 AUDCHF [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "AUDJPY",
+      "error": "MT5 AUDJPY [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "CHFJPY",
+      "error": "MT5 CHFJPY [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "EURGBP",
+      "error": "MT5 EURGBP [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "EURAUD",
+      "error": "MT5 EURAUD [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "EURCHF",
+      "error": "MT5 EURCHF [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "EURJPY",
+      "error": "MT5 EURJPY [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "EURNZD",
+      "error": "MT5 EURNZD [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "EURCAD",
+      "error": "MT5 EURCAD [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "GBPCHF",
+      "error": "MT5 GBPCHF [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "GBPJPY",
+      "error": "MT5 GBPJPY [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "CADCHF",
+      "error": "MT5 CADCHF [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "CADJPY",
+      "error": "MT5 CADJPY [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "GBPAUD",
+      "error": "MT5 GBPAUD [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "GBPCAD",
+      "error": "MT5 GBPCAD [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "GBPNZD",
+      "error": "MT5 GBPNZD [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "NZDCAD",
+      "error": "MT5 NZDCAD [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "NZDCHF",
+      "error": "MT5 NZDCHF [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "NZDJPY",
+      "error": "MT5 NZDJPY [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "NZDUSD",
+      "error": "MT5 NZDUSD [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "GBPUSD*t",
+      "error": "no instrument-lookup pip/schedule metadata for GBPUSD*t"
+    },
+    {
+      "symbol": "EURUSD*t",
+      "error": "no instrument-lookup pip/schedule metadata for EURUSD*t"
+    },
+    {
+      "symbol": "NZDUSD*t",
+      "error": "no instrument-lookup pip/schedule metadata for NZDUSD*t"
+    },
+    {
+      "symbol": "DAX40",
+      "error": "no instrument-lookup pip/schedule metadata for DAX40"
+    },
+    {
+      "symbol": "JPN225",
+      "error": "MT5 JPN225 [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "NAS100",
+      "error": "MT5 NAS100 [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "SP500",
+      "error": "no instrument-lookup pip/schedule metadata for SP500"
+    },
+    {
+      "symbol": "UK100",
+      "error": "MT5 UK100 [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "US30",
+      "error": "MT5 US30 [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "XAGUSD",
+      "error": "MT5 XAGUSD [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "XAUUSD",
+      "error": "MT5 XAUUSD [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "BTCUSD",
+      "error": "MT5 BTCUSD [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "ETHUSD",
+      "error": "MT5 ETHUSD [2026-07-11 15:14:00 UTC, 2026-07-13 15:14:00 UTC): MT5 bridge timed out; check that the EA is attached and its mailbox path matches: deadline has elapsed"
+    },
+    {
+      "symbol": "XTIUSD",
+      "error": "no instrument-lookup pip/schedule metadata for XTIUSD"
+    },
+    {
+      "symbol": "XBRUSD",
+      "error": "no instrument-lookup pip/schedule metadata for XBRUSD"
+    }
+  ]
+}
