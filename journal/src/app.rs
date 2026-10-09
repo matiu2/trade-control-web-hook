@@ -596,7 +596,7 @@ impl App {
             .data
             .get(trade_id)
             .and_then(|d| d.detail.as_ref())
-            .map(|detail| detail.broker.as_str())
+            .map(|detail| local_chart_client::chart_feed(&detail.broker, &row.account))
             // `PlanDetail::broker` is "" when no rule intent carried one (see
             // its doc comment) — NOT a missing field. Sending `&broker=` empty
             // is worse than sending nothing: `ChartBroker::parse("")` is
@@ -605,7 +605,7 @@ impl App {
             // default. Treated as "unknown" and folded into the `None` below.
             .filter(|broker| !broker.is_empty())?;
         self.chart_backend
-            .spec_url(&row.instrument, broker, &row.granularity)
+            .spec_url(&row.instrument, &broker, &row.granularity)
     }
 
     /// Add a job to the in-flight set. Returns `false` if it was already there
@@ -821,7 +821,11 @@ impl App {
             self.start_timeline(trade_id);
             return;
         };
-        let broker = detail.broker.clone();
+        let broker = if self.chart_backend.local_chart_url().is_some() {
+            local_chart_client::chart_feed(&detail.broker, &row.account)
+        } else {
+            detail.broker.clone()
+        };
         let goto = chart_goto_for(detail);
         if !self.mark_in_flight(trade_id, JobKind::LoadTv) {
             return;
@@ -1092,13 +1096,14 @@ impl App {
     /// (`drawings/<broker>/<instrument>-<tf>.json`). `None` means "not knowable
     /// yet"; the caller parks rather than guessing.
     fn geometry_broker(&self, trade_id: &str) -> Option<String> {
+        let row = self.plans.iter().find(|p| p.trade_id == trade_id)?;
         self.data
             .get(trade_id)
             .and_then(|d| d.detail.as_ref())
             // `PlanDetail::broker` is `""` when no rule intent carried one (see
             // its doc comment) — a real value meaning "unknown", not a missing
             // field. Folded into `None` so the caller treats it the same way.
-            .map(|detail| detail.broker.clone())
+            .map(|detail| local_chart_client::chart_feed(&detail.broker, &row.account))
             .filter(|broker| !broker.is_empty())
     }
 

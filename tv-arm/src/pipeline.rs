@@ -742,7 +742,7 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
     } = setup;
 
     let key = read_key()?;
-    let account = resolve_account(args, broker)?;
+    let account = resolve_account(args, broker, &chart_symbol)?;
     let out_dir = arm_out_dir(&raw_symbol)?;
     let now = Utc::now();
     // The time this arm treats as "now" for everything time-derived on the plan:
@@ -1100,6 +1100,9 @@ fn resolve_broker(args: &Args, full_symbol: &str) -> Result<Broker> {
             return Err(eyre!("unsupported TRADE_CONTROL_BROKER {trimmed:?}"));
         }
     }
+    if local_chart_client::mt5_chart_account(full_symbol).is_some() {
+        return Ok(Broker::Mt5);
+    }
     let (exchange, _) = split_symbol(full_symbol);
     Ok(exchange
         .and_then(Broker::from_exchange)
@@ -1216,7 +1219,7 @@ fn resolve_with_recovery(
 /// Errors when the broker has no default and the operator named no account.
 /// Substituting a placeholder would put a blank account name on the plan and
 /// fail at dispatch instead of here, where the cause is obvious.
-fn resolve_account(args: &Args, broker: Broker) -> Result<String> {
+fn resolve_account(args: &Args, broker: Broker, chart_symbol: &str) -> Result<String> {
     if let Some(a) = &args.account_id {
         return Ok(a.clone());
     }
@@ -1225,6 +1228,10 @@ fn resolve_account(args: &Args, broker: Broker) -> Result<String> {
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
         }
+    }
+    if broker == Broker::Mt5
+        && let Some(account) = local_chart_client::mt5_chart_account(chart_symbol) {
+        return Ok(account.to_string());
     }
     broker
         .default_account_index()

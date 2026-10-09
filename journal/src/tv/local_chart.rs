@@ -80,7 +80,7 @@ fn load_chart_local_with(
     goto: Option<&str>,
     opener: impl FnOnce(&str) -> Result<&'static str>,
 ) -> Result<bool> {
-    let symbol = local_chart_symbol(instrument);
+    let symbol = local_chart_client::local_chart_symbol_for_feed(instrument, Some(broker));
     let url = build_url(base_url, &symbol, broker, granularity, goto);
     opener(&url)?;
     Ok(false)
@@ -229,7 +229,7 @@ pub fn arm_setup_url(
     broker: &str,
     granularity: &str,
 ) -> Option<String> {
-    let symbol = local_chart_symbol(instrument);
+    let symbol = local_chart_client::local_chart_symbol_for_feed(instrument, Some(broker));
     let tf = local_chart_tf(granularity).or_else(|| {
         warn!(
             "local-chart: unrecognised granularity {granularity:?} for {symbol} — cannot \
