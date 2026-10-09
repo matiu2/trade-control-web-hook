@@ -21,3 +21,6 @@ dell
 .claude/trade-calendar-maker
 TODO-bug015-ttl-and-purge.md
 TODO-track-D-candle-cache-wasm-kv.md
+
+# Local MT5 login material
+.mt5-creds.toml

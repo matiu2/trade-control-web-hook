@@ -1173,7 +1173,7 @@ fn resolve_with_recovery(
         Broker::TradeNation => instrument_lookup::Broker::TradeNation,
         // The catalog has no IBKR column, so there is nothing to recover a
         // futures symbol from. Stage 5 adds `Broker::Ibkr` + rows there.
-        Broker::Ibkr => {
+        Broker::Ibkr | Broker::Mt5 => {
             return Err(eyre!(
                 "cannot recover chart symbol {tv_symbol:?} for ibkr: the instrument-lookup \
                  catalog has no IBKR listing yet"

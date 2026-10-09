@@ -4487,3 +4487,70 @@ can run behind a non-CF transport. A native HTTP server adapter (axum + a
 file-backed state store) is sketched in the plan but not yet implemented —
 build that out if you want to run this on a home machine with dynamic DNS
 rather than on Cloudflare Workers.
+
+
+## MT5 (The5ers demo/competition)
+
+MT5 execution uses the direct WebTerminal connection; server and replay candles
+use CandleBridge's historical paired bid/ask ticks. One EA attached to one chart
+serves every requested instrument. Keep MT5 and CandleBridge running for history;
+Algo Trading may remain disabled. Quotes and execution need no chart attachment.
+
+Create `~/.config/trade-control/mt5-accounts.toml` (or set `MT5_ACCOUNTS_FILE`):
+
+```toml
+[accounts.the5ers-competition]
+login = 12577408
+server = "FivePercentOnline-Experience"
+server_time = "+03:00" # explicit current broker clock; update if broker changes DST
+credentials_file = "/absolute/path/to/.mt5-creds.toml"
+mailbox = "/absolute/path/to/MetaTrader 5/MQL5/Files/mt5-read-only"
+```
+
+The credential file retains `[creds] username = "..."` and `password = "..."`.
+Keep it private and outside version control. The configuration pins the login,
+server and EA identity; the adapter refuses real accounts. Forex risk sizing uses
+MT5 contract size, lot limits and a fresh account-currency conversion. Literal
+`risk_units` / `--risk-units` means **lots** on MT5; percent and amount remain
+monetary SL risk. Existing exposure on the same instrument prevents a new entry.
+
+Register metadata in staging (competition is `--kind demo`):
+
+```sh
+trade-control-accounts --config ~/.config/trade-control/trade-control-staging.toml   add the5ers-competition --broker mt5 --kind demo
+trade-control-broker-check the5ers-competition   --config ~/.config/trade-control/trade-control-staging.toml   --instrument EURUSD --candle-count 3 --preview-minimum-short
+```
+
+The check reads quotes/history and validates a **dry-run** minimum-lot short
+with SL 20 pips and TP 40 pips. It transmits no market or pending orders.
+To arm, choose `tv-arm-staging --broker mt5 --account-id the5ers-competition`.
+MT5 spread forecasts have not been measured for the baked forecast table yet:
+arming requires the existing explicit `TV_ARM_ALLOW_UNBAKED=1` override. This
+leaves the live quote and historical candle spread checks in place. Other broker
+forecasts are never substituted for MT5. Zero spread is valid on a fresh MT5 quote.
+
+Journal's saved MT5 plans replay using `--source mt5`; the replay resolves the
+named account from their intents. For a plan without that account, supply
+`replay-candles-staging --source mt5 --mt5-account the5ers-competition ...`.
+
+Candles share PostgreSQL tables `candle_cache_mt5` and
+`candle_cache_mt5_bid_ask`, separate from bid-only `mt5_bid` history.
+`MT5_CACHE_DATABASE_URL` selects the candle database independently of the
+server state database. Default: local `candle_cache` database/role.
+The cache records its login/server identity and refuses a different account;
+use a separate candle database when changing accounts. Imported tick-minute bid
+OHLC must match native MT5 bid OHLC. Mid OHLC is built from paired tick mids,
+not averages of unrelated bid/ask extremes. H4/D1 follow candle-cache's FX
+session grid. Missing downloaded/tick history is an error; retry once MT5 has
+finished downloading it. No incomplete range is accepted as a full import.
+
+Warm the cache directly from the trading-libraries checkout:
+
+```sh
+cargo run --manifest-path mt5-data-source/Cargo.toml --bin mt5-candles --   --account the5ers-competition --symbol AUDUSD --timeframe H1 --count 300
+```
+
+Mutation timeouts stay ambiguous and block retry until reconciled. Partial fills
+report actual filled lots. Settlement correlates order tickets with position IDs
+through deals and includes commissions, fees and swap. History is bounded to 31
+days; an incomplete archive carries a warning rather than invented P&L.

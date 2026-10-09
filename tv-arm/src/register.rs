@@ -184,7 +184,7 @@ pub(crate) fn register_trade_plan(
     let pullback_arm = match built_trade.spec.pull_back {
         Some(atr_mult) => {
             let broker = built_trade.spec.broker;
-            let anchor_open = read_mid_blocking(kind_to_broker(broker), &built_trade.instrument)
+            let anchor_open = read_mid_blocking(kind_to_broker(broker), &built_trade.instrument, &built_trade.spec.account)
                 .wrap_err("read live mid for --pull-back anchor")?;
             Some(crate::trade_plan_build::PullbackArm {
                 anchor_open,

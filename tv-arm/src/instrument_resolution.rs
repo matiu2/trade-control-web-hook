@@ -65,6 +65,13 @@ pub fn resolve_for_broker(tv_symbol: &str, broker: ConvBroker) -> Result<Resolve
         )
     })?;
 
+    if broker == ConvBroker::Mt5 {
+        if asset.class != AssetClass::Forex { return Err(eyre!("MT5 adapter currently supports FX only")); }
+        let broker_symbol = trade_control_conventions::instrument_for(broker, &asset.id);
+        // No measured MT5 forecast exists yet; require the existing explicit override.
+        require_spread_coverage(&format!("MT5:{broker_symbol}"))?;
+        return Ok(ResolvedInstrument { asset, broker_symbol, precision:CatalogPrecision::from_asset(asset) });
+    }
     let il_broker = to_il_broker(broker).ok_or_else(|| {
         eyre!(
             "asset {} cannot be resolved for {}: the instrument-lookup catalog has no \
@@ -211,6 +218,7 @@ fn to_il_broker(broker: ConvBroker) -> Option<IlBroker> {
         ConvBroker::Oanda => Some(IlBroker::Oanda),
         ConvBroker::TradeNation => Some(IlBroker::TradeNation),
         ConvBroker::Ibkr => Some(IlBroker::Ibkr),
+        ConvBroker::Mt5 => None,
     }
 }
 

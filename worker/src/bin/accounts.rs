@@ -161,6 +161,7 @@ enum BrokerArg {
     Oanda,
     Tradenation,
     Ibkr,
+    Mt5,
 }
 
 impl From<BrokerArg> for BrokerKind {
@@ -169,6 +170,7 @@ impl From<BrokerArg> for BrokerKind {
             BrokerArg::Oanda => BrokerKind::Oanda,
             BrokerArg::Tradenation => BrokerKind::TradeNation,
             BrokerArg::Ibkr => BrokerKind::Ibkr,
+            BrokerArg::Mt5 => BrokerKind::Mt5,
         }
     }
 }
@@ -192,6 +194,10 @@ impl From<KindArg> for AccountKind {
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
+    use tracing_subscriber::prelude::*;
+    tracing_subscriber::registry().with(tracing_error::ErrorLayer::default())
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer()).try_init().ok();
     let cli = Cli::parse();
 
     let db_url = resolve_db_url(&cli)?;
@@ -263,6 +269,10 @@ async fn add(
     max_risk_pct: Option<f64>,
     max_open_positions: Option<u32>,
 ) -> Result<()> {
+    if broker == BrokerKind::Mt5 {
+        if kind.is_live() { return Err(eyre!("MT5 currently supports demo/competition only")); }
+        mt5_data_source::account_config::AccountConfig::load(&name)?;
+    }
     if broker == BrokerKind::Oanda && oanda_account_id.is_none() {
         return Err(eyre!(
             "an OANDA account needs --oanda-account-id (the sub-account routed under the shared OANDA_API_KEY)"

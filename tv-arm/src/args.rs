@@ -27,6 +27,8 @@ pub enum BrokerArg {
     TradeNation,
     /// Interactive Brokers (futures).
     Ibkr,
+    /// MT5 demo/competition account.
+    Mt5,
 }
 
 impl BrokerArg {
@@ -36,6 +38,7 @@ impl BrokerArg {
             Self::Oanda => trade_control_conventions::Broker::Oanda,
             Self::TradeNation => trade_control_conventions::Broker::TradeNation,
             Self::Ibkr => trade_control_conventions::Broker::Ibkr,
+            Self::Mt5 => trade_control_conventions::Broker::Mt5,
         }
     }
 }

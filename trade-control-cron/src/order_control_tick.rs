@@ -138,6 +138,7 @@ where
         BrokerHandle::Oanda(b) => run_both(b, store, &cfg, &src, account, now).await,
         BrokerHandle::TradeNation(b) => run_both(b, store, &cfg, &src, account, now).await,
         BrokerHandle::Ibkr(b) => run_both(b, store, &cfg, &src, account, now).await,
+        BrokerHandle::Mt5(b) => run_both(b, store, &cfg, &src, account, now).await,
     }
 }
 

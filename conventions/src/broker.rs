@@ -11,6 +11,8 @@ pub enum Broker {
     /// No broker implementation exists yet; the variant is here so the
     /// compiler enumerates the places that will need one.
     Ibkr,
+    /// MT5 demo/competition account, selected explicitly by name.
+    Mt5,
 }
 
 impl Broker {
@@ -18,7 +20,7 @@ impl Broker {
     /// role, and the two lists must agree because `tv-arm` maps between them.
     ///
     /// [`BrokerKind::ALL`]: https://docs.rs/trade-control-core
-    pub const ALL: &'static [Broker] = &[Broker::Oanda, Broker::TradeNation, Broker::Ibkr];
+    pub const ALL: &'static [Broker] = &[Broker::Oanda, Broker::TradeNation, Broker::Ibkr, Broker::Mt5];
 
     /// Look up a broker from a TradingView exchange tag (the prefix
     /// before the colon in `OANDA:EUR_USD`). Case-insensitive.
@@ -42,6 +44,7 @@ impl Broker {
             "oanda" => Some(Self::Oanda),
             "tradenation" => Some(Self::TradeNation),
             "ibkr" => Some(Self::Ibkr),
+            "mt5" => Some(Self::Mt5),
             _ => None,
         }
     }
@@ -52,6 +55,7 @@ impl Broker {
             Self::Oanda => "oanda",
             Self::TradeNation => "tradenation",
             Self::Ibkr => "ibkr",
+            Self::Mt5 => "mt5",
         }
     }
 
@@ -66,7 +70,7 @@ impl Broker {
         match self {
             Self::Oanda => Some("m-and-w"),
             Self::TradeNation => Some("reversals"),
-            Self::Ibkr => None,
+            Self::Ibkr | Self::Mt5 => None,
         }
     }
 }
@@ -120,7 +124,7 @@ mod tests {
     /// variant that was left out, so this walks `ALL` and also pins its length.
     #[test]
     fn all_covers_every_variant_and_round_trips() {
-        assert_eq!(Broker::ALL.len(), 3, "a new broker must be added to ALL");
+        assert_eq!(Broker::ALL.len(), 4, "a new broker must be added to ALL");
         for &b in Broker::ALL {
             assert_eq!(Broker::from_wire(b.as_str()), Some(b), "{b:?}");
         }

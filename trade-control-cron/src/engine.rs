@@ -467,6 +467,10 @@ async fn fetch_plan_settlement<S: StateStore>(
             b.fetch_settlement(&plan.instrument, since, &order_ids, now)
                 .await
         }
+        BrokerHandle::Mt5(b) => {
+            b.fetch_settlement(&plan.instrument, since, &order_ids, now)
+                .await
+        }
     };
 
     match fetched {
@@ -726,6 +730,7 @@ async fn fetch_candles(
         BrokerHandle::Oanda(b) => b.get_candles(instrument, granularity, since, now).await,
         BrokerHandle::TradeNation(b) => b.get_candles(instrument, granularity, since, now).await,
         BrokerHandle::Ibkr(b) => b.get_candles(instrument, granularity, since, now).await,
+        BrokerHandle::Mt5(b) => b.get_candles(instrument, granularity, since, now).await,
     };
     disposition(result)
 }
@@ -914,6 +919,7 @@ where
             dispatch_action(b, store, &verified, cron, granularity, now).await
         }
         BrokerHandle::Ibkr(b) => dispatch_action(b, store, &verified, cron, granularity, now).await,
+        BrokerHandle::Mt5(b) => dispatch_action(b, store, &verified, cron, granularity, now).await,
     };
     let outcome = result.describe();
     tracing::info!(

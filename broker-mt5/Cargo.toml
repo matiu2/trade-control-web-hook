@@ -1,0 +1,16 @@
+[package]
+name = "broker-mt5"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+trade-control-core = { path = "../core" }
+mt5-data-source = { path = "../../mt5-data-source" }
+candle-model = { path = "../../candle-model" }
+chrono = "0.4"
+color-eyre = "0.6"
+tracing = "0.1"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-error = "0.2"

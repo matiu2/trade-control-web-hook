@@ -327,7 +327,7 @@ fn broker_for(broker: BrokerKind) -> Option<instrument_lookup::Broker> {
     match broker {
         BrokerKind::Oanda => Some(instrument_lookup::Broker::Oanda),
         BrokerKind::TradeNation => Some(instrument_lookup::Broker::TradeNation),
-        BrokerKind::Ibkr => None,
+        BrokerKind::Ibkr | BrokerKind::Mt5 => None,
     }
 }
 

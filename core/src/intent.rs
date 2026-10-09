@@ -1634,6 +1634,8 @@ pub enum BrokerKind {
     /// exists yet. An account carrying this kind resolves to a loud error at
     /// the broker factory rather than falling back to another venue.
     Ibkr,
+    /// MT5 demo/competition account, selected explicitly by name.
+    Mt5,
 }
 
 impl BrokerKind {
@@ -1644,7 +1646,7 @@ impl BrokerKind {
     /// `["oanda", "tradenation"]` arrays this replaced were invisible to the
     /// compiler and each had to be found by hand.
     pub const ALL: &'static [BrokerKind] =
-        &[BrokerKind::Oanda, BrokerKind::TradeNation, BrokerKind::Ibkr];
+        &[BrokerKind::Oanda, BrokerKind::TradeNation, BrokerKind::Ibkr, BrokerKind::Mt5];
 
     /// The lowercase wire form — the same string serde produces.
     ///
@@ -1655,6 +1657,7 @@ impl BrokerKind {
             Self::Oanda => "oanda",
             Self::TradeNation => "tradenation",
             Self::Ibkr => "ibkr",
+            Self::Mt5 => "mt5",
         }
     }
 }
@@ -2400,7 +2403,7 @@ mod broker_kind_tests {
     fn all_lists_every_variant() {
         assert_eq!(
             BrokerKind::ALL.len(),
-            3,
+            4,
             "a new broker must be added to ALL"
         );
         assert!(BrokerKind::ALL.contains(&BrokerKind::Oanda));

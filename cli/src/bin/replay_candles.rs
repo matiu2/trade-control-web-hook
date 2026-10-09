@@ -153,7 +153,7 @@ async fn run() -> Result<()> {
 
     init_tracing();
 
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     // `--test-mode` is a fully-offline branch: no broker, no TradingView, no
     // env vars — everything comes from the saved fixture.
@@ -178,6 +178,12 @@ async fn run() -> Result<()> {
         ))
     })?;
     let plan = load_plan(&plan_path)?;
+    if args.source == CandleSource::Mt5 && args.mt5_account.is_none() {
+        let accounts: std::collections::BTreeSet<_> = plan.rules.iter()
+            .filter(|r| r.intent.broker == trade_control_core::intent::BrokerKind::Mt5)
+            .filter_map(|r| r.intent.account.clone()).collect();
+        if accounts.len() == 1 { args.mt5_account = accounts.into_iter().next(); }
+    }
 
     // Granularity comes from the plan; `--granularity` only overrides, and an
     // override must still match the plan (a mismatch would replay the wrong
@@ -263,6 +269,7 @@ async fn run() -> Result<()> {
         bar_secs,
         warmup_bars,
         args.cache_dir.clone(),
+        args.mt5_account.as_deref(),
     )
     .await?;
 
@@ -356,6 +363,7 @@ async fn run() -> Result<()> {
                     finer_gran,
                     &zoom_windows,
                     args.cache_dir.clone(),
+                    args.mt5_account.as_deref(),
                 )
                 .await;
 
@@ -605,6 +613,7 @@ async fn pull_with_warmup(
     bar_secs: i64,
     want_warmup: usize,
     cache_dir: Option<PathBuf>,
+    mt5_account: Option<&str>,
 ) -> Result<Vec<EngineCandle>> {
     let mut pull_from = start - Duration::seconds(bar_secs * want_warmup as i64);
     let mut attempt: u32 = 0;
@@ -623,7 +632,7 @@ async fn pull_with_warmup(
             "pulling candles (times in Brisbane, UTC+10)"
         );
         let candles =
-            candles::pull(source, symbol, gran, pull_from, pull_end, cache_dir.clone()).await?;
+            candles::pull(source, symbol, gran, pull_from, pull_end, cache_dir.clone(), mt5_account).await?;
         if candles.is_empty() {
             return Err(eyre!(
                 "no candles returned for {symbol} {gran_label} in [{pull_from}, {pull_end}]"
@@ -1039,6 +1048,7 @@ async fn pull_upkeep(
         start,
         end,
         args.cache_dir.clone(),
+        args.mt5_account.as_deref(),
     )
     .await
     .wrap_err_with(|| format!("pull the --upkeep {raw} bid/ask series"))?;
@@ -1079,6 +1089,7 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
         source: inputs.meta.source,
         symbol: &inputs.meta.instrument,
         cache_dir: args.cache_dir.clone(),
+        mt5_account: args.mt5_account.as_deref(),
     };
     let replay = run_frozen(
         &inputs.plan,
@@ -1303,6 +1314,7 @@ async fn run_frozen(
         finer_gran,
         &missed,
         refetch.cache_dir.clone(),
+        refetch.mt5_account,
     )
     .await;
     if fetched.is_empty() {
@@ -1344,6 +1356,7 @@ async fn run_frozen(
 /// under `cargo test` with no credentials), so reaching the network is opt-in
 /// per call site rather than assumed.
 struct FixtureRefetch<'a> {
+    mt5_account: Option<&'a str>,
     source: CandleSource,
     symbol: &'a str,
     cache_dir: Option<PathBuf>,
@@ -2005,6 +2018,7 @@ mod tests {
             instrument: None,
             granularity: None,
             source: CandleSource::TradeNation,
+            mt5_account: None,
             start: None,
             end: None,
             tv_mcp_root: None,

@@ -455,6 +455,7 @@ async fn sample_instrument_spread(
         BrokerHandle::Oanda(b) => b.get_quote(instrument).await,
         BrokerHandle::TradeNation(b) => b.get_quote(instrument).await,
         BrokerHandle::Ibkr(b) => b.get_quote(instrument).await,
+        BrokerHandle::Mt5(b) => b.get_quote(instrument).await,
     };
     let spread = quote.ok().map(|q| q.spread());
     cache.insert(instrument.to_string(), spread);
@@ -469,6 +470,7 @@ async fn list_positions(
         BrokerHandle::Oanda(b) => b.list_open_positions(account_id).await,
         BrokerHandle::TradeNation(b) => b.list_open_positions(account_id).await,
         BrokerHandle::Ibkr(b) => b.list_open_positions(account_id).await,
+        BrokerHandle::Mt5(b) => b.list_open_positions(account_id).await,
     };
     res.map_err(|e| e.to_string())
 }
@@ -483,6 +485,7 @@ async fn amend(
         BrokerHandle::Oanda(b) => b.amend_stop(account_id, id, new_stop).await,
         BrokerHandle::TradeNation(b) => b.amend_stop(account_id, id, new_stop).await,
         BrokerHandle::Ibkr(b) => b.amend_stop(account_id, id, new_stop).await,
+        BrokerHandle::Mt5(b) => b.amend_stop(account_id, id, new_stop).await,
     }
 }
 

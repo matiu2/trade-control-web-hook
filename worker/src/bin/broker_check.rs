@@ -21,6 +21,9 @@
 //! OANDA_API_KEY=… trade-control-broker-check testing --instrument EUR/USD
 //! ```
 
+#[path = "broker_check/mt5.rs"]
+mod mt5_probe;
+
 use clap::Parser;
 use color_eyre::eyre::{Result, eyre};
 
@@ -28,7 +31,7 @@ use trade_control_core::account::{MetadataError, MetadataStore};
 use trade_control_core::broker::Broker;
 use trade_control_core::intent::BrokerKind;
 use trade_control_worker::{
-    BrokerError, Config, PgMetadataStore, PgStateStore, Secrets, acquire_ibkr, acquire_oanda,
+    BrokerError, Config, PgMetadataStore, PgStateStore, Secrets, acquire_ibkr, acquire_mt5, acquire_oanda,
     acquire_tn,
 };
 
@@ -45,6 +48,14 @@ struct Cli {
     #[arg(long, default_value = "EUR/USD")]
     instrument: String,
 
+    /// Also verify this many closed H1 MT5 tick candles (read-only).
+    #[arg(long, default_value_t = 0)]
+    candle_count: u32,
+
+    /// Run minimum-lot MT5 short sizing and payload validation with dry_run=true.
+    #[arg(long)]
+    preview_minimum_short: bool,
+
     /// Path to a `trade-control.toml` for `database.url`. Omitted → same search
     /// as `trade-control-accounts` (`~/.config/trade-control/` then `./`).
     #[arg(long)]
@@ -58,6 +69,10 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
+    use tracing_subscriber::prelude::*;
+    tracing_subscriber::registry().with(tracing_error::ErrorLayer::default())
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer()).try_init().ok();
     let cli = Cli::parse();
 
     let db_url = resolve_db_url(&cli)?;
@@ -85,6 +100,11 @@ async fn main() -> Result<()> {
 
     // Acquire the broker exactly as the worker does, then one cheap read.
     let quote = match meta.broker {
+        BrokerKind::Mt5 => {
+            let broker = acquire_mt5(&meta).await.map_err(|e| eyre!("{e}"))?;
+            mt5_probe::check(&broker, &meta, &cli.instrument, cli.candle_count, cli.preview_minimum_short).await?;
+            broker.get_quote(&cli.instrument).await
+        }
         BrokerKind::TradeNation => {
             println!("acquiring TradeNation session from the enc store (by name)…");
             let broker = acquire_tn(&meta)
