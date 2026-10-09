@@ -235,11 +235,16 @@ fn is_inside_a_widen(instrument: &str, bar_open: DateTime<Utc>) -> bool {
 
 /// Decide what to do with one open position, given the candles the broker
 /// returned for it. Pure: no broker, no clock, no store.
+#[cfg(test)]
 pub fn decide(
     inputs: &BreakevenInputs<'_>,
     candles: Vec<Candle>,
     now: DateTime<Utc>,
 ) -> BreakevenDecision {
+    decide_for_account(inputs, candles, now, None)
+}
+
+pub fn decide_for_account(inputs: &BreakevenInputs<'_>, candles: Vec<Candle>, now: DateTime<Utc>, account: Option<&str>) -> BreakevenDecision {
     let Some(fill_at) = inputs.position.opened_at else {
         return BreakevenDecision::Blocked(BreakevenBlock::NoFillTime);
     };
@@ -247,7 +252,7 @@ pub fn decide(
     let armable = armable_candles(
         candles,
         inputs.snapshot.granularity,
-        &inputs.position.instrument,
+        &trade_control_core::spread_blackout::spread_lookup_key(&inputs.position.instrument, account),
         fill_at,
         now,
     );

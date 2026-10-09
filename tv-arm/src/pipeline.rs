@@ -425,7 +425,8 @@ fn setup_from_frozen(
     }
 
     let broker = resolve_broker(args, &frozen.chart_symbol)?;
-    let resolved = crate::instrument_resolution::resolve_for_broker(&frozen.chart_symbol, broker)?;
+    let account = resolve_account(args, broker, &frozen.chart_symbol)?;
+    let resolved = crate::instrument_resolution::resolve_for_account(&frozen.chart_symbol, broker, Some(&account))?;
     let instrument = resolved.broker_symbol.clone();
     // No live chart, so no TV Symbol-info to prefer — the catalog precision is
     // the answer, exactly as it is when a live arm can't reach tv-mcp.
@@ -526,7 +527,8 @@ fn read_setup_from_chart(args: &Args) -> Result<(SetupInputs, Roles)> {
     // successful recovery the user overlay is patched so future runs
     // resolve directly. If that also misses, we error with a
     // copy-pasteable TOML snippet built from the chart info.
-    let resolved = resolve_with_recovery(&state.symbol, broker, &mcp)?;
+    let account = resolve_account(args, broker, &state.symbol)?;
+    let resolved = resolve_with_recovery(&state.symbol, broker, &mcp, Some(&account))?;
     let instrument = resolved.broker_symbol.clone();
 
     info!(
@@ -1125,8 +1127,9 @@ fn resolve_with_recovery(
     tv_symbol: &str,
     broker: Broker,
     mcp: &TvMcp,
+    account: Option<&str>,
 ) -> Result<crate::instrument_resolution::ResolvedInstrument> {
-    let first_err = match crate::instrument_resolution::resolve_for_broker(tv_symbol, broker) {
+    let first_err = match crate::instrument_resolution::resolve_for_account(tv_symbol, broker, account) {
         Ok(resolved) => return Ok(resolved),
         Err(e) => e,
     };

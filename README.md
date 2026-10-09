@@ -4589,3 +4589,47 @@ Mutation timeouts stay ambiguous and block retry until reconciled. Partial fills
 report actual filled lots. Settlement correlates order tickets with position IDs
 through deals and includes commissions, fees and swap. History is bounded to 31
 days; an incomplete archive carries a warning rather than invented P&L.
+
+
+### Finish the MT5 spread calibration and build a release
+
+`generate-mt5` measures historical bid/ask minute candles through CandleBridge.
+Leave MT5 and the calibration process running until its status is `finished`.
+The account-specific defaults live in `core/src/spread_baseline_mt5.rs`; OANDA
+and TradeNation defaults stay in their existing file. Native broker symbols
+remain unchanged for quotes, orders and candle requests. Spread lookups use
+`mt5:<account>:<symbol>` so two suppliers cannot share a measurement by accident.
+
+A completed report can be validated and baked without placing any trades:
+
+```bash
+cargo run -p spread-baseline-gen --bin bake-mt5 -- \
+  --account the5ers-competition \
+  --report /tmp/the5ers-spread-profile-90d.json
+```
+
+The current 90-day job has a queued completion process:
+
+```bash
+cargo run -p spread-baseline-gen --bin finish-mt5 -- \
+  --account the5ers-competition \
+  --report /tmp/the5ers-spread-profile-90d.json \
+  --calibration-status /tmp/the5ers-spread-profile-90d-status.json \
+  --status /tmp/the5ers-spread-release-status.json
+```
+
+Run this from the repository root, once per calibration. It waits up to seven
+ days, requires a clean tracked `staging` checkout, validates the account identity,
+90-day window, complete catalogue, reviewed profiles, schedule and finite values,
+then commits the evidence and generated defaults. It runs the affected tests,
+Clippy and formatting, commits validation, chooses the next numbered release tag,
+rebuilds the worker and staging-configured CLIs, and pushes the branch and tag.
+Failures stop the job and are recorded in its status file; incomplete or thin
+reports never replace the defaults. The current launcher logs to
+`/tmp/the5ers-spread-release.log`. These temporary status files survive closing
+the terminal but not a machine reboot; restart the completion process after a
+reboot if it was waiting. Do not run a second copy while one is active.
+
+The release artifacts are in `target/release`. This completion job does not
+install binaries or restart trading services. Deploy staging separately with
+`./deploy-staging.sh` when ready to roll the running system.

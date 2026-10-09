@@ -264,7 +264,7 @@ async fn widen_one<S: StateStore>(
     // either this instrument has candle spread hours but now isn't one, OR it's
     // not in the candle table — disambiguate with the legacy NY-close-edge
     // fallback so uncovered assets keep their prior behaviour.
-    let baked_widen_frac = spread_hour_widen_frac(&position.instrument, now);
+    let baked_widen_frac = spread_hour_widen_frac(&trade_control_core::spread_blackout::spread_lookup_key(&position.instrument, account), now);
     if baked_widen_frac.is_none() && !is_ny_close_edge(now) {
         // Not a spread hour for this instrument, and not the legacy fallback
         // edge either → nothing to widen this tick. (Silent: the common case

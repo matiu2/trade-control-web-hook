@@ -170,7 +170,8 @@ impl<L: LineName> Rule for Retest<'_, L> {
         // is a liquidity-vacuum wick, not a genuine retest — don't stamp. Gates
         // the stamp only; the `last_close` scratch already recorded above.
         let spread_hour = trade_control_core::spread_blackout::is_spread_hour(
-            &self.rule.intent.instrument,
+            &trade_control_core::spread_blackout::spread_lookup_key(
+                &self.rule.intent.instrument, self.rule.intent.account.as_deref()),
             candle.time,
         );
 

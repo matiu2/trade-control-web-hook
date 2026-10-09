@@ -57,7 +57,7 @@ use trade_control_core::order_control::join_position_to_attempt;
 use trade_control_core::state::{EntryAttempt, StateStore};
 
 use crate::breakeven_decision::{
-    BREAKEVEN_MIN_ATR_FRACTION, BreakevenBlock, BreakevenDecision, BreakevenInputs, decide,
+    BREAKEVEN_MIN_ATR_FRACTION, BreakevenBlock, BreakevenDecision, BreakevenInputs,
 };
 use crate::broker_handle::BrokerHandle;
 use crate::seam::CronEnv;
@@ -225,7 +225,7 @@ async fn watch_one<B: PositionBroker>(
         position,
         current_stop,
     };
-    let (new_stop, armed_by, armed_at) = match decide(&inputs, candles, now) {
+    let (new_stop, armed_by, armed_at) = match crate::breakeven_decision::decide_for_account(&inputs, candles, now, account) {
         BreakevenDecision::Hold => return,
         BreakevenDecision::Blocked(BreakevenBlock::NoFillTime) => {
             tracing::error!(

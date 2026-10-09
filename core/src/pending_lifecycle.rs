@@ -961,7 +961,7 @@ async fn spread_hour_released<B: Broker>(
 ) -> bool {
     // Baked-hour-end — the deterministic off-signal (replay + live) — so no
     // quote round-trip on a clean bar.
-    if !is_spread_hour(&record.instrument, now) {
+    if !is_spread_hour(&crate::spread_blackout::spread_lookup_key(&record.instrument, record.account.as_deref()), now) {
         return true;
     }
     // Live-spread recovery — the early un-block, still inside the baked hour.
@@ -974,7 +974,7 @@ async fn spread_hour_released<B: Broker>(
         .ok()
         .map(|q| q.spread());
     crate::spread_blackout::spread_hour_released_at(
-        &record.instrument,
+        &crate::spread_blackout::spread_lookup_key(&record.instrument, record.account.as_deref()),
         record.pip_size,
         measured,
         now,

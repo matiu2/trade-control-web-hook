@@ -105,6 +105,7 @@ impl Coverage {
 pub fn coverage(instrument: &str) -> Coverage {
     let Some(row) = super::baseline_candle::SPREAD_BASELINE_CANDLE
         .iter()
+        .chain(super::baseline_mt5::SPREAD_BASELINE_MT5.iter())
         .find(|(_broker, symbol, ..)| *symbol == instrument)
     else {
         return Coverage::Missing;

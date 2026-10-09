@@ -59,6 +59,12 @@ mod baseline_candle {
     include!("spread_baseline_candle.rs");
 }
 
+mod baseline_mt5 {
+    include!("spread_baseline_mt5.rs");
+}
+mod account_scope;
+pub use account_scope::{mt5_spread_key, spread_lookup_key};
+
 mod coverage;
 pub use coverage::*;
 mod sample_mask;
@@ -109,6 +115,7 @@ fn schedule_tz(schedule: &str) -> Option<chrono_tz::Tz> {
 fn baked_candle_row(instrument: &str) -> Option<(&'static str, u32, &'static [f64; 24])> {
     baseline_candle::SPREAD_BASELINE_CANDLE
         .iter()
+        .chain(baseline_mt5::SPREAD_BASELINE_MT5.iter())
         .find(|(_broker, symbol, ..)| *symbol == instrument)
         .map(|(_broker, _symbol, schedule, _reviewed, mask, widen, ..)| (*schedule, *mask, widen))
 }
@@ -321,6 +328,7 @@ fn threshold_from_baseline(baseline: Option<(f64, f64, f64)>) -> f64 {
 pub fn baked_baseline(instrument: &str) -> Option<(f64, f64, f64)> {
     baseline_candle::SPREAD_BASELINE_CANDLE
         .iter()
+        .chain(baseline_mt5::SPREAD_BASELINE_MT5.iter())
         .find(|(_broker, symbol, ..)| *symbol == instrument)
         .map(
             |(
@@ -1549,6 +1557,7 @@ fn baked_forecast_row(
 ) -> Option<(&'static str, u32, &'static [f64; 24], &'static [f64; 24])> {
     baseline_candle::SPREAD_BASELINE_CANDLE
         .iter()
+        .chain(baseline_mt5::SPREAD_BASELINE_MT5.iter())
         .find(|(_broker, symbol, ..)| *symbol == instrument)
         .map(
             |(_broker, _symbol, schedule, _reviewed, mask, widen, _m, _l, _h, forecast)| {

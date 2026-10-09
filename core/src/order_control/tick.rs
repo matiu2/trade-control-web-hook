@@ -150,13 +150,13 @@ where
         // hour ended, or live spread recovered. Asked here, once, so
         // `stored_verdict` stays pure.
         let spread_hour_over = crate::spread_blackout::spread_hour_released_at(
-            &record.instrument,
+            &crate::spread_blackout::spread_lookup_key(&record.instrument, record.account.as_deref()),
             record.pip_size,
             measured,
             now,
         );
         let (expected_this_hour, expected_next_hour) =
-            spread_forecast_frac(&record.instrument, now);
+            spread_forecast_frac(&crate::spread_blackout::spread_lookup_key(&record.instrument, record.account.as_deref()), now);
         // A parked order has no stop distinct from its drawn one — it was never
         // placed — so the drawn distance is both the original and the current.
         let target = sl_target(

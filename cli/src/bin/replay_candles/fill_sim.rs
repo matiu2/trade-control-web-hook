@@ -422,7 +422,7 @@ pub fn simulate_fill_resolved_zoom(
     // The widen governs bars in `[effective_from, restored_at)`; outside it the
     // break-even-managed `active_stop` applies.
     let widen_trigger =
-        trade_control_core::spread_blackout::elevated_threshold_pips(&intent.instrument);
+        trade_control_core::spread_blackout::elevated_threshold_pips(&trade_control_core::spread_blackout::spread_lookup_key(&intent.instrument, intent.account.as_deref()));
     // EVERY widen episode, not just the first: a position open for days crosses
     // several spread hours and the live cron widens at each. Scoring the exit off
     // one episode left later spread hours bare and booked stop-outs the live
@@ -858,7 +858,7 @@ fn find_fill<'a>(
             let i = fill_window.iter().position(|c| {
                 book_reaches(c, entry_book, trigger_price, entry_approach)
                     && !trade_control_core::spread_blackout::suppress_on_spread_hour_bar_seconds(
-                        &intent.instrument,
+                        &trade_control_core::spread_blackout::spread_lookup_key(&intent.instrument, intent.account.as_deref()),
                         c.time,
                         bar_seconds,
                     )
@@ -938,7 +938,7 @@ pub fn breakeven_armed_at_resolved(
     // are state" display path), so it needs the same gate — reconstructed from
     // the same shared episode function, not re-derived here.
     let widen_trigger =
-        trade_control_core::spread_blackout::elevated_threshold_pips(&intent.instrument);
+        trade_control_core::spread_blackout::elevated_threshold_pips(&trade_control_core::spread_blackout::spread_lookup_key(&intent.instrument, intent.account.as_deref()));
     let widen_episodes = trade_control_core::order_control::WidenEpisodes::new(
         widen_episodes_at_resolved(resolved, intent, shell, pip_size, candles, widen_trigger)
             .into_iter()
@@ -1434,7 +1434,7 @@ pub fn widen_episodes_at_resolved(
         // (`blackout_apply::widen_one` passes `original_sl`), so the widened stop
         // this replay reconstructs matches the one the live broker holds to the pip.
         let widen_instant = trade_control_core::spread_blackout::spread_hour_widen_instant(
-            &intent.instrument,
+            &trade_control_core::spread_blackout::spread_lookup_key(&intent.instrument, intent.account.as_deref()),
             c.time,
             bar_seconds,
         );
@@ -1499,7 +1499,7 @@ pub fn widen_episodes_at_resolved(
         // bar open. Restore detection walks the *following bars*, so it's still
         // anchored to the bar time.
         let widen_at = widen_instant.map(|(at, _frac)| at).unwrap_or(c.time);
-        let restored_at = restore_bar(&fill.rest[i + 1..], c.time, pip_size, &intent.instrument);
+        let restored_at = restore_bar(&fill.rest[i + 1..], c.time, pip_size, &trade_control_core::spread_blackout::spread_lookup_key(&intent.instrument, intent.account.as_deref()));
         // This bar opens an episode, so under Rule 2 it does NOT arm break-even
         // — control reaches `episodes.push` below and skips the arm at the foot
         // of the loop via `continue`. Every path that reached here and did NOT

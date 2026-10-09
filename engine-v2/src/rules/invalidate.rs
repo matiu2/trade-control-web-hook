@@ -140,7 +140,8 @@ impl<L: LineName> Invalidate<'_, L> {
     /// spread-hour subtlety as [`BreakAndClose`](super::BreakAndClose).
     fn should_retire(&self, hit: bool, candle: &Candle) -> bool {
         hit && !trade_control_core::spread_blackout::is_spread_hour(
-            &self.rule.intent.instrument,
+            &trade_control_core::spread_blackout::spread_lookup_key(
+                &self.rule.intent.instrument, self.rule.intent.account.as_deref()),
             candle.time,
         )
     }

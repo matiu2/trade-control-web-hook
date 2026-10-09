@@ -152,10 +152,11 @@ fn geometry_of(attempt: &EntryAttempt, order: &PendingOrder) -> Option<Geometry>
 async fn spread_inputs<Q: SpreadSource>(
     quotes: &mut Q,
     instrument: &str,
+    account: Option<&str>,
     now: DateTime<Utc>,
 ) -> SpreadInputs {
     let measured = quotes.measured(instrument).await.unwrap_or(0.0);
-    let (expected_this_hour, expected_next_hour) = spread_forecast_frac(instrument, now);
+    let (expected_this_hour, expected_next_hour) = spread_forecast_frac(&crate::spread_blackout::spread_lookup_key(instrument, account), now);
     SpreadInputs {
         last_candle: measured,
         expected_this_hour,
@@ -249,7 +250,7 @@ where
         .find(|a| a.broker_order_id == order.order_id)?;
     let geometry = geometry_of(attempt, order)?;
 
-    let spreads = spread_inputs(quotes, &order.instrument, now).await;
+    let spreads = spread_inputs(quotes, &order.instrument, account, now).await;
     let target = sl_target(
         spreads,
         geometry.original_sl_distance,

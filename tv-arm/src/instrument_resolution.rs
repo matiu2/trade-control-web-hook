@@ -54,6 +54,10 @@ pub struct ResolvedInstrument {
 /// symbol field (slash form, underscore form, display name) all
 /// converge to the same `Asset`.
 pub fn resolve_for_broker(tv_symbol: &str, broker: ConvBroker) -> Result<ResolvedInstrument> {
+    resolve_for_account(tv_symbol, broker, None)
+}
+
+pub fn resolve_for_account(tv_symbol: &str, broker: ConvBroker, account: Option<&str>) -> Result<ResolvedInstrument> {
     let bare = strip_exchange(tv_symbol);
     let asset = instrument_lookup::resolve(bare)?.ok_or_else(|| {
         let hint = instrument_lookup::user_config_path()
@@ -70,8 +74,8 @@ pub fn resolve_for_broker(tv_symbol: &str, broker: ConvBroker) -> Result<Resolve
             return Err(eyre!("MT5 adapter currently supports FX only"));
         }
         let broker_symbol = trade_control_conventions::instrument_for(broker, &asset.id);
-        // No measured MT5 forecast exists yet; require the existing explicit override.
-        require_spread_coverage(&format!("MT5:{broker_symbol}"))?;
+        let key = trade_control_core::spread_blackout::mt5_spread_key(account.unwrap_or("<missing-account>"), &broker_symbol);
+        require_spread_coverage(&key)?;
         return Ok(ResolvedInstrument {
             asset,
             broker_symbol,

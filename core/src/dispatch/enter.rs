@@ -622,14 +622,14 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 }
                 Ok(quote) => {
                     let spread_pips = quote.spread() / pip_size;
-                    let threshold = spread_blackout::elevated_threshold_pips(&resolved.instrument);
+                    let threshold = spread_blackout::elevated_threshold_pips(&spread_blackout::spread_lookup_key(&resolved.instrument, verified.intent.account.as_deref()));
                     if spread_blackout::spread_blackout_decision(true, spread_pips, threshold) {
                         // Name the instrument's baked normal/spike so the
                         // operator can judge whether the block is right. Baked
                         // figures come from the candle-derived baseline table;
                         // absent for an uncatalogued instrument (then we only have
                         // the flat threshold to show).
-                        let normal = match spread_blackout::baked_baseline(&resolved.instrument) {
+                        let normal = match spread_blackout::baked_baseline(&spread_blackout::spread_lookup_key(&resolved.instrument, verified.intent.account.as_deref())) {
                             Some((low, high, median)) => format!(
                                 "{} normal spread ~{median:.1}p (seen {low:.1}–{high:.1}p)",
                                 resolved.instrument
@@ -1941,7 +1941,7 @@ async fn windowed_entry_spread<B: Broker>(
     // the calm, post-hour spread a promoted park is placed into.
     let fetched = candles.len();
     let candles = crate::spread_blackout::closes_outside_spread_hours(
-        instrument,
+        &crate::spread_blackout::spread_lookup_key(instrument, intent.account.as_deref()),
         &candles,
         granularity.seconds(),
     );
