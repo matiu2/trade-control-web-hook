@@ -10,8 +10,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 async fn main() -> Result<()> {
     color_eyre::install()?;
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "info".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .with(tracing_error::ErrorLayer::default())
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();

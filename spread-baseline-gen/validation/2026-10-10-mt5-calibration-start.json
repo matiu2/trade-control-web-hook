@@ -1,0 +1,40 @@
+{
+  "scope": {
+    "feed": "mt5-the5ers-competition",
+    "calendar_days": 90,
+    "from_utc": "2026-07-11T15:14:00Z",
+    "to_utc": "2026-10-09T15:14:00Z",
+    "requested_instruments": 43
+  },
+  "run_state": "running",
+  "report": "/tmp/the5ers-spread-profile-90d.json",
+  "log": "/tmp/the5ers-spread-profile-90d.log",
+  "status": "/tmp/the5ers-spread-profile-90d-status.json",
+  "command": [
+    "/home/matiu/projects/trading-libraries/trade-control-web-hook/target/debug/generate-mt5",
+    "--account",
+    "the5ers-competition",
+    "--days",
+    "90",
+    "--out",
+    "/tmp/the5ers-spread-profile-90d.json"
+  ],
+  "first_validated_window": {
+    "symbol": "EURUSD",
+    "minutes": 1089,
+    "through_utc": "2026-07-13T15:14:00Z"
+  },
+  "offline_validation": {
+    "tests_passed": 56,
+    "new_tests": 5,
+    "strict_clippy": "passed",
+    "cargo_fmt": "passed"
+  },
+  "orders_sent": false,
+  "installed_server_forecasts": false,
+  "limits": [
+    "This records the start of a long-running calibration, not its final results.",
+    "The existing symbol-only baked-table readers still need account-aware MT5 integration.",
+    "Report failures and InsufficientData review status must be inspected before baking."
+  ]
+}
