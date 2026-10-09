@@ -13,8 +13,8 @@
 //!
 //! - reading it from the **invalidation line** picked up a stale `too-high` left
 //!   over from a different trade and armed the wrong way. That line is now
-//!   validated to sit inside the fib's range (which catches the stale leftover)
-//!   but no longer decides anything.
+//!   validated to sit inside the fib's range when break/retest preps are used,
+//!   but no longer decides direction. Continuation cutoffs may sit outside it.
 //! - reading it from **raw point order** was a second, independent
 //!   wrong-direction bug (AUD/CAD 2026-07, head at `points[1]`).
 //!
@@ -77,11 +77,11 @@ pub fn resolve_hs_trade(
                  (draw the fib spanning head→neckline)"
             )
         })?;
-    // Rule 2: the invalidation (`too-low`/`too-high`) horizontal must sit
-    // inside the fib's head↔neckline range. A line outside that band belongs
-    // to a different, larger pattern — reject it rather than bake a poison
-    // level / mismatched setup.
-    if let Some(inv_price) = geom.invalidation
+    // A break/retest setup uses the fib's head↔neckline band to reject stale
+    // invalidation lines. With both preps skipped, the operator can place a
+    // continuation cutoff beyond either fib anchor.
+    if !(args.skip_break_and_close && args.skip_retest)
+        && let Some(inv_price) = geom.invalidation
         && !crate::geometry::price_within_fib_range(inv_price, head, neckline)
     {
         let (lo, hi) = (head.min(neckline), head.max(neckline));
@@ -821,6 +821,40 @@ mod tests {
                 assert!(msg.contains("outside the fib range"), "msg = {msg}");
             }
             other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn skip_bcr_keeps_continuation_cutoffs_outside_the_fib() {
+        use trade_control_core::intent::VetoSide;
+
+        for (head, neck, cutoff, label, direction, side) in [
+            (1.60675, 1.59808, 1.5962706008555703, "too-high", Direction::Short, VetoSide::Above),
+            (1.59808, 1.60675, 1.60856, "too-low", Direction::Long, VetoSide::Below),
+        ] {
+            let mut geom = PlanGeometry::from_roles(&hs_roles(fib("fib", head, neck), hline("inv", label, cutoff)));
+            geom.neckline = None;
+            let args = mw_args(&["--skip-bcr"]).apply_aliases();
+            let (actual, spec) = resolve_hs_trade(
+                &args, &geom, false, "EUR_CAD", "test", Broker::TradeNation,
+                test_precision(0.0001, 0.00001),
+            ).expect("continuation resolves without a neckline");
+            assert_eq!(actual, direction);
+            let veto = spec.entry_level_vetos.iter().find(|veto| veto.name == label).expect("cutoff is a veto");
+            assert_eq!(veto.level, cutoff);
+            assert_eq!(veto.past, side);
+        }
+    }
+
+    #[test]
+    fn skipping_only_one_prep_keeps_the_fib_range_check() {
+        let geom = PlanGeometry::from_roles(&hs_roles(fib("fib", 1.60675, 1.59808), hline("inv", "too-high", 1.59627)));
+        for flag in ["--skip-break-and-close", "--skip-retest"] {
+            let args = mw_args(&[flag]).apply_aliases();
+            assert!(matches!(resolve_hs_trade(
+                &args, &geom, false, "EUR_CAD", "test", Broker::TradeNation,
+                test_precision(0.0001, 0.00001),
+            ), Err(ResolveError::Reject(msg)) if msg.contains("outside the fib range")));
         }
     }
 

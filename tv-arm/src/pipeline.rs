@@ -349,6 +349,7 @@ fn read_setup_from_url(args: &Args, url: &str) -> Result<SetupInputs> {
     let mode = crate::spec_url::SpecMode::for_command(args.command.as_ref())?;
     let url = &crate::spec_url::normalise(url, mode)?;
     let url = &crate::spec_url::with_start(url, mode, parse_start(args)?)?;
+    let url = &crate::spec_url::with_preps(url, args.skip_break_and_close, args.skip_retest)?;
     let runtime = tokio::runtime::Runtime::new()
         .wrap_err("starting tokio runtime to fetch the frozen setup")?;
     let body = runtime.block_on(async {
