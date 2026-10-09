@@ -71,6 +71,7 @@ const ARM_OUT_ROOT: &str = "/tmp/trade-control-arm";
 /// consumer still needs the raw drawings (the position-entry tools) and that
 /// path is inherently live-chart. See [`SetupInputs`]' module doc.
 pub fn run(args: Args) -> Result<i32> {
+    crate::position_entry::validate_command(&args)?;
     // Source the setup: a frozen spec, or the live chart. `Roles` only exists on
     // the chart path — the position-entry tools need raw drawings, so a frozen
     // arm refuses them rather than silently arming something else.

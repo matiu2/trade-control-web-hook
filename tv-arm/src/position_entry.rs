@@ -54,6 +54,9 @@ use crate::position_trade::{PositionLevels, core_direction, resolve_levels};
 use crate::register_post::post_intent_blocking;
 use crate::roles::{PositionDirection, Roles};
 
+mod command;
+pub(crate) use command::validate_command;
+
 /// Where a position entry's numbers come from — a live TradingView drawing,
 /// or a frozen spec.
 ///

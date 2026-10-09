@@ -125,6 +125,11 @@ Saved MT5 plans replay through `journal-staging` using the account in their
 intents. Standalone replay can use
 `--source mt5 --mt5-account the5ers-competition`.
 
+Manual position-tool entries (`--market-entry`, `--stop-entry`, `--limit-entry`)
+submit a direct signed intent rather than an engine plan. Their `plan-out` and
+`replay` combinations are refused before any I/O. For a server check, use
+`--broker-dry-run register`; a successful dry run submits no broker order.
+
 ## Adding an account versus adding a broker
 
 Another account for an existing broker usually needs configuration,
