@@ -426,7 +426,11 @@ fn setup_from_frozen(
 
     let broker = resolve_broker(args, &frozen.chart_symbol)?;
     let account = resolve_account(args, broker, &frozen.chart_symbol)?;
-    let resolved = crate::instrument_resolution::resolve_for_account(&frozen.chart_symbol, broker, Some(&account))?;
+    let resolved = crate::instrument_resolution::resolve_for_account(
+        &frozen.chart_symbol,
+        broker,
+        Some(&account),
+    )?;
     let instrument = resolved.broker_symbol.clone();
     // No live chart, so no TV Symbol-info to prefer — the catalog precision is
     // the answer, exactly as it is when a live arm can't reach tv-mcp.
@@ -1129,10 +1133,11 @@ fn resolve_with_recovery(
     mcp: &TvMcp,
     account: Option<&str>,
 ) -> Result<crate::instrument_resolution::ResolvedInstrument> {
-    let first_err = match crate::instrument_resolution::resolve_for_account(tv_symbol, broker, account) {
-        Ok(resolved) => return Ok(resolved),
-        Err(e) => e,
-    };
+    let first_err =
+        match crate::instrument_resolution::resolve_for_account(tv_symbol, broker, account) {
+            Ok(resolved) => return Ok(resolved),
+            Err(e) => e,
+        };
     // Catalog miss — try the recovery path. If anything in here
     // fails, fall through to the original error so the operator sees
     // the actionable "add an overlay entry" hint.

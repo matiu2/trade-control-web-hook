@@ -156,7 +156,10 @@ async fn spread_inputs<Q: SpreadSource>(
     now: DateTime<Utc>,
 ) -> SpreadInputs {
     let measured = quotes.measured(instrument).await.unwrap_or(0.0);
-    let (expected_this_hour, expected_next_hour) = spread_forecast_frac(&crate::spread_blackout::spread_lookup_key(instrument, account), now);
+    let (expected_this_hour, expected_next_hour) = spread_forecast_frac(
+        &crate::spread_blackout::spread_lookup_key(instrument, account),
+        now,
+    );
     SpreadInputs {
         last_candle: measured,
         expected_this_hour,

@@ -696,7 +696,10 @@ fn render_fire(
                 .first()
                 .map(|bar| {
                     super::spread_breakdown::Breakdown::for_entry(
-                        &trade_control_core::spread_blackout::spread_lookup_key(&intent.instrument, intent.account.as_deref()),
+                        &trade_control_core::spread_blackout::spread_lookup_key(
+                            &intent.instrument,
+                            intent.account.as_deref(),
+                        ),
                         bar.close_spread() / plan.pip_size,
                         resolved.entry.reference_price(),
                         plan.pip_size,
@@ -836,7 +839,11 @@ fn render_fire(
     // exit — so a spread-hour spike that clears the widened stop no longer books a
     // false stop-out. These journal lines and the scored outcome read the same
     // reconstruction off the SAME placed bracket, so they can't disagree.
-    let widen_trigger = elevated_threshold_pips(&trade_control_core::spread_blackout::spread_lookup_key(&intent.instrument, intent.account.as_deref()));
+    let widen_trigger =
+        elevated_threshold_pips(&trade_control_core::spread_blackout::spread_lookup_key(
+            &intent.instrument,
+            intent.account.as_deref(),
+        ));
     if let Some(widen) = widened_stop_at_resolved(
         placed,
         intent,

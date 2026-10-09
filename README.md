@@ -4619,16 +4619,19 @@ cargo run -p spread-baseline-gen --bin finish-mt5 -- \
 ```
 
 Run this from the repository root, once per calibration. It waits up to seven
- days, requires a clean tracked `staging` checkout, validates the account identity,
-90-day window, complete catalogue, reviewed profiles, schedule and finite values,
+days, requires a clean tracked `staging` checkout, validates the account identity,
+90-day window, fully attempted catalogue, reviewed profiles, schedule and finite values,
 then commits the evidence and generated defaults. It runs the affected tests,
 Clippy and formatting, commits validation, chooses the next numbered release tag,
 rebuilds the worker and staging-configured CLIs, and pushes the branch and tag.
-Failures stop the job and are recorded in its status file; incomplete or thin
-reports never replace the defaults. The current launcher logs to
+An interrupted run, invalid data or failed checks stop the job and are recorded
+in its status file. Unavailable or unreviewed instruments stay uncovered; their
+reasons remain in the committed report. A run with no valid profiles never
+replaces the defaults. The current launcher logs to
 `/tmp/the5ers-spread-release.log`. These temporary status files survive closing
 the terminal but not a machine reboot; restart the completion process after a
-reboot if it was waiting. Do not run a second copy while one is active.
+reboot if it was waiting. A lock file beside the status file prevents a second active copy. If a crashed
+process left a stale lock, verify its recorded PID is gone before removing it.
 
 The release artifacts are in `target/release`. This completion job does not
 install binaries or restart trading services. Deploy staging separately with

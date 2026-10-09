@@ -1,0 +1,39 @@
+{
+  "date": "2026-10-10",
+  "branch": "staging",
+  "tests": {
+    "passed": 3039,
+    "failed": 0,
+    "ignored": 2,
+    "packages": [
+      "spread-baseline-gen",
+      "trade-control-core",
+      "trade-control-cron",
+      "trade-control-engine-v2",
+      "tv-arm",
+      "trade-control-cli",
+      "trade-control-worker",
+      "journal"
+    ],
+    "log": "/tmp/mt5-spread-integration-tests-final.log"
+  },
+  "clippy": {
+    "result": "passed, all targets with -D warnings",
+    "log": "/tmp/mt5-spread-integration-clippy-final.log"
+  },
+  "formatting": "passed",
+  "doctests": "passed (one existing ignored doc test)",
+  "unfinished_report_probe": {
+    "check": "unfinished live calibration cannot replace existing defaults",
+    "passed": true,
+    "exit_code": 1
+  },
+  "completion": {
+    "pid": 1492864,
+    "state": "waiting",
+    "detail": "90-day calibration still running"
+  },
+  "calibration": "still running; profiles, release tag and release builds are deferred until completion",
+  "deployment": "not performed",
+  "orders": "none placed"
+}

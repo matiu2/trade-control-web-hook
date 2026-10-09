@@ -11,14 +11,24 @@ fn report() -> Report {
     profile.baseline_high_pips = 0.5;
     profile.hour_p90_frac = [0.00002; 24];
     Report {
-        schema_version: 1, feed: "mt5-five".into(), login: 123,
-        server: "Demo".into(), from_utc: from, to_utc: to,
-        requested_symbols: vec!["EURUSD".into()], complete: true, failures: vec![],
+        schema_version: 1,
+        feed: "mt5-five".into(),
+        login: 123,
+        server: "Demo".into(),
+        from_utc: from,
+        to_utc: to,
+        requested_symbols: vec!["EURUSD".into()],
+        complete: true,
+        failures: vec![],
         instruments: vec![InstrumentReport {
-            symbol: "EURUSD".into(), pip_size: 0.0001, schedule: "ny".into(),
-            timezone: "America/New_York".into(), first_minute_utc: from,
+            symbol: "EURUSD".into(),
+            pip_size: 0.0001,
+            schedule: "ny".into(),
+            timezone: "America/New_York".into(),
+            first_minute_utc: from,
             last_minute_utc: to - chrono::Duration::minutes(1),
-            elevated_local_hours: vec![], profile,
+            elevated_local_hours: vec![],
+            profile,
         }],
     }
 }
@@ -64,4 +74,21 @@ fn reports_shorter_than_the_requested_ninety_days_are_rejected() {
     let mut r = report();
     r.from_utc = r.to_utc - chrono::Duration::days(14);
     assert!(render(&r, "five", 123, "Demo").is_err());
+}
+
+#[test]
+fn finished_failures_remain_unbaked_but_checkpoints_are_refused() {
+    let mut r = report();
+    r.complete = false;
+    r.requested_symbols.push("UNAVAILABLE".into());
+    assert!(render_finished(&r, "five", 123, "Demo").is_err());
+    r.failures.push(super::super::Failure {
+        symbol: "UNAVAILABLE".into(),
+        error: "broker tick history unavailable".into(),
+    });
+    let table = render_finished(&r, "five", 123, "Demo").unwrap();
+    assert!(table.contains("mt5:five:EURUSD"));
+    assert!(!table.contains("UNAVAILABLE"));
+    r.instruments[0].profile.review = ReviewStatus::InsufficientData;
+    assert!(render_finished(&r, "five", 123, "Demo").is_err());
 }

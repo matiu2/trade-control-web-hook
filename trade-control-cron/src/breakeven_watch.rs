@@ -225,7 +225,9 @@ async fn watch_one<B: PositionBroker>(
         position,
         current_stop,
     };
-    let (new_stop, armed_by, armed_at) = match crate::breakeven_decision::decide_for_account(&inputs, candles, now, account) {
+    let (new_stop, armed_by, armed_at) = match crate::breakeven_decision::decide_for_account(
+        &inputs, candles, now, account,
+    ) {
         BreakevenDecision::Hold => return,
         BreakevenDecision::Blocked(BreakevenBlock::NoFillTime) => {
             tracing::error!(

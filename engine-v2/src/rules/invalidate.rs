@@ -141,7 +141,9 @@ impl<L: LineName> Invalidate<'_, L> {
     fn should_retire(&self, hit: bool, candle: &Candle) -> bool {
         hit && !trade_control_core::spread_blackout::is_spread_hour(
             &trade_control_core::spread_blackout::spread_lookup_key(
-                &self.rule.intent.instrument, self.rule.intent.account.as_deref()),
+                &self.rule.intent.instrument,
+                self.rule.intent.account.as_deref(),
+            ),
             candle.time,
         )
     }

@@ -57,7 +57,11 @@ pub fn resolve_for_broker(tv_symbol: &str, broker: ConvBroker) -> Result<Resolve
     resolve_for_account(tv_symbol, broker, None)
 }
 
-pub fn resolve_for_account(tv_symbol: &str, broker: ConvBroker, account: Option<&str>) -> Result<ResolvedInstrument> {
+pub fn resolve_for_account(
+    tv_symbol: &str,
+    broker: ConvBroker,
+    account: Option<&str>,
+) -> Result<ResolvedInstrument> {
     let bare = strip_exchange(tv_symbol);
     let asset = instrument_lookup::resolve(bare)?.ok_or_else(|| {
         let hint = instrument_lookup::user_config_path()
@@ -74,7 +78,10 @@ pub fn resolve_for_account(tv_symbol: &str, broker: ConvBroker, account: Option<
             return Err(eyre!("MT5 adapter currently supports FX only"));
         }
         let broker_symbol = trade_control_conventions::instrument_for(broker, &asset.id);
-        let key = trade_control_core::spread_blackout::mt5_spread_key(account.unwrap_or("<missing-account>"), &broker_symbol);
+        let key = trade_control_core::spread_blackout::mt5_spread_key(
+            account.unwrap_or("<missing-account>"),
+            &broker_symbol,
+        );
         require_spread_coverage(&key)?;
         return Ok(ResolvedInstrument {
             asset,
@@ -153,10 +160,18 @@ fn require_spread_coverage(broker_symbol: &str) -> Result<()> {
     if coverage.is_covered() {
         return Ok(());
     }
-    let rebake = format!(
-        "cargo run -p spread-baseline-gen --bin generate -- \
-         --brokers <oanda|tradenation> --days 90 --only {broker_symbol:?}",
-    );
+    let rebake = if let Some((account, symbol)) = broker_symbol
+        .strip_prefix("mt5:")
+        .and_then(|key| key.split_once(':'))
+    {
+        format!(
+            "cargo run -p spread-baseline-gen --bin generate-mt5 -- --account {account:?} --days 90 --only {symbol:?} --out /tmp/mt5-spread-report.json; then cargo run -p spread-baseline-gen --bin bake-mt5 -- --account {account:?} --report /tmp/mt5-spread-report.json"
+        )
+    } else {
+        format!(
+            "cargo run -p spread-baseline-gen --bin generate -- --brokers <oanda|tradenation> --days 90 --only {broker_symbol:?}"
+        )
+    };
     if std::env::var(ALLOW_UNBAKED_ENV).is_ok_and(|v| v == "1") {
         tracing::warn!(
             instrument = broker_symbol,

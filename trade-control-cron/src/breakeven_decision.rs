@@ -244,7 +244,12 @@ pub fn decide(
     decide_for_account(inputs, candles, now, None)
 }
 
-pub fn decide_for_account(inputs: &BreakevenInputs<'_>, candles: Vec<Candle>, now: DateTime<Utc>, account: Option<&str>) -> BreakevenDecision {
+pub fn decide_for_account(
+    inputs: &BreakevenInputs<'_>,
+    candles: Vec<Candle>,
+    now: DateTime<Utc>,
+    account: Option<&str>,
+) -> BreakevenDecision {
     let Some(fill_at) = inputs.position.opened_at else {
         return BreakevenDecision::Blocked(BreakevenBlock::NoFillTime);
     };
@@ -252,7 +257,10 @@ pub fn decide_for_account(inputs: &BreakevenInputs<'_>, candles: Vec<Candle>, no
     let armable = armable_candles(
         candles,
         inputs.snapshot.granularity,
-        &trade_control_core::spread_blackout::spread_lookup_key(&inputs.position.instrument, account),
+        &trade_control_core::spread_blackout::spread_lookup_key(
+            &inputs.position.instrument,
+            account,
+        ),
         fill_at,
         now,
     );

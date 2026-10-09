@@ -2,13 +2,14 @@
 use candle_model::BidAskCandleData;
 use chrono::{DateTime, Utc};
 use color_eyre::{Result, eyre::ensure};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 use crate::{SpreadProfile, cache::minutes_from_cache, profile_from_minutes};
 
 pub mod bake;
+pub mod output;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Report {
     pub schema_version: u32,
     pub feed: String,
@@ -22,7 +23,7 @@ pub struct Report {
     pub failures: Vec<Failure>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Failure {
     pub symbol: String,
     pub error: String,
