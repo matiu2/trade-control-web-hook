@@ -132,7 +132,11 @@ submit a direct signed intent rather than an engine plan. Their `plan-out` and
 
 The offline-command guard was checked for all three position entry types,
 including a nonexistent spec file: rejection happens before reading the spec
-or contacting the worker. All 563 `tv-arm` tests and strict Clippy passed.
+or contacting the worker. All 565 `tv-arm` tests and strict Clippy passed,
+including a worker response delayed beyond the previous 20-second deadline.
+The CLI now waits up to 120 seconds for the result; it does not automatically
+resend an entry after a timeout. A timeout can leave an uncertain result, so
+inspect the server's request timeline before repeating a live entry.
 
 ## Adding an account versus adding a broker
 

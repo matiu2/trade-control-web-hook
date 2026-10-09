@@ -47,5 +47,8 @@ async fn preserves_worker_rejection_details() {
         .await
         .expect_err("worker rejection")
         .to_string();
-    assert!(error.contains("HTTP 400") && error.contains("entry rejected"), "{error}");
+    assert!(
+        error.contains("HTTP 400") && error.contains("entry rejected"),
+        "{error}"
+    );
 }
