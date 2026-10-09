@@ -38,6 +38,7 @@ pub fn secret_binding_for(broker: BrokerKind, account_name: &str) -> String {
         BrokerKind::TradeNation => "TN_ACCOUNT_",
         BrokerKind::Oanda => "OANDA_ACCOUNT_",
         BrokerKind::Ibkr => "IBKR_ACCOUNT_",
+        BrokerKind::Mt5 => "MT5_ACCOUNT_",
     };
     let normalised = account_name.to_ascii_uppercase().replace('-', "_");
     format!("{prefix}{normalised}")

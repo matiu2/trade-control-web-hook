@@ -176,6 +176,7 @@ fn source_for(broker: Broker) -> Option<CandleSource> {
         Broker::TradeNation => Some(CandleSource::TradeNation),
         Broker::Oanda => Some(CandleSource::Oanda),
         Broker::Ibkr => None,
+        Broker::Mt5 => Some(CandleSource::Mt5),
     }
 }
 

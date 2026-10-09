@@ -57,7 +57,9 @@ pub enum BrokerError {
     },
     /// An OANDA account record is missing its `oanda_account_id` (required to
     /// route to the right sub-account under the shared token).
-    MissingOandaAccountId { account: String },
+    MissingOandaAccountId {
+        account: String,
+    },
     /// `OANDA_API_KEY` isn't set but an OANDA account was requested.
     MissingOandaApiKey,
     /// TradeNation native login failed (no such account in the enc store, bad
@@ -66,11 +68,14 @@ pub enum BrokerError {
     /// An IBKR account record is missing its account id (`DU…` for paper,
     /// `U…` for live). A Gateway login can front several accounts, so this
     /// cannot be derived — routing to the wrong one would trade the wrong book.
-    MissingIbkrAccountId { account: String },
+    MissingIbkrAccountId {
+        account: String,
+    },
     /// Could not reach the IB Gateway. Unlike the HTTPS brokers this is a
     /// **local** failure: a Java process on this host is down, not logged in,
     /// or listening elsewhere. Carries the underlying message.
     IbkrConnect(String),
+    Mt5Connect(String),
 }
 
 impl std::fmt::Display for BrokerError {
@@ -89,6 +94,7 @@ impl std::fmt::Display for BrokerError {
                 write!(f, "ibkr account '{account}' has no ibkr_account_id")
             }
             Self::IbkrConnect(msg) => write!(f, "ibkr gateway connect failed: {msg}"),
+            Self::Mt5Connect(msg) => write!(f, "MT5 connect failed: {msg}"),
         }
     }
 }
@@ -445,5 +451,67 @@ mod tests {
         let meta = oanda_meta(Some("x"), AccountKind::Demo);
         let result = acquire_tn(&meta).await;
         assert!(matches!(result, Err(BrokerError::BrokerMismatch { .. })));
+    }
+}
+
+/// Bind execution and candle history to one explicitly configured MT5 account.
+pub async fn acquire_mt5(meta: &AccountMetadata) -> Result<broker_mt5::Mt5Broker, BrokerError> {
+    if meta.broker != BrokerKind::Mt5 {
+        return Err(BrokerError::BrokerMismatch {
+            intent: BrokerKind::Mt5,
+            account: meta.broker,
+        });
+    }
+    if meta.kind.is_live() {
+        return Err(BrokerError::Mt5Connect(
+            "only demo/competition MT5 accounts are supported".into(),
+        ));
+    }
+    let config = mt5_data_source::account_config::AccountConfig::load(&meta.name)
+        .map_err(|e| BrokerError::Mt5Connect(e.to_string()))?;
+    if let Some(id) = &meta.oanda_account_id
+        && id.parse::<u64>().ok() != Some(config.login)
+    {
+        return Err(BrokerError::Mt5Connect(
+            "metadata login differs from the pinned MT5 login".into(),
+        ));
+    }
+    broker_mt5::Mt5Broker::connect(&meta.name)
+        .await
+        .map_err(|e| BrokerError::Mt5Connect(e.to_string()))
+}
+
+#[cfg(test)]
+mod mt5_tests {
+    use super::*;
+    use trade_control_core::account::AccountKind;
+    #[tokio::test]
+    async fn mt5_rejects_foreign_and_live_accounts_before_credentials() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        let mut meta = AccountMetadata {
+            name: "missing-config".into(),
+            broker: BrokerKind::Mt5,
+            kind: AccountKind::Live,
+            caps: Default::default(),
+            oanda_account_id: None,
+        };
+        assert!(matches!(
+            acquire_mt5(&meta).await,
+            Err(BrokerError::Mt5Connect(_))
+        ));
+        meta.kind = AccountKind::Demo;
+        for &broker in BrokerKind::ALL.iter().filter(|b| **b != BrokerKind::Mt5) {
+            meta.broker = broker;
+            assert!(matches!(
+                acquire_mt5(&meta).await,
+                Err(BrokerError::BrokerMismatch { .. })
+            ));
+        }
     }
 }

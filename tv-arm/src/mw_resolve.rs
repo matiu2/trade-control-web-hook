@@ -66,7 +66,7 @@ pub fn resolve_mw_trade(
     // worker can mid→bid/ask correct entry/SL/TP at fill time. There is
     // no operator override — a failed read hard-errors rather than bake a
     // guessed spread.
-    let spread_pips = read_spread_blocking(broker, instrument, pip_size)?;
+    let spread_pips = read_spread_blocking(broker, instrument, pip_size, account)?;
     resolve_mw_trade_with_spread(
         args,
         geom,

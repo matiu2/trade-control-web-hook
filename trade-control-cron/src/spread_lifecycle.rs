@@ -105,5 +105,8 @@ where
         BrokerHandle::Ibkr(b) => {
             pending_order_lifecycle(b, store, &cfg_provider, &src, account, now, clear).await
         }
+        BrokerHandle::Mt5(b) => {
+            pending_order_lifecycle(b, store, &cfg_provider, &src, account, now, clear).await
+        }
     }
 }

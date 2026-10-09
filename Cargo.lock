@@ -345,6 +345,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-padding"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "broker-ibkr"
 version = "0.1.0"
 dependencies = [
@@ -353,6 +362,20 @@ dependencies = [
  "ibkr-client",
  "tokio",
  "tracing",
+ "trade-control-core",
+]
+
+[[package]]
+name = "broker-mt5"
+version = "0.1.0"
+dependencies = [
+ "candle-model",
+ "chrono",
+ "color-eyre",
+ "mt5-data-source",
+ "tracing",
+ "tracing-error",
+ "tracing-subscriber",
  "trade-control-core",
 ]
 
@@ -477,6 +500,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
 dependencies = [
  "rustversion",
+]
+
+[[package]]
+name = "cbc"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]
@@ -1011,6 +1043,12 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[package]]
+name = "data-encoding"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "date_time_parser"
@@ -1988,6 +2026,7 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
+ "block-padding",
  "generic-array",
 ]
 
@@ -2374,6 +2413,34 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mt5-data-source"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "candle-cache",
+ "candle-model",
+ "cbc",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "color-eyre",
+ "futures-util",
+ "hex",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "tokio-tungstenite",
+ "toml",
+ "tracing",
+ "tracing-error",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2984,9 +3051,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.1"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
  "chacha20",
  "getrandom 0.4.2",
@@ -3980,7 +4047,7 @@ dependencies = [
  "log",
  "md-5",
  "memchr",
- "rand 0.10.1",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4423,6 +4490,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
+dependencies = [
+ "futures-util",
+ "log",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tungstenite",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4667,6 +4750,7 @@ dependencies = [
  "getrandom 0.4.2",
  "hex",
  "instrument-lookup 0.7.0",
+ "mt5-data-source",
  "news-sentiment-tv",
  "oanda-client",
  "reqwest 0.12.23",
@@ -4719,6 +4803,7 @@ name = "trade-control-cron"
 version = "0.1.0"
 dependencies = [
  "broker-ibkr",
+ "broker-mt5",
  "broker-oanda",
  "broker-tradenation",
  "broker-tradenation-adapter",
@@ -4769,12 +4854,14 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "broker-ibkr",
+ "broker-mt5",
  "broker-oanda",
  "broker-tradenation",
  "broker-tradenation-adapter",
  "chrono",
  "clap",
  "color-eyre",
+ "mt5-data-source",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4856,6 +4943,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.10.3",
+ "rustls",
+ "rustls-pki-types",
+ "sha1",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "tv-arm"
 version = "0.1.0"
 dependencies = [
@@ -4866,6 +4971,7 @@ dependencies = [
  "hex",
  "instrument-lookup 0.7.0",
  "local-chart-client",
+ "mt5-data-source",
  "news-sentiment-tv",
  "oanda-client",
  "reqwest 0.12.23",

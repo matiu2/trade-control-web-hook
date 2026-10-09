@@ -12,6 +12,7 @@ name = "replay-candles"
 path = "src/bin/replay_candles.rs"
 
 [dependencies]
+mt5-data-source = { path = "../../mt5-data-source" }
 # `postgres-storage` (NOT the default `redb-storage`): ReDB holds an exclusive
 # file lock for the process's lifetime, so a second concurrent `replay-candles`
 # dies with "Database already open. Cannot acquire lock." — which used to look

@@ -1065,6 +1065,7 @@ mod tests {
     /// Test shim for [`first_confirmed_signal_at`] preserving the pre-refactor
     /// positional filter order (dir / kind / golden / not_before / after) so the
     /// scan tests read the same — it just folds them into a `SignalCriteria`.
+    #[allow(clippy::too_many_arguments)] // Test fixture mirrors the detector call.
     fn fc(
         candles: &[Candle],
         as_of: usize,

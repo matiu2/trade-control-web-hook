@@ -16,6 +16,12 @@ use trade_control_cli::replay_args::CandleSource;
 /// `source` feed expects. Tries a direct broker-symbol hit first, then the
 /// general catalog resolver, exactly like `parse_instrument`.
 pub fn resolve_for(raw: &str, source: CandleSource) -> Result<String> {
+    if source == CandleSource::Mt5 {
+        return Ok(trade_control_conventions::instrument_for(
+            trade_control_conventions::Broker::Mt5,
+            raw,
+        ));
+    }
     let asset = by_broker_symbol(broker_of(source), raw)
         .map_err(|e| eyre!("instrument-lookup overlay error resolving {raw:?}: {e}"))?
         .or(resolve(raw)
@@ -41,6 +47,7 @@ fn broker_of(source: CandleSource) -> Broker {
     match source {
         CandleSource::Oanda => Broker::Oanda,
         CandleSource::TradeNation => Broker::TradeNation,
+        CandleSource::Mt5 => Broker::Oanda, // MT5 exits before catalog lookup above.
     }
 }
 

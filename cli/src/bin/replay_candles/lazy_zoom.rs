@@ -276,10 +276,21 @@ pub async fn fetch_windows(
     finer: super::granularity::ReplayGranularity,
     windows: &[ZoomWindow],
     cache_dir: Option<std::path::PathBuf>,
+    mt5_account: Option<&str>,
 ) -> Vec<BidAskCandle> {
     let mut out = Vec::new();
     for w in coalesce(windows.to_vec()) {
-        match super::candles::pull(source, symbol, finer, w.start, w.end, cache_dir.clone()).await {
+        match super::candles::pull(
+            source,
+            symbol,
+            finer,
+            w.start,
+            w.end,
+            cache_dir.clone(),
+            mt5_account,
+        )
+        .await
+        {
             Ok(cs) => out.extend(cs),
             Err(e) => tracing::warn!(
                 error = %e,

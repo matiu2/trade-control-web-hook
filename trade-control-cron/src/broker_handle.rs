@@ -16,4 +16,5 @@ pub enum BrokerHandle {
     /// Gateway-touching call on this arm currently fails loudly rather than
     /// answering plausibly — see `broker-ibkr`'s module docs.
     Ibkr(broker_ibkr::IbkrBroker),
+    Mt5(broker_mt5::Mt5Broker),
 }

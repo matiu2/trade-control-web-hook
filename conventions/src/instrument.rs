@@ -38,6 +38,14 @@ pub fn instrument_for(broker: Broker, raw_sym: &str) -> String {
         Broker::TradeNation => '/',
         Broker::Oanda => '_',
         Broker::Ibkr => return raw_sym.to_string(),
+        Broker::Mt5 => {
+            let compact = raw_sym.replace(['/', '_'], "");
+            return if compact.len() == 6 && compact.bytes().all(|b| b.is_ascii_alphabetic()) {
+                compact.to_ascii_uppercase()
+            } else {
+                raw_sym.to_string()
+            };
+        }
     };
     if raw_sym.len() == 6 && raw_sym.chars().all(|c| c.is_ascii_alphabetic()) {
         let a = raw_sym[..3].to_ascii_uppercase();
@@ -114,5 +122,17 @@ mod tests {
             instrument_for(Broker::TradeNation, "Spot Silver"),
             "Spot Silver"
         );
+    }
+}
+
+#[cfg(test)]
+mod mt5_tests {
+    use super::*;
+    #[test]
+    fn mt5_currency_pairs_are_compact_and_suffixes_are_preserved() {
+        assert_eq!(instrument_for(Broker::Mt5, "eur/cad"), "EURCAD");
+        assert_eq!(instrument_for(Broker::Mt5, "EUR_CAD"), "EURCAD");
+        assert_eq!(instrument_for(Broker::Mt5, "EURCAD.a"), "EURCAD.a");
+        assert_eq!(Broker::Mt5.default_account_index(), None);
     }
 }

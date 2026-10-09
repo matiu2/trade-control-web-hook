@@ -20,6 +20,8 @@ name = "trade-control-broker-check"
 path = "src/bin/broker_check.rs"
 
 [dependencies]
+mt5-data-source = { path = "../../mt5-data-source" }
+broker-mt5 = { path = "../broker-mt5" }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
 broker-ibkr = { version = "0.1.0", path = "../broker-ibkr" }
 broker-oanda = { version = "0.1.0", path = "../broker-oanda" }

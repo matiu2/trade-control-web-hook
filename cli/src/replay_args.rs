@@ -34,6 +34,8 @@ pub enum CandleSource {
     TradeNation,
     /// OANDA v20 candles via candle-cache.
     Oanda,
+    /// Paired MT5 ticks via CandleBridge and the dedicated mt5 cache.
+    Mt5,
 }
 
 impl CandleSource {
@@ -44,6 +46,7 @@ impl CandleSource {
         match self {
             Self::TradeNation => "tradenation",
             Self::Oanda => "oanda",
+            Self::Mt5 => "mt5",
         }
     }
 }
@@ -194,6 +197,10 @@ pub struct ReplayArgs {
     /// the broker. TradeNation matches the live engine.
     #[arg(long, value_enum, default_value_t = CandleSource::TradeNation)]
     pub source: CandleSource,
+
+    /// Named MT5 account; defaults to the account embedded in the plan.
+    #[arg(long)]
+    pub mt5_account: Option<String>,
 
     /// Window start. A bare datetime is Brisbane time (UTC+10, no DST) — the
     /// zone this tool renders every candle/fill in — e.g. `2026-06-30T17:00`.

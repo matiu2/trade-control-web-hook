@@ -19,6 +19,7 @@ pub fn broker_to_kind(b: Broker) -> cli::BrokerKind {
         Broker::Oanda => cli::BrokerKind::Oanda,
         Broker::TradeNation => cli::BrokerKind::TradeNation,
         Broker::Ibkr => cli::BrokerKind::Ibkr,
+        Broker::Mt5 => cli::BrokerKind::Mt5,
     }
 }
 
@@ -28,6 +29,7 @@ pub fn kind_to_broker(k: cli::BrokerKind) -> Broker {
         cli::BrokerKind::Oanda => Broker::Oanda,
         cli::BrokerKind::TradeNation => Broker::TradeNation,
         cli::BrokerKind::Ibkr => Broker::Ibkr,
+        cli::BrokerKind::Mt5 => Broker::Mt5,
     }
 }
 

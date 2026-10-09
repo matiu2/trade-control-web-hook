@@ -37,15 +37,20 @@ use trade_control_conventions::Broker;
 ///
 /// Hard-errors (never falls back) on any read failure or a
 /// non-positive spread.
-pub async fn read_spread_pips(broker: Broker, instrument: &str, pip_size: f64) -> Result<f64> {
+pub async fn read_spread_pips(
+    broker: Broker,
+    instrument: &str,
+    pip_size: f64,
+    account: Option<&str>,
+) -> Result<f64> {
     // Reject zero, negative, and NaN pip sizes (a NaN fails `> 0.0`).
     if pip_size.is_nan() || pip_size <= 0.0 {
         return Err(eyre!(
             "pip_size must be positive to convert spread to pips; got {pip_size}"
         ));
     }
-    let (bid, ask) = read_bid_ask(broker, instrument).await?;
-    let spread_price = spread_from_bid_ask(bid, ask)?;
+    let (bid, ask) = read_bid_ask(broker, instrument, account).await?;
+    let spread_price = validated_spread(broker, bid, ask)?;
     let spread_pips = spread_price / pip_size;
     info!(
         broker = broker.as_str(),
@@ -60,10 +65,10 @@ pub async fn read_spread_pips(broker: Broker, instrument: &str, pip_size: f64) -
 /// the retrace from the same reference in replay and live. Reuses the same
 /// bid/ask read as [`read_spread_pips`]; hard-errors on a stale/degenerate quote
 /// (a bad anchor would silently mis-fire every pullback).
-pub async fn read_mid(broker: Broker, instrument: &str) -> Result<f64> {
-    let (bid, ask) = read_bid_ask(broker, instrument).await?;
+pub async fn read_mid(broker: Broker, instrument: &str, account: Option<&str>) -> Result<f64> {
+    let (bid, ask) = read_bid_ask(broker, instrument, account).await?;
     // Reuse the spread validation to reject non-finite / inverted quotes.
-    spread_from_bid_ask(bid, ask)?;
+    validated_spread(broker, bid, ask)?;
     let mid = (bid + ask) / 2.0;
     info!(
         broker = broker.as_str(),
@@ -81,8 +86,21 @@ pub async fn read_mid(broker: Broker, instrument: &str) -> Result<f64> {
 /// (plan §"Cannot be verified offline"), and this module's contract is to
 /// refuse rather than fall back — a guessed futures spread would mis-size
 /// every entry it touched.
-async fn read_bid_ask(broker: Broker, instrument: &str) -> Result<(f64, f64)> {
+async fn read_bid_ask(
+    broker: Broker,
+    instrument: &str,
+    account: Option<&str>,
+) -> Result<(f64, f64)> {
     match broker {
+        Broker::Mt5 => {
+            let account =
+                account.ok_or_else(|| eyre!("MT5 live quotes require a named account"))?;
+            let trader = mt5_data_source::account_config::AccountConfig::load(account)?
+                .trader()
+                .await?;
+            let quote = trader.quote(instrument).await?;
+            Ok((quote.bid, quote.ask))
+        }
         Broker::Oanda => read_oanda_bid_ask(instrument).await,
         Broker::TradeNation => read_tradenation_bid_ask(instrument).await,
         Broker::Ibkr => Err(eyre!(
@@ -96,6 +114,13 @@ async fn read_bid_ask(broker: Broker, instrument: &str) -> Result<(f64, f64)> {
 /// non-finite, zero, or inverted (`ask <= bid`) quote is a hard error —
 /// it usually means the market is closed or the feed is stale, and a
 /// degenerate spread must not be baked into an order.
+fn validated_spread(broker: Broker, bid: f64, ask: f64) -> Result<f64> {
+    if broker == Broker::Mt5 && bid.is_finite() && bid > 0.0 && bid == ask {
+        return Ok(0.0);
+    }
+    spread_from_bid_ask(bid, ask)
+}
+
 fn spread_from_bid_ask(bid: f64, ask: f64) -> Result<f64> {
     if !bid.is_finite() || !ask.is_finite() {
         return Err(eyre!(
@@ -209,7 +234,7 @@ mod tests {
             .build()
             .expect("rt");
         let err = rt
-            .block_on(read_spread_pips(Broker::Oanda, "EUR_USD", 0.0))
+            .block_on(read_spread_pips(Broker::Oanda, "EUR_USD", 0.0, None))
             .expect_err("must reject zero pip_size");
         assert!(format!("{err}").contains("pip_size must be positive"));
     }
