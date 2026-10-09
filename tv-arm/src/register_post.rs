@@ -23,9 +23,9 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 /// URL (see the per-env deploy scripts).
 const BAKED_WEBHOOK: &str = env!("BAKED_WEBHOOK");
 
-/// Timeout for the register POST. Generous — the worker only validates +
-/// records the plan, but a cold worker can take a couple of seconds.
-const POST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Direct entries also authenticate, validate candles and preview broker sizing.
+/// The MT5 dry run took 41 seconds; keep waiting for its result without retrying.
+const POST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// POST the already-signed register body to the worker on a throwaway runtime.
 ///
@@ -55,17 +55,21 @@ pub fn post_intent_blocking(signed_body: String) -> Result<String> {
 /// Factored out so it can be exercised against a local mock in tests without
 /// the runtime bridge.
 async fn post_intent(signed_body: String) -> Result<String> {
+    post_intent_to(BAKED_WEBHOOK, signed_body).await
+}
+
+async fn post_intent_to(webhook: &str, signed_body: String) -> Result<String> {
     let client = reqwest::Client::builder()
         .timeout(POST_TIMEOUT)
         .build()
         .wrap_err("build reqwest client")?;
     let resp = client
-        .post(BAKED_WEBHOOK)
+        .post(webhook)
         .header("content-type", "text/plain")
         .body(signed_body)
         .send()
         .await
-        .wrap_err_with(|| format!("POST to {BAKED_WEBHOOK}"))?;
+        .wrap_err_with(|| format!("POST to {webhook}"))?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if status.is_success() {
@@ -77,3 +81,6 @@ async fn post_intent(signed_body: String) -> Result<String> {
         body.trim()
     ))
 }
+
+#[cfg(test)]
+mod tests;
