@@ -29,7 +29,8 @@
 use color_eyre::eyre::Result;
 use tracing::warn;
 
-use instrument_lookup::{Broker, by_broker_symbol};
+#[cfg(test)]
+use local_chart_client::local_chart_symbol;
 
 /// Default local-chart URL, matching its own `DEFAULT_PORT` (`src/args.rs`).
 pub const DEFAULT_LOCAL_CHART_URL: &str = "http://127.0.0.1:8790";
@@ -84,32 +85,6 @@ fn load_chart_local_with(
     let url = build_url(base_url, &symbol, broker, granularity, goto);
     opener(&url)?;
     Ok(false)
-}
-
-/// Resolve a plan instrument id to local-chart's own convention: a bare
-/// OANDA-style symbol (`EUR_USD`), **never** exchange-qualified — unlike
-/// [`super::tv_symbol`], local-chart is single-broker (OANDA-fed) and its
-/// `#instrument` box holds exactly this form (`local-chart/src/symbol.rs`'s
-/// `resolve_symbol` doc comment: "The chart's instrument box... use
-/// `EUR_USD`").
-///
-/// Tries both broker views of the raw id (a TradeNation-form id like
-/// `AUD/CHF` needs to resolve too, even though local-chart only *trades*
-/// OANDA-fed data) and falls back to stripping separators when the catalog
-/// has no OANDA form for this asset — the same last-resort `tv.rs` uses, so
-/// an unknown/OANDA-less instrument still opens *something* rather than
-/// nothing.
-fn local_chart_symbol(instrument: &str) -> String {
-    [Broker::Oanda, Broker::TradeNation]
-        .into_iter()
-        .find_map(|b| {
-            by_broker_symbol(b, instrument)
-                .ok()
-                .flatten()
-                .and_then(|asset| asset.symbol_for(Broker::Oanda))
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| super::strip_separators(instrument))
 }
 
 /// local-chart's accepted timeframe tokens (`local-chart/src/granularity.rs`
@@ -258,6 +233,19 @@ mod tests {
     /// The `--spec-url` points at `/arm-setup` with the SAME instrument+tf
     /// mapping the navigation URL uses — a replay must arm off the chart the
     /// `l` key just loaded, not a differently-derived one.
+    #[test]
+    fn mt5_navigation_and_arm_urls_preserve_exact_account_symbols() {
+        let feed = "mt5-the5ers-competition";
+        let url = arm_setup_url("http://127.0.0.1:8790", "EURUSD", feed, "h1").unwrap();
+        assert!(url.contains("instrument=EURUSD&tf=h1&broker=mt5-the5ers-competition"));
+        load_chart_local_with("http://127.0.0.1:8790", "EURUSD", feed, "h1", None, |url| {
+            assert!(url.contains("instrument=EURUSD"));
+            assert!(url.contains("broker=mt5-the5ers-competition"));
+            Ok("test")
+        })
+        .unwrap();
+    }
+
     #[test]
     fn arm_setup_url_matches_the_navigation_mapping() {
         let url = arm_setup_url("http://127.0.0.1:8790", "EUR/CAD", "oanda", "h1");

@@ -470,7 +470,10 @@ async fn run() -> Result<()> {
             granularity::engine_label(gran.engine()),
             // The broker this replay actually ran against — it decides which
             // chart the consumer draws the positions on.
-            &local_chart_client::chart_feed(args.source.as_str(), args.mt5_account.as_deref().unwrap_or_default()),
+            &local_chart_client::chart_feed(
+                args.source.as_str(),
+                args.mt5_account.as_deref().unwrap_or_default(),
+            ),
             &fires,
         );
         doc.write(path)?;

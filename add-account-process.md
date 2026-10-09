@@ -30,6 +30,8 @@ directory. Inspect the selected database before writing account metadata.
 | `~/.cargo/bin/*-staging` | Installed arming, journal and replay tools | Rebuilt `trade-control`, `tv-arm`, `journal`, `replay-candles` and `tv-news` with the staging suffix. |
 | `~/.cargo/bin/trade-control-accounts` and `trade-control-broker-check` | Unsuffixed operator tools | Rebuilt these too; their database selection is runtime configuration. |
 | `~/.local/bin/trade-control-worker-{dev,staging}` and matching systemd user services | Active server processes | Updated both native worker binaries; each retains its own runtime configuration and database. |
+| `local-chart` feed selector and `/feeds`, `/instruments?broker=…` | Chart discovery | Discovers each configured profile as `mt5-<account>`, fetches its authenticated symbol catalogue, and stores drawings under that feed key. No manual instrument JSON edit is needed. |
+| `local-chart-client`, `tv-arm`, `journal`, `replay-candles` | Account identity through chart links and exports | Preserves exact MT5 symbols and the named account feed in exported specs, navigation, plan geometry and replay positions. |
 | `README.md` and this file | Repeatable operator instructions | Recorded setup, read-only validation, candle import and current limitations. |
 
 ## Register and verify metadata
@@ -103,14 +105,20 @@ OHLC is built from tick mids. Download failures or incomplete history fail
 explicitly; retry after the terminal has downloaded the requested history.
 
 `MT5_CACHE_DATABASE_URL` selects the candle database independently of the
-worker state database. The current MT5 cache supports one pinned login/server
-per database. A second MT5 profile needs account-specific cache routing or a
-separate worker/candle database; do not erase the identity row to mix feeds.
+worker state database. Each MT5 login/server has an isolated cache namespace. The original matching
+account keeps `candle_cache_mt5`; additional identities use
+`candle_cache_mt5_<login>_<server-hash>` with matching `_bid_ask` and `_identity`
+tables. Do not erase identity rows or reuse another provider's cached candles.
 Update the explicit broker clock if the broker changes its UTC offset.
 
 ## Arming and replay
 
 Select `--broker mt5 --account-id the5ers-competition` with `tv-arm-staging`.
+The chart exports `mt5-the5ers-competition:EURUSD`; `tv-arm` can infer its
+broker and account when flags/environment do not override them. Journal
+links use `broker=mt5-the5ers-competition`, while account metadata keeps the
+broker kind `mt5`.
+
 MT5 has no baked spread forecast yet, so arming currently needs the explicit
 `TV_ARM_ALLOW_UNBAKED=1` override; live and historical spread checks remain.
 Saved MT5 plans replay through `journal-staging` using the account in their

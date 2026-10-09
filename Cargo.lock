@@ -4750,6 +4750,7 @@ dependencies = [
  "getrandom 0.4.2",
  "hex",
  "instrument-lookup 0.7.0",
+ "local-chart-client",
  "mt5-data-source",
  "news-sentiment-tv",
  "oanda-client",

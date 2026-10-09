@@ -1230,7 +1230,8 @@ fn resolve_account(args: &Args, broker: Broker, chart_symbol: &str) -> Result<St
         }
     }
     if broker == Broker::Mt5
-        && let Some(account) = local_chart_client::mt5_chart_account(chart_symbol) {
+        && let Some(account) = local_chart_client::mt5_chart_account(chart_symbol)
+    {
         return Ok(account.to_string());
     }
     broker
@@ -1497,6 +1498,22 @@ mod tests {
     use clap::Parser;
     use trade_control_conventions::Direction;
 
+    #[test]
+    fn named_chart_accounts_resolve_without_a_default_mt5_account() {
+        let args = mw_args(&["--broker", "mt5"]);
+        let symbol = "mt5-the5ers-competition:EURUSD";
+        assert_eq!(resolve_broker(&args, symbol).unwrap(), Broker::Mt5);
+        assert_eq!(
+            resolve_account(&args, Broker::Mt5, symbol).unwrap(),
+            "the5ers-competition"
+        );
+        let override_args = mw_args(&["--broker", "mt5", "--account-id", "other-demo"]);
+        assert_eq!(
+            resolve_account(&override_args, Broker::Mt5, symbol).unwrap(),
+            "other-demo"
+        );
+        assert!(resolve_account(&args, Broker::Mt5, "MT5:EURUSD").is_err());
+    }
     /// The source text of `arm_from_inputs`' body.
     ///
     /// Three tests below scan it for properties the type system can't express

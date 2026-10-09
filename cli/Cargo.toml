@@ -12,6 +12,7 @@ name = "replay-candles"
 path = "src/bin/replay_candles.rs"
 
 [dependencies]
+local-chart-client = { version = "0.4.4", path = "../../local-chart-client" }
 mt5-data-source = { path = "../../mt5-data-source" }
 # `postgres-storage` (NOT the default `redb-storage`): ReDB holds an exclusive
 # file lock for the process's lifetime, so a second concurrent `replay-candles`
