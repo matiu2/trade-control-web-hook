@@ -16,6 +16,7 @@
 pub mod cache;
 pub mod compute;
 pub mod fetch;
+pub mod mt5;
 pub mod render;
 pub mod shrink_guard;
 pub mod universe;

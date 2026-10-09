@@ -120,7 +120,7 @@ pub const FLAG_PERCENTILE: f64 = 0.75;
 /// `elevated_hours == 0` isn't ambiguous between "analysed, genuinely flat" and
 /// "never looked / too little data". Recorded per row so we can see which
 /// instruments have actually been analysed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ReviewStatus {
     /// Analysed with enough data; the mask (possibly empty) is the verdict.
     /// An empty mask here means "reviewed, genuinely no spread hour".
@@ -139,7 +139,7 @@ pub enum ReviewStatus {
 }
 
 /// The computed spread profile for one (broker, instrument).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SpreadProfile {
     /// Bit `h` set ⇒ UTC hour `h` is a spread hour for this instrument.
     pub elevated_hours: u32,

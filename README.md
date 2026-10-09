@@ -4535,6 +4535,34 @@ arming requires the existing explicit `TV_ARM_ALLOW_UNBAKED=1` override. This
 leaves the live quote and historical candle spread checks in place. Other broker
 forecasts are never substituted for MT5. Zero spread is valid on a fresh MT5 quote.
 
+Measure this account's expected spreads using `spread-baseline-gen`'s MT5
+calibration binary (read-only; MT5/CandleBridge and PostgreSQL must be running):
+
+```sh
+cargo run -p spread-baseline-gen --bin generate-mt5 -- \
+  --account the5ers-competition --days 90 --out /tmp/the5ers-spread-profile.json
+# Optional shorter spot-check:
+cargo run -p spread-baseline-gen --bin generate-mt5 -- \
+  --account the5ers-competition --days 14 --only AUDUSD,EURCAD,AUDCHF \
+  --out /tmp/the5ers-spread-pilot.json
+```
+
+The default universe comes from this account's live instrument catalogue. The
+report pins the account feed, login, server and UTC measurement range. It uses
+validated tick-derived M1 closing spreads and the existing generator's
+schedule-local hourly algorithm, including median/p10/p90 spreads in pips and
+per-hour forecasts. All lookbacks are calendar days. `--to <RFC3339>` fixes the
+end for a reproducible rerun. Existing minute-cache data is reused; a cold full
+run can take many hours. Completed profiles and failures are saved after each
+instrument; `complete: false` means the full requested run has not succeeded.
+Instruments without catalogue pip/schedule metadata are reported as failures.
+`review: InsufficientData` remains explicit even if the range fetch succeeded.
+
+This JSON report is calibration evidence, not an installed server default.
+It does not overwrite the existing baked Rust table or remove the unbaked
+arming requirement. Installing MT5 forecasts needs account-aware table reads:
+two MT5 providers can use identical instrument names with different spreads.
+
 Journal's saved MT5 plans replay using `--source mt5`; the replay resolves the
 named account from their intents. For a plan without that account, supply
 `replay-candles-staging --source mt5 --mt5-account the5ers-competition ...`.
