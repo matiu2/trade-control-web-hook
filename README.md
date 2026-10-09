@@ -4491,6 +4491,9 @@ rather than on Cloudflare Workers.
 
 ## MT5 (The5ers demo/competition)
 
+See [Adding a trading account](add-account-process.md) for the configuration,
+environment-specific account indexes, local CLI history and deployment checklist.
+
 MT5 execution uses the direct WebTerminal connection; server and replay candles
 use CandleBridge's historical paired bid/ask ticks. One EA attached to one chart
 serves every requested instrument. Keep MT5 and CandleBridge running for history;
