@@ -289,11 +289,23 @@ mod tests {
     #[test]
     fn skipped_preps_are_forwarded_for_register_and_replay() {
         for mode in [SpecMode::Register, SpecMode::Replay] {
-            let url = normalise("http://127.0.0.1:8790/?instrument=EUR_CAD&tf=h1&broker=tradenation", mode).expect("normalise");
-            for (skip_break, skip_retest, wanted) in [(true, true, Some("true")), (true, false, None), (false, true, None), (false, false, None)] {
+            let url = normalise(
+                "http://127.0.0.1:8790/?instrument=EUR_CAD&tf=h1&broker=tradenation",
+                mode,
+            )
+            .expect("normalise");
+            for (skip_break, skip_retest, wanted) in [
+                (true, true, Some("true")),
+                (true, false, None),
+                (false, true, None),
+                (false, false, None),
+            ] {
                 let converted = with_preps(&url, skip_break, skip_retest).expect("preps forwarded");
                 let parsed = Url::parse(&converted).expect("URL");
-                let param = parsed.query_pairs().find(|(key, _)| key == "skip_bcr").map(|(_, value)| value.into_owned());
+                let param = parsed
+                    .query_pairs()
+                    .find(|(key, _)| key == "skip_bcr")
+                    .map(|(_, value)| value.into_owned());
                 assert_eq!(param.as_deref(), wanted);
             }
         }
@@ -302,8 +314,14 @@ mod tests {
     #[test]
     fn cli_preps_override_an_endpoint_urls_skip_bcr_param() {
         let url = "http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&mode=register&skip_bcr=true&skip_bcr=false";
-        assert_eq!(with_preps(url, true, true).expect("both skipped"), "http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&mode=register&skip_bcr=true");
-        assert_eq!(with_preps(url, false, false).expect("preps enabled"), "http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&mode=register");
+        assert_eq!(
+            with_preps(url, true, true).expect("both skipped"),
+            "http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&mode=register&skip_bcr=true"
+        );
+        assert_eq!(
+            with_preps(url, false, false).expect("preps enabled"),
+            "http://127.0.0.1:8790/arm-setup?instrument=EUR_CAD&mode=register"
+        );
     }
 
     /// The operator's actual paste, from the browser address bar.

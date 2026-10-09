@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-09 — continuation invalidation with `--skip-bcr`
+
+`--spec-url` now forwards `skip_bcr=true` when both break-and-close and retest
+are skipped. Local-chart uses that flag to export continuation cutoffs outside
+the TP fib and waive the neckline drawing requirement. `tv-arm` accepts those
+cutoffs and keeps their continuous entry veto; direction still comes from the fib.
+Setups using either prep retain the existing fib-range check.
+
+Regression tests cover the EUR/CAD short cutoff at 1.5962706008555703 below
+its fib range [1.59808, 1.60675], the long mirror, partial prep skips, and HTTP
+flag forwarding. Requires the matching local-chart export update.
+
 ## v150 — 2026-09-29 — `--spec-url` forwards a replay's `--start` as `start=`
 
 **Why.** local-chart's `/arm-setup` needs a start instant for a replay spec

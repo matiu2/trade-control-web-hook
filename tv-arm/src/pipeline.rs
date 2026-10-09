@@ -2034,6 +2034,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_setup_from_url_forwards_skipped_break_and_retest() {
+        for flags in [
+            vec!["--skip-bcr", "register"],
+            vec!["--skip-break-and-close", "--skip-retest", "register"],
+            vec!["--trend", "replay"],
+        ] {
+            let args = mw_args(&flags).apply_aliases();
+            let err = read_setup_from_url(
+                &args,
+                "http://127.0.0.1:1/?instrument=EUR_CAD&tf=h1&broker=tradenation",
+            )
+            .expect_err("nothing is listening on :1")
+            .to_string();
+            assert!(err.contains("skip_bcr=true"), "{err}");
+        }
+    }
+
     /// With no subcommand there is no mode to ask for, and the refusal comes
     /// BEFORE the fetch — the error is ours, not a connection failure.
     #[test]

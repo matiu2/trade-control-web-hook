@@ -829,18 +829,45 @@ mod tests {
         use trade_control_core::intent::VetoSide;
 
         for (head, neck, cutoff, label, direction, side) in [
-            (1.60675, 1.59808, 1.5962706008555703, "too-high", Direction::Short, VetoSide::Above),
-            (1.59808, 1.60675, 1.60856, "too-low", Direction::Long, VetoSide::Below),
+            (
+                1.60675,
+                1.59808,
+                1.5962706008555703,
+                "too-high",
+                Direction::Short,
+                VetoSide::Above,
+            ),
+            (
+                1.59808,
+                1.60675,
+                1.60856,
+                "too-low",
+                Direction::Long,
+                VetoSide::Below,
+            ),
         ] {
-            let mut geom = PlanGeometry::from_roles(&hs_roles(fib("fib", head, neck), hline("inv", label, cutoff)));
+            let mut geom = PlanGeometry::from_roles(&hs_roles(
+                fib("fib", head, neck),
+                hline("inv", label, cutoff),
+            ));
             geom.neckline = None;
             let args = mw_args(&["--skip-bcr"]).apply_aliases();
             let (actual, spec) = resolve_hs_trade(
-                &args, &geom, false, "EUR_CAD", "test", Broker::TradeNation,
+                &args,
+                &geom,
+                false,
+                "EUR_CAD",
+                "test",
+                Broker::TradeNation,
                 test_precision(0.0001, 0.00001),
-            ).expect("continuation resolves without a neckline");
+            )
+            .expect("continuation resolves without a neckline");
             assert_eq!(actual, direction);
-            let veto = spec.entry_level_vetos.iter().find(|veto| veto.name == label).expect("cutoff is a veto");
+            let veto = spec
+                .entry_level_vetos
+                .iter()
+                .find(|veto| veto.name == label)
+                .expect("cutoff is a veto");
             assert_eq!(veto.level, cutoff);
             assert_eq!(veto.past, side);
         }
@@ -848,7 +875,10 @@ mod tests {
 
     #[test]
     fn skipping_only_one_prep_keeps_the_fib_range_check() {
-        let geom = PlanGeometry::from_roles(&hs_roles(fib("fib", 1.60675, 1.59808), hline("inv", "too-high", 1.59627)));
+        let geom = PlanGeometry::from_roles(&hs_roles(
+            fib("fib", 1.60675, 1.59808),
+            hline("inv", "too-high", 1.59627),
+        ));
         for flag in ["--skip-break-and-close", "--skip-retest"] {
             let args = mw_args(&[flag]).apply_aliases();
             assert!(matches!(resolve_hs_trade(
