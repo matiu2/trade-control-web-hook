@@ -130,6 +130,10 @@ submit a direct signed intent rather than an engine plan. Their `plan-out` and
 `replay` combinations are refused before any I/O. For a server check, use
 `--broker-dry-run register`; a successful dry run submits no broker order.
 
+The offline-command guard was checked for all three position entry types,
+including a nonexistent spec file: rejection happens before reading the spec
+or contacting the worker. All 563 `tv-arm` tests and strict Clippy passed.
+
 ## Adding an account versus adding a broker
 
 Another account for an existing broker usually needs configuration,

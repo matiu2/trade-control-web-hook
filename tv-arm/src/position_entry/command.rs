@@ -25,7 +25,10 @@ mod tests {
     #[test]
     fn offline_position_commands_fail_before_reading_the_spec_or_posting() {
         for entry in ["--market-entry", "--stop-entry", "--limit-entry"] {
-            for command in [vec!["plan-out", "/tmp/unused-position-plan.json"], vec!["replay"]] {
+            for command in [
+                vec!["plan-out", "/tmp/unused-position-plan.json"],
+                vec!["replay"],
+            ] {
                 let args = Args::try_parse_from(
                     ["tv-arm", "--spec-in", "/missing-position-spec.json", entry]
                         .into_iter()
