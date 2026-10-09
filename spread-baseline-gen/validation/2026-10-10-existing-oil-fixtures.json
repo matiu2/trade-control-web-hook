@@ -1,0 +1,13 @@
+{
+  "baseline_commit": "608254d4",
+  "comparison": "Five pre-existing BCO golden divergences reproduce identically before and after MT5 spread integration. Only exit_price, exit_time, r of leg 1 and net_r updated. No strategy code changed for these fixtures.",
+  "fixtures": [
+    "bco-usd-h1-2026-08-13-normal-news-on-entry-market",
+    "bco-usd-h1-2026-08-13-skip-bcr-news-off-entry-market",
+    "bco-usd-h1-2026-08-13-skip-bcr-news-on-entry-market",
+    "bco-usd-h1-2026-08-13-strategy-v2-news-on-entry-market",
+    "bco-usd-h1-2026-08-13-strategy-v2-qm-market-news-on-entry-market"
+  ],
+  "baseline_log": "/tmp/mt5-spread-baseline-corpus.log",
+  "integration_log": "/tmp/mt5-spread-integration-tests.log"
+}
