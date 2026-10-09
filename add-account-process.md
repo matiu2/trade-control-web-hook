@@ -131,3 +131,8 @@ Its code commits are `f9eb0cf3` and `6232a177`. Validation passed 3,578 workspac
 tests and strict Clippy; five existing oil replay golden mismatches were
 reproduced identically on the pre-integration code. Both account indexes and
 staging's signed dry-run route were checked after installation.
+
+After the default-index registration, both `trade-control-accounts list` and
+`trade-control-staging account names` returned `the5ers-competition`. Both
+worker health endpoints passed. The nine CLI history tests, formatting check
+and strict workspace Clippy check passed for this follow-up.
