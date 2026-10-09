@@ -96,6 +96,7 @@ mod tests {
 
     fn ev(name: &str, currency: &str, impact: Impact, time_utc: &str) -> EconomicEvent {
         EconomicEvent {
+            event_id: None,
             name: name.to_string(),
             currency: currency.to_string(),
             impact,

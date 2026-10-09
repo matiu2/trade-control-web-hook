@@ -31,8 +31,8 @@ use trade_control_core::account::{MetadataError, MetadataStore};
 use trade_control_core::broker::Broker;
 use trade_control_core::intent::BrokerKind;
 use trade_control_worker::{
-    BrokerError, Config, PgMetadataStore, PgStateStore, Secrets, acquire_ibkr, acquire_mt5, acquire_oanda,
-    acquire_tn,
+    BrokerError, Config, PgMetadataStore, PgStateStore, Secrets, acquire_ibkr, acquire_mt5,
+    acquire_oanda, acquire_tn,
 };
 
 #[derive(Parser)]
@@ -70,9 +70,12 @@ struct Cli {
 async fn main() -> Result<()> {
     color_eyre::install()?;
     use tracing_subscriber::prelude::*;
-    tracing_subscriber::registry().with(tracing_error::ErrorLayer::default())
+    tracing_subscriber::registry()
+        .with(tracing_error::ErrorLayer::default())
         .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(tracing_subscriber::fmt::layer()).try_init().ok();
+        .with(tracing_subscriber::fmt::layer())
+        .try_init()
+        .ok();
     let cli = Cli::parse();
 
     let db_url = resolve_db_url(&cli)?;
@@ -102,7 +105,14 @@ async fn main() -> Result<()> {
     let quote = match meta.broker {
         BrokerKind::Mt5 => {
             let broker = acquire_mt5(&meta).await.map_err(|e| eyre!("{e}"))?;
-            mt5_probe::check(&broker, &meta, &cli.instrument, cli.candle_count, cli.preview_minimum_short).await?;
+            mt5_probe::check(
+                &broker,
+                &meta,
+                &cli.instrument,
+                cli.candle_count,
+                cli.preview_minimum_short,
+            )
+            .await?;
             broker.get_quote(&cli.instrument).await
         }
         BrokerKind::TradeNation => {

@@ -135,7 +135,10 @@ pub fn validate_instrument(
         BrokerKind::Mt5 => {
             let account = account.ok_or_else(|| eyre!("MT5 requires an explicit named account"))?;
             let config = mt5_data_source::account_config::AccountConfig::load(account)?;
-            run_blocking(async { config.trader().await?.symbol(name).await?; Ok(None) })
+            run_blocking(async {
+                config.trader().await?.symbol(name).await?;
+                Ok(None)
+            })
         }
         BrokerKind::TradeNation => {
             let cache = load_cache(false, account, None)?;

@@ -280,7 +280,17 @@ pub async fn fetch_windows(
 ) -> Vec<BidAskCandle> {
     let mut out = Vec::new();
     for w in coalesce(windows.to_vec()) {
-        match super::candles::pull(source, symbol, finer, w.start, w.end, cache_dir.clone(), mt5_account).await {
+        match super::candles::pull(
+            source,
+            symbol,
+            finer,
+            w.start,
+            w.end,
+            cache_dir.clone(),
+            mt5_account,
+        )
+        .await
+        {
             Ok(cs) => out.extend(cs),
             Err(e) => tracing::warn!(
                 error = %e,

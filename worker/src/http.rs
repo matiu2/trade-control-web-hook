@@ -64,7 +64,9 @@ use trade_control_core::intent::{Action, BrokerKind, VetoLevel};
 use trade_control_core::state::StateStore;
 
 use crate::dispatch_config_native::build_dispatch_config_native;
-use crate::{PgMetadataStore, PgStateStore, Secrets, acquire_ibkr, acquire_mt5, acquire_oanda, acquire_tn};
+use crate::{
+    PgMetadataStore, PgStateStore, Secrets, acquire_ibkr, acquire_mt5, acquire_oanda, acquire_tn,
+};
 
 /// Shared application state owned by the local dispatcher thread. The HMAC
 /// `signing_key` is stored **already hex-decoded** (the wire key is hex; the
@@ -517,7 +519,7 @@ async fn dispatch_broker(
                 );
             }
         },
-BrokerKind::Mt5 => match acquire_mt5(&meta).await {
+        BrokerKind::Mt5 => match acquire_mt5(&meta).await {
             Ok(broker) => run_action(&broker, &state.store, verified, &cfg, now, body).await,
             Err(err) => {
                 tracing::error!("mt5 acquire failed: {err}");

@@ -37,7 +37,12 @@ use trade_control_conventions::Broker;
 ///
 /// Hard-errors (never falls back) on any read failure or a
 /// non-positive spread.
-pub async fn read_spread_pips(broker: Broker, instrument: &str, pip_size: f64, account: Option<&str>) -> Result<f64> {
+pub async fn read_spread_pips(
+    broker: Broker,
+    instrument: &str,
+    pip_size: f64,
+    account: Option<&str>,
+) -> Result<f64> {
     // Reject zero, negative, and NaN pip sizes (a NaN fails `> 0.0`).
     if pip_size.is_nan() || pip_size <= 0.0 {
         return Err(eyre!(
@@ -81,11 +86,18 @@ pub async fn read_mid(broker: Broker, instrument: &str, account: Option<&str>) -
 /// (plan §"Cannot be verified offline"), and this module's contract is to
 /// refuse rather than fall back — a guessed futures spread would mis-size
 /// every entry it touched.
-async fn read_bid_ask(broker: Broker, instrument: &str, account: Option<&str>) -> Result<(f64, f64)> {
+async fn read_bid_ask(
+    broker: Broker,
+    instrument: &str,
+    account: Option<&str>,
+) -> Result<(f64, f64)> {
     match broker {
         Broker::Mt5 => {
-            let account = account.ok_or_else(|| eyre!("MT5 live quotes require a named account"))?;
-            let trader = mt5_data_source::account_config::AccountConfig::load(account)?.trader().await?;
+            let account =
+                account.ok_or_else(|| eyre!("MT5 live quotes require a named account"))?;
+            let trader = mt5_data_source::account_config::AccountConfig::load(account)?
+                .trader()
+                .await?;
             let quote = trader.quote(instrument).await?;
             Ok((quote.bid, quote.ask))
         }
@@ -103,7 +115,9 @@ async fn read_bid_ask(broker: Broker, instrument: &str, account: Option<&str>) -
 /// it usually means the market is closed or the feed is stale, and a
 /// degenerate spread must not be baked into an order.
 fn validated_spread(broker: Broker, bid: f64, ask: f64) -> Result<f64> {
-    if broker == Broker::Mt5 && bid.is_finite() && bid > 0.0 && bid == ask { return Ok(0.0); }
+    if broker == Broker::Mt5 && bid.is_finite() && bid > 0.0 && bid == ask {
+        return Ok(0.0);
+    }
     spread_from_bid_ask(bid, ask)
 }
 

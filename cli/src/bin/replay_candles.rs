@@ -179,10 +179,15 @@ async fn run() -> Result<()> {
     })?;
     let plan = load_plan(&plan_path)?;
     if args.source == CandleSource::Mt5 && args.mt5_account.is_none() {
-        let accounts: std::collections::BTreeSet<_> = plan.rules.iter()
+        let accounts: std::collections::BTreeSet<_> = plan
+            .rules
+            .iter()
             .filter(|r| r.intent.broker == trade_control_core::intent::BrokerKind::Mt5)
-            .filter_map(|r| r.intent.account.clone()).collect();
-        if accounts.len() == 1 { args.mt5_account = accounts.into_iter().next(); }
+            .filter_map(|r| r.intent.account.clone())
+            .collect();
+        if accounts.len() == 1 {
+            args.mt5_account = accounts.into_iter().next();
+        }
     }
 
     // Granularity comes from the plan; `--granularity` only overrides, and an
@@ -631,8 +636,16 @@ async fn pull_with_warmup(
             attempt,
             "pulling candles (times in Brisbane, UTC+10)"
         );
-        let candles =
-            candles::pull(source, symbol, gran, pull_from, pull_end, cache_dir.clone(), mt5_account).await?;
+        let candles = candles::pull(
+            source,
+            symbol,
+            gran,
+            pull_from,
+            pull_end,
+            cache_dir.clone(),
+            mt5_account,
+        )
+        .await?;
         if candles.is_empty() {
             return Err(eyre!(
                 "no candles returned for {symbol} {gran_label} in [{pull_from}, {pull_end}]"

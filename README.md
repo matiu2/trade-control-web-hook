@@ -4511,14 +4511,17 @@ The credential file retains `[creds] username = "..."` and `password = "..."`.
 Keep it private and outside version control. The configuration pins the login,
 server and EA identity; the adapter refuses real accounts. Forex risk sizing uses
 MT5 contract size, lot limits and a fresh account-currency conversion. Literal
-`risk_units` / `--risk-units` means **lots** on MT5; percent and amount remain
+`size_units` means **lots** on MT5; percent and amount remain
 monetary SL risk. Existing exposure on the same instrument prevents a new entry.
 
 Register metadata in staging (competition is `--kind demo`):
 
 ```sh
-trade-control-accounts --config ~/.config/trade-control/trade-control-staging.toml   add the5ers-competition --broker mt5 --kind demo
-trade-control-broker-check the5ers-competition   --config ~/.config/trade-control/trade-control-staging.toml   --instrument EURUSD --candle-count 3 --preview-minimum-short
+trade-control-accounts --config ~/.config/trade-control/staging-worker.toml \
+  add the5ers-competition --broker mt5 --kind demo
+trade-control-broker-check the5ers-competition \
+  --config ~/.config/trade-control/staging-worker.toml \
+  --instrument EURUSD --candle-count 3 --preview-minimum-short
 ```
 
 The check reads quotes/history and validates a **dry-run** minimum-lot short
@@ -4547,7 +4550,8 @@ finished downloading it. No incomplete range is accepted as a full import.
 Warm the cache directly from the trading-libraries checkout:
 
 ```sh
-cargo run --manifest-path mt5-data-source/Cargo.toml --bin mt5-candles --   --account the5ers-competition --symbol AUDUSD --timeframe H1 --count 300
+cargo run --manifest-path mt5-data-source/Cargo.toml --bin mt5-candles -- \
+  --account the5ers-competition --symbol AUDUSD --timeframe H1 --count 300
 ```
 
 Mutation timeouts stay ambiguous and block retry until reconciled. Partial fills

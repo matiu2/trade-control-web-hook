@@ -37,10 +37,24 @@ pub async fn pull(
 ) -> Result<Vec<EngineCandle>> {
     if source == CandleSource::Mt5 {
         use candle_model::BidAskDataSource;
-        color_eyre::eyre::ensure!(cache_dir.is_none(), "MT5 uses its pinned candle_cache_mt5 namespace; --cache-dir is unsupported");
-        let name = mt5_account.ok_or_else(|| eyre!("--source mt5 requires --mt5-account or a plan with one named MT5 account"))?;
-        let source = mt5_data_source::account_config::AccountConfig::load(name)?.candles().await?;
-        let candles = source.get_candles_range_bid_ask(symbol,from.fixed_offset(),to.fixed_offset(),granularity.candle_model()).await?;
+        color_eyre::eyre::ensure!(
+            cache_dir.is_none(),
+            "MT5 uses its pinned candle_cache_mt5 namespace; --cache-dir is unsupported"
+        );
+        let name = mt5_account.ok_or_else(|| {
+            eyre!("--source mt5 requires --mt5-account or a plan with one named MT5 account")
+        })?;
+        let source = mt5_data_source::account_config::AccountConfig::load(name)?
+            .candles()
+            .await?;
+        let candles = source
+            .get_candles_range_bid_ask(
+                symbol,
+                from.fixed_offset(),
+                to.fixed_offset(),
+                granularity.candle_model(),
+            )
+            .await?;
         return Ok(candles.candles.iter().map(to_engine_candle).collect());
     }
     let config = CacheConfig::default().with_cache_dir(match cache_dir {

@@ -96,7 +96,7 @@ impl CronEnv for NativeCronEnv {
                     None
                 }
             },
-BrokerKind::Mt5 => match acquire_mt5(&meta).await {
+            BrokerKind::Mt5 => match acquire_mt5(&meta).await {
                 Ok(b) => Some(BrokerHandle::Mt5(b)),
                 Err(err) => {
                     tracing::error!("cron: mt5 acquire failed for '{}': {err}", meta.name);

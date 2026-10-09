@@ -37,7 +37,10 @@ pub fn read_spread_blocking(
         .map_err(ResolveError::Fatal)?;
     runtime
         .block_on(crate::spread::read_spread_pips(
-            broker, instrument, pip_size, Some(account),
+            broker,
+            instrument,
+            pip_size,
+            Some(account),
         ))
         .map_err(ResolveError::Fatal)
 }

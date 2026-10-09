@@ -22,7 +22,7 @@
 
 use candle_cache::{CacheClient, CacheConfig};
 use candle_model::Granularity;
-use chrono::{DateTime, Duration, FixedOffset, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use tradenation_api::TradeNationClient;
 
 /// The reproduction case: Coffee 15m, the window the Coffee M15 replays used.

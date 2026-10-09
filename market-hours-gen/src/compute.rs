@@ -257,14 +257,14 @@ mod tests {
             // 30 warmup bars leading to a close, then a big-jump reopen.
             for _ in 0..30 {
                 bars.push(bar(t, 100.0, 100.1, 99.9, 100.0));
-                t = t + chrono::Duration::hours(1);
+                t += chrono::Duration::hours(1);
             }
             // Ensure the close bar is mid-week (Mon–Thu). Advance to next Wed if
             // we've drifted; just force the reopen 3h later with a big jump.
             let big = 100.0 + 5.0; // 5.0 jump vs ATR ~0.2 → way over 1 ATR
-            t = t + chrono::Duration::hours(3);
+            t += chrono::Duration::hours(3);
             bars.push(bar(t, big, big + 0.1, big - 0.1, big));
-            t = t + chrono::Duration::hours(1);
+            t += chrono::Duration::hours(1);
         }
         let p = profile_from_bars(&bars);
         assert!(p.attention_gaps >= MIN_SAMPLES, "enough attention gaps");

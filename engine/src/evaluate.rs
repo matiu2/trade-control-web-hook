@@ -5537,7 +5537,7 @@ mod tests {
         let mut prior = seed_at(Phase::AwaitEntry, "2026-06-01T00:00:00Z");
         prior.break_close_at = Some(break_at);
         let mut window = warm_atr_window(30, first);
-        window.push(retest_bar.clone());
+        window.push(retest_bar);
         run_window(&p, &prior, &[retest_bar], &window)
             .new_state
             .retest_seen_at
@@ -5555,11 +5555,11 @@ mod tests {
         // Non-golden: same low (1.2000, same cross), but range only 0.0080 < ATR.
         let weak = candle("2026-06-02T06:00:00Z", 1.2050, 1.2080, 1.2000, 1.2050);
         assert!(
-            retest_golden_stamps(golden.clone(), true),
+            retest_golden_stamps(golden, true),
             "a golden retest bar stamps under --bcr-require-golden"
         );
         assert!(
-            !retest_golden_stamps(weak.clone(), true),
+            !retest_golden_stamps(weak, true),
             "a non-golden retest bar (same cross, smaller range) is rejected"
         );
         // Flag off: the weak bar's cross stamps as before (no regression).
@@ -5600,7 +5600,7 @@ mod tests {
             .origin_open
             .insert("03-prep-break-and-close".into(), 1.2100);
         let mut window = warm_atr_window(30, first);
-        window.push(break_bar.clone());
+        window.push(break_bar);
         run_window(&p, &prior, &[break_bar], &window)
             .new_state
             .phase
@@ -5617,11 +5617,11 @@ mod tests {
         // Non-golden: same 1.1950 close (same break), range only 0.0080 < ATR.
         let weak = candle("2026-06-02T06:00:00Z", 1.1960, 1.1980, 1.1950, 1.1950);
         assert!(
-            break_golden_stamps(golden.clone(), true),
+            break_golden_stamps(golden, true),
             "a golden break bar advances the spine under --bcr-require-golden"
         );
         assert!(
-            !break_golden_stamps(weak.clone(), true),
+            !break_golden_stamps(weak, true),
             "a non-golden break bar (same close, smaller range) does not advance"
         );
         // Flag off: the weak break stamps as before (no regression).
@@ -6621,7 +6621,7 @@ mod tests {
         let st = seed_plan_state(&p, &warmup, ts("2026-06-30T00:00:00Z"));
         // The fix: seeding records NO origin — it's left for the first live bar.
         assert!(
-            st.origin_open.get("03-prep-break-and-close").is_none(),
+            !st.origin_open.contains_key("03-prep-break-and-close"),
             "seed must not anchor origin to the warm-up bar"
         );
         // First LIVE bar opens BELOW (1.1980) and closes below — fixes origin

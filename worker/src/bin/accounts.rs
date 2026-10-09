@@ -195,9 +195,12 @@ impl From<KindArg> for AccountKind {
 async fn main() -> Result<()> {
     color_eyre::install()?;
     use tracing_subscriber::prelude::*;
-    tracing_subscriber::registry().with(tracing_error::ErrorLayer::default())
+    tracing_subscriber::registry()
+        .with(tracing_error::ErrorLayer::default())
         .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(tracing_subscriber::fmt::layer()).try_init().ok();
+        .with(tracing_subscriber::fmt::layer())
+        .try_init()
+        .ok();
     let cli = Cli::parse();
 
     let db_url = resolve_db_url(&cli)?;
@@ -270,7 +273,9 @@ async fn add(
     max_open_positions: Option<u32>,
 ) -> Result<()> {
     if broker == BrokerKind::Mt5 {
-        if kind.is_live() { return Err(eyre!("MT5 currently supports demo/competition only")); }
+        if kind.is_live() {
+            return Err(eyre!("MT5 currently supports demo/competition only"));
+        }
         mt5_data_source::account_config::AccountConfig::load(&name)?;
     }
     if broker == BrokerKind::Oanda && oanda_account_id.is_none() {

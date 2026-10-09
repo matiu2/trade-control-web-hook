@@ -20,7 +20,12 @@ impl Broker {
     /// role, and the two lists must agree because `tv-arm` maps between them.
     ///
     /// [`BrokerKind::ALL`]: https://docs.rs/trade-control-core
-    pub const ALL: &'static [Broker] = &[Broker::Oanda, Broker::TradeNation, Broker::Ibkr, Broker::Mt5];
+    pub const ALL: &'static [Broker] = &[
+        Broker::Oanda,
+        Broker::TradeNation,
+        Broker::Ibkr,
+        Broker::Mt5,
+    ];
 
     /// Look up a broker from a TradingView exchange tag (the prefix
     /// before the colon in `OANDA:EUR_USD`). Case-insensitive.

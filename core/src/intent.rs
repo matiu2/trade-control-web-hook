@@ -1645,8 +1645,12 @@ impl BrokerKind {
     /// a picker or validates a broker string reads this; the hardcoded
     /// `["oanda", "tradenation"]` arrays this replaced were invisible to the
     /// compiler and each had to be found by hand.
-    pub const ALL: &'static [BrokerKind] =
-        &[BrokerKind::Oanda, BrokerKind::TradeNation, BrokerKind::Ibkr, BrokerKind::Mt5];
+    pub const ALL: &'static [BrokerKind] = &[
+        BrokerKind::Oanda,
+        BrokerKind::TradeNation,
+        BrokerKind::Ibkr,
+        BrokerKind::Mt5,
+    ];
 
     /// The lowercase wire form — the same string serde produces.
     ///
