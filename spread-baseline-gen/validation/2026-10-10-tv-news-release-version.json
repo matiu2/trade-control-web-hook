@@ -1,0 +1,8 @@
+{
+  "date": "2026-10-10",
+  "change": "tv-news release version reporting",
+  "offline_tests": "45 passed, 0 failed",
+  "clippy": "all targets with warnings denied: passed",
+  "formatting": "passed",
+  "live_broker_calls": 0
+}
