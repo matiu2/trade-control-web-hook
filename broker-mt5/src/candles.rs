@@ -1,10 +1,10 @@
-use candle_model::{BidAskCandleData, BidAskDataSource};
+use candle_model::BidAskCandleData;
 use chrono::{DateTime, Utc};
-use mt5_data_source::tick_source::TickDataSource;
+use mt5_data_source::cached_feed::CachedFeed;
 use trade_control_core::broker::{BidAskCandle, CandleError, Granularity};
 
 pub(crate) async fn read(
-    source: &TickDataSource,
+    source: &CachedFeed,
     symbol: &str,
     gran: Granularity,
     since: DateTime<Utc>,
@@ -22,7 +22,7 @@ pub(crate) async fn read(
         Granularity::D1 => candle_model::Granularity::OneDay,
     };
     let bars = source
-        .get_candles_range_bid_ask(symbol, since.fixed_offset(), now.fixed_offset(), gran)
+        .paired_range(symbol, since, now, gran)
         .await
         .map_err(|error| {
             tracing::warn!(symbol, %error, "MT5 historical tick candles unavailable");

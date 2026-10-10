@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use color_eyre::Result;
 use mt5_data_source::{
     account_config::AccountConfig,
-    tick_source::TickDataSource,
+    cached_feed::CachedFeed,
     web::trading::{StopChange, Trader},
 };
 use trade_control_core::broker::*;
@@ -19,14 +19,14 @@ use trade_control_core::settlement::Settlement;
 
 pub struct Mt5Broker {
     pub(crate) trader: Trader,
-    pub(crate) candles: TickDataSource,
+    pub(crate) candles: CachedFeed,
     account_name: String,
 }
 impl Mt5Broker {
     pub async fn connect(name: &str) -> Result<Self> {
         let config = AccountConfig::load(name)?;
         let trader = config.trader().await?;
-        let candles = config.candles().await?;
+        let candles = CachedFeed::new(config.clone());
         Ok(Self {
             trader,
             candles,
