@@ -215,7 +215,9 @@ async fn run() -> Result<()> {
     let raw_instrument = window.instrument.as_deref().unwrap_or(&plan.instrument);
     let symbol = instrument::resolve_for(raw_instrument, args.source)?;
     let mt5_history = replay_candles::mt5_history::Mt5Replay::new(
-        args.mt5_account.as_deref(), args.mt5_history, plan.pip_size,
+        args.mt5_account.as_deref(),
+        args.mt5_history,
+        plan.pip_size,
     );
 
     let start = window.start;
@@ -1110,11 +1112,18 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
     // the missing window from the broker/candle-cache rather than silently
     // scoring it as a stop. The fixture's own `meta` says which source and symbol
     // it came from, so the refetch targets the same feed that produced it.
-    let fixture_account = args.mt5_account.clone().or_else(|| inputs.plan.rules.iter()
-        .find(|rule| rule.intent.broker == trade_control_core::intent::BrokerKind::Mt5)
-        .and_then(|rule| rule.intent.account.clone()));
+    let fixture_account = args.mt5_account.clone().or_else(|| {
+        inputs
+            .plan
+            .rules
+            .iter()
+            .find(|rule| rule.intent.broker == trade_control_core::intent::BrokerKind::Mt5)
+            .and_then(|rule| rule.intent.account.clone())
+    });
     let mt5_history = replay_candles::mt5_history::Mt5Replay::from_saved(
-        fixture_account.as_deref(), inputs.plan.pip_size, inputs.meta.estimated_spread.clone(),
+        fixture_account.as_deref(),
+        inputs.plan.pip_size,
+        inputs.meta.estimated_spread.clone(),
     );
     let refetch = FixtureRefetch {
         source: inputs.meta.source,
@@ -1165,12 +1174,13 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
     let economics = Some(&rendered.economics);
     let computed = ReplayOutcome::compute(&replay, args.simulate, economics);
 
-    let row = batch::BatchResult::ok(
+    let mut row = batch::BatchResult::ok(
         name,
         Some(inputs.plan.trade_id.clone()),
         inputs.meta.arm.clone(),
         computed.outcome.clone(),
     );
+    row.estimated_spread = inputs.meta.estimated_spread.clone();
 
     if args.check {
         match fixture::load_expected(dir) {

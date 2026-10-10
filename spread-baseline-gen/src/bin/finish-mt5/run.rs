@@ -76,6 +76,9 @@ fn bake(args: &Args) -> Result<spread_baseline_gen::mt5::Report> {
 
 fn check(args: &Args) -> Result<()> {
     write_status(args, "checking", "testing and linting generated profiles")?;
+    run("cargo", &["fmt", "--manifest-path", "../candle-cache/Cargo.toml"])?;
+    run("cargo", &["test", "--manifest-path", "../candle-cache/Cargo.toml", "--lib"])?;
+    run("cargo", &["clippy", "--manifest-path", "../candle-cache/Cargo.toml", "--all-targets", "--", "-D", "warnings"])?;
     run("cargo", &["fmt", "--all"])?;
     run("cargo", &check_args("test"))?;
     run("cargo", &check_args("clippy"))?;
@@ -126,7 +129,11 @@ fn record_checks(args: &Args, report: &spread_baseline_gen::mt5::Report) -> Resu
 
 fn commit_cache_table(message: &str) -> Result<()> {
     const TABLE: &str = "src/spread_profiles/mt5.rs";
-    let changed = output("git", &["-C", "../candle-cache", "diff", "--name-only", "--", TABLE])?;
+    run("git", &["-C", "../candle-cache", "diff", "--cached", "--quiet"])?;
+    let changed = output(
+        "git",
+        &["-C", "../candle-cache", "diff", "--name-only", "--", TABLE],
+    )?;
     if changed.is_empty() {
         return Ok(());
     }

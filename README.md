@@ -4628,80 +4628,33 @@ through deals and includes commissions, fees and swap. History is bounded to 31
 days; an incomplete archive carries a warning rather than invented P&L.
 
 
-### Finish the MT5 spread calibration and build a release
+### Shared spread calibration and historical MT5 replay
 
-`generate-mt5` measures historical bid/ask minute candles through CandleBridge.
-The named-account client starts the saved Linux/Bottles CandleBridge profile if
-MT5 has exited, with one recovery attempt for an interrupted read. Keep the
-calibration process running until its status is `finished`.
-The account-specific defaults live in `../candle-cache/src/spread_profiles/mt5.rs`; OANDA
-and TradeNation defaults stay in their existing file. Native broker symbols
-remain unchanged for quotes, orders and candle requests. Spread lookups use
-`mt5:<account>:<symbol>` so two suppliers cannot share a measurement by accident.
+The baked broker profiles now belong to candle-cache. Server spread policy and
+replay estimates read the same account-scoped values. The baking tools write to
+`../candle-cache/src/spread_profiles/{candle,mt5}.rs`; `finish-mt5` validates and
+publishes the cache revision before publishing the server release.
 
-A completed report can be validated and baked without placing any trades:
+See [the shared spread-baking guide](../candle-cache/SPREAD-BAKING.md) for
+measurement, resume, preview, baking, checks and release/deployment commands.
+Run these tools from this server repository. Calibration and deep bid-history
+backfill are separate jobs.
 
-Resume an interrupted or partially failed report at its original dates, keeping
-completed profiles and using cached tick minutes for unfinished instruments:
+MT5 replay defaults to `--mt5-history auto`: genuine bid/ask/mid history where
+available, otherwise native bid candles plus the named account's baked 90-day
+median spread after a history-unavailable error. The report labels this
+`ESTIMATED`; saved fixtures and JSON batch results retain the exact estimate.
+Estimates do not enter the genuine candle cache or replace live quotes.
 
-```bash
-cargo run -p spread-baseline-gen --bin generate-mt5 -- \
-  --account the5ers-competition --days 90 \
-  --resume /tmp/the5ers-spread-profile-90d.json \
-  --out /tmp/the5ers-spread-profile-90d-retry.json
+```sh
+# Native bid candles plus the reviewed spread; no EA needed for this replay.
+tv-arm-staging --skip-bcr --spec-url='http://127.0.0.1:8790/?instrument=AUDCAD&tf=d&broker=mt5-the5ers-competition&goto=2007-03-04T20%3A30%3A30Z&from=1152345265&to=1188346972' \
+  replay --mt5-history estimated
+
+# Require genuine historical bid/ask/mid instead.
+replay-candles-staging --plan /tmp/mt5-plan.json --source mt5 \
+  --mt5-account the5ers-competition --mt5-history paired
 ```
 
-Resume validates the account, catalogue and sampling window. Recoverable bridge
-preflight failures wait and retry without marking later instruments unavailable.
-After the retry budget is exhausted, the checkpoint remains resumable.
-Native `*t` FX variants and DAX40/SP500/XTIUSD/
-XBRUSD use explicit underlying pip/schedule aliases; their measured spreads and
-runtime keys remain separate. Pass the new report and runner status to the
-completion command below.
-
-Add `--require-complete` to `finish-mt5` when recovering a failed full-account
-run. It preserves the current baked table and stops before a new release if
-any requested instrument remains failed or unattempted.
-
-```bash
-cargo run -p spread-baseline-gen --bin bake-mt5 -- \
-  --account the5ers-competition \
-  --report /tmp/the5ers-spread-profile-90d.json
-```
-
-The current 90-day job has a queued completion process:
-
-```bash
-cargo run -p spread-baseline-gen --bin finish-mt5 -- \
-  --account the5ers-competition \
-  --report /tmp/the5ers-spread-profile-90d.json \
-  --calibration-status /tmp/the5ers-spread-profile-90d-status.json \
-  --status /tmp/the5ers-spread-release-status.json
-```
-
-Run this from the repository root, once per calibration. It waits up to seven
-days, requires a clean tracked `staging` checkout, validates the account identity,
-90-day window, fully attempted catalogue, reviewed profiles, schedule and finite values,
-then commits the evidence and generated defaults. It runs the affected tests,
-Clippy and formatting, commits validation, chooses the next numbered release tag,
-rebuilds the worker and staging-configured CLIs, and pushes the branch and tag.
-An interrupted run, invalid data or failed checks stop the job and are recorded
-in its status file. Unavailable or unreviewed instruments stay uncovered; their
-reasons remain in the committed report. A run with no valid profiles never
-replaces the defaults. The current launcher logs to
-`/tmp/the5ers-spread-release.log`. These temporary status files survive closing
-the terminal but not a machine reboot; restart the completion process after a
-reboot if it was waiting. A lock file beside the status file prevents a second active copy. If a crashed
-process left a stale lock, verify its recorded PID is gone before removing it.
-
-The release artifacts are in `target/release`. This completion job does not
-install binaries or restart trading services. Deploy staging separately with
-`./deploy-staging.sh` when ready to roll the running system.
-
-When promotion and deployment have been authorized, add `--publish-main
---deploy-staging` to `finish-mt5`. After the checks and staging push, this
-fast-forwards and pushes `main`, then runs `./deploy-staging.sh` to install the
-staging CLIs and restart only the staging worker. Independently advanced main
-commits stop promotion; they are never overwritten. The status records each
-step and becomes `complete` only after deployment succeeds. The calibration
-uses only the named MT5 account and does not place orders or access OANDA.
+Live trading remains on genuine bid/ask data. A missing account/instrument
+calibration or a connection/identity failure is still an error.

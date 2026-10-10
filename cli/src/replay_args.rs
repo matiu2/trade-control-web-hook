@@ -19,7 +19,7 @@ use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use trade_control_core::intent::Direction;
 
-/// Which broker candle-cache pulls (and caches) candles from. **Both** sources
+/// Which broker candle-cache pulls (and caches) candles from. All sources
 /// always go through candle-cache, so either choice fills the on-disk cache and
 /// reduces future broker calls — `--source` only selects the broker, never
 /// whether the cache is used. The live cron engine pulls from TradeNation, so
@@ -34,7 +34,7 @@ pub enum CandleSource {
     TradeNation,
     /// OANDA v20 candles via candle-cache.
     Oanda,
-    /// Paired MT5 ticks via CandleBridge and the dedicated mt5 cache.
+    /// MT5 cached history; genuine pairs or labelled baked-spread replay estimates.
     Mt5,
 }
 
@@ -205,7 +205,7 @@ pub struct ReplayArgs {
     #[arg(long)]
     pub granularity: Option<String>,
 
-    /// Which broker candle-cache pulls from. Both sources always go through
+    /// Which broker candle-cache pulls from. All sources always go through
     /// candle-cache (filling the on-disk cache either way); this only selects
     /// the broker. TradeNation matches the live engine.
     #[arg(long, value_enum, default_value_t = CandleSource::TradeNation)]
@@ -650,6 +650,23 @@ mod tests {
     fn source_wire_form() {
         assert_eq!(CandleSource::TradeNation.as_str(), "tradenation");
         assert_eq!(CandleSource::Oanda.as_str(), "oanda");
+        assert_eq!(CandleSource::Mt5.as_str(), "mt5");
+    }
+
+    #[test]
+    fn mt5_history_defaults_to_auto_and_accepts_explicit_policies() {
+        use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init().ok();
+        let parse = |flags: &[&str]| {
+            ReplayArgs::try_parse_from(["replay-candles", "--plan", "p.json"].into_iter().chain(flags.iter().copied())).unwrap()
+        };
+        assert_eq!(parse(&[]).mt5_history, Mt5HistoryMode::Auto);
+        assert_eq!(parse(&["--mt5-history", "estimated"]).mt5_history, Mt5HistoryMode::Estimated);
+        assert_eq!(parse(&["--mt5-history", "paired"]).mt5_history, Mt5HistoryMode::Paired);
     }
 
     #[test]

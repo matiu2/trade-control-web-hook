@@ -31,7 +31,7 @@ consistently on a grid the exchange doesn't trade on.
 
 Per-instrument session anchor: D1 opens at the instrument's own market open,
 H4 grid starts from it. The seam already exists — the spread-blackout baseline
-table (`core/src/spread_baseline_candle.rs`) carries a per-instrument
+table (`../candle-cache/src/spread_profiles/candle.rs`) carries a per-instrument
 `schedule` name (`ny`, `sydney`, …) with a timezone; nothing but the spread
 hour reads it. A session anchor keyed on that schedule would need to land in:
 

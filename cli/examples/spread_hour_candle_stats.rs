@@ -500,7 +500,7 @@ fn metrics_json(m: &Metrics) -> String {
 /// pinned to exactly the rows the engine flags. Cross-checked below against the
 /// public `is_spread_hour`, which is the real oracle.
 fn flagged_instruments(broker: &str, max: usize) -> Vec<String> {
-    const TABLE: &str = include_str!("../../core/src/spread_baseline_candle.rs");
+    const TABLE: &str = include_str!("../../../candle-cache/src/spread_profiles/candle.rs");
     let prefix = format!("(\"{broker}\"");
     let mut out = Vec::new();
     for line in TABLE.lines() {

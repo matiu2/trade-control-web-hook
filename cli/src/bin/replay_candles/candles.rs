@@ -10,7 +10,9 @@
 //! half-spread). The conversion is a field map plus a timezone normalisation —
 //! OANDA and TradeNation both stamp UTC-offset times, so `with_timezone(&Utc)`
 //! is lossless. A data source that serves mid-only yields bid == ask == mid,
-//! and the simulator degrades cleanly to exact-level mid fills.
+//! and the simulator degrades cleanly to exact-level mid fills. MT5 offline replay
+//! can instead estimate missing ask/mid from the account-scoped baked spread;
+//! that provenance is displayed and saved, and estimates never enter the cache.
 
 use candle_cache::{CacheClient, CacheConfig, CacheError};
 use chrono::{DateTime, FixedOffset, Utc};

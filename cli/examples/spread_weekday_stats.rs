@@ -330,7 +330,7 @@ impl TimeParts for DateTime<FixedOffset> {
 /// matters at *any* hour, so restricting to elevated-hour instruments would beg
 /// it. Parses the generated table directly (it lives behind a private module).
 fn universe(broker: &str, max: usize) -> Vec<String> {
-    const TABLE: &str = include_str!("../../core/src/spread_baseline_candle.rs");
+    const TABLE: &str = include_str!("../../../candle-cache/src/spread_profiles/candle.rs");
     let prefix = format!("(\"{broker}\"");
     let mut out = Vec::new();
     for line in TABLE.lines() {

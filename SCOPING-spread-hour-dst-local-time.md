@@ -67,7 +67,7 @@ Normalized, not a tz-per-row. In `instrument-lookup`:
 - A full year of data now SHARPENS (all of it lands in the same local hour)
   instead of smearing across two UTC hours → can widen `--days` back up.
 
-### Table format (`core/src/spread_baseline_candle.rs`)
+### Table format (`../candle-cache/src/spread_profiles/candle.rs`)
 Row becomes `(broker, symbol, tz_id, reviewed, mask_local, widen[24])`.
 `mask_local` bits are local hours. Migration: regenerate the whole table.
 

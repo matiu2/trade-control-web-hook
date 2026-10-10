@@ -95,7 +95,7 @@ pub fn render_table(rows: &[BaselineRow]) -> String {
          hours.\n// Don't conflate them: one asks \"is this an elevated hour?\", the other \
          \"what\n// spread do I expect here?\". See the module docs.\n",
     );
-    s.push_str("#[allow(clippy::type_complexity)]\n");
+    s.push_str("#[rustfmt::skip]\n#[allow(clippy::type_complexity)]\n");
     s.push_str(
         "pub static SPREAD_BASELINE_CANDLE: &[(&str, &str, &str, bool, u32, [f64; 24], \
          f64, f64, f64, [f64; 24])] = &[\n",

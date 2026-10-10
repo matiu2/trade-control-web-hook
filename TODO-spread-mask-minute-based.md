@@ -34,7 +34,7 @@ flag the hour.
       `[20,21]`), EUR_USD → `[21]`, XAU_USD → `[]`. All anchors PASS.
       TODO: still need a TN GBP/AUD re-bake + TN anchor pass (EUR/USD, AUD/CHF,
       Spot Gold) — run TN separately (slow, paged M1).
-- [ ] 5. Update committed `core/src/spread_baseline_candle.rs` (mask table).
+- [ ] 5. Update committed `../candle-cache/src/spread_profiles/candle.rs` (mask table).
       Regression test in core: OANDA GBP_AUD is `[21]` not `[20,21]`.
 - [ ] 6. clippy + fmt; commit; (staging deploy is the user's call — it restarts
       the live demo worker).

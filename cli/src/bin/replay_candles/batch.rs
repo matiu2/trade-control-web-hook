@@ -98,6 +98,9 @@ pub struct BatchResult {
     /// aggregate; read `outcome` on a `!ok` row to see what it measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<ReplayEconomics>,
+    /// Saved calibrated spread when ask/mid were estimated from native MT5 bid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_spread: Option<super::mt5_history::EstimatedSpread>,
 }
 
 impl BatchResult {
@@ -117,6 +120,7 @@ impl BatchResult {
             arm,
             trade_id,
             outcome,
+            estimated_spread: None,
         }
     }
 
@@ -134,6 +138,7 @@ impl BatchResult {
             cell: None,
             trade_id: None,
             outcome: None,
+            estimated_spread: None,
         }
     }
 
@@ -343,6 +348,29 @@ mod tests {
             net_r,
             ..ReplayEconomics::new()
         }
+    }
+
+    #[test]
+    fn estimated_spread_survives_json_and_mismatched_results() {
+        use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init().ok();
+        let estimate = super::super::mt5_history::EstimatedSpread {
+            profile: "mt5:the5ers-competition:AUDCAD".into(),
+            median_pips: 0.6,
+            pip_size: 0.0001,
+        };
+        let mut row = BatchResult::ok("mt5-old-history", None, None, Some(econ(0.1)));
+        row.estimated_spread = Some(estimate.clone());
+        let row = BatchResult::mismatched(row, Some(&econ(0.2)), "mismatch");
+        let encoded = serde_json::to_string(&row).unwrap();
+        let decoded: BatchResult = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.estimated_spread, Some(estimate));
+        assert!(!decoded.ok);
+        assert!(decoded.outcome.is_some());
     }
 
     /// A successful row derives its grid cell from the arm block, so a consumer

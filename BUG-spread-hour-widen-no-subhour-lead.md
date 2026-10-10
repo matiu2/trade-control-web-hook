@@ -180,7 +180,7 @@ OANDA_TOKEN=... OANDA_ACCOUNT_ID=... cargo run --example gbpaud_zoom
 
 ## Related, handled separately (do NOT fix here)
 
-- **OANDA GBP_AUD mask over-flags hour 20.** `core/src/spread_baseline_candle.rs`
+- **OANDA GBP_AUD mask over-flags hour 20.** `../candle-cache/src/spread_profiles/candle.rs`
   row `("oanda","GBP_AUD", …, 3145728 = [20,21], …)`. Minute data shows 6am
   (20:00 UTC) is calm; the `[20]` bit is a close-sampled-H1 boundary artifact
   (the 20:55–20:59 ramp bleeding into the hour-20 p90 bucket). TN's `[21]` is

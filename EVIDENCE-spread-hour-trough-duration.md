@@ -122,7 +122,7 @@ candle/minute-derived generator); the shipped mask is not sampler-derived.
 - Hysteresis invariant `RECOVERED (4.0) < ELEVATED (8.0)` is asserted directly
   in a test (`spread_blackout.rs:767`).
 
-From the current baked table (`core/src/spread_baseline_candle.rs`, whole-window
+From the current baked table (`../candle-cache/src/spread_profiles/candle.rs`, whole-window
 p10/p50/p90 in pips, columns 7-9 of each row):
 
 | broker | symbol | median_pips (whole window) | low (p10) | high (p90) | elevated_threshold_pips (median*5) |

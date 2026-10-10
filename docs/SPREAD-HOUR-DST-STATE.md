@@ -6,7 +6,7 @@ anything spread-hour related._
 ## TL;DR
 
 - **The spread-hour mask is a compile-time baked table**
-  (`core/src/spread_baseline_candle.rs`, `include!`-ed into
+  (`../candle-cache/src/spread_profiles/candle.rs`, `include!`-ed into
   `core/src/spread_blackout.rs`). **Nothing regenerates it at runtime.** It is
   refreshed only by *manually* running the `spread-baseline-gen` generator and
   rebuilding.
@@ -156,7 +156,7 @@ bash -c '
 # per-symbol loops in `bash -c '...'` or they silently no-op.
 
 # Splice: OANDA file header + oanda rows + TN row lines + `];`, then copy into
-# core/src/spread_baseline_candle.rs, rebuild, run the tests, commit.
+# ../candle-cache/src/spread_profiles/candle.rs, rebuild, run the tests, commit.
 ```
 
 How it works internally (the "zoom in"):
@@ -229,7 +229,7 @@ tightly. But the current cost is already ~nil when idle.
 - `core/src/spread_blackout.rs` — the gate: `is_spread_hour`,
   `mask_active_with_lead`, `spread_hour_widen_for/instant`, `schedule_tz`,
   `spread_block_ttl_seconds`, `spread_block_window`. Reads the baked table.
-- `core/src/spread_baseline_candle.rs` — the **baked mask table** (6-tuple:
+- `../candle-cache/src/spread_profiles/candle.rs` — the **baked mask table** (6-tuple:
   `broker, symbol, schedule, reviewed, mask_local, widen[24]`). `@generated`.
 - `core/src/ny_clock.rs` — hand-rolled 5pm-NY DST fallback (`is_ny_close_edge`).
 - `core/build.rs` — compile-time bake of `spread_baseline.rs` (the reject-
