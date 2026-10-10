@@ -13,7 +13,7 @@ use clap::Parser;
 /// Annotate the active TradingView chart with vertical-line pairs for
 /// upcoming forex-factory news events.
 #[derive(Debug, Parser)]
-#[command(version, about, long_about = None)]
+#[command(version = env!("GIT_VERSION"), about, long_about = None)]
 pub struct Args {
     /// Print the plan but draw nothing. Useful for sanity-checking
     /// what events would land on the chart.
