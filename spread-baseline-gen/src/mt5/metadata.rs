@@ -1,6 +1,9 @@
 //! Explicit native MT5 aliases for pip units and market-local schedules only.
 //! Every native instrument still gets its own measured/account-scoped profile.
-use color_eyre::{Result, eyre::{ensure, eyre}};
+use color_eyre::{
+    Result,
+    eyre::{ensure, eyre},
+};
 use instrument_lookup::{Asset, AssetClass};
 
 pub fn resolve(symbol: &str) -> Result<&'static Asset> {
@@ -14,7 +17,10 @@ pub fn resolve(symbol: &str) -> Result<&'static Asset> {
     let asset = instrument_lookup::resolve(canonical)?
         .ok_or_else(|| eyre!("no instrument-lookup pip/schedule metadata for {symbol}"))?;
     if symbol.ends_with("*t") {
-        ensure!(asset.class == AssetClass::Forex, "unsupported non-FX MT5 *t variant {symbol}");
+        ensure!(
+            asset.class == AssetClass::Forex,
+            "unsupported non-FX MT5 *t variant {symbol}"
+        );
     }
     Ok(asset)
 }
@@ -24,9 +30,22 @@ mod tests {
     use super::*;
     #[test]
     fn native_aliases_retain_the_underlying_schedule_and_units() {
-        for (native, canonical) in [("EURUSD*t", "EURUSD"), ("GBPUSD*t", "GBPUSD"),
-            ("NZDUSD*t", "NZDUSD"), ("DAX40", "DE30"), ("SP500", "SPX500"),
-            ("XTIUSD", "WTICOUSD"), ("XBRUSD", "BCOUSD")] {
+        use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::fmt::layer())
+            .try_init()
+            .ok();
+        for (native, canonical) in [
+            ("EURUSD*t", "EURUSD"),
+            ("GBPUSD*t", "GBPUSD"),
+            ("NZDUSD*t", "NZDUSD"),
+            ("DAX40", "DE30"),
+            ("SP500", "SPX500"),
+            ("XTIUSD", "WTICOUSD"),
+            ("XBRUSD", "BCOUSD"),
+        ] {
             let got = resolve(native).unwrap();
             let expected = instrument_lookup::resolve(canonical).unwrap().unwrap();
             assert_eq!(got.id, expected.id);

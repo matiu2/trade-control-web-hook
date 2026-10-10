@@ -1,8 +1,8 @@
 //! Read-only calibration; writes an account-pinned JSON report, never a live table.
-#[path = "generate-mt5/run.rs"]
-mod mt5_calibration;
 #[path = "generate-mt5/checkpoint.rs"]
 mod checkpoint;
+#[path = "generate-mt5/run.rs"]
+mod mt5_calibration;
 
 use clap::Parser;
 use color_eyre::Result;

@@ -1,0 +1,105 @@
+{
+  "change": "Resume account-pinned calibration and explicit native metadata aliases",
+  "sampling_window": "2026-07-11T15:14:00Z through 2026-10-09T15:14:00Z",
+  "preserved_completed_profiles": 5,
+  "remaining_catalogue_entries": 38,
+  "generator_tests_passed": 66,
+  "clippy": "passed",
+  "formatting": "passed",
+  "live_bridge_identity": "verified login/server/clock after Bottles restart",
+  "native_alias_probe": [
+    {
+      "symbol": "GBPUSD*t",
+      "range": {
+        "status": "ok",
+        "error": "",
+        "records": 0
+      },
+      "ticks": {
+        "status": "error",
+        "error": "tick history unavailable or incomplete (MT5 error 0); retry; copied 0",
+        "records": 0
+      }
+    },
+    {
+      "symbol": "EURUSD*t",
+      "range": {
+        "status": "ok",
+        "error": "",
+        "records": 0
+      },
+      "ticks": {
+        "status": "error",
+        "error": "tick history unavailable or incomplete (MT5 error 0); retry; copied 0",
+        "records": 0
+      }
+    },
+    {
+      "symbol": "NZDUSD*t",
+      "range": {
+        "status": "ok",
+        "error": "",
+        "records": 0
+      },
+      "ticks": {
+        "status": "error",
+        "error": "tick history unavailable or incomplete (MT5 error 0); retry; copied 0",
+        "records": 0
+      }
+    },
+    {
+      "symbol": "DAX40",
+      "range": {
+        "status": "ok",
+        "error": "",
+        "records": 5
+      },
+      "ticks": {
+        "status": "ok",
+        "error": "",
+        "records": 745
+      }
+    },
+    {
+      "symbol": "SP500",
+      "range": {
+        "status": "ok",
+        "error": "",
+        "records": 5
+      },
+      "ticks": {
+        "status": "ok",
+        "error": "",
+        "records": 406
+      }
+    },
+    {
+      "symbol": "XTIUSD",
+      "range": {
+        "status": "ok",
+        "error": "",
+        "records": 5
+      },
+      "ticks": {
+        "status": "ok",
+        "error": "",
+        "records": 646
+      }
+    },
+    {
+      "symbol": "XBRUSD",
+      "range": {
+        "status": "ok",
+        "error": "",
+        "records": 5
+      },
+      "ticks": {
+        "status": "ok",
+        "error": "",
+        "records": 641
+      }
+    }
+  ],
+  "completion_guard": "--require-complete refuses partial replacement releases",
+  "orders_submitted": 0
+}

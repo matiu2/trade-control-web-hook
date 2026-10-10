@@ -35,7 +35,11 @@ pub fn finish(args: &Args) -> Result<()> {
 fn bake(args: &Args) -> Result<spread_baseline_gen::mt5::Report> {
     let config = mt5_data_source::account_config::AccountConfig::load(&args.account)?;
     let evidence = std::fs::read(&args.report)?;
-    let report = serde_json::from_slice(&evidence)?;
+    let report: spread_baseline_gen::mt5::Report = serde_json::from_slice(&evidence)?;
+    ensure!(
+        !args.require_complete || (report.complete && report.failures.is_empty()),
+        "full calibration required; preserve existing baked profiles and resolve the remaining failures"
+    );
     let table = spread_baseline_gen::mt5::bake::render_finished(
         &report,
         &args.account,

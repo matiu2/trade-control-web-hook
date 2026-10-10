@@ -4594,13 +4594,36 @@ days; an incomplete archive carries a warning rather than invented P&L.
 ### Finish the MT5 spread calibration and build a release
 
 `generate-mt5` measures historical bid/ask minute candles through CandleBridge.
-Leave MT5 and the calibration process running until its status is `finished`.
+The named-account client starts the saved Linux/Bottles CandleBridge profile if
+MT5 has exited, with one recovery attempt for an interrupted read. Keep the
+calibration process running until its status is `finished`.
 The account-specific defaults live in `core/src/spread_baseline_mt5.rs`; OANDA
 and TradeNation defaults stay in their existing file. Native broker symbols
 remain unchanged for quotes, orders and candle requests. Spread lookups use
 `mt5:<account>:<symbol>` so two suppliers cannot share a measurement by accident.
 
 A completed report can be validated and baked without placing any trades:
+
+Resume an interrupted or partially failed report at its original dates, keeping
+completed profiles and using cached tick minutes for unfinished instruments:
+
+```bash
+cargo run -p spread-baseline-gen --bin generate-mt5 -- \
+  --account the5ers-competition --days 90 \
+  --resume /tmp/the5ers-spread-profile-90d.json \
+  --out /tmp/the5ers-spread-profile-90d-retry.json
+```
+
+Resume validates the account, catalogue and sampling window. Bridge preflight
+failures stop the run with an unattempted checkpoint rather than recording every
+remaining symbol as unavailable. Native `*t` FX variants and DAX40/SP500/XTIUSD/
+XBRUSD use explicit underlying pip/schedule aliases; their measured spreads and
+runtime keys remain separate. Pass the new report and runner status to the
+completion command below.
+
+Add `--require-complete` to `finish-mt5` when recovering a failed full-account
+run. It preserves the current baked table and stops before a new release if
+any requested instrument remains failed or unattempted.
 
 ```bash
 cargo run -p spread-baseline-gen --bin bake-mt5 -- \

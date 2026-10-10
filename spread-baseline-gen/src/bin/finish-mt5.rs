@@ -15,6 +15,9 @@ struct Args {
     calibration_status: PathBuf,
     #[arg(long)]
     status: PathBuf,
+    /// Refuse a new bake/release until every requested instrument has succeeded.
+    #[arg(long)]
+    require_complete: bool,
 }
 
 fn main() -> Result<()> {

@@ -5,7 +5,7 @@ use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
 use color_eyre::{
     Result,
-    eyre::{Context, ensure},
+    eyre::{Context, ensure, eyre},
 };
 use mt5_data_source::{account_config::AccountConfig, tick_source::TickDataSource};
 use spread_baseline_gen::mt5::{Failure, InstrumentReport, Report, instrument_report};
@@ -82,12 +82,18 @@ pub async fn run(args: Args) -> Result<()> {
     let end = report.to_utc;
     save(&args.out, &report).await?;
     let desktop = config.desktop()?;
-    desktop.identity().await.wrap_err("MT5 calibration bridge preflight")?;
+    desktop
+        .identity()
+        .await
+        .wrap_err("MT5 calibration bridge preflight")?;
     let source = config.candles().await?;
     for (index, symbol) in requested.iter().enumerate() {
         // A dead/unresponsive bridge is a run-wide interruption, not evidence
         // that every later instrument is unavailable. Leave them unattempted.
-        desktop.identity().await.wrap_err("MT5 calibration bridge interrupted; resume this checkpoint")?;
+        desktop
+            .identity()
+            .await
+            .wrap_err("MT5 calibration bridge interrupted; resume this checkpoint")?;
         tracing::info!(
             symbol,
             instrument = index + 1,
@@ -103,7 +109,10 @@ pub async fn run(args: Args) -> Result<()> {
                 report.instruments.push(row);
             }
             Err(error) => {
-                desktop.identity().await.wrap_err("MT5 bridge interrupted; resume this checkpoint")?;
+                desktop
+                    .identity()
+                    .await
+                    .wrap_err("MT5 bridge interrupted; resume this checkpoint")?;
                 tracing::warn!(symbol, %error, "MT5 calibration failed; no replacement profile emitted");
                 report.failures.push(Failure {
                     symbol: symbol.clone(),
