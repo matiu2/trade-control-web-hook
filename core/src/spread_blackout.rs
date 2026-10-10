@@ -56,11 +56,11 @@ pub fn spread_blackout_decision(window_open: bool, spread_pips: f64, threshold_p
 /// hour at 21:00 UTC in summer (EDT) and 22:00 UTC in winter (EST) from the
 /// *same* mask bit. See `SCOPING-spread-hour-dst-local-time.md`.
 mod baseline_candle {
-    include!("spread_baseline_candle.rs");
+    pub use candle_cache::spread_profiles::SPREAD_BASELINE_CANDLE;
 }
 
 mod baseline_mt5 {
-    include!("spread_baseline_mt5.rs");
+    pub use candle_cache::spread_profiles::SPREAD_BASELINE_MT5;
 }
 mod account_scope;
 pub use account_scope::{mt5_spread_key, spread_lookup_key};

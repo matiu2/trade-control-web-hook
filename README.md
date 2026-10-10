@@ -4634,7 +4634,7 @@ days; an incomplete archive carries a warning rather than invented P&L.
 The named-account client starts the saved Linux/Bottles CandleBridge profile if
 MT5 has exited, with one recovery attempt for an interrupted read. Keep the
 calibration process running until its status is `finished`.
-The account-specific defaults live in `core/src/spread_baseline_mt5.rs`; OANDA
+The account-specific defaults live in `../candle-cache/src/spread_profiles/mt5.rs`; OANDA
 and TradeNation defaults stay in their existing file. Native broker symbols
 remain unchanged for quotes, orders and candle requests. Spread lookups use
 `mt5:<account>:<symbol>` so two suppliers cannot share a measurement by accident.

@@ -11,7 +11,7 @@ struct Args {
     account: String,
     #[arg(long)]
     report: PathBuf,
-    #[arg(long, default_value = "core/src/spread_baseline_mt5.rs")]
+    #[arg(long, default_value = "../candle-cache/src/spread_profiles/mt5.rs")]
     out: PathBuf,
 }
 

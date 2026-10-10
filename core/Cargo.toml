@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+candle-cache = { path = "../../candle-cache", default-features = false }
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 chrono = { version = "0.4.44", default-features = false, features = ["alloc", "serde"] }
 hex = "0.4.3"

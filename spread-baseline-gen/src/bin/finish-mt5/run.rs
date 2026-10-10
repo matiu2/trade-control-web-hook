@@ -4,7 +4,7 @@ use color_eyre::{Result, eyre::ensure};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-const TABLE_PATH: &str = "core/src/spread_baseline_mt5.rs";
+const TABLE_PATH: &str = "../candle-cache/src/spread_profiles/mt5.rs";
 
 #[derive(Deserialize)]
 struct CalibrationStatus {
@@ -61,7 +61,8 @@ fn bake(args: &Args) -> Result<spread_baseline_gen::mt5::Report> {
         &table,
     )?;
     std::fs::write(&evidence_path, evidence)?;
-    run("git", &["add", "--", TABLE_PATH, &evidence_path])?;
+    commit_cache_table("feat(spreads): bake validated MT5 calibration")?;
+    run("git", &["add", "--", &evidence_path])?;
     run(
         "git",
         &[
@@ -113,12 +114,24 @@ fn record_checks(args: &Args, report: &spread_baseline_gen::mt5::Report) -> Resu
             &serde_json::json!({"account":args.account,"feed":report.feed,"instruments":report.instruments.len(),"tests":"passed","clippy":"passed","formatting":"passed"}),
         )?,
     )?;
-    run("git", &["add", "--", TABLE_PATH, &receipt_path])?;
+    commit_cache_table("style(spreads): format validated MT5 profiles")?;
+    run("git", &["-C", "../candle-cache", "push", "origin", "HEAD"])?;
+    run("git", &["add", "--", &receipt_path])?;
     run(
         "git",
         &["commit", "-m", "test(spreads): verify baked MT5 profiles"],
     )?;
     Ok(())
+}
+
+fn commit_cache_table(message: &str) -> Result<()> {
+    const TABLE: &str = "src/spread_profiles/mt5.rs";
+    let changed = output("git", &["-C", "../candle-cache", "diff", "--name-only", "--", TABLE])?;
+    if changed.is_empty() {
+        return Ok(());
+    }
+    run("git", &["-C", "../candle-cache", "add", "--", TABLE])?;
+    run("git", &["-C", "../candle-cache", "commit", "-m", message])
 }
 
 fn wait_for_calibration(args: &Args) -> Result<()> {

@@ -52,7 +52,7 @@ struct Args {
     /// Output path for the generated table. Defaults to the **live** table, so
     /// a full bake needs no path argument and cannot land in the cwd by
     /// accident. A spot-check (`--only`) must redirect this somewhere else.
-    #[arg(long, default_value = "core/src/spread_baseline_candle.rs")]
+    #[arg(long, default_value = "../candle-cache/src/spread_profiles/candle.rs")]
     out: PathBuf,
 
     /// Restrict to these broker symbols (comma-separated) — for spot-checks.
