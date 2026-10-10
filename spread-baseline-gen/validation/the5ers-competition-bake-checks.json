@@ -3,6 +3,6 @@
   "clippy": "passed",
   "feed": "mt5-the5ers-competition",
   "formatting": "passed",
-  "instruments": 5,
+  "instruments": 40,
   "tests": "passed"
 }
