@@ -1,0 +1,20 @@
+{
+  "release": "v155",
+  "code_commit": "f9ccc36d",
+  "cache_commit": "1f74b47",
+  "cache_release": "v15",
+  "deploy_script": "./deploy-staging.sh",
+  "deploy_exit": 0,
+  "staging_health": "ok",
+  "worker_pid": 3888476,
+  "worker_artifact_sha256": "8bbcc2dc1e4b1ea09ca8fff7161af0435a33af03043fcd6c31fabd2a9d5b7ec8",
+  "installed_versions": {
+    "tv-arm-staging": "v155",
+    "replay-candles-staging": "v155",
+    "journal-staging": "v155"
+  },
+  "baking_tools_release_build": "passed; help defaults target shared cache profiles",
+  "installed_replay": "old AUDCAD D1 estimated-mode replay and saved fixture golden/JSON checks passed",
+  "server_main_and_staging": "fast-forwarded and pushed",
+  "deployed_at_brisbane": "2026-10-11 09:50"
+}
