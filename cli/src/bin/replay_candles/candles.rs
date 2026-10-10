@@ -33,23 +33,14 @@ pub async fn pull(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     cache_dir: Option<PathBuf>,
-    mt5_account: Option<&str>,
+    mt5_history: &super::mt5_history::Mt5Replay<'_>,
 ) -> Result<Vec<EngineCandle>> {
     if source == CandleSource::Mt5 {
         color_eyre::eyre::ensure!(
             cache_dir.is_none(),
             "MT5 uses its pinned candle_cache_mt5 namespace; --cache-dir is unsupported"
         );
-        let name = mt5_account.ok_or_else(|| {
-            eyre!("--source mt5 requires --mt5-account or a plan with one named MT5 account")
-        })?;
-        let source = mt5_data_source::cached_feed::CachedFeed::new(
-            mt5_data_source::account_config::AccountConfig::load(name)?,
-        );
-        let candles = source
-            .paired_range(symbol, from, to, granularity.candle_model())
-            .await?;
-        return Ok(candles.candles.iter().map(to_engine_candle).collect());
+        return mt5_history.pull(symbol, granularity, from, to).await;
     }
     let config = CacheConfig::default().with_cache_dir(match cache_dir {
         Some(dir) => dir,
@@ -182,7 +173,7 @@ fn tradenation_source() -> Result<TradeNationClient> {
 
 /// Field-map a candle-cache bid/ask candle to the engine's bid/ask candle (drop
 /// volume, normalise the timestamp to UTC).
-fn to_engine_candle(cd: &candle_model::BidAskCandleData) -> EngineCandle {
+pub(super) fn to_engine_candle(cd: &candle_model::BidAskCandleData) -> EngineCandle {
     EngineCandle {
         time: to_utc(cd.timestamp),
         o: cd.open,

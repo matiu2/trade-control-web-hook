@@ -56,6 +56,7 @@ mod replay_candles {
     pub mod instrument;
     pub mod lazy_zoom;
     pub mod lifecycle;
+    pub mod mt5_history;
     pub mod outcome;
     pub mod positions_out;
     pub mod replay;
@@ -213,6 +214,9 @@ async fn run() -> Result<()> {
 
     let raw_instrument = window.instrument.as_deref().unwrap_or(&plan.instrument);
     let symbol = instrument::resolve_for(raw_instrument, args.source)?;
+    let mt5_history = replay_candles::mt5_history::Mt5Replay::new(
+        args.mt5_account.as_deref(), args.mt5_history, plan.pip_size,
+    );
 
     let start = window.start;
     let end = window.end;
@@ -274,7 +278,7 @@ async fn run() -> Result<()> {
         bar_secs,
         warmup_bars,
         args.cache_dir.clone(),
-        args.mt5_account.as_deref(),
+        &mt5_history,
     )
     .await?;
 
@@ -310,7 +314,7 @@ async fn run() -> Result<()> {
     // The upkeep ticks (job 2): a finer bid/ask series over the live window
     // whose bar closes are the live 900 s order-control instants. `None` (the
     // default) is byte-identical. Pulled once and shared by both zoom passes.
-    let upkeep = pull_upkeep(&args, &symbol, gran.engine(), start, pull_end).await?;
+    let upkeep = pull_upkeep(&args, &symbol, gran.engine(), start, pull_end, &mt5_history).await?;
 
     // Sub-bar zoom (PR-2), run LAZILY in two passes (see `lazy_zoom`).
     //
@@ -368,7 +372,7 @@ async fn run() -> Result<()> {
                     finer_gran,
                     &zoom_windows,
                     args.cache_dir.clone(),
-                    args.mt5_account.as_deref(),
+                    &mt5_history,
                 )
                 .await;
 
@@ -436,6 +440,9 @@ async fn run() -> Result<()> {
         &mark_cfg,
         futures,
     );
+    if let Some(estimate) = mt5_history.provenance() {
+        print!("{}", estimate.notice());
+    }
     print!("{}", rendered.text);
 
     if annotate {
@@ -489,6 +496,7 @@ async fn run() -> Result<()> {
             instrument: symbol.clone(),
             granularity: gran.engine(),
             source: args.source,
+            estimated_spread: mt5_history.provenance(),
             start,
             end,
             message: args.message.clone(),
@@ -621,7 +629,7 @@ async fn pull_with_warmup(
     bar_secs: i64,
     want_warmup: usize,
     cache_dir: Option<PathBuf>,
-    mt5_account: Option<&str>,
+    mt5_history: &replay_candles::mt5_history::Mt5Replay<'_>,
 ) -> Result<Vec<EngineCandle>> {
     let mut pull_from = start - Duration::seconds(bar_secs * want_warmup as i64);
     let mut attempt: u32 = 0;
@@ -646,7 +654,7 @@ async fn pull_with_warmup(
             pull_from,
             pull_end,
             cache_dir.clone(),
-            mt5_account,
+            mt5_history,
         )
         .await?;
         if candles.is_empty() {
@@ -1044,6 +1052,7 @@ async fn pull_upkeep(
     plan_gran: Granularity,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
+    mt5_history: &replay_candles::mt5_history::Mt5Replay<'_>,
 ) -> Result<Option<upkeep::UpkeepTicks>> {
     let Some(raw) = &args.upkeep else {
         return Ok(None);
@@ -1064,7 +1073,7 @@ async fn pull_upkeep(
         start,
         end,
         args.cache_dir.clone(),
-        args.mt5_account.as_deref(),
+        mt5_history,
     )
     .await
     .wrap_err_with(|| format!("pull the --upkeep {raw} bid/ask series"))?;
@@ -1101,11 +1110,17 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
     // the missing window from the broker/candle-cache rather than silently
     // scoring it as a stop. The fixture's own `meta` says which source and symbol
     // it came from, so the refetch targets the same feed that produced it.
+    let fixture_account = args.mt5_account.clone().or_else(|| inputs.plan.rules.iter()
+        .find(|rule| rule.intent.broker == trade_control_core::intent::BrokerKind::Mt5)
+        .and_then(|rule| rule.intent.account.clone()));
+    let mt5_history = replay_candles::mt5_history::Mt5Replay::from_saved(
+        fixture_account.as_deref(), inputs.plan.pip_size, inputs.meta.estimated_spread.clone(),
+    );
     let refetch = FixtureRefetch {
         source: inputs.meta.source,
         symbol: &inputs.meta.instrument,
         cache_dir: args.cache_dir.clone(),
-        mt5_account: args.mt5_account.as_deref(),
+        mt5_history: &mt5_history,
     };
     let replay = run_frozen(
         &inputs.plan,
@@ -1142,6 +1157,9 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
     // Under --json the report text would corrupt the JSON on stdout; the rows
     // carry the same numbers, so suppress it.
     if !args.json {
+        if let Some(estimate) = &inputs.meta.estimated_spread {
+            print!("{}", estimate.notice());
+        }
         print!("{}", rendered.text);
     }
     let economics = Some(&rendered.economics);
@@ -1330,7 +1348,7 @@ async fn run_frozen(
         finer_gran,
         &missed,
         refetch.cache_dir.clone(),
-        refetch.mt5_account,
+        refetch.mt5_history,
     )
     .await;
     if fetched.is_empty() {
@@ -1372,7 +1390,7 @@ async fn run_frozen(
 /// under `cargo test` with no credentials), so reaching the network is opt-in
 /// per call site rather than assumed.
 struct FixtureRefetch<'a> {
-    mt5_account: Option<&'a str>,
+    mt5_history: &'a replay_candles::mt5_history::Mt5Replay<'a>,
     source: CandleSource,
     symbol: &'a str,
     cache_dir: Option<PathBuf>,
@@ -2035,6 +2053,7 @@ mod tests {
             granularity: None,
             source: CandleSource::TradeNation,
             mt5_account: None,
+            mt5_history: trade_control_cli::replay_args::Mt5HistoryMode::Auto,
             start: None,
             end: None,
             tv_mcp_root: None,

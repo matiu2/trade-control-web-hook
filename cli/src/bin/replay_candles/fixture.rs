@@ -102,6 +102,9 @@ pub struct FixtureMeta {
     pub granularity: Granularity,
     /// Which broker the candles came from (recorded for provenance).
     pub source: CandleSource,
+    /// Offline estimated ask/mid provenance. Absent for genuine historical books.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_spread: Option<super::mt5_history::EstimatedSpread>,
     /// Window start (UTC), as resolved at save time.
     pub start: DateTime<Utc>,
     /// Window end (UTC), as resolved at save time (the plan's trade-expiry etc).
@@ -959,6 +962,7 @@ mod tests {
             instrument: "EUR_USD".into(),
             granularity: Granularity::H1,
             source: CandleSource::TradeNation,
+            estimated_spread: None,
             start: Utc.with_ymd_and_hms(2026, 6, 18, 11, 0, 0).unwrap(),
             end: Utc.with_ymd_and_hms(2026, 6, 18, 23, 0, 0).unwrap(),
             message: None,

@@ -38,6 +38,19 @@ pub enum CandleSource {
     Mt5,
 }
 
+/// Price-history policy applies only to offline MT5 replay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mt5HistoryMode {
+    /// Prefer genuine paired history; estimate with baked spread if unavailable.
+    #[default]
+    Auto,
+    /// Require genuine historical bid, ask and mid.
+    Paired,
+    /// Use cached native bid candles and the baked median spread, without the EA.
+    Estimated,
+}
+
 impl CandleSource {
     /// The lower-case wire form — the value `--source` accepts and the
     /// string `tv-arm ... replay` passes through when it derives the source
@@ -201,6 +214,12 @@ pub struct ReplayArgs {
     /// Named MT5 account; defaults to the account embedded in the plan.
     #[arg(long)]
     pub mt5_account: Option<String>,
+
+    /// MT5 replay history: auto falls back to explicitly labelled estimated
+    /// ask/mid using this account's baked spread. Paired requires genuine history;
+    /// estimated goes directly to native bid cache. Does not affect live trading.
+    #[arg(long, value_enum, default_value_t = Mt5HistoryMode::Auto)]
+    pub mt5_history: Mt5HistoryMode,
 
     /// Window start. A bare datetime is Brisbane time (UTC+10, no DST) — the
     /// zone this tool renders every candle/fill in — e.g. `2026-06-30T17:00`.
