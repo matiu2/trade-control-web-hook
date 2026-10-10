@@ -1,0 +1,9 @@
+{
+  "date": "2026-10-10",
+  "tests": "67 passed, 0 failed",
+  "clippy": "all targets with warnings denied: passed",
+  "formatting": "passed",
+  "promotion_test": "local bare Git remote: fast-forward succeeds and divergent main is preserved",
+  "staging_deployment": "explicit opt-in only; production deploy never invoked",
+  "oanda_live_used": false
+}

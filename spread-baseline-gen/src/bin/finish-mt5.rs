@@ -45,9 +45,9 @@ fn main() -> Result<()> {
 
 #[path = "finish-mt5/lock.rs"]
 mod lock;
+#[path = "finish-mt5/promotion.rs"]
+mod promotion;
 #[path = "finish-mt5/release.rs"]
 mod release;
 #[path = "finish-mt5/run.rs"]
 mod run;
-#[path = "finish-mt5/promotion.rs"]
-mod promotion;

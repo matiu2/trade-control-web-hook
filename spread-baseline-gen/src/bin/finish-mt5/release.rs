@@ -59,13 +59,15 @@ pub fn build_and_publish(args: &Args) -> Result<()> {
         write_status(args, "deploying-staging", &version)?;
         run("./deploy-staging.sh", &[])?;
     }
-    let deployment = if args.deploy_staging { "staging deployed" } else { "deployment not performed" };
+    let deployment = if args.deploy_staging {
+        "staging deployed"
+    } else {
+        "deployment not performed"
+    };
     write_status(
         args,
         "complete",
-        &format!(
-            "{version}: spreads baked, checks passed, release binaries rebuilt; {deployment}"
-        ),
+        &format!("{version}: spreads baked, checks passed, release binaries rebuilt; {deployment}"),
     )?;
     tracing::info!(%version, "MT5 spread bake and release build complete");
     Ok(())
