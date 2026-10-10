@@ -5,7 +5,7 @@ use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
 use color_eyre::{
     Result,
-    eyre::{Context, ensure, eyre},
+    eyre::{Context, ensure},
 };
 use mt5_data_source::{account_config::AccountConfig, tick_source::TickDataSource};
 use spread_baseline_gen::mt5::{Failure, InstrumentReport, Report, instrument_report};
@@ -28,6 +28,9 @@ pub struct Args {
     /// JSON report path; the existing live Rust table cannot be overwritten.
     #[arg(long)]
     out: PathBuf,
+    /// Preserve completed profiles and retry missing/failed symbols at the original dates.
+    #[arg(long, conflicts_with_all = ["only", "to"])]
+    resume: Option<PathBuf>,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -69,9 +72,22 @@ pub async fn run(args: Args) -> Result<()> {
         instruments: Vec::new(),
         failures: Vec::new(),
     };
+    if let Some(path) = &args.resume {
+        report = serde_json::from_slice(&tokio::fs::read(path).await?)?;
+        super::checkpoint::validate(&report, &args.account, &config, &requested, args.days)?;
+        report.complete = false;
+        report.failures.clear();
+    }
+    let requested = super::checkpoint::remaining(&report);
+    let end = report.to_utc;
     save(&args.out, &report).await?;
+    let desktop = config.desktop()?;
+    desktop.identity().await.wrap_err("MT5 calibration bridge preflight")?;
     let source = config.candles().await?;
     for (index, symbol) in requested.iter().enumerate() {
+        // A dead/unresponsive bridge is a run-wide interruption, not evidence
+        // that every later instrument is unavailable. Leave them unattempted.
+        desktop.identity().await.wrap_err("MT5 calibration bridge interrupted; resume this checkpoint")?;
         tracing::info!(
             symbol,
             instrument = index + 1,
@@ -87,6 +103,7 @@ pub async fn run(args: Args) -> Result<()> {
                 report.instruments.push(row);
             }
             Err(error) => {
+                desktop.identity().await.wrap_err("MT5 bridge interrupted; resume this checkpoint")?;
                 tracing::warn!(symbol, %error, "MT5 calibration failed; no replacement profile emitted");
                 report.failures.push(Failure {
                     symbol: symbol.clone(),
@@ -113,9 +130,7 @@ async fn measure(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Result<InstrumentReport> {
-    let asset = instrument_lookup::resolve(symbol)
-        .map_err(|e| eyre!("{e}"))?
-        .ok_or_else(|| eyre!("no instrument-lookup pip/schedule metadata for {symbol}"))?;
+    let asset = spread_baseline_gen::mt5::metadata::resolve(symbol)?;
     let timezone = asset
         .spread_schedule_tz()
         .ok_or_else(|| eyre!("no spread schedule timezone for {symbol}"))?

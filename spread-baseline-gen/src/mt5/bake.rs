@@ -138,8 +138,7 @@ fn validate_row(row: &InstrumentReport) -> Result<()> {
         ) && profile.n_bars >= MIN_INSTRUMENT_BARS,
         "insufficient reviewed data for {symbol}"
     );
-    let asset = instrument_lookup::resolve(symbol)?
-        .ok_or_else(|| color_eyre::eyre::eyre!("no metadata for {symbol}"))?;
+    let asset = super::metadata::resolve(symbol)?;
     ensure!(
         asset.spread_schedule == row.schedule
             && asset.spread_schedule_tz().as_deref() == Some(row.timezone.as_str()),

@@ -8,6 +8,7 @@ use crate::{SpreadProfile, cache::minutes_from_cache, profile_from_minutes};
 
 pub mod bake;
 pub mod output;
+pub mod metadata;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Report {
