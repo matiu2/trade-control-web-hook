@@ -31,9 +31,26 @@ pub struct Args {
     /// Preserve completed profiles and retry missing/failed symbols at the original dates.
     #[arg(long, conflicts_with_all = ["only", "to"])]
     resume: Option<PathBuf>,
+    /// Reconnect only read failures, with exponential delay capped at five minutes.
+    #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u32).range(0..=100))]
+    reconnect_attempts: u32,
 }
 
-pub async fn run(args: Args) -> Result<()> {
+impl Args {
+    pub fn resume_path(&self) -> Option<PathBuf> {
+        self.resume.clone()
+    }
+
+    pub fn reconnect_attempts(&self) -> u32 {
+        self.reconnect_attempts
+    }
+
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+}
+
+pub async fn attempt(args: &Args, resume: &mut Option<PathBuf>) -> Result<()> {
     ensure!(
         args.out.extension().is_some_and(|e| e == "json"),
         "--out must be a JSON report path"
@@ -72,7 +89,7 @@ pub async fn run(args: Args) -> Result<()> {
         instruments: Vec::new(),
         failures: Vec::new(),
     };
-    if let Some(path) = &args.resume {
+    if let Some(path) = resume.as_ref() {
         report = serde_json::from_slice(&tokio::fs::read(path).await?)?;
         super::checkpoint::validate(&report, &args.account, &config, &requested, args.days)?;
         report.complete = false;
@@ -81,6 +98,9 @@ pub async fn run(args: Args) -> Result<()> {
     let requested = super::checkpoint::remaining(&report);
     let end = report.to_utc;
     save(&args.out, &report).await?;
+    // Only reuse a checkpoint written by this attempt or explicitly supplied.
+    // Never adopt an unrelated pre-existing --out file after login fails.
+    *resume = Some(args.out.clone());
     let desktop = config.desktop()?;
     desktop
         .identity()

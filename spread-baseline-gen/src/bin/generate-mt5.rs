@@ -3,6 +3,8 @@
 mod checkpoint;
 #[path = "generate-mt5/run.rs"]
 mod mt5_calibration;
+#[path = "generate-mt5/recovery.rs"]
+mod recovery;
 
 use clap::Parser;
 use color_eyre::Result;
@@ -18,5 +20,5 @@ async fn main() -> Result<()> {
         .with(tracing_error::ErrorLayer::default())
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
-    mt5_calibration::run(mt5_calibration::Args::parse()).await
+    recovery::run(mt5_calibration::Args::parse()).await
 }
