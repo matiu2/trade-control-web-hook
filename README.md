@@ -4659,3 +4659,11 @@ process left a stale lock, verify its recorded PID is gone before removing it.
 The release artifacts are in `target/release`. This completion job does not
 install binaries or restart trading services. Deploy staging separately with
 `./deploy-staging.sh` when ready to roll the running system.
+
+When promotion and deployment have been authorized, add `--publish-main
+--deploy-staging` to `finish-mt5`. After the checks and staging push, this
+fast-forwards and pushes `main`, then runs `./deploy-staging.sh` to install the
+staging CLIs and restart only the staging worker. Independently advanced main
+commits stop promotion; they are never overwritten. The status records each
+step and becomes `complete` only after deployment succeeds. The calibration
+uses only the named MT5 account and does not place orders or access OANDA.

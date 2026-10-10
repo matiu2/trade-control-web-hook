@@ -18,6 +18,12 @@ struct Args {
     /// Refuse a new bake/release until every requested instrument has succeeded.
     #[arg(long)]
     require_complete: bool,
+    /// Fast-forward main to the validated staging release and push it.
+    #[arg(long)]
+    publish_main: bool,
+    /// Install staging binaries and restart the staging worker after publishing.
+    #[arg(long)]
+    deploy_staging: bool,
 }
 
 fn main() -> Result<()> {
@@ -43,3 +49,5 @@ mod lock;
 mod release;
 #[path = "finish-mt5/run.rs"]
 mod run;
+#[path = "finish-mt5/promotion.rs"]
+mod promotion;
