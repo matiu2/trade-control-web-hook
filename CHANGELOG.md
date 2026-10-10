@@ -1,5 +1,11 @@
 # Changelog
 
+## v154 — 2026-10-11 — refresh forming range candles
+
+Shared candle-cache excludes forming bars from range persistence and coverage,
+including rows written by an older client. Completed history remains reusable;
+live and range refreshes cannot freeze the current candle.
+
 ## v153 — 2026-10-11 — shared cache for worker and chart candles
 
 The worker’s OANDA and TradeNation historical reads now use the same broker
