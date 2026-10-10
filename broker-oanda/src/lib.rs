@@ -6,7 +6,6 @@
 //! explicitly (derived from the account's `kind`) so each account hits its own
 //! environment.
 
-mod candles;
 mod exit;
 mod fx;
 mod oanda;
@@ -41,7 +40,9 @@ use oanda::{
     list_pending_orders as list_pending_orders_impl,
     lookup_attempt_state as lookup_attempt_state_impl, place_entry,
 };
-use oanda_client::OandaClient;
+use oanda_client::{OandaClient, data_source::OandaDataSource};
+use candle_puller::Puller;
+use std::sync::Arc;
 use trade_control_core::broker::{
     AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, CloseOutcome,
     EntryError, EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
@@ -50,7 +51,8 @@ use trade_control_core::broker::{
 /// Authenticated OANDA broker handle. Holds the API client and the account id
 /// resolved at construction time.
 pub struct OandaBroker {
-    client: OandaClient,
+    client: Arc<OandaClient>,
+    candles: Puller<OandaDataSource>,
     account_id: String,
 }
 
@@ -66,7 +68,10 @@ impl OandaBroker {
         } else {
             OandaClient::new(api_key)
         };
-        Self { client, account_id }
+        let client = Arc::new(client);
+        let namespace = if live { "candle_cache_oanda_live" } else { "candle_cache_oanda" };
+        let candles = Puller::new(namespace, OandaDataSource::with_shared_client(client.clone(), account_id.clone()));
+        Self { client, account_id, candles }
     }
 }
 
@@ -182,7 +187,7 @@ impl Broker for OandaBroker {
         since: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<Vec<Candle>, CandleError> {
-        candles::get_candles(&self.client, instrument, granularity, since, now).await
+        self.candles.mid(instrument, granularity, since, now).await
     }
 
     async fn get_bidask_candles(
@@ -192,6 +197,6 @@ impl Broker for OandaBroker {
         since: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<Vec<BidAskCandle>, CandleError> {
-        candles::get_bidask_candles(&self.client, instrument, granularity, since, now).await
+        self.candles.bidask(instrument, granularity, since, now).await
     }
 }

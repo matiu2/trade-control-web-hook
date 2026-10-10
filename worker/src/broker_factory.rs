@@ -158,7 +158,7 @@ pub async fn acquire_tn(meta: &AccountMetadata) -> Result<TradeNationAdapter, Br
         .ok_or_else(|| {
             BrokerError::TradeNationLogin("broker_tradenation::login returned None".into())
         })?;
-    Ok(TradeNationAdapter(broker))
+    Ok(TradeNationAdapter::new(broker))
 }
 
 /// Loopback address of the **paper** IB Gateway.

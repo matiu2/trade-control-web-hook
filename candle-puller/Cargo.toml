@@ -1,0 +1,18 @@
+[package]
+name = "candle-puller"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+candle-cache = { path = "../../candle-cache", default-features = false, features = ["postgres-storage"] }
+candle-model = { path = "../../candle-model" }
+chrono = "0.4"
+color-eyre = "0.6"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+trade-control-core = { path = "../core" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-error = "0.2"

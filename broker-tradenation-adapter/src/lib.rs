@@ -6,6 +6,7 @@
 //! [`Broker`].
 
 use broker_tradenation::TradeNationBroker;
+#[cfg(test)]
 use candle_model::Granularity as CmGranularity;
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::{
@@ -15,12 +16,13 @@ use trade_control_core::broker::{
 };
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 use trade_control_core::settlement::Settlement;
-use tradenation_api::ohlcv::PriceType;
 use tradenation_api::{OpeningOrder, Position, TransactionRecord};
 
 mod exit;
+mod candles;
 mod session_anchor;
 mod settlement;
+#[cfg(test)]
 use session_anchor::session_anchor;
 
 /// Closed-trade scan window. Plan §3 recommends ~50; one TN page
@@ -31,7 +33,14 @@ use session_anchor::session_anchor;
 /// `Cancelled` instead. See report-back note in the 1b commit.
 const CLOSED_TRADE_HISTORY_DAYS: u32 = 90;
 
-pub struct TradeNationAdapter(pub TradeNationBroker);
+pub struct TradeNationAdapter(pub std::sync::Arc<TradeNationBroker>, candle_puller::Puller<candles::Source>);
+impl TradeNationAdapter {
+    pub fn new(broker: TradeNationBroker) -> Self {
+        let broker = std::sync::Arc::new(broker);
+        let candles = candle_puller::Puller::new("candle_cache_tradenation", candles::Source(broker.clone()));
+        Self(broker, candles)
+    }
+}
 
 impl Broker for TradeNationAdapter {
     async fn lookup_trade_exit(
@@ -279,169 +288,11 @@ impl Broker for TradeNationAdapter {
             .collect())
     }
 
-    async fn get_candles(
-        &self,
-        instrument: &str,
-        granularity: Granularity,
-        since: DateTime<Utc>,
-        now: DateTime<Utc>,
-    ) -> Result<Vec<Candle>, CandleError> {
-        if since >= now {
-            return Err(CandleError::BadRange);
-        }
-        // TN's chart OHLCV is count-back-from-`end_time`, not a true range,
-        // so fetch enough candles to cover the window then trim to `> since`
-        // with `filter_new_candles`. `native` from `to_cm_granularity` is whether
-        // TN's raw endpoint serves this TF directly (min/quarter/hour/day). H4/M5
-        // have no native endpoint (they need adapter-side aggregation, not yet
-        // built) so they're rejected loudly here.
-        let (cm_gran, native) = to_cm_granularity(granularity);
-        if !native {
-            tracing::error!(
-                "tn get_candles({instrument}): granularity {granularity:?} not TN-native"
-            );
-            // Structural, not a degenerate window — the engine must surface this
-            // loudly, never treat it as an empty no-op (bug ②: silent brick).
-            return Err(CandleError::UnsupportedGranularity);
-        }
-        let count = candle_count_for_window(granularity, since, now);
-
-        // name → market_id (same first hop as `get_quote`).
-        let market = tradenation_api::resolve_market(self.0.client(), self.0.session(), instrument)
-            .await
-            .map_err(|err| {
-                tracing::error!("tn get_candles resolve_market({instrument}): {err:?}");
-                CandleError::Transient
-            })?;
-
-        // `get_candles_range_aggregated` is the drop-in for `get_candles_range`
-        // that serves non-native TFs (H4/D1/M5) by fetching the native base
-        // (H1/M1) and rolling it up. H4 and D1 sit on the INSTRUMENT's session
-        // anchor (17:00 New York for FX, the cash open for an exchange-bound
-        // market — `instrument-lookup`'s table, the same `Anchor`
-        // the replay's candle source reaches through candle-cache, so live and
-        // replay see the same bars). Native TFs pass straight through.
-        let raw = tradenation_api::aggregation::get_candles_range_aggregated_on(
-            self.0.client(),
-            market.market_id,
-            cm_gran,
-            PriceType::Mid,
-            count,
-            now,
-            session_anchor(instrument),
-        )
-        .await
-        .map_err(|err| {
-            tracing::error!(
-                "tn get_candles({instrument}, market_id={}, count={count}): {err:?}",
-                market.market_id
-            );
-            CandleError::Transient
-        })?;
-
-        Ok(closed_candles_since(&raw, granularity, since, now))
+    async fn get_candles(&self, instrument: &str, granularity: Granularity, since: DateTime<Utc>, now: DateTime<Utc>) -> Result<Vec<Candle>, CandleError> {
+        self.1.mid(instrument, granularity, since, now).await
     }
-
-    async fn get_bidask_candles(
-        &self,
-        instrument: &str,
-        granularity: Granularity,
-        since: DateTime<Utc>,
-        now: DateTime<Utc>,
-    ) -> Result<Vec<BidAskCandle>, CandleError> {
-        if since >= now {
-            return Err(CandleError::BadRange);
-        }
-        // Same native-TF + count-back windowing as `get_candles`. TN serves one
-        // OHLCV series per `PriceType`, so a two-sided read is THREE fetches
-        // (mid for the OHLC the engine convention uses, bid + ask for the
-        // books) zipped by timestamp. NOTE for the H4 switch-over: this path
-        // fetches H4 for ALL THREE PriceTypes — the aggregating `tradenation-api`
-        // must serve H4 for Mid, Bid AND Ask, not just Mid.
-        let (cm_gran, native) = to_cm_granularity(granularity);
-        if !native {
-            tracing::error!(
-                "tn get_bidask_candles({instrument}): granularity {granularity:?} not TN-native"
-            );
-            // Structural, not a degenerate window — see `get_candles` above.
-            return Err(CandleError::UnsupportedGranularity);
-        }
-        let market = tradenation_api::resolve_market(self.0.client(), self.0.session(), instrument)
-            .await
-            .map_err(|err| {
-                tracing::error!("tn get_bidask_candles resolve_market({instrument}): {err:?}");
-                CandleError::Transient
-            })?;
-
-        let map_err = |err| {
-            tracing::error!(
-                "tn get_bidask_candles({instrument}, market_id={}): {err:?}",
-                market.market_id
-            );
-            CandleError::Transient
-        };
-
-        // A window wider than TN's per-request ceiling (e.g. many days of M1) is
-        // fetched in several count-back chunks walking backward from `now`; a
-        // window that fits is a single chunk. Each chunk is three series (mid +
-        // bid + ask) zipped by timestamp, then all chunks union-dedup by
-        // timestamp so the +slack seam overlap collapses to one bar.
-        let mut by_ts: std::collections::HashMap<DateTime<Utc>, BidAskCandle> =
-            std::collections::HashMap::new();
-        for (count, end) in chunk_windows(granularity, since, now) {
-            // Aggregating fetch: H4/M5 built from the native base per PriceType,
-            // each side rolled up on the same UTC buckets (see `get_candles`).
-            let fetch = |price: PriceType| {
-                tradenation_api::aggregation::get_candles_range_aggregated_on(
-                    self.0.client(),
-                    market.market_id,
-                    cm_gran,
-                    price,
-                    count,
-                    end,
-                    session_anchor(instrument),
-                )
-            };
-            // Sequential (the session client is `!Send`).
-            let mid = fetch(PriceType::Mid).await.map_err(map_err)?;
-            let bid = fetch(PriceType::Bid).await.map_err(map_err)?;
-            let ask = fetch(PriceType::Ask).await.map_err(map_err)?;
-
-            // Index bid/ask by timestamp so a length/gap mismatch between the
-            // series drops that bar rather than mis-aligning the whole window.
-            let bid_by_ts: std::collections::HashMap<_, _> =
-                bid.iter().map(|c| (c.timestamp, c)).collect();
-            let ask_by_ts: std::collections::HashMap<_, _> =
-                ask.iter().map(|c| (c.timestamp, c)).collect();
-
-            for m in &mid {
-                let (Some(b), Some(a)) = (bid_by_ts.get(&m.timestamp), ask_by_ts.get(&m.timestamp))
-                else {
-                    continue;
-                };
-                let time = m.timestamp.with_timezone(&Utc);
-                if time <= since {
-                    continue; // strictly after the watermark
-                }
-                by_ts.entry(time).or_insert(BidAskCandle {
-                    time,
-                    o: m.open,
-                    h: m.high,
-                    l: m.low,
-                    c: m.close,
-                    bid_o: b.open,
-                    bid_h: b.high,
-                    bid_l: b.low,
-                    bid_c: b.close,
-                    ask_o: a.open,
-                    ask_h: a.high,
-                    ask_l: a.low,
-                    ask_c: a.close,
-                });
-            }
-        }
-
-        Ok(closed_bidask_window(by_ts, granularity, now))
+    async fn get_bidask_candles(&self, instrument: &str, granularity: Granularity, since: DateTime<Utc>, now: DateTime<Utc>) -> Result<Vec<BidAskCandle>, CandleError> {
+        self.1.bidask(instrument, granularity, since, now).await
     }
 
     async fn amend_stop(
@@ -715,13 +566,16 @@ fn to_upstream_entry(e: &ResolvedEntry) -> broker_tradenation::ResolvedEntry {
 /// the aggregator genuinely cannot build would still be rejected
 /// (`UnsupportedGranularity`); today every engine `Granularity` is covered
 /// (min/15m/hour native; H4=4×H1, D1=24×H1, M5=5×M1).
+#[cfg(test)]
 const TN_SERVES_H4: bool = true;
+#[cfg(test)]
 const TN_SERVES_M5: bool = true;
 
 /// Engine [`Granularity`] → `candle_model::Granularity` + whether
 /// `tradenation-api` serves it (native or aggregated). Native TFs are
 /// minute / quarter(15m) / hour; H4/D1/M5 are served by aggregation
 /// ([`TN_SERVES_H4`]/[`TN_SERVES_M5`] = `true`, see there; D1 always). Pure.
+#[cfg(test)]
 fn to_cm_granularity(g: Granularity) -> (CmGranularity, bool) {
     match g {
         Granularity::M1 => (CmGranularity::OneMinute, true),
@@ -804,6 +658,7 @@ fn to_cm_granularity(g: Granularity) -> (CmGranularity, bool) {
 /// trims on `time > watermark`, and a bar that opened seconds ago is
 /// legitimately newer than the watermark, which is exactly why its own docs say
 /// "broker impls call this after dropping any still-forming bar".
+#[cfg(test)]
 fn closed_candles_since(
     raw: &[candle_model::CandleData],
     granularity: Granularity,
@@ -833,6 +688,7 @@ fn closed_candles_since(
 /// `time <= since` skip while zipping the three price series) instead of calling
 /// `filter_new_candles`, and that hand-rolled trim only cuts the OLD end, so the
 /// newest bar it yields is the forming one exactly as on the mid path.
+#[cfg(test)]
 fn closed_bidask_window(
     by_ts: std::collections::HashMap<DateTime<Utc>, BidAskCandle>,
     granularity: Granularity,
@@ -847,6 +703,7 @@ fn closed_bidask_window(
 /// rule. They had two independent hand-written windowing expressions before and
 /// only the mid one was ever examined; a second copy of this predicate is how
 /// the bid/ask side silently keeps the bug after the mid side is fixed.
+#[cfg(test)]
 fn drop_forming_bar<C: BarOpen>(candles: Vec<C>, g: Granularity, as_of: DateTime<Utc>) -> Vec<C> {
     let bar = chrono::Duration::seconds(g.seconds());
     candles
@@ -857,16 +714,19 @@ fn drop_forming_bar<C: BarOpen>(candles: Vec<C>, g: Granularity, as_of: DateTime
 
 /// A candle that knows when its bar opened. Implemented for both candle shapes
 /// the adapter returns so [`drop_forming_bar`] is written once.
+#[cfg(test)]
 trait BarOpen {
     fn open_time(&self) -> DateTime<Utc>;
 }
 
+#[cfg(test)]
 impl BarOpen for Candle {
     fn open_time(&self) -> DateTime<Utc> {
         self.time
     }
 }
 
+#[cfg(test)]
 impl BarOpen for BidAskCandle {
     fn open_time(&self) -> DateTime<Utc> {
         self.time
