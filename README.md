@@ -4454,6 +4454,34 @@ arming decision. The worker's news-window vetos still flow through
 `tv-arm` and the `news-start`/`news-end` convention. Suppress with
 `--no-sentiment`.
 
+### Shared candle cache
+
+Historical candles for local-chart, the server worker, replay, tv-arm and journal
+replay go through candle-cache. Cache hits are shared between processes; misses
+are fetched from the selected provider and saved. Each broker has separate
+tables, and MT5 history is additionally pinned to the account login/server.
+
+The native worker's OANDA and TradeNation adapters use the `candle-puller` crate
+with a long-lived, lazily opened cache. It uses `CANDLE_CACHE_DATABASE_URL` or the
+local `candle_cache` database, independently of the worker's `DATABASE_URL` for
+trade state. Default tables match chart/replay: `candle_cache_oanda` and
+`candle_cache_tradenation`. OANDA live history has a separate namespace.
+OANDA's incomplete/partial price books are removed before persistence; the shared
+puller also excludes forming bars, preserves session/DST boundaries and returns
+closed bars strictly after the worker watermark. Cache failures skip the tick as
+transient errors.
+
+MT5 callers share `mt5_data_source::cached_feed::CachedFeed`. Genuine paired
+history fills through the EA only on a miss. Verified coverage, including market
+gaps, allows repeated and overlapping reads without contacting the terminal.
+Older chart-only native bid history uses its own web-backed cache and is labelled
+bid; trading never substitutes it for genuine paired history.
+
+The chart's OANDA/TradeNation live tail also uses the cache gateway: it refreshes
+the provider's latest bars, persists settled bars, and leaves a forming tail
+uncached so its prices can change. Live quotes and execution retain their broker
+connections. IBKR historical candles remain unsupported.
+
 ### Forex-factory disk cache
 
 Both `tv-arm` and `tv-news` route every week-fetch through a shared on-disk
@@ -4496,7 +4524,7 @@ environment-specific account indexes, local CLI history and deployment checklist
 
 MT5 execution uses the direct WebTerminal connection; server and replay candles
 use CandleBridge's historical paired bid/ask ticks. One EA attached to one chart
-serves every requested instrument. Keep MT5 and CandleBridge running for history;
+serves every requested instrument. Cache misses require MT5 and CandleBridge; cached reads do not;
 Algo Trading may remain disabled. Quotes and execution need no chart attachment.
 
 Create `~/.config/trade-control/mt5-accounts.toml` (or set `MT5_ACCOUNTS_FILE`):

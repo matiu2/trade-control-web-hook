@@ -1,8 +1,33 @@
 # SCOPING — route the live worker's candle fetch through `candle-cache` (shared puller)
 
-**Status:** SCOPED, not implemented. The low-risk half (shared ATR-aware
-detector-window depth) shipped separately on branch
-`feat/shared-candle-cache-puller`; this doc covers the larger re-plumb.
+**Status:** IMPLEMENTED (2026-10-11). The historical proposal below is retained
+for context; its direct-worker-fetch description no longer describes runtime.
+
+The worker's OANDA/TradeNation broker adapters now use the shared `candle-puller`
+crate and broker-specific PostgreSQL tables used by chart/replay. MT5 worker,
+chart and replay use the account-scoped `CachedFeed`. tv-arm and journal delegate
+their historical replay reads to replay-candles. Broker execution/quotes are
+separate from historical candles.
+
+Resolved seams:
+
+- One lazy, retained cache per adapter; background eviction is disabled.
+- OANDA removes incomplete and partial MBA blocks before persistence.
+- Closed-window filtering uses actual session/calendar boundaries, including DST.
+- Worker results remain sorted, deduplicated and strictly after the watermark.
+- Cache failures map to transient errors. Candle storage uses its own database,
+  independent of the worker's trade-state `DATABASE_URL`.
+- The TradeNation miss source retains authenticated session reuse, wide-window
+  chunking and M5/H4 aggregation. Mid reads project the same cached paired bars.
+- Live chart refresh goes through the cache gateway, stores settled bars and
+  refreshes forming bars without making them permanent coverage.
+- MT5 coverage is checked before EA calls; orphaned coverage cannot hide evicted
+  candle rows. Strict trading history never falls back to bid-only data.
+
+Regression tests cover miss-fill/repeat-hit, actual book preservation, forming
+bar exclusion, watermark sorting, DST closure, overlapping MT5 windows and cache
+row eviction. The existing worker/replay suites are also run. No market orders
+are needed to test this routing change.
 
 ## Why
 

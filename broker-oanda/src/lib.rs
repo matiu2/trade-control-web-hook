@@ -32,6 +32,7 @@ pub mod conformance_support {
     pub use crate::oanda::{OrderFate, compute_attempt_state};
 }
 
+use candle_puller::Puller;
 use chrono::{DateTime, Utc};
 use oanda::{
     amend_stop as amend_stop_impl, cancel_order as cancel_order_impl,
@@ -41,7 +42,6 @@ use oanda::{
     lookup_attempt_state as lookup_attempt_state_impl, place_entry,
 };
 use oanda_client::{OandaClient, data_source::OandaDataSource};
-use candle_puller::Puller;
 use std::sync::Arc;
 use trade_control_core::broker::{
     AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, CloseOutcome,
@@ -69,9 +69,20 @@ impl OandaBroker {
             OandaClient::new(api_key)
         };
         let client = Arc::new(client);
-        let namespace = if live { "candle_cache_oanda_live" } else { "candle_cache_oanda" };
-        let candles = Puller::new(namespace, OandaDataSource::with_shared_client(client.clone(), account_id.clone()));
-        Self { client, account_id, candles }
+        let namespace = if live {
+            "candle_cache_oanda_live"
+        } else {
+            "candle_cache_oanda"
+        };
+        let candles = Puller::new(
+            namespace,
+            OandaDataSource::with_shared_client(client.clone(), account_id.clone()),
+        );
+        Self {
+            client,
+            account_id,
+            candles,
+        }
     }
 }
 
@@ -197,6 +208,8 @@ impl Broker for OandaBroker {
         since: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<Vec<BidAskCandle>, CandleError> {
-        self.candles.bidask(instrument, granularity, since, now).await
+        self.candles
+            .bidask(instrument, granularity, since, now)
+            .await
     }
 }

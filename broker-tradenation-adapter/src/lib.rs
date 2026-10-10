@@ -18,12 +18,10 @@ use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 use trade_control_core::settlement::Settlement;
 use tradenation_api::{OpeningOrder, Position, TransactionRecord};
 
-mod exit;
 mod candles;
+mod exit;
 mod session_anchor;
 mod settlement;
-#[cfg(test)]
-use session_anchor::session_anchor;
 
 /// Closed-trade scan window. Plan §3 recommends ~50; one TN page
 /// returns ~50 records so we fetch a single page. **Caveat: TN's
@@ -33,11 +31,15 @@ use session_anchor::session_anchor;
 /// `Cancelled` instead. See report-back note in the 1b commit.
 const CLOSED_TRADE_HISTORY_DAYS: u32 = 90;
 
-pub struct TradeNationAdapter(pub std::sync::Arc<TradeNationBroker>, candle_puller::Puller<candles::Source>);
+pub struct TradeNationAdapter(
+    pub std::sync::Arc<TradeNationBroker>,
+    candle_puller::Puller<candles::Source>,
+);
 impl TradeNationAdapter {
     pub fn new(broker: TradeNationBroker) -> Self {
         let broker = std::sync::Arc::new(broker);
-        let candles = candle_puller::Puller::new("candle_cache_tradenation", candles::Source(broker.clone()));
+        let candles =
+            candle_puller::Puller::new("candle_cache_tradenation", candles::Source(broker.clone()));
         Self(broker, candles)
     }
 }
@@ -288,10 +290,22 @@ impl Broker for TradeNationAdapter {
             .collect())
     }
 
-    async fn get_candles(&self, instrument: &str, granularity: Granularity, since: DateTime<Utc>, now: DateTime<Utc>) -> Result<Vec<Candle>, CandleError> {
+    async fn get_candles(
+        &self,
+        instrument: &str,
+        granularity: Granularity,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Candle>, CandleError> {
         self.1.mid(instrument, granularity, since, now).await
     }
-    async fn get_bidask_candles(&self, instrument: &str, granularity: Granularity, since: DateTime<Utc>, now: DateTime<Utc>) -> Result<Vec<BidAskCandle>, CandleError> {
+    async fn get_bidask_candles(
+        &self,
+        instrument: &str,
+        granularity: Granularity,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<BidAskCandle>, CandleError> {
         self.1.bidask(instrument, granularity, since, now).await
     }
 
@@ -733,6 +747,7 @@ impl BarOpen for BidAskCandle {
     }
 }
 
+#[cfg(test)]
 fn candle_count_for_window(g: Granularity, since: DateTime<Utc>, now: DateTime<Utc>) -> usize {
     const SLACK: i64 = 3;
     let span = (now - since).num_seconds().max(0);

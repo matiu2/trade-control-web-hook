@@ -383,10 +383,12 @@ dependencies = [
 name = "broker-oanda"
 version = "0.1.0"
 dependencies = [
+ "candle-puller",
  "chrono",
  "color-eyre",
  "oanda-client",
  "serde_json",
+ "tokio",
  "tracing",
  "trade-control-core",
 ]
@@ -411,7 +413,9 @@ version = "0.1.0"
 dependencies = [
  "broker-tradenation",
  "candle-model",
+ "candle-puller",
  "chrono",
+ "color-eyre",
  "serde_json",
  "tracing",
  "trade-control-core",
@@ -485,6 +489,21 @@ dependencies = [
  "color-eyre",
  "serde",
  "trading-base",
+]
+
+[[package]]
+name = "candle-puller"
+version = "0.1.0"
+dependencies = [
+ "candle-cache",
+ "candle-model",
+ "chrono",
+ "color-eyre",
+ "tokio",
+ "tracing",
+ "tracing-error",
+ "tracing-subscriber",
+ "trade-control-core",
 ]
 
 [[package]]
