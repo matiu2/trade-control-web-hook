@@ -1,5 +1,18 @@
 # Changelog
 
+## v153 — 2026-10-11 — shared cache for worker and chart candles
+
+The worker’s OANDA and TradeNation historical reads now use the same broker
+cache tables as chart/replay. MT5 chart, worker and replay share an account-scoped
+gateway; verified cache hits avoid EA calls, including overlapping ranges and
+recent reads. Strict trading history retains real bid/ask/mid. Chart-only older
+bid history stays separately labelled and cached.
+
+The worker cache database is independent of its trade-state database. Forming
+bars and incomplete OANDA books are excluded before persistence; session/DST
+closure and strictly-after-watermark results are preserved.
+
+
 ## 2026-10-09 — continuation invalidation with `--skip-bcr`
 
 `--spec-url` now forwards `skip_bcr=true` when both break-and-close and retest
