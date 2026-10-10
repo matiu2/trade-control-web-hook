@@ -78,7 +78,7 @@ after bumping its `instrument-lookup` dep to 0.4).
 
 The DST-aware hour mask is produced by `spread-baseline-gen` (in the
 `trade-control-spread-mask` worktree / crate). You run it by hand, it writes
-`spread_baseline_candle.rs`, you commit + rebuild. **This is the "pull hourly,
+`candle-cache/src/spread_profiles/candle.rs`, you commit + rebuild. **This is the "pull hourly,
 zoom in" method** — it already is the workflow, and it is *not* scheduled. See
 "The canonical mask-refresh workflow" below.
 

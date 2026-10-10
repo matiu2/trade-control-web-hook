@@ -357,7 +357,8 @@ mod tests {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(tracing_error::ErrorLayer::default())
             .with(tracing_subscriber::fmt::layer().with_test_writer())
-            .try_init().ok();
+            .try_init()
+            .ok();
         let estimate = super::super::mt5_history::EstimatedSpread {
             profile: "mt5:the5ers-competition:AUDCAD".into(),
             median_pips: 0.6,

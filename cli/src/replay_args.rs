@@ -660,13 +660,25 @@ mod tests {
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(tracing_error::ErrorLayer::default())
             .with(tracing_subscriber::fmt::layer().with_test_writer())
-            .try_init().ok();
+            .try_init()
+            .ok();
         let parse = |flags: &[&str]| {
-            ReplayArgs::try_parse_from(["replay-candles", "--plan", "p.json"].into_iter().chain(flags.iter().copied())).unwrap()
+            ReplayArgs::try_parse_from(
+                ["replay-candles", "--plan", "p.json"]
+                    .into_iter()
+                    .chain(flags.iter().copied()),
+            )
+            .unwrap()
         };
         assert_eq!(parse(&[]).mt5_history, Mt5HistoryMode::Auto);
-        assert_eq!(parse(&["--mt5-history", "estimated"]).mt5_history, Mt5HistoryMode::Estimated);
-        assert_eq!(parse(&["--mt5-history", "paired"]).mt5_history, Mt5HistoryMode::Paired);
+        assert_eq!(
+            parse(&["--mt5-history", "estimated"]).mt5_history,
+            Mt5HistoryMode::Estimated
+        );
+        assert_eq!(
+            parse(&["--mt5-history", "paired"]).mt5_history,
+            Mt5HistoryMode::Paired
+        );
     }
 
     #[test]

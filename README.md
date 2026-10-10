@@ -4558,47 +4558,15 @@ trade-control-broker-check the5ers-competition \
 The check reads quotes/history and validates a **dry-run** minimum-lot short
 with SL 20 pips and TP 40 pips. It transmits no market or pending orders.
 To arm, choose `tv-arm-staging --broker mt5 --account-id the5ers-competition`.
-MT5 spread forecasts have not been measured for the baked forecast table yet:
-arming requires the existing explicit `TV_ARM_ALLOW_UNBAKED=1` override. This
-leaves the live quote and historical candle spread checks in place. Other broker
-forecasts are never substituted for MT5. Zero spread is valid on a fresh MT5 quote.
+Reviewed MT5 forecasts are baked per named account/instrument in candle-cache.
+Covered instruments use those profiles directly; uncovered instruments retain
+the existing coverage refusal and explicit `TV_ARM_ALLOW_UNBAKED=1` override.
+Live quote and historical candle spread checks still apply. Other accounts'
+forecasts are never substituted. Zero spread is valid on a fresh MT5 quote.
 
-Measure this account's expected spreads using `spread-baseline-gen`'s MT5
-calibration binary (read-only; MT5/CandleBridge and PostgreSQL must be running):
-
-```sh
-cargo run -p spread-baseline-gen --bin generate-mt5 -- \
-  --account the5ers-competition --days 90 --out /tmp/the5ers-spread-profile.json
-# Optional shorter spot-check:
-cargo run -p spread-baseline-gen --bin generate-mt5 -- \
-  --account the5ers-competition --days 14 --only AUDUSD,EURCAD,AUDCHF \
-  --out /tmp/the5ers-spread-pilot.json
-```
-
-The default universe comes from this account's live instrument catalogue. The
-report pins the account feed, login, server and UTC measurement range. It uses
-validated tick-derived M1 closing spreads and the existing generator's
-schedule-local hourly algorithm, including median/p10/p90 spreads in pips and
-per-hour forecasts. All lookbacks are calendar days. `--to <RFC3339>` fixes the
-end for a reproducible rerun. Existing minute-cache data is reused; a cold full
-run can take many hours. Completed profiles and failures are saved after each
-instrument; `complete: false` means the full requested run has not succeeded.
-Connection interruptions use bounded read-only recovery: terminal disconnects,
-login common/server/network errors and connection timeouts wait 15, 30, 60,
-120 and 240 seconds, then five minutes between later attempts. The default
-`--reconnect-attempts 12` permits twelve retries; `0` disables recovery.
-Each attempt revalidates the account and catalogue, preserves the original UTC
-sample dates and completed profiles, and reuses cached minutes. Account,
-permission, protocol and candle-validation errors still stop or remain explicit
-instrument failures. A web login rejection does not establish its cause;
-recovery gives a temporary broker problem time to clear without retrying forever.
-Instruments without catalogue pip/schedule metadata are reported as failures.
-`review: InsufficientData` remains explicit even if the range fetch succeeded.
-
-This JSON report is calibration evidence, not an installed server default.
-It does not overwrite the existing baked Rust table or remove the unbaked
-arming requirement. Installing MT5 forecasts needs account-aware table reads:
-two MT5 providers can use identical instrument names with different spreads.
+For measuring, resuming and installing updated defaults, follow the
+[shared spread-baking guide](../candle-cache/SPREAD-BAKING.md). A calibration
+JSON is evidence; baking and rebuilding consumers installs the new profiles.
 
 Journal's saved MT5 plans replay using `--source mt5`; the replay resolves the
 named account from their intents. For a plan without that account, supply

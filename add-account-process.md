@@ -27,6 +27,7 @@ directory. Inspect the selected database before writing account metadata.
 | PostgreSQL `accounts`, database `trade_control_dev` | Default operator account listing and dev routing | Added the same named account after updating the active dev worker to understand `mt5`. |
 | `~/.config/trade-control/history.yaml` | Local account suggestions and `build-trade` known-account validation | Added the account name, preserving existing prep/veto/account history. Under `XDG_CONFIG_HOME`, use that configuration root instead. The native account-management CLI currently does not refresh this file. |
 | PostgreSQL candle database `candle_cache` | Persistent candle history | Filled `candle_cache_mt5` (mid) and `candle_cache_mt5_bid_ask` (bid/ask/mid); `candle_cache_mt5_identity` pins the provider login/server. |
+| `../candle-cache/src/spread_profiles/mt5.rs` | Shared expected-spread profiles | Bake reviewed 90-day calibration with `mt5:<account>:<native-symbol>` keys, then publish cache and rebuild consumers. See [spread baking](../candle-cache/SPREAD-BAKING.md). |
 | `~/.cargo/bin/*-staging` | Installed arming, journal and replay tools | Rebuilt `trade-control`, `tv-arm`, `journal`, `replay-candles` and `tv-news` with the staging suffix. |
 | `~/.cargo/bin/trade-control-accounts` and `trade-control-broker-check` | Unsuffixed operator tools | Rebuilt these too; their database selection is runtime configuration. |
 | `~/.local/bin/trade-control-worker-{dev,staging}` and matching systemd user services | Active server processes | Updated both native worker binaries; each retains its own runtime configuration and database. |
@@ -119,11 +120,17 @@ broker and account when flags/environment do not override them. Journal
 links use `broker=mt5-the5ers-competition`, while account metadata keeps the
 broker kind `mt5`.
 
-MT5 has no baked spread forecast yet, so arming currently needs the explicit
-`TV_ARM_ALLOW_UNBAKED=1` override; live and historical spread checks remain.
+Reviewed account-specific forecasts are shared through candle-cache. Uncovered
+instruments still require the explicit `TV_ARM_ALLOW_UNBAKED=1` override;
+live and historical spread checks remain. Never copy another account's profile.
 Saved MT5 plans replay through `journal-staging` using the account in their
 intents. Standalone replay can use
 `--source mt5 --mt5-account the5ers-competition`.
+Offline replay defaults to `--mt5-history auto`: unavailable genuine ask/mid
+may be estimated from native bid and the same reviewed median. Reports and
+fixtures identify the estimate. `--mt5-history paired` requires genuine books;
+`--mt5-history estimated` reads cache/web bid history without the EA. This does
+not change live trading's requirement for real bid/ask.
 
 Manual position-tool entries (`--market-entry`, `--stop-entry`, `--limit-entry`)
 submit a direct signed intent rather than an engine plan. Their `plan-out` and

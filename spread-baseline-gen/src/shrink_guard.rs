@@ -4,7 +4,7 @@
 //!
 //! [`render_table`](crate::render::render_table) emits **only the rows from the
 //! current run** — it does not merge with what is already on disk. That makes
-//! `--only "Bitcoin" --out core/src/spread_baseline_candle.rs` look like an
+//! `--only "Bitcoin" --out ../candle-cache/src/spread_profiles/candle.rs` look like an
 //! incremental top-up while actually replacing all ~193 rows with one, silently
 //! un-baking every other instrument. Each un-baked instrument then reads as
 //! `Coverage::Missing` at arm time, and (before the arm-time gate existed) would

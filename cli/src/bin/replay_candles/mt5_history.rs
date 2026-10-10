@@ -20,9 +20,18 @@ pub struct EstimatedSpread {
 }
 impl EstimatedSpread {
     fn validate(&self) -> Result<()> {
-        ensure!(self.median_pips.is_finite() && self.median_pips > 0.0, "invalid saved replay spread");
-        ensure!(self.pip_size.is_finite() && self.pip_size > 0.0, "invalid saved replay pip size");
-        ensure!((self.median_pips * self.pip_size).is_finite(), "replay spread overflow");
+        ensure!(
+            self.median_pips.is_finite() && self.median_pips > 0.0,
+            "invalid saved replay spread"
+        );
+        ensure!(
+            self.pip_size.is_finite() && self.pip_size > 0.0,
+            "invalid saved replay pip size"
+        );
+        ensure!(
+            (self.median_pips * self.pip_size).is_finite(),
+            "replay spread overflow"
+        );
         Ok(())
     }
     fn resolve(account: &str, symbol: &str, pip_size: f64) -> Result<Self> {

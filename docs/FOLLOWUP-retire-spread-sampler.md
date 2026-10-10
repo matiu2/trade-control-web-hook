@@ -29,7 +29,7 @@ in place only as historical reference.
 ## Why it was stopped, not just fixed
 
 The spread-HOUR *timing* already migrated to the on-demand candle generator
-(`spread-baseline-gen` → `spread_baseline_candle.rs`, DST-aware local-hour
+(`spread-baseline-gen` → `candle-cache/src/spread_profiles/candle.rs`, DST-aware local-hour
 masks). The sampler was down to just the magnitude threshold. It had also been
 broken since 2026-07-15: it pins `instrument-lookup ^0.3.0`, but the
 spread-schedule feature bumped `instrument-lookup` to `0.4.0`, so its hourly

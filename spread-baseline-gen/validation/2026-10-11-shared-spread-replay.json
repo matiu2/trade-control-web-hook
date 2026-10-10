@@ -1,0 +1,34 @@
+{
+  "scope": "Shared cache-owned calibration, baking workflow and offline MT5 replay fallback",
+  "cache_revision": "1f74b47",
+  "cache_release": "v15",
+  "checks": {
+    "server_tests_passed": 2680,
+    "cache_tests_passed": 225,
+    "frozen_fixture_corpus": "passed",
+    "clippy": "core, CLI, tv-arm, spread-baseline-gen, worker: all-targets with -D warnings passed; cache passed separately",
+    "formatting": "passed"
+  },
+  "history_check": {
+    "account": "the5ers-competition",
+    "instrument": "AUDCAD",
+    "timeframe": "D1",
+    "start": "2007-03-04T20:30:30Z",
+    "end": "2007-08-29T00:22:52Z",
+    "auto_exit": 0,
+    "estimated_exit": 0,
+    "paired_exit": 3,
+    "median_pips": 0.7999999999996898,
+    "pip_size": 0.0001,
+    "fixture_golden_check": "passed",
+    "fixture_json_provenance": "present",
+    "outcome": "Done, veto fired; no simulated entry",
+    "broker_orders_sent": 0
+  },
+  "tools": {
+    "generate_default": "../candle-cache/src/spread_profiles/candle.rs",
+    "bake_mt5_default": "../candle-cache/src/spread_profiles/mt5.rs",
+    "completion": "checks cache then server, publishes cache first"
+  },
+  "documentation": "candle-cache/SPREAD-BAKING.md is authoritative; generator/release orchestration stays in server workspace"
+}

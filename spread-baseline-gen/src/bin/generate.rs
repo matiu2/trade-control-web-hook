@@ -2,7 +2,7 @@
 //!
 //! Fetches H1 bid/ask candles from OANDA and/or TradeNation for the catalog
 //! instruments, computes the per-(broker, instrument) med3 spread-hour mask,
-//! writes a committed `spread_baseline_candle.rs` table, and prints a
+//! writes the shared `candle-cache/src/spread_profiles/candle.rs` table, and prints a
 //! validation report diffing the masks against the known anchors.
 //!
 //! **Stage 1 does NOT swap the live gate** — it only produces + validates the
