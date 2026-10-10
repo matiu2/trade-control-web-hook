@@ -1,5 +1,8 @@
 //! Reconnect read-only calibration without advancing the sampling checkpoint.
-use color_eyre::{Result, eyre::{Report, eyre}};
+use color_eyre::{
+    Result,
+    eyre::{Report, eyre},
+};
 use mt5_data_source::read_retry::is_retryable_read;
 use std::time::Duration;
 
@@ -39,14 +42,27 @@ mod tests {
         tracing_subscriber::registry()
             .with(tracing_subscriber::EnvFilter::from_default_env())
             .with(tracing_error::ErrorLayer::default())
-            .with(tracing_subscriber::fmt::layer()).try_init().ok();
+            .with(tracing_subscriber::fmt::layer())
+            .try_init()
+            .ok();
         let disconnected: Report = ConnectionError::Disconnected.into();
-        assert_eq!((0..7).map(|n| retry_delay(&disconnected, n, 12).unwrap().as_secs())
-            .collect::<Vec<_>>(), [15, 30, 60, 120, 240, 300, 300]);
+        assert_eq!(
+            (0..7)
+                .map(|n| retry_delay(&disconnected, n, 12).unwrap().as_secs())
+                .collect::<Vec<_>>(),
+            [15, 30, 60, 120, 240, 300, 300]
+        );
         assert_eq!(retry_delay(&disconnected, 12, 12), None);
         assert_eq!(retry_delay(&disconnected, 0, 0), None);
-        assert_eq!(retry_delay(&eyre!("MT5 account/server mismatch"), 0, 12), None);
-        let login: Report = ConnectionError::CommandStatus { command: 28, status: 2 }.into();
+        assert_eq!(
+            retry_delay(&eyre!("MT5 account/server mismatch"), 0, 12),
+            None
+        );
+        let login: Report = ConnectionError::CommandStatus {
+            command: 28,
+            status: 2,
+        }
+        .into();
         assert_eq!(retry_delay(&login, 0, 12), Some(Duration::from_secs(15)));
     }
 }

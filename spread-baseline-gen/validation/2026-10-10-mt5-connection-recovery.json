@@ -1,0 +1,44 @@
+{
+  "date": "2026-10-10",
+  "account": "the5ers-competition",
+  "reported_incident": {
+    "ea_error": "MT5 terminal is disconnected; refusing cached terminal history",
+    "web_error": "MT5 command 28 returned status 2",
+    "previous_supervisor_result": "Repeated interrupted calibration; preserving existing baked defaults"
+  },
+  "preserved_report": {
+    "from_utc": "2026-07-11T15:14:00Z",
+    "to_utc": "2026-10-09T15:14:00Z",
+    "requested_symbols": 43,
+    "completed_profiles_at_recovery": 15
+  },
+  "recovery": {
+    "retry_delays_seconds": [
+      15,
+      30,
+      60,
+      120,
+      240,
+      300
+    ],
+    "later_delay_cap_seconds": 300,
+    "default_reconnect_retries": 12,
+    "account_and_catalogue_revalidated": true,
+    "only_connection_errors_retry": true,
+    "native_web_history_worker_recovered": true,
+    "calibration_runner_pid": 2601010,
+    "calibration_worker_pid": 2601011,
+    "completion_supervisor_pid": 2601045
+  },
+  "validation": {
+    "library_tests_passed": 110,
+    "ignored_live_tests": 3,
+    "generator_package_tests_passed": 68,
+    "clippy": "both packages, all targets, -D warnings passed",
+    "fmt": "passed",
+    "worker_rebuilt": true,
+    "live_ea_identity_connected": true,
+    "orders_submitted": false,
+    "oanda_accessed": false
+  }
+}

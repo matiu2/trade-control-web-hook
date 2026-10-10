@@ -4555,6 +4555,15 @@ per-hour forecasts. All lookbacks are calendar days. `--to <RFC3339>` fixes the
 end for a reproducible rerun. Existing minute-cache data is reused; a cold full
 run can take many hours. Completed profiles and failures are saved after each
 instrument; `complete: false` means the full requested run has not succeeded.
+Connection interruptions use bounded read-only recovery: terminal disconnects,
+login common/server/network errors and connection timeouts wait 15, 30, 60,
+120 and 240 seconds, then five minutes between later attempts. The default
+`--reconnect-attempts 12` permits twelve retries; `0` disables recovery.
+Each attempt revalidates the account and catalogue, preserves the original UTC
+sample dates and completed profiles, and reuses cached minutes. Account,
+permission, protocol and candle-validation errors still stop or remain explicit
+instrument failures. A web login rejection does not establish its cause;
+recovery gives a temporary broker problem time to clear without retrying forever.
 Instruments without catalogue pip/schedule metadata are reported as failures.
 `review: InsufficientData` remains explicit even if the range fetch succeeded.
 
@@ -4614,9 +4623,10 @@ cargo run -p spread-baseline-gen --bin generate-mt5 -- \
   --out /tmp/the5ers-spread-profile-90d-retry.json
 ```
 
-Resume validates the account, catalogue and sampling window. Bridge preflight
-failures stop the run with an unattempted checkpoint rather than recording every
-remaining symbol as unavailable. Native `*t` FX variants and DAX40/SP500/XTIUSD/
+Resume validates the account, catalogue and sampling window. Recoverable bridge
+preflight failures wait and retry without marking later instruments unavailable.
+After the retry budget is exhausted, the checkpoint remains resumable.
+Native `*t` FX variants and DAX40/SP500/XTIUSD/
 XBRUSD use explicit underlying pip/schedule aliases; their measured spreads and
 runtime keys remain separate. Pass the new report and runner status to the
 completion command below.
