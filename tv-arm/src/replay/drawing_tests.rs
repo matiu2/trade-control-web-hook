@@ -142,6 +142,7 @@ async fn a_replay_without_fills_clears_old_brackets_and_draws_nothing() {
 #[tokio::test]
 async fn closed_positions_end_at_their_exit_candle_and_open_positions_at_window_end() {
     let cases = [
+        ("sl", 0, 0),
         ("sl", 0, 10),
         ("tp", 20, 30),
         ("reversal", 40, 50),
@@ -158,6 +159,11 @@ async fn closed_positions_end_at_their_exit_candle_and_open_positions_at_window_
     for (request, (outcome, fill, exit)) in requests.iter().zip(cases) {
         let (_, body) = request.split_once("\r\n\r\n").expect("drawing body");
         let drawing: Value = serde_json::from_str(body).expect("drawing JSON");
+        assert_eq!(
+            drawing["options"]["widthSeconds"],
+            json!(exit - fill),
+            "{outcome} visible duration"
+        );
         assert_eq!(
             drawing["anchors"][0]["time"],
             json!(fill),
