@@ -19,7 +19,7 @@ use trade_control_core::settlement::Settlement;
 
 pub struct Mt5Broker {
     pub(crate) trader: Trader,
-    pub(crate) candles: CachedFeed,
+    pub(crate) candles: Box<CachedFeed>,
     account_name: String,
 }
 impl Mt5Broker {
@@ -29,7 +29,7 @@ impl Mt5Broker {
         let candles = CachedFeed::new(config.clone());
         Ok(Self {
             trader,
-            candles,
+            candles: Box::new(candles),
             account_name: name.into(),
         })
     }
