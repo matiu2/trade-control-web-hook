@@ -380,10 +380,9 @@ fn draw_positions_on_local_chart(url: &str, path: &Path) -> Result<()> {
             return Ok(());
         }
     };
-    // Draw the not-taken brackets too: on local-chart they are cheap (muted
-    // grey) and the operator asked for a replay precisely to see what the plan
-    // would have done, including the entries it never got.
-    match local_chart_client::draw_positions(&doc, url, true) {
+    // Only filled positions belong on the chart. Rejected entries (including
+    // another entry while a trade is open) and unfilled orders have no position.
+    match local_chart_client::draw_positions(&doc, url, false) {
         Ok(drawn) => {
             info!(drawn, url, "drew replay positions on local-chart");
             println!("drew {drawn} position(s) on local-chart");
@@ -393,6 +392,9 @@ fn draw_positions_on_local_chart(url: &str, path: &Path) -> Result<()> {
     std::fs::remove_file(path).ok();
     Ok(())
 }
+
+#[cfg(test)]
+mod drawing_tests;
 
 #[cfg(test)]
 mod tests {
