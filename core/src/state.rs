@@ -1045,6 +1045,17 @@ pub trait StateStore {
         attempt_no: u32,
     ) -> impl Future<Output = Result<(), StateError>>;
 
+    /// Journal changed resolution evidence. Returns false for an unchanged
+    /// observation. Recording is independent of permission to place an order.
+    fn record_attempt_diagnostic(
+        &self,
+        _attempt: &EntryAttempt,
+        _diagnostic: &crate::attempt_resolution::Diagnostic,
+        _now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<bool, StateError>> {
+        async { Ok(true) }
+    }
+
     /// Update a previously-recorded attempt with the broker's trade
     /// id, snapshotted lazily the first time the worker observes the
     /// attempt has filled into an open trade. Idempotent — calling

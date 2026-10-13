@@ -179,6 +179,8 @@ pub struct CronNote {
     /// Broker-confirmed closure, recorded once per originating entry order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broker_exit: Option<crate::broker_exit::BrokerExit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_resolution: Option<crate::attempt_resolution::Diagnostic>,
 }
 
 /// Mint a short request id. We have no RNG in the wasm worker
@@ -325,6 +327,7 @@ mod tests {
             severity: CronNoteSeverity::Warn,
             message: "believed OPEN, broker shows CLOSED WIN realized_pl=18369.2245".into(),
             broker_exit: None,
+            attempt_resolution: None,
         };
         let json = serde_json::to_string(&note).unwrap();
         let back: CronNote = serde_json::from_str(&json).unwrap();

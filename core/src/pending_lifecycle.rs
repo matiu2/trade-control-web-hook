@@ -638,9 +638,9 @@ async fn classify_cancel_failure<B: Broker>(broker: &B, order: &PendingOrder) ->
         Ok(AttemptState::Pending) => CancelOutcome::StillResting,
         // Filled — restoring would double up on a live/finished position.
         Ok(AttemptState::OpenPosition { .. }) => CancelOutcome::Vanished("filled-open-position"),
-        Ok(AttemptState::ClosedWin { .. }) | Ok(AttemptState::ClosedLossOrBreakeven { .. }) => {
-            CancelOutcome::Vanished("filled-and-closed")
-        }
+        Ok(AttemptState::ClosedWin { .. })
+        | Ok(AttemptState::ClosedLossOrBreakeven { .. })
+        | Ok(AttemptState::ClosedConfirmed { .. }) => CancelOutcome::Vanished("filled-and-closed"),
         // Dead without filling (rejected / expired / cancelled upstream).
         Ok(AttemptState::Cancelled) => CancelOutcome::Vanished("cancelled-upstream"),
         // Not found anywhere: we lost track. Still "not resting", so the same

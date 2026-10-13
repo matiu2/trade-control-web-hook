@@ -1663,6 +1663,17 @@ impl PgStateStore {
 
 // AUTO-PORTED TRAIT IMPL — seen family delegates; rest todo!() until ported.
 impl StateStore for PgStateStore {
+    async fn record_attempt_diagnostic(
+        &self,
+        attempt: &EntryAttempt,
+        diagnostic: &trade_control_core::attempt_resolution::Diagnostic,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StateError> {
+        crate::attempt_recording::record(&self.pool, attempt, diagnostic, now)
+            .await
+            .map_err(backend)
+    }
+
     async fn is_seen(&self, id: &str) -> Result<bool, StateError> {
         self.is_seen_impl(id).await
     }

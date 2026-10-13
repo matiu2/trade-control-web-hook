@@ -54,6 +54,7 @@ pub(crate) async fn record<C: CronEnv>(
         severity: CronNoteSeverity::Info,
         message: message.clone(),
         broker_exit: Some(exit),
+        attempt_resolution: None,
     };
     match cron.record_broker_exit(note).await {
         Ok(()) => tracing::info!("reconcile: plan={} {message}", attempt.trade_id),

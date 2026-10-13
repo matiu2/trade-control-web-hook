@@ -530,7 +530,8 @@ pub async fn run_enter<B: Broker, S: StateStore>(
         // every park above the retry gate: probe the dedup first, and answer
         // `Rejected` (nothing was placed, so the intent id is not consumed).
         if crate::market_session::session_closed(&resolved.instrument, now) {
-            if let Some(rejection) = dedup_before_park(broker, store, verified, &origin).await {
+            if let Some(rejection) = dedup_before_park(broker, store, verified, &origin, now).await
+            {
                 return rejection;
             }
             let entry_price = entry_reference_price(&resolved.entry);
@@ -679,7 +680,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                             // was promoted, and opened a second position
                             // (`BUG-spread-park-bypasses-entry-dedup.md`).
                             if let Some(rejection) =
-                                dedup_before_park(broker, store, verified, &origin).await
+                                dedup_before_park(broker, store, verified, &origin, now).await
                             {
                                 return rejection;
                             }
@@ -875,7 +876,9 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 // gate, so a fresh fire the gate would have deduplicated (an
                 // open position, a resting order, a same-bar re-fire) must be
                 // rejected here, not parked and promoted on top of the trade.
-                if let Some(rejection) = dedup_before_park(broker, store, verified, &origin).await {
+                if let Some(rejection) =
+                    dedup_before_park(broker, store, verified, &origin, now).await
+                {
                     return rejection;
                 }
                 let parked = park_stored_entry(
@@ -1021,7 +1024,16 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     let retry_attempt_no = if !origin.skips_retry_gate()
         && verified.intent.effective_entry_dedup().needs_retry_gate()
     {
-        match crate::retry_gate::evaluate(broker, store, &verified.intent, &verified.shell).await {
+        match crate::retry_gate::evaluate_at(
+            broker,
+            store,
+            &verified.intent,
+            &verified.shell,
+            now,
+            crate::retry_gate::GateMode::Full,
+        )
+        .await
+        {
             crate::retry_gate::RetryGateOutcome::Proceed { next_attempt_no } => {
                 Some(next_attempt_no)
             }
@@ -1384,11 +1396,21 @@ async fn dedup_before_park<B: Broker, S: StateStore>(
     store: &S,
     verified: &incoming::Verified,
     origin: &EntryOrigin,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Option<ActionResult> {
     if origin.skips_retry_gate() || !verified.intent.effective_entry_dedup().needs_retry_gate() {
         return None;
     }
-    match crate::retry_gate::probe(broker, store, &verified.intent, &verified.shell).await {
+    match crate::retry_gate::evaluate_at(
+        broker,
+        store,
+        &verified.intent,
+        &verified.shell,
+        now,
+        crate::retry_gate::GateMode::Probe,
+    )
+    .await
+    {
         crate::retry_gate::RetryGateOutcome::Proceed { .. } => None,
         crate::retry_gate::RetryGateOutcome::Rejected {
             status,
@@ -3255,7 +3277,7 @@ mod spread_gate_park_tests {
     /// park, and how many orders reached the broker.
     fn session_fire(
         instrument: &str,
-        now: DateTime<Utc>,
+        now: chrono::DateTime<chrono::Utc>,
         state: Option<AttemptState>,
     ) -> (ActionResult, Option<StoredOrder>, u32) {
         let store = MemStateStore::default();

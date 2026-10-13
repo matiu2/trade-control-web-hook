@@ -47,6 +47,7 @@ fn note<C: CronEnv>(
         severity,
         message,
         broker_exit: None,
+        attempt_resolution: None,
     });
 }
 
@@ -194,6 +195,9 @@ async fn reconcile_one<C: CronEnv, B: AttemptBroker>(
         )
         .await;
     match resolved {
+        Ok(AttemptState::ClosedConfirmed { exit }) => {
+            exit_reporting::record(cron, attempt, *exit, now).await
+        }
         Ok(
             AttemptState::ClosedWin { realized_pl }
             | AttemptState::ClosedLossOrBreakeven { realized_pl },
@@ -269,6 +273,10 @@ async fn reconcile_unresolved<C: CronEnv, B: AttemptBroker>(
     let resolved = broker
         .lookup_attempt_state(&attempt.instrument, &attempt.broker_order_id, None)
         .await;
+    if let Ok(AttemptState::ClosedConfirmed { exit }) = &resolved {
+        exit_reporting::record(cron, attempt, *exit.clone(), now).await;
+        return;
+    }
     if let Ok(
         AttemptState::ClosedWin { realized_pl }
         | AttemptState::ClosedLossOrBreakeven { realized_pl },

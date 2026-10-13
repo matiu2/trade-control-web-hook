@@ -822,3 +822,18 @@ mod tests {
         assert!(events.is_empty());
     }
 }
+
+#[cfg(test)]
+mod attempt_resolution_tests {
+    #[test]
+    fn resolution_evidence_is_visible_in_journal_timeline() {
+        let payload = serde_json::json!({"notes":[{"ts":"2026-10-09T01:00:18Z","source":"attempt-resolution","severity":"warn",
+            "message":"order=27030154 state=unknown reason=competing-executions"}]});
+        let events = super::parse_events(&payload.to_string());
+        assert!(
+            events
+                .iter()
+                .any(|e| e.text.contains("27030154") && e.text.contains("competing-executions"))
+        );
+    }
+}

@@ -45,7 +45,7 @@
 //! plumbing, not part of the sweep decision logic.
 
 use chrono::{DateTime, Utc};
-use trade_control_core::broker::{AttemptState, Broker};
+use trade_control_core::broker::Broker;
 use trade_control_core::intent::BlackoutCloseAction;
 use trade_control_core::state::{EntryAttempt, StateStore};
 
@@ -203,13 +203,13 @@ async fn maybe_breach_cancel<S: StateStore, B: Broker>(
     attempt: &EntryAttempt,
     stop_loss: f64,
     broker: &B,
-    _now: DateTime<Utc>,
+    now: DateTime<Utc>,
 ) -> Result<(), String> {
-    // Before anything else, see whether this attempt has FILLED since the last
-    // tick, and if so write the broker's own trade id onto the row. See
-    // [`snapshot_broker_trade_id`] — this is the only production path that
-    // observes an ordinary fill.
-    snapshot_broker_trade_id(store, attempt, broker).await;
+    // Only confirmed resting orders may enter pending-order cancellation.
+    // A recovered position id must survive for stop management and reporting.
+    if !confirmed_pending(store, attempt, broker, now).await {
+        return Ok(());
+    }
 
     let current = broker
         .get_current_price(&attempt.instrument)
@@ -233,105 +233,26 @@ async fn maybe_breach_cancel<S: StateStore, B: Broker>(
     }
 }
 
-/// Snapshot the broker's own trade id onto an attempt the first tick it is seen
-/// to have **filled**.
-///
-/// # Why this lives in the sweep
-///
-/// `join_position_to_attempt` matches an open position back to the attempt that
-/// opened it in two stages: exact on `broker_trade_id == position_id`, else a
-/// coarse `(instrument, direction, account)` fallback that **cannot separate two
-/// look-alike attempts** — a multi-shot re-entry, or two setups on one pair — and
-/// returns whichever comes first. A mis-join hands the wrong trade's geometry to
-/// whichever cron is amending that position's stop.
-///
-/// The exact stage was supposed to prevent that, but nothing populated it. The
-/// only production writer was the retry gate, on the path where it looks up a
-/// prior attempt and **rejects** a re-entry — code a trade that fills once and is
-/// never re-fired never reaches. So `broker_trade_id` stayed `None` for the
-/// position's whole life and every break-even / blackout amend went through the
-/// coarse fallback, correct only by luck when just one position matched.
-///
-/// This is the missing observation. Nothing else watches a resting order become
-/// a filled one: the break-even and blackout passes need the join to have already
-/// worked, and the order-control re-price matches on `broker_order_id` against
-/// orders that are by definition still **resting**. The sweep is the one pass
-/// that visits every attempt with a broker already in hand.
-///
-/// # Cost
-///
-/// One extra `lookup_attempt_state` per tick per attempt that has **not yet**
-/// been seen to fill, and **zero** for the rest of a position's life — the
-/// `is_some` guard short-circuits before any I/O. So the steady-state cost of a
-/// filled position is nothing, and the transient cost is bounded by the number of
-/// orders actually resting. This mirrors the care `retry_gate` takes in skipping
-/// its open-position backstop when there is nothing to correlate against.
-///
-/// # Failure convention
-///
-/// Fail-soft, like [`persist_adverse_extreme`]: log and carry on. Every outcome
-/// other than `OpenPosition` is left alone rather than written as anything —
-/// a `Pending` order has no trade id yet, and a lookup that errors tells us
-/// nothing, so in both cases the right stored value is the one already there.
-/// The next tick asks again.
-async fn snapshot_broker_trade_id<S: StateStore, B: Broker>(
+/// Observe fills through the shared resolver before treating an attempt as
+/// resting. Once an id is saved, the sweep needs no further broker lookup.
+/// Unknown states and transport failures preserve the row for the next tick.
+async fn confirmed_pending<S: StateStore, B: Broker>(
     store: &S,
     attempt: &EntryAttempt,
     broker: &B,
-) {
-    // Already snapshotted — the common case for the whole life of a filled
-    // position. Costs nothing and, critically, never REWRITES: the stored id is
-    // what the join keys on, so a later lookup must not be able to move it.
+    now: DateTime<Utc>,
+) -> bool {
     if attempt.broker_trade_id.is_some() {
-        return;
+        return false;
     }
-    let state = broker
-        .lookup_attempt_state(
-            &attempt.instrument,
-            &attempt.broker_order_id,
-            attempt.broker_trade_id.as_deref(),
-        )
-        .await;
-    let broker_trade_id = match state {
-        Ok(AttemptState::OpenPosition { broker_trade_id }) => broker_trade_id,
-        // Still resting, already closed, gone, or unknown — nothing to record.
-        Ok(_) => return,
+    match trade_control_core::attempt_resolution::observe(broker, store, attempt, now).await {
+        Ok(trade_control_core::broker::AttemptState::Pending) => true,
+        Ok(_) => false,
         Err(err) => {
-            tracing::error!(
-                "cron sweep lookup_attempt_state({}/{}/#{}): {err}",
-                attempt.account.as_deref().unwrap_or("<global>"),
-                attempt.trade_id,
-                attempt.attempt_no,
-            );
-            return;
+            tracing::error!(trade_id = %attempt.trade_id, order_id = %attempt.broker_order_id, %err, "fill observation failed");
+            false
         }
-    };
-    if let Err(err) = store
-        .set_entry_attempt_broker_trade_id(
-            attempt.account.as_deref(),
-            &attempt.trade_id,
-            attempt.attempt_no,
-            &broker_trade_id,
-        )
-        .await
-    {
-        tracing::error!(
-            "cron sweep set_entry_attempt_broker_trade_id({}/{}/#{}): {err}",
-            attempt.account.as_deref().unwrap_or("<global>"),
-            attempt.trade_id,
-            attempt.attempt_no,
-        );
-        return;
     }
-    tracing::info!(
-        "cron sweep: attempt {}/{}/#{} filled — snapshotted broker_trade_id={broker_trade_id} \
-         (instrument={}, order_id={})",
-        attempt.account.as_deref().unwrap_or("<global>"),
-        attempt.trade_id,
-        attempt.attempt_no,
-        attempt.instrument,
-        attempt.broker_order_id,
-    );
 }
 
 /// Write an advanced running adverse extreme back onto the row — the half of
@@ -633,8 +554,7 @@ mod tests {
     struct ScriptedBroker {
         quotes: RefCell<std::collections::VecDeque<f64>>,
         cancels: RefCell<Vec<String>>,
-        /// What `lookup_attempt_state` answers. `Unknown` (the default) is the
-        /// "still resting, nothing to snapshot" case the extreme tests want.
+        /// What `lookup_attempt_state` answers. Pending models a resting order.
         attempt_state: RefCell<Result<AttemptState, LookupError>>,
         /// How many times the sweep asked. Counting it is what makes "the id is
         /// written ONCE, not re-asked every tick" an assertion rather than a
@@ -647,7 +567,7 @@ mod tests {
             Self {
                 quotes: RefCell::new(quotes.iter().copied().collect()),
                 cancels: RefCell::new(Vec::new()),
-                attempt_state: RefCell::new(Ok(AttemptState::Unknown)),
+                attempt_state: RefCell::new(Ok(AttemptState::Pending)),
                 lookups: RefCell::new(0),
             }
         }
@@ -939,7 +859,7 @@ mod tests {
     // The sweep is the only production path that watches a resting order become
     // a filled one, so it is where the id that makes
     // `join_position_to_attempt`'s exact stage usable gets written. See
-    // `snapshot_broker_trade_id` for why the other four attempt-keyed crons
+    // `confirmed_pending` for why the other four attempt-keyed crons
     // could not do it.
     //
     // Driven through `maybe_breach_cancel` (via `drive`) — the real caller —
@@ -978,6 +898,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn filled_attempt_survives_a_quote_beyond_its_original_stop() {
+        let store = MemStateStore::new();
+        let broker = ScriptedBroker::new(&[1.0]).filled_as("POS-REAL");
+        let row = resting(Direction::Long, 1.05);
+        drive(&store, &broker, &row, 1);
+        assert_eq!(broker.cancelled(), 0);
+        assert_eq!(
+            saved(&store, &row.trade_id).broker_trade_id.as_deref(),
+            Some("POS-REAL")
+        );
+    }
+
     /// An order still RESTING has no trade id yet, and must not acquire one.
     /// Writing anything here would be worse than writing nothing: the join
     /// treats a present id as authoritative, so a fabricated one aliases
@@ -985,8 +918,7 @@ mod tests {
     #[test]
     fn a_still_resting_attempt_gets_no_trade_id() {
         let store = MemStateStore::new();
-        // `Pending` — the default `Unknown` would also do, but this is the shape
-        // an unfilled order actually reports.
+        // An unfilled order is positively confirmed as pending.
         let mut broker = ScriptedBroker::new(&[1.1000]);
         broker.attempt_state = RefCell::new(Ok(AttemptState::Pending));
         let row = resting(Direction::Long, 1.0500);
@@ -1079,21 +1011,30 @@ mod tests {
         );
     }
 
-    /// The snapshot must not change what the sweep DOES. A filled attempt whose
-    /// stored extreme is already past its stop still cancels on this tick — the
-    /// lookup is an observation bolted onto the front, not a new gate.
+    /// A stale adverse extreme cannot turn a filled position into a resting order.
     #[test]
-    fn snapshotting_does_not_suppress_the_breach_cancel() {
+    fn snapshotting_preserves_a_filled_attempt_with_a_breached_extreme() {
         let store = MemStateStore::new();
         let broker = ScriptedBroker::new(&[1.1050]).filled_as("POS-REAL");
         let mut row = resting(Direction::Long, 1.0950);
-        row.adverse_extreme = Some(1.0900); // already breached
+        row.adverse_extreme = Some(1.0900);
         drive(&store, &broker, &row, 1);
+        assert_eq!(broker.cancelled(), 0);
         assert_eq!(
-            broker.cancelled(),
-            1,
-            "the breach decision must be unaffected by the fill observation",
+            saved(&store, &row.trade_id).broker_trade_id.as_deref(),
+            Some("POS-REAL")
         );
+    }
+
+    #[test]
+    fn unknown_attempt_is_not_cancelled_or_deleted_on_a_stop_breach() {
+        let store = MemStateStore::new();
+        let mut broker = ScriptedBroker::new(&[1.0]);
+        broker.attempt_state = RefCell::new(Ok(AttemptState::Unknown));
+        let row = resting(Direction::Long, 1.05);
+        drive(&store, &broker, &row, 1);
+        assert_eq!(broker.cancelled(), 0);
+        assert_eq!(saved(&store, &row.trade_id).broker_trade_id, None);
     }
 
     /// Guard against over-correction: the sweep's genuinely TERMINAL reasons

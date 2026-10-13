@@ -138,6 +138,7 @@ enum ExpectedState {
     OpenPosition,
     ClosedWin,
     ClosedLossOrBreakeven,
+    ClosedUnpriced,
     Cancelled,
     Unknown,
 }
@@ -152,6 +153,7 @@ impl ExpectedState {
             AttemptState::ClosedLossOrBreakeven { .. } => Self::ClosedLossOrBreakeven,
             AttemptState::Cancelled => Self::Cancelled,
             AttemptState::Unknown => Self::Unknown,
+            AttemptState::ClosedConfirmed { .. } => Self::ClosedUnpriced,
         }
     }
 }
@@ -606,4 +608,87 @@ async fn payloads_differ_only_where_documented() {
             broker_trade_id: format!("{ORDER_ID}-pos")
         }
     );
+}
+
+/// TN activity has separate entry/position events and a changed bracket ID.
+/// Compare decision categories with the actual replay held ledger, without
+/// pretending that an unpriced broker close is a replay -1R loss.
+#[tokio::test]
+async fn tradenation_activity_and_replay_agree_on_retry_eligibility() {
+    use tracing_subscriber::prelude::*;
+    use trade_control_core::{
+        attempt_resolution::{self, Event, EventKind, Evidence, Position},
+        intent::Direction,
+    };
+    tracing_subscriber::registry()
+        .with(tracing_error::ErrorLayer::default())
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer().with_test_writer())
+        .try_init()
+        .ok();
+    let event = |kind, id: &str, seconds| Event {
+        kind,
+        id: id.into(),
+        instrument: "EUR/CAD".into(),
+        direction: Direction::Short,
+        currency: "USD".into(),
+        stake: 1.0,
+        at: ts(seconds),
+        price: Some(1.1),
+    };
+    let category = |state: &AttemptState| match state {
+        AttemptState::Pending => "pending",
+        AttemptState::OpenPosition { .. } => "open",
+        AttemptState::ClosedWin { .. }
+        | AttemptState::ClosedLossOrBreakeven { .. }
+        | AttemptState::ClosedConfirmed { .. } => "closed",
+        AttemptState::Cancelled => "cancelled",
+        AttemptState::Unknown => "unknown",
+    };
+    for situation in [
+        Situation::RestingUnfilled,
+        Situation::FilledStillOpen,
+        Situation::ClosedAtLoss,
+        Situation::CancelledNeverFilled,
+        Situation::UnresolvableAtBroker,
+    ] {
+        let mut evidence = Evidence {
+            history_complete: true,
+            ..Evidence::default()
+        };
+        match situation {
+            Situation::RestingUnfilled => evidence.pending.push(ORDER_ID.into()),
+            Situation::FilledStillOpen | Situation::ClosedAtLoss => {
+                evidence.events = vec![
+                    event(EventKind::Open, "position-tn", 3600),
+                    event(EventKind::Execute, ORDER_ID, 3601),
+                ];
+                if matches!(situation, Situation::FilledStillOpen) {
+                    evidence.positions.push(Position {
+                        id: "position-tn".into(),
+                        order_id: "bracket-child".into(),
+                        entry_price: Some(1.1),
+                        opened_at: Some(ts(3600)),
+                    });
+                } else {
+                    evidence
+                        .events
+                        .push(event(EventKind::Close, "position-tn", 7200));
+                }
+            }
+            Situation::CancelledNeverFilled => {
+                evidence
+                    .events
+                    .push(event(EventKind::Cancel, ORDER_ID, 3600))
+            }
+            _ => {}
+        }
+        let live = attempt_resolution::resolve(ORDER_ID, None, &evidence).state;
+        let replay = replay_state(situation).await;
+        assert_eq!(
+            category(&live),
+            category(&replay),
+            "{situation:?}: live={live:?}, replay={replay:?}"
+        );
+    }
 }

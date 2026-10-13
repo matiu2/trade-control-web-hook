@@ -8,6 +8,7 @@
 pub mod account;
 pub mod allow_close_gate;
 pub mod allow_entry_gate;
+pub mod attempt_resolution;
 pub mod blackout_recreate;
 pub mod blackout_widen;
 pub mod broker;

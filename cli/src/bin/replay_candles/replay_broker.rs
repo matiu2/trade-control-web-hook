@@ -1063,16 +1063,20 @@ impl ReplayBroker {
             };
         }
         if self.open.borrow().iter().any(|p| p.order_id == order_id) {
-            return AttemptState::OpenPosition {
-                broker_trade_id: format!("{order_id}-pos"),
-            };
+            return trade_control_core::attempt_resolution::position_state(
+                &format!("{order_id}-pos"),
+                true,
+                None,
+            );
         }
         if let Some(t) = self.closed.borrow().iter().find(|t| t.order_id == order_id) {
             return match t.reason {
-                ExitReason::TookProfit => AttemptState::ClosedWin { realized_pl: 1.0 },
+                ExitReason::TookProfit => {
+                    trade_control_core::attempt_resolution::closed_with_pl(1.0)
+                }
                 // StoppedOut / Reversal / Expiry → loss-or-breakeven (re-sim maps
                 // any non-TP close to ClosedLossOrBreakeven with -1.0).
-                _ => AttemptState::ClosedLossOrBreakeven { realized_pl: -1.0 },
+                _ => trade_control_core::attempt_resolution::closed_with_pl(-1.0),
             };
         }
         // Never placed (or dropped as unresolvable) — the gate only asks about ids

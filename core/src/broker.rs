@@ -330,15 +330,17 @@ pub enum AttemptState {
     ClosedWin { realized_pl: f64 },
     /// Filled, position closed at a loss (or breakeven).
     ClosedLossOrBreakeven { realized_pl: f64 },
+    /// Broker-confirmed closure whose cash P/L is unavailable.
+    ClosedConfirmed {
+        exit: Box<crate::broker_exit::BrokerTradeExit>,
+    },
     /// Order vanished from pending without filling
     /// (rejected/expired/cancelled). TradeNation can do this upstream;
     /// OANDA can via TIF expiry. Treat as "this attempt is dead;
     /// the next entry message can try again".
     Cancelled,
-    /// Order not found anywhere — neither pending nor open, and
-    /// either never had a snapshotted trade id or its closed-trade
-    /// row aged out. Equivalent to `Cancelled` for retry-counting,
-    /// but logged distinctly since it means we lost track.
+    /// The available evidence cannot establish this attempt's lifecycle.
+    /// Blocks re-entry; absence from a snapshot is not cancellation evidence.
     Unknown,
 }
 
@@ -478,24 +480,29 @@ pub trait Broker {
     /// `EntryAttempt` row (it does so on the first lookup that
     /// finds the attempt as an open trade).
     ///
-    /// Algorithm (same on both brokers):
-    /// 1. If any pending order has `id == broker_order_id` → `Pending`.
-    /// 2. If any open trade has `originating_order_id ==
-    ///    Some(broker_order_id)` → `OpenPosition { broker_trade_id:
-    ///    trade.id }`. **Match via `originating_order_id`, not
-    ///    `trade.id` — on TradeNation those differ (PositionID vs
-    ///    OrderID).**
-    /// 3. Otherwise, if we have a stored `broker_trade_id`, look it
-    ///    up in `get_closed_trades` and bucket realised P&L:
-    ///    `> 0` → `ClosedWin`, `<= 0` → `ClosedLossOrBreakeven`.
-    /// 4. Otherwise → `Cancelled` (or `Unknown` if we never
-    ///    snapshotted a trade id).
+    /// Prefer exact order/position identifiers. Adapters may recover a missing
+    /// link from unambiguous broker history. Confirm closure or cancellation
+    /// with positive evidence; return `Unknown` for missing or ambiguous facts.
     fn lookup_attempt_state(
         &self,
         instrument: &str,
         broker_order_id: &str,
         broker_trade_id: Option<&str>,
     ) -> impl Future<Output = Result<AttemptState, LookupError>>;
+
+    /// Detailed observations use the same resolver as ordinary retry lookups.
+    fn lookup_attempt(
+        &self,
+        instrument: &str,
+        broker_order_id: &str,
+        broker_trade_id: Option<&str>,
+    ) -> impl Future<Output = Result<crate::attempt_resolution::Observation, LookupError>> {
+        async move {
+            self.lookup_attempt_state(instrument, broker_order_id, broker_trade_id)
+                .await
+                .map(crate::attempt_resolution::Observation::plain)
+        }
+    }
 
     /// Read the broker's actual closing transaction and the TP/SL order it
     /// filled. None means this broker cannot resolve an exit, never "still

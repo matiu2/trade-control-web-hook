@@ -58,6 +58,7 @@ async fn broker_exit_is_durable_and_unique_per_account_plan_and_entry_order() {
         severity: CronNoteSeverity::Info,
         message: exit.summary_lines().join("\n"),
         broker_exit: Some(exit),
+        attempt_resolution: None,
     };
     assert!(
         !broker_exit_recorded(store.pool(), Some("test-a"), &trade_id, "2525")
@@ -288,4 +289,90 @@ async fn record_tick_inserts_and_round_trips() {
         .execute(store.pool())
         .await
         .expect("cleanup tick bundle");
+}
+
+#[tokio::test]
+async fn attempt_evidence_survives_restart_and_deduplicates_concurrent_writes() {
+    use tracing_subscriber::prelude::*;
+    use trade_control_core::{
+        attempt_resolution::{self, Evidence},
+        intent::Direction,
+        state::{EntryAttempt, StateStore},
+    };
+    use trade_control_worker::recording_pg::cron_notes_for_trade;
+    tracing_subscriber::registry()
+        .with(tracing_error::ErrorLayer::default())
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer().with_test_writer())
+        .try_init()
+        .ok();
+    let store = store().await;
+    let now = Utc::now();
+    let mut attempt = EntryAttempt {
+        trade_id: format!("attempt-diagnostic-{}", now.timestamp_nanos_opt().unwrap()),
+        account: Some("test-account-a".into()),
+        instrument: "AUD/USD".into(),
+        attempt_no: 1,
+        broker_order_id: "27030154".into(),
+        broker_trade_id: None,
+        direction: Direction::Long,
+        placed_at: now,
+        shell_time: now,
+        expires_at: now + chrono::Duration::hours(1),
+        stop_loss_price: Some(0.69368),
+        pip_size: Some(0.0001),
+        cancel_at: None,
+        breakeven: None,
+        order_control: None,
+        adverse_extreme: None,
+        blackout_close: Default::default(),
+        superseded: false,
+    };
+    let diagnostic = attempt_resolution::resolve("27030154", None, &Evidence::default())
+        .diagnostic
+        .unwrap();
+    let (a, b) = tokio::join!(
+        store.record_attempt_diagnostic(&attempt, &diagnostic, now),
+        store.record_attempt_diagnostic(&attempt, &diagnostic, now)
+    );
+    assert_ne!(a.unwrap(), b.unwrap(), "exactly one concurrent insert");
+    let reopened = PgStateStore::connect(&test_db_url()).await.unwrap();
+    assert!(
+        !reopened
+            .record_attempt_diagnostic(&attempt, &diagnostic, now)
+            .await
+            .unwrap()
+    );
+    let mut changed = diagnostic.clone();
+    changed.reason = "competing-executions".into();
+    assert!(
+        reopened
+            .record_attempt_diagnostic(&attempt, &changed, now)
+            .await
+            .unwrap()
+    );
+    assert!(
+        reopened
+            .record_attempt_diagnostic(&attempt, &diagnostic, now)
+            .await
+            .unwrap(),
+        "recurrence after a state change is visible"
+    );
+    attempt.account = Some("test-account-b".into());
+    assert!(
+        reopened
+            .record_attempt_diagnostic(&attempt, &diagnostic, now)
+            .await
+            .unwrap()
+    );
+    let notes = cron_notes_for_trade(reopened.pool(), &attempt.trade_id)
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 4);
+    assert_eq!(notes[0].attempt_resolution.as_ref(), Some(&diagnostic));
+    sqlx::query("DELETE FROM cron_notes WHERE correlation_id=$1")
+        .bind(&attempt.trade_id)
+        .execute(reopened.pool())
+        .await
+        .unwrap();
 }

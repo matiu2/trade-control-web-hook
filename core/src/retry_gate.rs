@@ -147,7 +147,7 @@ fn resolve_max_retries(tunable: &Tunable<u32>, shell: &Shell) -> Result<u32, Ret
 /// `intent.effective_entry_dedup().needs_retry_gate()` — the caller is responsible for
 /// keeping the engine-latched path free of any state-store / broker lookups so
 /// the byte-identical baseline holds.
-/// How [`evaluate_in`] may act on what it finds.
+/// How [`evaluate_at`] may act on what it finds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateMode {
     /// The real gate: a still-resting prior order is CANCELLED so the caller
@@ -169,7 +169,7 @@ pub async fn evaluate<B: Broker, S: StateStore>(
     intent: &Intent,
     shell: &Shell,
 ) -> RetryGateOutcome {
-    evaluate_in(broker, store, intent, shell, GateMode::Full).await
+    evaluate_at(broker, store, intent, shell, shell.time, GateMode::Full).await
 }
 
 /// The gate's verdict with **no broker side effect** ([`GateMode::Probe`]):
@@ -182,14 +182,15 @@ pub async fn probe<B: Broker, S: StateStore>(
     intent: &Intent,
     shell: &Shell,
 ) -> RetryGateOutcome {
-    evaluate_in(broker, store, intent, shell, GateMode::Probe).await
+    evaluate_at(broker, store, intent, shell, shell.time, GateMode::Probe).await
 }
 
-async fn evaluate_in<B: Broker, S: StateStore>(
+pub async fn evaluate_at<B: Broker, S: StateStore>(
     broker: &B,
     store: &S,
     intent: &Intent,
     shell: &Shell,
+    now: DateTime<Utc>,
     mode: GateMode,
 ) -> RetryGateOutcome {
     let shell_time = shell.time;
@@ -279,14 +280,7 @@ async fn evaluate_in<B: Broker, S: StateStore>(
     // fall through to placement; closed/cancelled/unknown rows are
     // skipped over toward older attempts.
     for attempt in attempts.iter().rev() {
-        match broker
-            .lookup_attempt_state(
-                &intent.instrument,
-                &attempt.broker_order_id,
-                attempt.broker_trade_id.as_deref(),
-            )
-            .await
-        {
+        match crate::attempt_resolution::observe(broker, store, attempt, now).await {
             Ok(AttemptState::Pending) => {
                 if mode == GateMode::Probe {
                     tracing::info!(
@@ -331,29 +325,9 @@ async fn evaluate_in<B: Broker, S: StateStore>(
                     Err(_) => {
                         // Race: order may have filled between observing
                         // Pending and our cancel. Re-lookup to find out.
-                        match broker
-                            .lookup_attempt_state(
-                                &intent.instrument,
-                                &attempt.broker_order_id,
-                                attempt.broker_trade_id.as_deref(),
-                            )
-                            .await
+                        match crate::attempt_resolution::observe(broker, store, attempt, now).await
                         {
-                            Ok(AttemptState::OpenPosition { broker_trade_id }) => {
-                                if attempt.broker_trade_id.is_none()
-                                    && let Err(err) = store
-                                        .set_entry_attempt_broker_trade_id(
-                                            account,
-                                            trade_id,
-                                            attempt.attempt_no,
-                                            &broker_trade_id,
-                                        )
-                                        .await
-                                {
-                                    tracing::error!(
-                                        "KV set_entry_attempt_broker_trade_id (raced): {err}"
-                                    );
-                                }
+                            Ok(AttemptState::OpenPosition { .. }) => {
                                 return RetryGateOutcome::Rejected {
                                     status: 412,
                                     message: "trade already open (raced with cancel)",
@@ -368,6 +342,13 @@ async fn evaluate_in<B: Broker, S: StateStore>(
                             // successfully, on the understanding that a
                             // replacement follows immediately, earns the
                             // cap-slot refund. Conservative: it keeps counting.
+                            Ok(AttemptState::Unknown | AttemptState::Pending) => {
+                                return RetryGateOutcome::Rejected {
+                                    status: 412,
+                                    message: "prior attempt state unknown",
+                                    outcome: "rejected: prior-attempt-unknown".into(),
+                                };
+                            }
                             Ok(_) => break,
                             Err(LookupError::Transient) => {
                                 return RetryGateOutcome::Rejected {
@@ -380,26 +361,16 @@ async fn evaluate_in<B: Broker, S: StateStore>(
                     }
                 }
             }
-            Ok(AttemptState::OpenPosition { broker_trade_id }) => {
-                if attempt.broker_trade_id.is_none()
-                    && let Err(err) = store
-                        .set_entry_attempt_broker_trade_id(
-                            account,
-                            trade_id,
-                            attempt.attempt_no,
-                            &broker_trade_id,
-                        )
-                        .await
-                {
-                    tracing::error!("KV set_entry_attempt_broker_trade_id: {err}");
-                }
+            Ok(AttemptState::OpenPosition { .. }) => {
                 return RetryGateOutcome::Rejected {
                     status: 412,
                     message: "trade already open",
                     outcome: "rejected: trade-already-open".into(),
                 };
             }
-            Ok(AttemptState::ClosedWin { .. }) | Ok(AttemptState::ClosedLossOrBreakeven { .. }) => {
+            Ok(AttemptState::ClosedWin { .. })
+            | Ok(AttemptState::ClosedLossOrBreakeven { .. })
+            | Ok(AttemptState::ClosedConfirmed { .. }) => {
                 // Collapsed state — this attempt is provably done. Look
                 // at the next-older attempt; if none remain, fall
                 // through to the cap check.
@@ -1680,6 +1651,87 @@ mod tests {
             .cloned()
             .unwrap();
         assert_eq!(stored[0].broker_trade_id.as_deref(), Some("btid-42"));
+    }
+
+    #[test]
+    fn failed_cancel_with_unresolved_or_still_pending_state_blocks_reentry() {
+        for state in [AttemptState::Unknown, AttemptState::Pending] {
+            let broker = MockBroker::default();
+            let store = CountingStore::default();
+            let intent = intent_with_retries(3);
+            run(record_placement(
+                &store,
+                &intent,
+                ts("2026-05-25T13:00:00Z"),
+                intent.not_after,
+                ts("2026-05-25T13:00:01Z"),
+                1,
+                "order-1",
+                Direction::Long,
+                1.05,
+                None,
+                None,
+                None,
+            ));
+            broker.push_lookup(AttemptState::Pending);
+            broker.push_cancel_err();
+            broker.push_lookup(state);
+            assert_rejected(
+                run(evaluate(&broker, &store, &intent, &fixture_shell())),
+                412,
+                "prior-attempt-unknown",
+            );
+        }
+    }
+
+    #[test]
+    fn confirmed_close_without_pnl_allows_retry_and_persists_recovered_id() {
+        use crate::attempt_resolution::{Event, EventKind, Evidence};
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(3);
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "order-1",
+            Direction::Long,
+            1.05,
+            None,
+            None,
+            None,
+        ));
+        let state = crate::attempt_resolution::resolve(
+            "order-1",
+            Some("recovered-position"),
+            &Evidence {
+                events: vec![Event {
+                    kind: EventKind::Close,
+                    id: "recovered-position".into(),
+                    instrument: "EUR/USD".into(),
+                    direction: Direction::Short,
+                    currency: "USD".into(),
+                    stake: 1.0,
+                    at: ts("2026-05-25T13:01:00Z"),
+                    price: Some(1.04),
+                }],
+                ..Evidence::default()
+            },
+        )
+        .state;
+        broker.push_lookup(state);
+        assert_proceed(run(evaluate(&broker, &store, &intent, &fixture_shell())), 2);
+        assert_eq!(*store.set_btid_calls.borrow(), 1);
+        let stored = store.attempts.borrow();
+        assert_eq!(
+            stored.get(&("acct-a".into(), "trade-xyz".into())).unwrap()[0]
+                .broker_trade_id
+                .as_deref(),
+            Some("recovered-position")
+        );
     }
 
     /// OpenPosition on the newest attempt → 412, broker_trade_id
