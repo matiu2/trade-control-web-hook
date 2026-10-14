@@ -13,14 +13,10 @@ pub(crate) async fn place(
     max_positions: u32,
     req: &EntryRequest<'_>,
 ) -> Result<Placement, EntryError> {
-    let account = broker
+    // Risk decisions must bypass the short-lived snapshots used by cron reads.
+    let (account, trades) = broker
         .trader
-        .account()
-        .await
-        .map_err(|_| EntryError::AccountFetch)?;
-    let trades = broker
-        .trader
-        .trades()
+        .risk_snapshot()
         .await
         .map_err(|_| EntryError::AccountFetch)?;
     if trades.positions.len() + trades.orders.len() >= max_positions as usize {
