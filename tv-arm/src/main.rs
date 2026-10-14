@@ -34,6 +34,7 @@ mod geometry;
 mod hs_resolve;
 mod instrument_recovery;
 mod instrument_resolution;
+mod mt5_instrument;
 mod mw_geometry;
 mod mw_resolve;
 mod news_marker;

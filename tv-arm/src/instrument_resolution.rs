@@ -63,7 +63,13 @@ pub fn resolve_for_account(
     account: Option<&str>,
 ) -> Result<ResolvedInstrument> {
     let bare = strip_exchange(tv_symbol);
-    let asset = instrument_lookup::resolve(bare)?.ok_or_else(|| {
+    let asset = instrument_lookup::resolve(bare)?;
+    let asset = if broker == ConvBroker::Mt5 && asset.is_none() {
+        instrument_lookup::resolve(&crate::mt5_instrument::catalog_symbol(bare))?
+    } else {
+        asset
+    };
+    let asset = asset.ok_or_else(|| {
         let hint = instrument_lookup::user_config_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "~/.config/instrument-lookup/mappings.toml".to_string());
@@ -74,20 +80,13 @@ pub fn resolve_for_account(
     })?;
 
     if broker == ConvBroker::Mt5 {
-        if asset.class != AssetClass::Forex {
-            return Err(eyre!("MT5 adapter currently supports FX only"));
-        }
-        let broker_symbol = trade_control_conventions::instrument_for(broker, &asset.id);
+        let resolved = crate::mt5_instrument::resolve(bare, asset, account)?;
         let key = trade_control_core::spread_blackout::mt5_spread_key(
-            account.unwrap_or("<missing-account>"),
-            &broker_symbol,
+            account.ok_or_else(|| eyre!("MT5 requires an explicit named account"))?,
+            &resolved.broker_symbol,
         );
         require_spread_coverage(&key)?;
-        return Ok(ResolvedInstrument {
-            asset,
-            broker_symbol,
-            precision: CatalogPrecision::from_asset(asset),
-        });
+        return Ok(resolved);
     }
     let il_broker = to_il_broker(broker).ok_or_else(|| {
         eyre!(

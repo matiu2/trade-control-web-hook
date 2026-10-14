@@ -1,8 +1,8 @@
 //! Instrument-name validation and autocomplete for trade-control subcommands.
 //!
 //! Wraps [`tradenation_instrument_cache::InstrumentCache`] with sync helpers
-//! the clap CLI can call directly. The cache crate is async (tokio); we spin
-//! a current-thread runtime per call.
+//! the clap CLI can call directly. Async broker reads use the shared CLI
+//! runtime so pooled MT5 sockets survive successive calls.
 //!
 //! OANDA is a no-op today — the user hasn't asked for OANDA-side validation
 //! and OANDA's `EUR_USD`-style names already round-trip cleanly through
@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::blocking::run_blocking;
 use color_eyre::eyre::{Result, eyre};
 use trade_control_core::intent::BrokerKind;
 use tradenation_api::{login_demo, login_demo_named};
@@ -160,19 +161,6 @@ pub fn resolve_with_cache(cache: &InstrumentCache, name: &str) -> Result<Option<
         }
         Err(err @ ResolveError::NotFound { .. }) => Err(eyre!("{err}")),
     }
-}
-
-/// Run an async future on a fresh current-thread tokio runtime. We don't
-/// hold the CLI long enough to warrant a worker-thread runtime.
-pub(crate) fn run_blocking<F, T>(fut: F) -> Result<T>
-where
-    F: std::future::Future<Output = Result<T>>,
-{
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| eyre!("building tokio runtime: {e}"))?;
-    rt.block_on(fut)
 }
 
 #[cfg(test)]

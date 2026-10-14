@@ -4992,6 +4992,7 @@ dependencies = [
 name = "tv-arm"
 version = "0.1.0"
 dependencies = [
+ "broker-mt5",
  "chrono",
  "clap",
  "clap_complete",

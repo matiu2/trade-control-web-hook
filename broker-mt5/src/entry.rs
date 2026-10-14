@@ -1,4 +1,4 @@
-use crate::{Mt5Broker, mapping, sizing};
+use crate::{Mt5Broker, contract, mapping, sizing};
 use mt5_data_source::web::trading::{
     Direction as Side, OrderKind, OrderRequest, SymbolInfo, Trader,
 };
@@ -33,10 +33,7 @@ pub(crate) async fn place(
         .symbol(req.instrument)
         .await
         .map_err(|_| EntryError::OrderRejected)?;
-    // FX linear contract P/L is verified. Refuse futures/options/bonds with different formulas.
-    if !matches!(symbol.calc_mode, 0 | 5) {
-        return Err(EntryError::ContractSizeUnavailable);
-    }
+    contract::validate_calc_mode(symbol.calc_mode)?;
     let quote = broker
         .trader
         .quote(req.instrument)
@@ -54,7 +51,7 @@ pub(crate) async fn place(
             .map(|p| p.profit + p.swap + p.commission)
             .sum::<f64>();
     let rate = currency_rate(&broker.trader, &symbol.profit_currency, &account.currency).await?;
-    let loss = (price - stop).abs() * symbol.contract_size * rate;
+    let loss = contract::loss_per_lot(symbol.calc_mode, symbol.contract_size, price, stop, rate)?;
     let lots = sizing::lots(req.risk, equity, loss, cap, &symbol.rules)?;
     let order = OrderRequest {
         symbol: req.instrument.into(),

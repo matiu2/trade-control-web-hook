@@ -7,7 +7,7 @@ use trade_control_core::{
     broker::{AttemptState, EntryError},
     intent::{Direction, RiskBudget},
 };
-fn logging() {
+pub(crate) fn logging() {
     use tracing_subscriber::prelude::*;
     tracing_subscriber::registry()
         .with(tracing_error::ErrorLayer::default())
@@ -16,7 +16,7 @@ fn logging() {
         .try_init()
         .ok();
 }
-fn rules() -> Rules {
+pub(crate) fn rules() -> Rules {
     Rules {
         path: String::new(),
         spread_points: 0,
