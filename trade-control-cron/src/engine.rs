@@ -4,7 +4,7 @@
 //! Where the order sweep walks pending broker orders, this walks every
 //! registered [`TradePlan`](trade_control_core::trade_plan::TradePlan). For
 //! each plan it loads the persisted [`PlanState`], fetches the candles that have
-//! closed since the watermark, runs the pure [`evaluate_plan`] FSM, persists the
+//! closed since the watermark, runs the pure [`trade_control_engine::evaluate_plan`] FSM, persists the
 //! advanced state, and dispatches each fired intent through the *same* handlers
 //! the webhook uses (`run_enter` / `run_close` / the veto + prep handlers). The
 //! plan was already HMAC-verified at register time, so the engine synthesises a
@@ -38,13 +38,15 @@
 //! # Where the tests live
 //!
 //! The decision logic is pure and tested where it lives: the FSM
-//! ([`evaluate_plan`]) and the seed-without-firing rule ([`seed_plan_state`])
+//! ([`trade_control_engine::evaluate_plan`]) and the seed-without-firing rule ([`seed_plan_state`])
 //! have native table tests in the `trade-control-engine` crate;
 //! [`Shell::from_candle`] is tested in `core`. This module's own functions are
 //! thin glue over the concrete [`BrokerHandle`] and the [`CronEnv`] seam, so
 //! only the pure helpers (`seed_since`, `plan_state_expires_at`, the trendline
 //! anchor math) are unit-tested here. End-to-end behaviour is exercised on the
 //! demo deploy, run in parallel with the live TV alerts (Stage F gate).
+
+mod detector_history;
 
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{Broker, Candle, CandleError, Granularity, filter_new_candles};
@@ -178,7 +180,6 @@ where
     // fetch a wider back-window ending at `now` for the detector; otherwise the
     // window is unused and `fresh` stands in.
     let detector_window = detector_window_for(&broker, plan, &fresh, now).await?;
-
     let eval = evaluate_plan(plan, &prior, &fresh, &detector_window, now, expires_at);
 
     // Surface any trendline out-of-window anchor diagnostics the pure evaluator
@@ -798,19 +799,11 @@ async fn detector_window_for(
         return Ok(fresh.to_vec());
     };
 
-    let window = fetch_candles(broker, &plan.instrument, plan.granularity, since, now).await?;
-
-    // Merge fetched history with `fresh` and dedup by open-time so every new
-    // candle is present even if the history fetch's closed-bar cutoff dropped the
-    // most recent one. Ascending by time.
-    let mut merged = window;
-    for c in fresh {
-        if !merged.iter().any(|w| w.time == c.time) {
-            merged.push(*c);
-        }
-    }
-    merged.sort_by_key(|c| c.time);
-    Ok(merged)
+    let want_history = pine_since.map_or(0, |_| pine_lookback_bars(plan.granularity));
+    detector_history::fetch_window(since, fresh, want_history, |from| {
+        fetch_candles(broker, &plan.instrument, plan.granularity, from, now)
+    })
+    .await
 }
 
 /// The fetch start a `PinePattern` entry needs: [`detector_lookback_bars`] of

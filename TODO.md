@@ -1,3 +1,17 @@
+# TODO — AUDCHF live H4 detector history (2026-10-14)
+
+- [x] Confirm missed signals: weekend leaves 26 candles in a 38-bar calendar
+      span; H4 ATR needs 36, so golden entries never fire.
+- [x] Add nine regression tests using genuine cached AUDCHF H4 candles.
+      Genuine mid prices decline the 07:00 Brisbane bar but permit the 11:00
+      and 15:00 bars once ATR is warm; estimated replay prices differ at rollover.
+- [x] Widen live detector history until the earliest fresh bar has enough
+      actual preceding candles. If older history genuinely does not exist,
+      report it loudly and process available candles normally so protection
+      rules remain live and incoming candles can eventually warm ATR.
+- [x] Tests (core, engine, cron, native worker), clippy and fmt pass.
+- [x] Independent bug and failure-handling reviews pass.
+
 # TODO — reconcile findings visible in journal, as a proper 3rd event kind (2026-10-03)
 
 ## Why
