@@ -4892,6 +4892,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "mt5-data-source",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "serde_yaml",

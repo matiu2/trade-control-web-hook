@@ -47,6 +47,7 @@
 //! demo deploy, run in parallel with the live TV alerts (Stage F gate).
 
 mod detector_history;
+mod health;
 
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{Broker, Candle, CandleError, Granularity, filter_new_candles};
@@ -91,13 +92,20 @@ where
     tracing::info!("cron engine: {} registered plans", plans.len());
 
     for stored in plans {
-        if let Err(err) = tick_one(store, cron, &stored, now).await {
+        let result = tick_one(store, cron, &stored, now).await;
+        if let Err(err) = &result {
             tracing::error!(
                 "cron engine[{}/{}]: {err}",
                 stored.account.as_deref().unwrap_or("<global>"),
                 stored.plan.trade_id,
             );
         }
+        cron.record_engine_health(health::observation(
+            &stored,
+            result.as_ref().err().map(String::as_str),
+            now,
+        ))
+        .await;
     }
 }
 
@@ -132,18 +140,12 @@ where
     let prior = match read_plan_state_settled(store, account, &plan.trade_id).await? {
         Some(state) => state,
         None => {
-            let broker = cron
-                .acquire_broker(account)
-                .await
-                .ok_or("broker acquisition failed")?;
+            let broker = cron.acquire_engine_broker(account).await?;
             return seed_first_tick(store, &broker, plan, account, expires_at, now).await;
         }
     };
 
-    let broker = cron
-        .acquire_broker(account)
-        .await
-        .ok_or("broker acquisition failed")?;
+    let broker = cron.acquire_engine_broker(account).await?;
 
     // Fetch candles closed since the watermark. A plan with no watermark (an
     // earlier seed that found an empty window) re-seeds from the back-window.
@@ -759,6 +761,7 @@ fn disposition(result: Result<Vec<Candle>, CandleError>) -> Result<Vec<Candle>, 
                 .into(),
         ),
         Err(CandleError::Transient) => Err("candle fetch failed (transient)".into()),
+        Err(CandleError::Unavailable(reason)) => Err(format!("candle fetch failed: {reason}")),
     }
 }
 
@@ -915,6 +918,21 @@ where
         BrokerHandle::Mt5(b) => dispatch_action(b, store, &verified, cron, granularity, now).await,
     };
     let outcome = result.describe();
+    if verified.intent.action == Action::Enter && !matches!(&result, ActionResult::Ok(_)) {
+        cron.record_cron_note(trade_control_core::recording::CronNote {
+            ts: now.to_rfc3339(),
+            trade_id: verified.intent.trade_id.clone().unwrap_or_default(),
+            account: verified.intent.account.clone(),
+            source: "entry-dispatch".into(),
+            severity: trade_control_core::recording::CronNoteSeverity::Warn,
+            message: format!(
+                "{} {:?}: entry was not confirmed: {outcome}",
+                verified.intent.instrument, granularity
+            ),
+            broker_exit: None,
+            attempt_resolution: None,
+        });
+    }
     tracing::info!(
         "cron engine fired: rule={} action={:?} id={} outcome={outcome}",
         fired.rule_id,
@@ -1150,6 +1168,17 @@ mod tests {
     #[test]
     fn disposition_transient_is_an_error() {
         assert!(disposition(Err(CandleError::Transient)).is_err());
+    }
+
+    #[test]
+    fn disposition_preserves_mt5_identity_failure_for_the_journal() {
+        let result = disposition(Err(CandleError::Unavailable(
+            "MT5 GBPAUD: account/server mismatch".into(),
+        )));
+        assert_eq!(
+            result,
+            Err("candle fetch failed: MT5 GBPAUD: account/server mismatch".into())
+        );
     }
 
     #[test]

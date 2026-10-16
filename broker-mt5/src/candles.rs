@@ -26,7 +26,7 @@ pub(crate) async fn read(
         .await
         .map_err(|error| {
             tracing::warn!(symbol, %error, "MT5 historical tick candles unavailable");
-            CandleError::Transient
+            CandleError::Unavailable(format!("MT5 {symbol}: {error:#}"))
         })?;
     Ok(bars
         .candles

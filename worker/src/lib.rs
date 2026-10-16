@@ -6,8 +6,10 @@
 mod broker_factory;
 mod config;
 mod dispatch_config_native;
+mod engine_health;
 pub mod http;
 mod native_cron;
+mod operator_alert;
 mod pg;
 mod pg_accounts;
 pub mod recording_pg;

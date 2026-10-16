@@ -372,6 +372,23 @@ pub fn derive_outcome(json: &str) -> (String, bool) {
     let Ok(v) = serde_json::from_str::<Value>(json) else {
         return ("?".to_string(), false);
     };
+    // The latest engine-health observation states whether evaluation is
+    // currently blocked, including failures before any tick could be recorded.
+    if let Some(note) = v.get("notes").and_then(Value::as_array).and_then(|notes| {
+        notes
+            .iter()
+            .filter(|note| note.get("source").and_then(Value::as_str) == Some("engine-health"))
+            .max_by_key(|note| note.get("ts").and_then(Value::as_str).unwrap_or_default())
+    }) && note.get("severity").and_then(Value::as_str) == Some("error")
+    {
+        return (
+            note.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("plan evaluation failed")
+                .into(),
+            false,
+        );
+    }
     let mut result: Option<(String, bool)> = None;
     if let Some(records) = v.get("records").and_then(|r| r.as_array()) {
         for rec in records {
@@ -401,6 +418,32 @@ pub fn derive_outcome(json: &str) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_failure_is_visible_without_ticks_and_recovery_clears_the_error() {
+        let failed = serde_json::json!({"records": [], "ticks": [], "notes": [
+            {"ts":"2026-10-16T01:08:24Z", "source":"engine-health", "severity":"error", "message":"MT5 account/server mismatch"}
+        ]});
+        assert_eq!(
+            derive_outcome(&failed.to_string()),
+            ("MT5 account/server mismatch".into(), false)
+        );
+        let events = parse_events(&failed.to_string());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].marker, '!');
+        assert!(
+            events[0]
+                .text
+                .contains("(error): MT5 account/server mismatch")
+        );
+        let mut recovered = failed;
+        recovered["notes"].as_array_mut().unwrap().push(serde_json::json!({"ts":"2026-10-16T04:23:37Z", "source":"engine-health", "severity":"info", "message":"plan evaluation resumed"}));
+        assert_eq!(
+            derive_outcome(&recovered.to_string()),
+            ("no dispatch recorded".into(), false)
+        );
+        assert_eq!(parse_events(&recovered.to_string()).len(), 2);
+    }
 
     #[test]
     fn confirmed_broker_exit_replaces_only_its_obsolete_warnings() {

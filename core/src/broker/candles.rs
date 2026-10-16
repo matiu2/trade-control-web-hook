@@ -150,6 +150,8 @@ impl Granularity {
 pub enum CandleError {
     /// Network / 5xx / decode / other transient broker failure.
     Transient,
+    /// A feed failure with a safe, operator-facing explanation.
+    Unavailable(String),
     /// The requested window is degenerate (`since >= now`). A legitimate no-op:
     /// the caller may treat it as "no new candles" and widen on the next tick.
     /// Distinct from `Transient` so the engine logs it as a logic bug rather
@@ -168,6 +170,7 @@ impl core::fmt::Display for CandleError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Transient => f.write_str("broker candle fetch failed (transient)"),
+            Self::Unavailable(reason) => write!(f, "broker candle fetch failed: {reason}"),
             Self::BadRange => f.write_str("candle fetch range is degenerate or rejected"),
             Self::UnsupportedGranularity => f.write_str("broker does not serve this granularity"),
         }

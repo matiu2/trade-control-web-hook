@@ -136,6 +136,7 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
                     sweep_loop(state.clone(), cron.clone(), sweep_period),
                     order_control_loop(state.clone(), cron.clone(), order_control_period),
                     reconcile_loop(state.clone(), cron.clone(), reconcile_period),
+                    operator_alert_loop(state.clone()),
                     expiry_gc_loop(state, expiry_gc_period),
                 );
             });
@@ -407,6 +408,20 @@ async fn expiry_gc_loop(state: Arc<AppState>, period: Duration) {
                 Ok(deleted) => tracing::info!("scheduler: expired-row GC deleted {deleted} row(s)"),
                 Err(err) => tracing::error!("scheduler: expired-row GC failed: {err}"),
             }
+        })
+        .await;
+    }
+}
+
+/// Notifications have their own cadence, so a stalled evaluation or a plan
+/// retiring cannot strand a committed failed-entry warning.
+async fn operator_alert_loop(state: Arc<AppState>) {
+    let mut interval = skip_interval(Duration::from_secs(15));
+    loop {
+        interval.tick().await;
+        let pool = state.store.pool().clone();
+        run_isolated("operator-alerts", async move {
+            crate::operator_alert::flush(&pool).await;
         })
         .await;
     }

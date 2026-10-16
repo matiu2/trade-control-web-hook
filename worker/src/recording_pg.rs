@@ -191,6 +191,7 @@ pub async fn record_cron_note(pool: &sqlx::PgPool, note: &CronNote) -> Result<()
     };
     let body = serde_json::to_value(note).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
 
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO cron_notes \
          (ts, correlation_id, account, source, severity, message, body) \
@@ -203,9 +204,12 @@ pub async fn record_cron_note(pool: &sqlx::PgPool, note: &CronNote) -> Result<()
     .bind(note.severity.to_string())
     .bind(&note.message)
     .bind(body)
-    .execute(pool)
-    .await
-    .map(|_| ())
+    .execute(&mut *tx)
+    .await?;
+    if note.severity != trade_control_core::recording::CronNoteSeverity::Info {
+        crate::operator_alert::enqueue(tx.as_mut(), note).await?;
+    }
+    tx.commit().await
 }
 
 /// Read every [`CronNote`] for one trade, oldest first — the read side of
