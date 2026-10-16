@@ -1255,21 +1255,27 @@ impl PgStateStore {
         plan: &TradePlan,
     ) -> Result<(), StateError> {
         let body = to_jsonb(plan)?;
+        let mut tx = self.pool.begin().await.map_err(backend)?;
         sqlx::query(
             "DELETE FROM trade_plan WHERE account IS NOT DISTINCT FROM $1 AND trade_id = $2",
         )
         .bind(account)
         .bind(&plan.trade_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(backend)?;
         sqlx::query("INSERT INTO trade_plan (account, trade_id, body) VALUES ($1, $2, $3)")
             .bind(account)
             .bind(&plan.trade_id)
             .bind(body)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(backend)?;
+        let note = crate::trade_notifications::registered(account, plan, Utc::now());
+        crate::trade_notifications::record_in(tx.as_mut(), "registered", &note)
+            .await
+            .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
         Ok(())
     }
 

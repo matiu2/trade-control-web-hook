@@ -69,7 +69,7 @@ async fn deliver_one(
     client
         .post(endpoint)
         .timeout(Duration::from_secs(2))
-        .json(&serde_json::json!({"origin": origin(), "note": body}))
+        .json(&serde_json::json!({"origin": origin(), "event_id": key, "note": body}))
         .send()
         .await?
         .error_for_status()?;

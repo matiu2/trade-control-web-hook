@@ -7,6 +7,7 @@ mod broker_factory;
 mod config;
 mod dispatch_config_native;
 mod engine_health;
+mod entry_notifications;
 pub mod http;
 mod native_cron;
 mod operator_alert;
@@ -15,6 +16,7 @@ mod pg_accounts;
 pub mod recording_pg;
 mod scheduler;
 mod secrets;
+mod trade_notifications;
 
 pub use broker_factory::{BrokerError, acquire_ibkr, acquire_mt5, acquire_oanda, acquire_tn};
 pub use config::{Config, ConfigError, DatabaseConfig, HttpConfig, SchedulerConfig};

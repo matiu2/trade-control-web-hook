@@ -137,6 +137,7 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
                     order_control_loop(state.clone(), cron.clone(), order_control_period),
                     reconcile_loop(state.clone(), cron.clone(), reconcile_period),
                     operator_alert_loop(state.clone()),
+                    entry_notification_loop(state.clone(), cron.clone()),
                     expiry_gc_loop(state, expiry_gc_period),
                 );
             });
@@ -422,6 +423,19 @@ async fn operator_alert_loop(state: Arc<AppState>) {
         let pool = state.store.pool().clone();
         run_isolated("operator-alerts", async move {
             crate::operator_alert::flush(&pool).await;
+        })
+        .await;
+    }
+}
+
+/// This observer never places orders or updates the retry ledger.
+async fn entry_notification_loop(state: Arc<AppState>, cron: NativeCronEnv) {
+    let mut interval = skip_interval(Duration::from_secs(15));
+    loop {
+        interval.tick().await;
+        let (state, cron) = (state.clone(), cron.clone());
+        run_isolated("entry-notifications", async move {
+            crate::entry_notifications::poll(&state.store, &cron).await;
         })
         .await;
     }
