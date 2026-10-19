@@ -22,6 +22,7 @@ mod control_result;
 mod enter;
 mod entry_origin;
 mod invalidate;
+mod near_market;
 mod seen;
 mod shared;
 mod veto;

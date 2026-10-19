@@ -7,11 +7,15 @@ use trade_control_core::{
     intent::{Direction, ResolvedEntry},
 };
 
+#[cfg(test)]
+mod distance_tests;
+
 pub(crate) async fn place(
     broker: &Mt5Broker,
     cap: f64,
     max_positions: u32,
     req: &EntryRequest<'_>,
+    market_band: Option<MarketEntryBand>,
 ) -> Result<Placement, EntryError> {
     // Risk decisions must bypass the short-lived snapshots used by cron reads.
     let (account, trades) = broker
@@ -51,6 +55,30 @@ pub(crate) async fn place(
             .map(|p| p.profit + p.swap + p.commission)
             .sum::<f64>();
     let rate = currency_rate(&broker.trader, &symbol.profit_currency, &account.currency).await?;
+    // Account/FX reads can take seconds. A market rescue needs its OWN fresh
+    // executable quote and size, rather than the pending order's reference.
+    let price = if let Some(band) = market_band {
+        let fresh = broker
+            .trader
+            .quote(req.instrument)
+            .await
+            .map_err(|_| EntryError::AccountFetch)?;
+        let (_, price) = entry_price(req, &symbol, fresh.bid, fresh.ask)?;
+        let aligned_request = EntryRequest {
+            stop_loss: stop,
+            take_profit: take,
+            instrument: req.instrument,
+            direction: req.direction,
+            entry: req.entry.clone(),
+            risk: req.risk,
+            dry_run: req.dry_run,
+            contract_multiplier: req.contract_multiplier,
+        };
+        band.check(&aligned_request, price)?;
+        price
+    } else {
+        price
+    };
     let loss = contract::loss_per_lot(symbol.calc_mode, symbol.contract_size, price, stop, rate)?;
     let lots = sizing::lots(req.risk, equity, loss, cap, &symbol.rules)?;
     let order = OrderRequest {
@@ -111,13 +139,22 @@ fn entry_price(
         ResolvedEntry::Stop { trigger_price } => (OrderKind::Stop, align(trigger_price, s)?),
         ResolvedEntry::Limit { trigger_price } => (OrderKind::Limit, align(trigger_price, s)?),
     };
-    let distance = match (kind, req.direction) {
-        (OrderKind::Stop, Direction::Long) | (OrderKind::Limit, Direction::Short) => price - market,
-        (OrderKind::Stop, Direction::Short) | (OrderKind::Limit, Direction::Long) => market - price,
+    let pending_kind = match kind {
+        OrderKind::Stop => PendingEntryKind::Stop,
+        OrderKind::Limit => PendingEntryKind::Limit,
         _ => return Ok((kind, price)),
     };
-    let min_distance = f64::from(s.rules.stops_points.max(0)) * s.point;
-    if distance <= 0.0 || distance < min_distance {
+    let snapshot = PendingEntryDistance {
+        kind: pending_kind,
+        direction: req.direction,
+        trigger_price: price,
+        quote: Quote { bid, ask },
+        minimum_distance: f64::from(s.rules.stops_points.max(0)) * s.point,
+    };
+    if !snapshot.is_valid() {
+        return Err(EntryError::OrderRejected);
+    }
+    if snapshot.is_rejected() {
         tracing::warn!(
             instrument = req.instrument,
             direction = ?req.direction,
@@ -125,11 +162,15 @@ fn entry_price(
             price,
             bid,
             ask,
-            distance,
-            min_distance,
+            distance = snapshot.signed_distance(),
+            min_distance = snapshot.minimum_distance,
             "MT5 pending entry blocked before transmission: trigger too close to market"
         );
-        return Err(EntryError::EntryTooCloseToMarket);
+        return Err(if snapshot.is_near() {
+            EntryError::EntryWithinMinimumDistance(snapshot)
+        } else {
+            EntryError::EntryTooCloseToMarket
+        });
     }
     Ok((kind, price))
 }

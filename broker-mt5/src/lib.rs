@@ -55,7 +55,16 @@ impl Broker for Mt5Broker {
         positions: u32,
         req: &EntryRequest<'_>,
     ) -> std::result::Result<Placement, EntryError> {
-        entry::place(self, cap, positions, req).await
+        entry::place(self, cap, positions, req, None).await
+    }
+    async fn place_market_entry_in_band(
+        &self,
+        cap: f64,
+        positions: u32,
+        req: &EntryRequest<'_>,
+        band: MarketEntryBand,
+    ) -> std::result::Result<Placement, EntryError> {
+        entry::place(self, cap, positions, req, Some(band)).await
     }
     async fn close_positions(&self, instrument: &str) -> CloseOutcome {
         let Ok(trades) = self.trader.trades().await else {

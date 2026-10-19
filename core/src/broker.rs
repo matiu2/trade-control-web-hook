@@ -16,6 +16,8 @@ use crate::settlement::Settlement;
 
 mod candles;
 pub use candles::*;
+mod entry_distance;
+pub use entry_distance::{MarketEntryBand, PendingEntryDistance, PendingEntryKind};
 
 /// A live two-sided quote. `spread()` is the spread-blackout feature's
 /// filter signal; entry recovery uses ask for longs and bid for shorts.
@@ -260,6 +262,11 @@ pub enum EntryError {
     /// or skip) instead of dropping the entry. The stop-loss distance is
     /// **not** the cause.
     EntryTooCloseToMarket,
+    /// Verified local pending-entry rejection with the executable quote and
+    /// broker minimum; only evidence inside that band permits market rescue.
+    EntryWithinMinimumDistance(PendingEntryDistance),
+    /// A guarded market recovery could not enforce its price band or R floor.
+    MarketRecoveryDeclined(String),
     OrderRejected,
     /// The broker confirmed the HTTP call succeeded but the response body
     /// could not be parsed, so whether an order was actually placed is
@@ -294,12 +301,13 @@ impl core::fmt::Display for EntryError {
             Self::EntryTooCloseToMarket => {
                 f.write_str("entry trigger too close to (or wrong side of) the market price")
             }
+            Self::EntryWithinMinimumDistance(distance) => distance.fmt(f),
+            Self::MarketRecoveryDeclined(reason) => f.write_str(reason),
             Self::OrderRejected => f.write_str("broker rejected the order"),
             Self::AmbiguousSuccess(detail) => write!(
                 f,
-                "broker confirmed the request but the response could not be \
-                 read — an order may have been placed; check the broker \
-                 directly before retrying ({detail})"
+                "entry submission outcome is unknown; an order may already exist; \
+                 reconcile with the broker before retrying ({detail})"
             ),
         }
     }
@@ -459,6 +467,23 @@ pub trait Broker {
         max_open_positions: u32,
         req: &EntryRequest<'_>,
     ) -> impl Future<Output = Result<Placement, EntryError>>;
+
+    /// Market rescue after verified stop AND limit proximity rejections.
+    /// Implementations must enforce `band` on their own fresh sizing quote.
+    /// Unsupported brokers decline rather than delegate to an unbounded entry.
+    fn place_market_entry_in_band(
+        &self,
+        _max_risk_pct: f64,
+        _max_open_positions: u32,
+        _req: &EntryRequest<'_>,
+        _band: MarketEntryBand,
+    ) -> impl Future<Output = Result<Placement, EntryError>> {
+        async {
+            Err(EntryError::MarketRecoveryDeclined(
+                "broker cannot enforce the market fallback price band".into(),
+            ))
+        }
+    }
 
     /// Close all positions for `instrument`.
     ///

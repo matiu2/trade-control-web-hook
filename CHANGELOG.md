@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-10-19 — bounded market fallback after two proximity rejections
+
+MT5 stop entries configured to recover as limits now have one third attempt:
+market, only after BOTH stop and limit fail local validation inside the broker
+minimum-distance band at the original trigger. Generic wrong-side errors and
+other failures cannot authorize it. A fresh executable price must remain inside
+the narrower band (and any explicit slippage allowance); MT5 rechecks after
+account/FX reads, preserves SL/TP, revalidates minimum R and entry veto levels,
+and sizes again.
+
+Entry outcomes now preserve the recovery stage, original trigger, bid/ask,
+distance and minimum, and explain why market was not attempted or confirmed.
+Recovered markets are labelled `entered` and use the placed reference in their
+break-even snapshot. The chain consumes one entry attempt. Uncertain responses
+from any recovery preserve duplicate suppression rather than becoming ordinary
+retryable price failures. Dry runs show their stages without submitting trades.
+
+Tests cover the recorded AUDJPY 110.138 trigger with bid/ask 110.123/110.133,
+the short mirror, accepted limits, unrelated failures at either pending stage,
+uncertainty, moved/invalid quotes, exact minimum-distance rounding, price/R
+bounds, explicit caps, dry runs and one-attempt bookkeeping. This fixes the
+placement lifecycle for near-price failures; it does not enable continuous
+trigger watching or change the separately tracked replay rejection model.
+
 ## 2026-10-19 — use executable quotes for entry recovery
 
 Stop-entry recovery now checks the ask for longs and bid for shorts, matching

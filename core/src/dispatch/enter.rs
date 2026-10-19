@@ -16,6 +16,8 @@ use crate::spread_blackout;
 use crate::state::{StateStore, veto_ttl_seconds};
 
 #[cfg(test)]
+mod near_market_tests;
+#[cfg(test)]
 mod recovery_quote_tests;
 
 /// Render a raw price for an operator-facing message: fixed generous precision
@@ -1056,20 +1058,51 @@ pub async fn run_enter<B: Broker, S: StateStore>(
         None
     };
 
-    // First placement. On `EntryTooCloseToMarket` (TN `#19-10`), the
-    // stop trigger was overtaken by price; the optional `recover_entry`
-    // policy may recover with a *single* synchronous market re-place
-    // (never a loop — a too-close means price is moving). The re-place
-    // is the SAME intended entry, so it shares `retry_attempt_no` and
-    // does not consume an extra multi-shot slot.
+    // A verified near-price rejection may try stop → limit → bounded market.
+    // Generic wrong-side rejections keep the configured single recovery.
+    // All stages are the SAME entry, sharing one retry_attempt_no; no loops.
     // Set by the fallback when it declines to recover, so the failure
     // outcome can name *why* (not just that the entry was forfeited).
     let mut recover_skip_reason: Option<&'static str> = None;
+    let mut recovery_detail = String::new();
     let placement = match broker
         .place_entry(max_risk_pct, max_open_positions, &entry_request)
         .await
     {
         Ok(placed) => Ok(placed),
+        Err(EntryError::EntryWithinMinimumDistance(distance))
+            if matches!(resolved.entry, crate::intent::ResolvedEntry::Stop { .. })
+                && resolved
+                    .recover_entry
+                    .is_some_and(|r| r.action == crate::intent::RecoverEntryAction::Limit) =>
+        {
+            super::near_market::recover(
+                broker,
+                &resolved,
+                distance,
+                &verified.intent.entry_level_vetos,
+                max_risk_pct,
+                max_open_positions,
+                &mut recovery_detail,
+            )
+            .await
+            .map(|recovered| {
+                resolved.entry = recovered.entry;
+                recovered.placement
+            })
+        }
+        Err(EntryError::EntryWithinMinimumDistance(distance)) => {
+            recovery_detail = distance.to_string();
+            place_entry_too_close_fallback(
+                broker,
+                &resolved,
+                &verified.intent.id,
+                max_risk_pct,
+                max_open_positions,
+                &mut recover_skip_reason,
+            )
+            .await
+        }
         Err(EntryError::EntryTooCloseToMarket) => {
             place_entry_too_close_fallback(
                 broker,
@@ -1089,7 +1122,10 @@ pub async fn run_enter<B: Broker, S: StateStore>(
             let order_id = placed.order_id.clone();
             if resolved.dry_run {
                 tracing::info!("DRY-RUN entry id={} (not placed)", verified.intent.id);
-                ActionResult::Ok(format!("dry-run: id={}", verified.intent.id))
+                ActionResult::Ok(super::near_market::describe(
+                    format!("dry-run: id={}", verified.intent.id),
+                    &recovery_detail,
+                ))
             } else {
                 tracing::info!("entry placed id={} order={}", verified.intent.id, order_id);
                 if let Some(attempt_no) = retry_attempt_no {
@@ -1230,10 +1266,13 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 //
                 // The VERB is chosen from the order type, because a placement is
                 // not a fill — see `placement_verb`.
-                ActionResult::Ok(format!(
-                    "{}: order={order_id}{}",
-                    placement_verb(&resolved.entry),
-                    placed.describe_fill()
+                ActionResult::Ok(super::near_market::describe(
+                    format!(
+                        "{}: order={order_id}{}",
+                        placement_verb(&resolved.entry),
+                        placed.describe_fill()
+                    ),
+                    &recovery_detail,
                 ))
             }
         }
@@ -1281,7 +1320,10 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                     "entry blocked: computed position size is below the broker minimum \
                      (sl_distance {r_distance})",
                 ),
-                outcome: format!("rejected: units-below-minimum{parked}"),
+                outcome: super::near_market::describe(
+                    format!("rejected: units-below-minimum{parked}"),
+                    &recovery_detail,
+                ),
             }
         }
         Err(err @ EntryError::AmbiguousSuccess(_)) => {
@@ -1290,7 +1332,10 @@ pub async fn run_enter<B: Broker, S: StateStore>(
             // next fire from placing a duplicate on top of it. This is the
             // one outcome where "let the next bar retry" is the dangerous
             // choice rather than the safe one. See EntryError::AmbiguousSuccess.
-            let outcome = recover_entry::outcome_for_entry_failure(&err, recover_skip_reason);
+            let outcome = super::near_market::describe(
+                recover_entry::outcome_for_entry_failure(&err, recover_skip_reason),
+                &recovery_detail,
+            );
             tracing::error!(
                 "entry outcome unknown, NOT retrying: {err} ({outcome}) — verify at the broker"
             );
@@ -1301,7 +1346,10 @@ pub async fn run_enter<B: Broker, S: StateStore>(
             // a too-close / broker failure must never poison the seen-id
             // so the next signal bar can retry. The too-close case gets
             // a distinct outcome string for log-grep observability.
-            let outcome = recover_entry::outcome_for_entry_failure(&err, recover_skip_reason);
+            let outcome = super::near_market::describe(
+                recover_entry::outcome_for_entry_failure(&err, recover_skip_reason),
+                &recovery_detail,
+            );
             tracing::error!("entry failed: {err} ({outcome})");
             ActionResult::Failed(outcome)
         }
@@ -1679,7 +1727,7 @@ async fn maybe_update_mw_state<B: Broker>(
     }
 }
 
-/// Single synchronous market re-place for a stop-entry rejected with
+/// Configured synchronous recovery for a stop-entry rejected with
 /// `#19-10` ("entry too close to / wrong side of market"). Reads the
 /// current market price, applies the `recover_entry` slippage guard
 /// (pure [`recover_entry::recover_entry_plan`]), and on a within-threshold
@@ -1699,7 +1747,9 @@ async fn maybe_update_mw_state<B: Broker>(
 /// Returns the original [`EntryError::EntryTooCloseToMarket`] (so the
 /// caller surfaces the distinct outcome) when the fallback is absent,
 /// out of threshold, `skip`, a wrong-side `limit`, or the re-place
-/// itself fails / the price read fails. One attempt only.
+/// the price read fails. A recovery submission failure is propagated unchanged,
+/// especially an uncertain broker outcome. One attempt only; the distinct
+/// verified-proximity path in `near_market` owns the third market attempt.
 /// `skip_reason` is an **out-parameter**: on any path that declines to
 /// recover it is set to the short `recover-entry-*` token naming why, so
 /// the caller can record it in the ledger outcome. It stays `None` when a
@@ -1815,14 +1865,12 @@ async fn place_entry_too_close_fallback<B: Broker>(
                     Ok(placed)
                 }
                 Err(err) => {
-                    // One attempt only — do not loop. Surface the
-                    // original too-close identity so telemetry shows the
-                    // recovery was attempted and failed, and the seen-id
-                    // stays un-poisoned for the next bar.
+                    // Preserve the actual error: an uncertain submission
+                    // must reach the caller's duplicate-suppression branch.
                     tracing::error!(
                         "too-close fallback: market re-place failed: {err} (id={intent_id})"
                     );
-                    Err(EntryError::EntryTooCloseToMarket)
+                    Err(err)
                 }
             }
         }
@@ -1861,13 +1909,12 @@ async fn place_entry_too_close_fallback<B: Broker>(
                     Ok(placed)
                 }
                 Err(err) => {
-                    // One attempt only. Surface the original too-close
-                    // identity so the seen-id stays un-poisoned and the
-                    // next bar can retry.
+                    // An unrelated or uncertain error is not evidence of
+                    // another distance rejection and must remain intact.
                     tracing::error!(
                         "too-close fallback: limit re-place failed: {err} (id={intent_id})"
                     );
-                    Err(EntryError::EntryTooCloseToMarket)
+                    Err(err)
                 }
             }
         }
@@ -1907,7 +1954,7 @@ async fn place_entry_too_close_fallback<B: Broker>(
                     tracing::error!(
                         "too-close fallback: stop re-place failed: {err} (id={intent_id})"
                     );
-                    Err(EntryError::EntryTooCloseToMarket)
+                    Err(err)
                 }
             }
         }

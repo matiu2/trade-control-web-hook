@@ -49,6 +49,8 @@ fn failure_token(err: &EntryError) -> &'static str {
         EntryError::UnitsBelowMinimum => "units-below-minimum",
         EntryError::ContractSizeUnavailable => "contract-size-unavailable",
         EntryError::EntryTooCloseToMarket => "too-close-to-market",
+        EntryError::EntryWithinMinimumDistance(_) => "pending-entry-too-close",
+        EntryError::MarketRecoveryDeclined(_) => "market-recovery-declined",
         EntryError::OrderRejected => "broker-rejected",
         EntryError::AmbiguousSuccess(_) => "ambiguous-success",
     }
@@ -301,6 +303,17 @@ mod tests {
             EntryError::UnitsBelowMinimum,
             EntryError::ContractSizeUnavailable,
             EntryError::EntryTooCloseToMarket,
+            EntryError::EntryWithinMinimumDistance(crate::broker::PendingEntryDistance {
+                kind: crate::broker::PendingEntryKind::Stop,
+                direction: Direction::Long,
+                trigger_price: 110.138,
+                quote: crate::broker::Quote {
+                    bid: 110.123,
+                    ask: 110.133,
+                },
+                minimum_distance: 0.010,
+            }),
+            EntryError::MarketRecoveryDeclined("outside the permitted price band".into()),
             EntryError::OrderRejected,
         ];
         let tokens: Vec<&str> = all.iter().map(failure_token).collect();
