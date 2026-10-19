@@ -235,6 +235,13 @@ pub struct EntryRequest<'a> {
 #[derive(Debug)]
 pub enum EntryError {
     AccountFetch,
+    /// Position risk could not be converted into the account currency before
+    /// submission. Keep the pair and cause visible in operator outcomes.
+    CurrencyConversion {
+        from: String,
+        to: String,
+        detail: String,
+    },
     EquityParse,
     RiskCapExceeded {
         requested: f64,
@@ -289,6 +296,12 @@ impl core::fmt::Display for EntryError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::AccountFetch => f.write_str("failed to fetch account"),
+            Self::CurrencyConversion { from, to, detail } => {
+                write!(
+                    f,
+                    "failed to convert {from} to {to} for position sizing: {detail}"
+                )
+            }
             Self::EquityParse => f.write_str("failed to parse account equity"),
             Self::RiskCapExceeded { requested, cap } => {
                 write!(f, "risk {requested}% > cap {cap}%")

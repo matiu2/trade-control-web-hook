@@ -43,6 +43,7 @@ use crate::intent::{Direction, RecoverEntryAction, ResolvedRecoverEntry};
 fn failure_token(err: &EntryError) -> &'static str {
     match err {
         EntryError::AccountFetch => "account-fetch",
+        EntryError::CurrencyConversion { .. } => "currency-conversion",
         EntryError::EquityParse => "equity-parse",
         EntryError::RiskCapExceeded { .. } => "risk-cap-exceeded",
         EntryError::OpenPositionsCapExceeded => "open-positions-cap",
@@ -294,6 +295,11 @@ mod tests {
         use std::collections::HashSet;
         let all = [
             EntryError::AccountFetch,
+            EntryError::CurrencyConversion {
+                from: "JPY".into(),
+                to: "USD".into(),
+                detail: "no listed conversion route".into(),
+            },
             EntryError::EquityParse,
             EntryError::RiskCapExceeded {
                 requested: 2.0,
@@ -345,6 +351,19 @@ mod tests {
         assert!(outcome.contains("risk-cap-exceeded"), "{outcome}");
         assert!(outcome.contains('2'), "lost the requested pct: {outcome}");
         assert!(outcome.contains('1'), "lost the cap: {outcome}");
+    }
+
+    #[test]
+    fn currency_conversion_failure_preserves_pair_and_cause_in_operator_outcomes() {
+        let outcome = outcome_for_entry_error(&EntryError::CurrencyConversion {
+            from: "JPY".into(),
+            to: "USD".into(),
+            detail: "USDJPY quote timed out".into(),
+        });
+        assert_eq!(
+            outcome,
+            "entry-failed: currency-conversion (failed to convert JPY to USD for position sizing: USDJPY quote timed out)"
+        );
     }
 
     /// The recovery skip reason must reach the ledger, not just the log.
