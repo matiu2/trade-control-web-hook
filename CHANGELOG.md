@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-10-19 — use executable quotes for entry recovery
+
+Stop-entry recovery now checks the ask for longs and bid for shorts, matching
+broker placement. Using mid could skip a valid recovery limit when the trigger
+was inside the spread, or allow a market recovery beyond its slippage bound.
+MT5's local pending-entry rejection now logs the bid, ask, trigger, distance
+and broker minimum, explicitly stating that the order was never transmitted.
+
+Investigation of `ihs-audjpy-4c834155` found a long stop at 110.138, SL 109.720
+and TP 110.999. AUDJPY requires 0.010 minimum entry distance. Historical ticks
+at 02:00:17.779 UTC were bid 110.123 / ask 110.133, matching the logged recovery
+mid 110.128: the configured limit fallback correctly declined this particular
+attempt. MT5 history contained no AUDJPY orders or deals around the attempt.
+The quote-selection fix does not change that historical verdict.
+
+Regression tests cover both directions inside the spread, executable-price
+market slippage and sizing references, read failures, wrong-side controls and
+the actual AUDJPY recovery quote. The separate replay rejection gap remains
+tracked in `BUG-replay-blind-to-broker-entry-recovery.md`; a replay position
+does not establish that a live order was accepted.
+
 ## v154 — 2026-10-11 — refresh forming range candles
 
 Shared candle-cache excludes forming bars from range persistence and coverage,

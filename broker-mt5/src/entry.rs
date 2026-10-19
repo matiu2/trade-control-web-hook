@@ -116,7 +116,19 @@ fn entry_price(
         (OrderKind::Stop, Direction::Short) | (OrderKind::Limit, Direction::Long) => market - price,
         _ => return Ok((kind, price)),
     };
-    if distance <= 0.0 || distance < f64::from(s.rules.stops_points.max(0)) * s.point {
+    let min_distance = f64::from(s.rules.stops_points.max(0)) * s.point;
+    if distance <= 0.0 || distance < min_distance {
+        tracing::warn!(
+            instrument = req.instrument,
+            direction = ?req.direction,
+            ?kind,
+            price,
+            bid,
+            ask,
+            distance,
+            min_distance,
+            "MT5 pending entry blocked before transmission: trigger too close to market"
+        );
         return Err(EntryError::EntryTooCloseToMarket);
     }
     Ok((kind, price))

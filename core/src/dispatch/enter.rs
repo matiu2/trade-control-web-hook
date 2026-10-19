@@ -15,6 +15,9 @@ use crate::recover_entry;
 use crate::spread_blackout;
 use crate::state::{StateStore, veto_ttl_seconds};
 
+#[cfg(test)]
+mod recovery_quote_tests;
+
 /// Render a raw price for an operator-facing message: fixed generous precision
 /// (enough for 5dp FX and finer) with trailing zeros trimmed, so an index level
 /// like `209.99` doesn't print as `209.9930432131929` (float dust from the
@@ -1731,19 +1734,34 @@ async fn place_entry_too_close_fallback<B: Broker>(
         }
     };
 
-    // The current price drives both the slippage guard and the new
-    // market reference. A failed read is "price unavailable" → skip.
-    let current_price = match broker.get_current_price(&resolved.instrument).await {
-        Ok(p) => p,
+    // Recovery must use the same executable side as placement: ask for buys,
+    // bid for sells. A trigger inside the spread can already be overtaken by
+    // that side while mid still says a recovery limit is on the wrong side.
+    let quote = match broker.get_quote(&resolved.instrument).await {
+        Ok(quote) => quote,
         Err(err) => {
             tracing::error!(
-                "too-close fallback: get_current_price({}) failed: {err} (id={intent_id})",
+                "too-close fallback: get_quote({}) failed: {err} (id={intent_id})",
                 resolved.instrument
             );
             *skip_reason = Some("recover-entry-price-read-failed");
             return Err(EntryError::EntryTooCloseToMarket);
         }
     };
+    let current_price = match resolved.direction {
+        crate::intent::Direction::Long => quote.ask,
+        crate::intent::Direction::Short => quote.bid,
+    };
+    tracing::info!(
+        id = intent_id,
+        instrument = resolved.instrument,
+        direction = ?resolved.direction,
+        bid = quote.bid,
+        ask = quote.ask,
+        trigger_price,
+        current_price,
+        "too-close fallback: checking executable quote"
+    );
 
     match recover_entry::recover_entry_plan(
         resolved.recover_entry.as_ref(),

@@ -18,7 +18,7 @@ mod candles;
 pub use candles::*;
 
 /// A live two-sided quote. `spread()` is the spread-blackout feature's
-/// filter signal; everything else in the codebase only needs `mid()`.
+/// filter signal; entry recovery uses ask for longs and bid for shorts.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Quote {
     pub bid: f64,
@@ -535,8 +535,9 @@ pub trait Broker {
     ) -> impl Future<Output = Result<(), CancelError>>;
 
     /// Fetch a live two-sided [`Quote`] for an instrument. The
-    /// spread-blackout systems read [`Quote::spread`]; everything else
-    /// reads [`Quote::mid`] via the [`Broker::get_current_price`] default.
+    /// spread-blackout systems read [`Quote::spread`]; entry recovery uses
+    /// ask for longs and bid for shorts. Price-path watchers use [`Quote::mid`]
+    /// via the [`Broker::get_current_price`] default.
     fn get_quote(&self, instrument: &str) -> impl Future<Output = Result<Quote, LookupError>>;
 
     /// All open positions on the account.

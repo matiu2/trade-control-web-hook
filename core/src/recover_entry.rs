@@ -136,7 +136,8 @@ pub enum RecoverEntryPlan {
 ///
 /// `recover_entry` is the resolved recovery carried on the trade (`None`
 /// when the operator didn't opt in). `trigger_price` is the original
-/// stop trigger; `current_price` is a fresh read of the market.
+/// stop trigger; `current_price` is the fresh executable entry price (ask for
+/// longs, bid for shorts), never the midpoint.
 ///
 /// Rules:
 /// - No fallback, or `skip` → [`RecoverEntryPlan::Skip`] (today's behaviour).
