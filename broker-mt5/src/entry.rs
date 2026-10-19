@@ -1,7 +1,5 @@
-use crate::{Mt5Broker, contract, mapping, sizing};
-use mt5_data_source::web::trading::{
-    Direction as Side, OrderKind, OrderRequest, SymbolInfo, Trader,
-};
+use crate::{Mt5Broker, contract, currency_conversion, mapping, sizing};
+use mt5_data_source::web::trading::{Direction as Side, OrderKind, OrderRequest, SymbolInfo};
 use trade_control_core::{
     broker::*,
     intent::{Direction, ResolvedEntry},
@@ -50,7 +48,9 @@ pub(crate) async fn place(
             .iter()
             .map(|p| p.profit + p.swap + p.commission)
             .sum::<f64>();
-    let rate = currency_rate(&broker.trader, &symbol.profit_currency, &account.currency).await?;
+    let rate =
+        currency_conversion::rate(&broker.trader, &symbol.profit_currency, &account.currency)
+            .await?;
     let loss = contract::loss_per_lot(symbol.calc_mode, symbol.contract_size, price, stop, rate)?;
     let lots = sizing::lots(req.risk, equity, loss, cap, &symbol.rules)?;
     let order = OrderRequest {
@@ -147,36 +147,5 @@ pub(crate) fn validate_stops(
         Ok(())
     } else {
         Err(EntryError::OrderRejected)
-    }
-}
-/// Conservative cost conversion: paying quote currency uses ask; inverse uses bid.
-async fn leg(trader: &Trader, from: &str, to: &str) -> Option<f64> {
-    if from == to {
-        return Some(1.0);
-    }
-    if let Ok(q) = trader.quote(&format!("{from}{to}")).await {
-        return Some(q.ask);
-    }
-    trader
-        .quote(&format!("{to}{from}"))
-        .await
-        .ok()
-        .map(|q| 1.0 / q.bid)
-}
-async fn currency_rate(trader: &Trader, from: &str, to: &str) -> Result<f64, EntryError> {
-    let rate = if let Some(rate) = leg(trader, from, to).await {
-        rate
-    } else {
-        leg(trader, from, "USD")
-            .await
-            .ok_or(EntryError::AccountFetch)?
-            * leg(trader, "USD", to)
-                .await
-                .ok_or(EntryError::AccountFetch)?
-    };
-    if rate.is_finite() && rate > 0.0 {
-        Ok(rate)
-    } else {
-        Err(EntryError::AccountFetch)
     }
 }

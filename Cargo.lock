@@ -373,6 +373,7 @@ dependencies = [
  "chrono",
  "color-eyre",
  "mt5-data-source",
+ "tokio",
  "tracing",
  "tracing-error",
  "tracing-subscriber",

@@ -1,6 +1,7 @@
 //! Named MT5 demo/competition execution and tick-derived mid history.
 mod candles;
 pub mod contract;
+mod currency_conversion;
 mod entry;
 mod history;
 mod mapping;
