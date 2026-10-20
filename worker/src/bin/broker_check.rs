@@ -21,6 +21,8 @@
 //! OANDA_API_KEY=… trade-control-broker-check testing --instrument EUR/USD
 //! ```
 
+#[path = "broker_check/ctrader.rs"]
+mod ctrader_probe;
 #[path = "broker_check/mt5.rs"]
 mod mt5_probe;
 
@@ -31,8 +33,8 @@ use trade_control_core::account::{MetadataError, MetadataStore};
 use trade_control_core::broker::Broker;
 use trade_control_core::intent::BrokerKind;
 use trade_control_worker::{
-    BrokerError, Config, PgMetadataStore, PgStateStore, Secrets, acquire_ctrader, acquire_ibkr,
-    acquire_mt5, acquire_oanda, acquire_tn,
+    BrokerError, Config, PgMetadataStore, PgStateStore, Secrets, acquire_ibkr, acquire_mt5,
+    acquire_oanda, acquire_tn,
 };
 
 #[derive(Parser)]
@@ -109,14 +111,7 @@ async fn main() -> Result<()> {
                     "MT5-specific diagnostic flags do not apply to cTrader"
                 ));
             }
-            let broker = acquire_ctrader(&meta).await.map_err(|e| eyre!("{e}"))?;
-            let instrument = broker.instrument_metadata(&cli.instrument).await?;
-            let equity = broker.equity().await?;
-            println!(
-                "cTrader authenticated: equity={equity}; symbol={} pip_size={} min_units={} step_units={}",
-                instrument.name, instrument.pip_size, instrument.min_units, instrument.step_units
-            );
-            broker.get_quote(&cli.instrument).await
+            Ok(ctrader_probe::check(&meta, &cli.instrument).await?)
         }
         BrokerKind::Mt5 => {
             let broker = acquire_mt5(&meta).await.map_err(|e| eyre!("{e}"))?;
@@ -185,7 +180,7 @@ async fn main() -> Result<()> {
                 q.ask,
                 q.spread()
             );
-            println!("broker session is LIVE — this account can place demo trades.");
+            println!("read-only quote access verified; order execution was not tested.");
             Ok(())
         }
         Err(e) => Err(eyre!(

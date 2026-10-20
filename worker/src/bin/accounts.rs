@@ -246,6 +246,10 @@ async fn main() -> Result<()> {
 async fn list(accounts: &PgMetadataStore, json: bool) -> Result<()> {
     let rows = accounts.list().await.map_err(meta_err)?;
     if json {
+        let rows = rows
+            .iter()
+            .map(trade_control_worker::account_capabilities::listing)
+            .collect::<Vec<_>>();
         println!("{}", serde_json::to_string(&rows)?);
         return Ok(());
     }
@@ -283,9 +287,8 @@ async fn add(
     max_open_positions: Option<u32>,
 ) -> Result<()> {
     if broker == BrokerKind::Ctrader {
-        let config = ctrader_api::Config::load(&name)?;
-        trade_control_worker::validate_ctrader_config(kind, oanda_account_id.as_deref(), &config)
-            .map_err(|error| eyre!("{error}"))?;
+        broker_ctrader::access::Profile::load(&name)?
+            .validate(kind.is_live(), oanda_account_id.as_deref())?;
     }
     if broker == BrokerKind::Mt5 {
         if kind.is_live() {
@@ -354,6 +357,13 @@ fn render(m: &AccountMetadata) -> String {
     }
     if let Some(p) = m.caps.max_open_positions {
         s.push_str(&format!("  max_open_positions={p}"));
+    }
+    if m.broker == BrokerKind::Ctrader {
+        let capabilities = trade_control_worker::account_capabilities::capabilities(m);
+        s.push_str(&format!(
+            "  {} ({})",
+            capabilities.readiness, capabilities.reason
+        ));
     }
     s
 }

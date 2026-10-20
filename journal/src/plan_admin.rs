@@ -39,6 +39,33 @@ pub struct AccountChoice {
     pub name: String,
     pub broker: String,
     pub kind: String,
+    #[serde(default)]
+    pub capabilities: Option<AccountCapabilities>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct AccountCapabilities {
+    pub quotes: bool,
+    pub execution: bool,
+    pub history: bool,
+    pub readiness: String,
+    pub reason: String,
+}
+
+impl AccountChoice {
+    pub fn unavailable_reason(&self, purpose: AccountPurpose) -> Option<&str> {
+        match &self.capabilities {
+            Some(caps)
+                if !caps.history || (purpose == AccountPurpose::SwapAccount && !caps.execution) =>
+            {
+                Some(&caps.reason)
+            }
+            None if self.broker == "ctrader" => {
+                Some("cTrader capability unknown; refresh account configuration")
+            }
+            _ => None,
+        }
+    }
 }
 
 pub fn parse_accounts(json: &str) -> Result<Vec<AccountChoice>> {
@@ -135,5 +162,17 @@ mod tests {
         let text = PlanAction::ClosedManually.explanation("trade-1");
         assert!(text.contains("already closed"));
         assert!(text.contains("No broker-close request"));
+    }
+
+    #[test]
+    fn quote_only_and_unknown_ctrader_are_unavailable_for_both_plan_actions() {
+        let choices = parse_accounts(r#"[{"name":"fix","broker":"ctrader","kind":"demo","capabilities":{"quotes":true,"execution":false,"history":false,"readiness":"quotes-only","reason":"Open API needed"}},{"name":"unknown","broker":"ctrader","kind":"demo"}]"#).unwrap();
+        for purpose in [AccountPurpose::Paper, AccountPurpose::SwapAccount] {
+            assert!(
+                choices
+                    .iter()
+                    .all(|account| account.unavailable_reason(purpose).is_some())
+            );
+        }
     }
 }

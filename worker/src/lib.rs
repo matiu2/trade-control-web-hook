@@ -36,4 +36,5 @@ pub use secrets::{
     DEFAULT_MAX_OPEN_POSITIONS, DEFAULT_MAX_RISK_PCT, DEFAULT_PIP_SIZE, Secrets, SecretsError,
 };
 
+pub mod account_capabilities;
 pub mod attempt_recording;

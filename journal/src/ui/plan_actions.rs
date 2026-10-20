@@ -108,15 +108,23 @@ fn account_lines(picker: &AccountPicker, height: u16) -> Vec<Line<'static>> {
         .map(|(index, account)| {
             let selected = index == picker.selected;
             let marker = if selected { "▶" } else { " " };
-            let style = if selected {
+            let unavailable = account.unavailable_reason(picker.purpose);
+            let style = if unavailable.is_some() {
+                Style::default().fg(Color::DarkGray)
+            } else if selected {
                 button_style()
             } else {
                 Style::default().fg(Color::White)
             };
             Line::styled(
                 format!(
-                    "{marker} {}  {}  {}",
-                    account.name, account.broker, account.kind
+                    "{marker} {}  {}  {}{}",
+                    account.name,
+                    account.broker,
+                    account.kind,
+                    unavailable
+                        .map(|reason| format!("  [unavailable: {reason}]"))
+                        .unwrap_or_default()
                 ),
                 style,
             )
@@ -345,6 +353,7 @@ mod tests {
                 name: "reversals".into(),
                 broker: "tradenation".into(),
                 kind: "demo".into(),
+                capabilities: None,
             }],
             selected: 0,
         });
@@ -360,5 +369,23 @@ mod tests {
                 account: "reversals".into()
             }
         );
+    }
+
+    #[test]
+    fn quote_only_account_click_cannot_confirm_a_plan_transition() {
+        let mut app = app();
+        for purpose in [AccountPurpose::Paper, AccountPurpose::SwapAccount] {
+            let accounts = crate::plan_admin::parse_accounts(r#"[{"name":"ctrader-demo","broker":"ctrader","kind":"demo","capabilities":{"quotes":true,"execution":false,"history":false,"readiness":"quotes-only","reason":"FIX quotes only; Open API needed"}}]"#).unwrap();
+            app.account_picker = Some(AccountPicker {
+                trade_id: "original-trade".into(),
+                purpose,
+                accounts,
+                selected: 0,
+            });
+            app.accept_account();
+            assert!(app.action_confirm.is_none());
+            assert!(app.account_picker.is_some());
+            assert!(app.status.text.contains("Open API"));
+        }
     }
 }

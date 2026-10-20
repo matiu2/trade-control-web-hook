@@ -374,6 +374,7 @@ mod tests {
                 name: "reversals".into(),
                 broker: "tradenation".into(),
                 kind: "demo".into(),
+                capabilities: None,
             }],
             selected: 0,
         });

@@ -12,6 +12,12 @@
 //!   - `unlock <INSTRUMENT>` — POST a signed control body that clears
 //!     the cooldown for one instrument.
 
+#[path = "trade_control/control_validation.rs"]
+mod control_validation;
+use control_validation::{
+    canonicalize_instrument, canonicalize_instrument_or_force, scope_ctrader_control,
+};
+
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -608,6 +614,9 @@ struct UnlockCmdArgs {
     /// `XAUUSD.F`) and the canonical name won't match it.
     #[arg(long)]
     force: bool,
+    /// Named cTrader Open API profile and control scope (required for cTrader).
+    #[arg(long, required_if_eq("broker", "ctrader"))]
+    account: Option<String>,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -631,6 +640,9 @@ struct PrepCmdArgs {
     /// Broker the instrument belongs to (see `unlock --broker`).
     #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
     broker: BrokerKindArg,
+    /// Named cTrader Open API profile and control scope (required for cTrader).
+    #[arg(long, required_if_eq("broker", "ctrader"))]
+    account: Option<String>,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -662,6 +674,9 @@ struct VetoCmdArgs {
     /// Broker the instrument belongs to (see `unlock --broker`).
     #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
     broker: BrokerKindArg,
+    /// Named cTrader Open API profile and control scope (required for cTrader).
+    #[arg(long, required_if_eq("broker", "ctrader"))]
+    account: Option<String>,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -695,7 +710,7 @@ struct ClearPrepCmdArgs {
     /// `(account, instrument, step)`; omit for a global (`_`) prep, or pass
     /// the account name (e.g. `reversals`) to clear an account-scoped one.
     /// `status` shows each prep's `account:` field — match it exactly.
-    #[arg(long)]
+    #[arg(long, required_if_eq("broker", "ctrader"))]
     account: Option<String>,
     /// Broker the instrument belongs to (see `unlock --broker`).
     #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
@@ -722,7 +737,7 @@ struct ClearVetoCmdArgs {
     /// `(account, trade_id, instrument, name)`; omit for a global (`_`)
     /// veto, or pass the account name to clear an account-scoped one.
     /// `status` shows each veto's `account:` field — match it exactly.
-    #[arg(long)]
+    #[arg(long, required_if_eq("broker", "ctrader"))]
     account: Option<String>,
     /// Broker the instrument belongs to (see `unlock --broker`).
     #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
@@ -1798,8 +1813,12 @@ fn run_market_info(args: MarketInfoCmdArgs) -> Result<()> {
     // Market-info is TradeNation-only, so always canonicalize against the
     // TN catalog (unless --force) — lets the operator type US30 / EUR_USD
     // and have it resolved to the broker's MarketName before sending.
-    let instrument =
-        canonicalize_instrument_or_force(BrokerKindArg::TradeNation, &args.instrument, args.force)?;
+    let instrument = canonicalize_instrument_or_force(
+        BrokerKindArg::TradeNation,
+        None,
+        &args.instrument,
+        args.force,
+    )?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_market_info_intent(&instrument, now, &suffix);
@@ -1943,55 +1962,18 @@ fn annotate_instrument(
     }
 }
 
-/// Validate `instrument` against `broker`'s catalog, returning the canonical
-/// name (or the input verbatim when the broker has no catalog / the name
-/// already matched exactly). On miss this returns the cache's
-/// "did you mean ..." error, which the caller propagates so the worker
-/// never sees an unknown instrument.
-fn canonicalize_instrument(broker: BrokerKindArg, instrument: &str) -> Result<String> {
-    let broker_kind: BrokerKind = broker.into();
-    // No account context on these admin commands — fall back to the
-    // default-demo login. The catalog is account-agnostic so this is
-    // safe; if the local default demo is missing the operator gets a
-    // clear error pointing at the local store.
-    match validate_instrument(broker_kind, None, instrument)? {
-        Some(canonical) => {
-            tracing::warn!(
-                input = %instrument,
-                canonical = %canonical,
-                "instrument resolved to canonical broker name",
-            );
-            Ok(canonical)
-        }
-        None => Ok(instrument.to_string()),
-    }
-}
-
-/// Same as [`canonicalize_instrument`] but returns the input verbatim
-/// when `force` is set. Used by `unlock --force`, `clear-prep --force`,
-/// and `clear-veto --force` to clear stranded non-canonical keys that
-/// the catalog can't resolve.
-fn canonicalize_instrument_or_force(
-    broker: BrokerKindArg,
-    instrument: &str,
-    force: bool,
-) -> Result<String> {
-    if force {
-        tracing::warn!(
-            input = %instrument,
-            "--force: sending instrument verbatim, skipping catalog validation",
-        );
-        return Ok(instrument.to_string());
-    }
-    canonicalize_instrument(broker, instrument)
-}
-
 fn run_unlock(args: UnlockCmdArgs) -> Result<()> {
-    let key = load_key(&args.common.key_file)?;
-    let instrument = canonicalize_instrument_or_force(args.broker, &args.instrument, args.force)?;
+    let instrument = canonicalize_instrument_or_force(
+        args.broker,
+        args.account.as_deref(),
+        &args.instrument,
+        args.force,
+    )?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
-    let intent = build_unlock_intent(&instrument, now, &suffix);
+    let mut intent = build_unlock_intent(&instrument, now, &suffix);
+    scope_ctrader_control(&mut intent, args.broker, args.account.as_deref())?;
+    let key = load_key(&args.common.key_file)?;
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");
@@ -1999,11 +1981,11 @@ fn run_unlock(args: UnlockCmdArgs) -> Result<()> {
 }
 
 fn run_prep(args: PrepCmdArgs) -> Result<()> {
-    let key = load_key(&args.common.key_file)?;
-    let instrument = canonicalize_instrument(args.broker, &args.instrument)?;
+    let instrument =
+        canonicalize_instrument(args.broker, args.account.as_deref(), &args.instrument)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
-    let intent = build_prep_intent(
+    let mut intent = build_prep_intent(
         &instrument,
         &args.step,
         args.ttl_hours,
@@ -2011,6 +1993,8 @@ fn run_prep(args: PrepCmdArgs) -> Result<()> {
         now,
         &suffix,
     );
+    scope_ctrader_control(&mut intent, args.broker, args.account.as_deref())?;
+    let key = load_key(&args.common.key_file)?;
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     record_prep_use(&args.step);
@@ -2024,8 +2008,8 @@ fn run_prep(args: PrepCmdArgs) -> Result<()> {
 }
 
 fn run_veto(args: VetoCmdArgs) -> Result<()> {
-    let key = load_key(&args.common.key_file)?;
-    let instrument = canonicalize_instrument(args.broker, &args.instrument)?;
+    let instrument =
+        canonicalize_instrument(args.broker, args.account.as_deref(), &args.instrument)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     // Default level is sent as `None` to keep the wire form minimal —
@@ -2034,7 +2018,7 @@ fn run_veto(args: VetoCmdArgs) -> Result<()> {
         VetoLevelArg::StopNextEntry => None,
         other => Some(other.into()),
     };
-    let intent = build_veto_intent(
+    let mut intent = build_veto_intent(
         &instrument,
         &args.trade_id,
         &args.name,
@@ -2044,6 +2028,8 @@ fn run_veto(args: VetoCmdArgs) -> Result<()> {
         now,
         &suffix,
     );
+    scope_ctrader_control(&mut intent, args.broker, args.account.as_deref())?;
+    let key = load_key(&args.common.key_file)?;
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     record_veto_use(&args.name);
@@ -2055,17 +2041,23 @@ fn run_veto(args: VetoCmdArgs) -> Result<()> {
 }
 
 fn run_clear_prep(args: ClearPrepCmdArgs) -> Result<()> {
-    let key = load_key(&args.common.key_file)?;
-    let instrument = canonicalize_instrument_or_force(args.broker, &args.instrument, args.force)?;
+    let instrument = canonicalize_instrument_or_force(
+        args.broker,
+        args.account.as_deref(),
+        &args.instrument,
+        args.force,
+    )?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
-    let intent = build_clear_prep_intent(
+    let mut intent = build_clear_prep_intent(
         &instrument,
         &args.step,
         args.account.as_deref(),
         now,
         &suffix,
     );
+    scope_ctrader_control(&mut intent, args.broker, args.account.as_deref())?;
+    let key = load_key(&args.common.key_file)?;
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");
@@ -2073,11 +2065,15 @@ fn run_clear_prep(args: ClearPrepCmdArgs) -> Result<()> {
 }
 
 fn run_clear_veto(args: ClearVetoCmdArgs) -> Result<()> {
-    let key = load_key(&args.common.key_file)?;
-    let instrument = canonicalize_instrument_or_force(args.broker, &args.instrument, args.force)?;
+    let instrument = canonicalize_instrument_or_force(
+        args.broker,
+        args.account.as_deref(),
+        &args.instrument,
+        args.force,
+    )?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
-    let intent = build_clear_veto_intent(
+    let mut intent = build_clear_veto_intent(
         &instrument,
         &args.trade_id,
         &args.name,
@@ -2085,6 +2081,8 @@ fn run_clear_veto(args: ClearVetoCmdArgs) -> Result<()> {
         now,
         &suffix,
     );
+    scope_ctrader_control(&mut intent, args.broker, args.account.as_deref())?;
+    let key = load_key(&args.common.key_file)?;
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");

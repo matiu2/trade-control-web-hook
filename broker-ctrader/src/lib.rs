@@ -1,5 +1,6 @@
 //! cTrader platform adapter. Broker-neutral protocol lives in `ctrader-api`.
 //! Prices are reconstructed from paired historical quotes, never bid-only bars.
+pub mod access;
 mod candles;
 mod entry;
 mod history;
@@ -27,7 +28,7 @@ pub struct CtraderBroker {
 }
 impl CtraderBroker {
     pub async fn connect(name: &str) -> Result<Self> {
-        Self::connect_config(name, Config::load(name)?).await
+        Self::connect_config(name, access::Profile::load(name)?.require_execution()?).await
     }
     pub async fn connect_config(name: &str, config: Config) -> Result<Self> {
         Ok(Self {

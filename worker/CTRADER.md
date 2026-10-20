@@ -1,5 +1,43 @@
 # cTrader Open API integration
 
+## FIX quote-only accounts
+
+An account with cTrader FIX credentials can be registered before Open API OAuth
+is available. Store the QUOTE session credentials in owner-only (0600)
+`~/.config/trade-control/ctrader-fix-accounts.toml`, or override its location with
+`CTRADER_FIX_ACCOUNTS_FILE`. Each named table matches the account index name:
+
+```toml
+[ctrader-demo]
+host = "your-broker-host"
+port = 5211 # The SSL QUOTE port from your own credentials panel.
+sender_comp_id = "demo.broker.123456"
+target_comp_id = "cServer"
+sender_sub_id = "QUOTE"
+password = "your-FIX-password"
+```
+
+```sh
+trade-control-accounts add ctrader-demo --broker ctrader --kind demo
+trade-control-accounts list --json
+trade-control-broker-check ctrader-demo --instrument AUDUSD
+```
+
+Registration validates the named configuration's environment and optional pinned
+login. JSON account listings include configured quote/execution/history
+capabilities and readiness; they do not claim broker connectivity. The checker
+authenticates FIX, discovers the exact symbol and reads real bid/ask prices.
+FIX profiles support quotes only: no orders, positions, equity, candle history,
+paper plan evaluation or account swaps. Journal shows these accounts disabled
+with a reason. Servers reject their execution/history acquisition before opening
+a socket. Existing plans are not migrated by account registration.
+
+The worker, cron programs and CLI must all see the same private named profile
+file (or identical `CTRADER_FIX_ACCOUNTS_FILE` override). A named Open API profile
+takes precedence when present; malformed or inaccessible Open API configuration
+is an error and never silently falls back to FIX. The FIX login is not an Open
+API `ctidTraderAccountId`; discover the latter independently when enabling OAuth.
+
 cTrader is an account platform shared by many brokers. This integration has two
 layers: the standalone `ctrader-api` crate implements the official transport and
 OAuth session, while `broker-ctrader` adapts it to trade-control's `Broker` trait.
@@ -102,3 +140,12 @@ Do the read-only broker check first. Then use a demo account to validate order
 submission, stops, amendments, fills, disconnect recovery and broker history
 before enabling unattended management. No authenticated broker session or
 demo/live order execution has been validated during implementation.
+
+## Account-scoped CLI controls
+
+For cTrader, `prep`, `veto`, `clear-prep`, `clear-veto` and `unlock` require
+`--broker ctrader --account <named-open-api-profile>`. They validate the actual
+account and native instrument before signing or posting state changes, and use
+the same account scope in the signed intent. FIX QUOTE profiles are refused;
+`--force` cannot bypass cTrader account or instrument validation. Other brokers
+retain their existing command defaults and `--force` behavior.

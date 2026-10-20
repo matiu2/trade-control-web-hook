@@ -95,6 +95,10 @@ impl App {
         let Some(account) = picker.current() else {
             return;
         };
+        if let Some(reason) = account.unavailable_reason(picker.purpose) {
+            self.status = Status::error(reason);
+            return;
+        }
         self.action_confirm = Some(ActionConfirmation {
             trade_id: picker.trade_id.clone(),
             action: picker.purpose.action(account.name.clone()),

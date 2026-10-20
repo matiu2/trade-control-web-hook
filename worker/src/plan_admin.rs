@@ -51,7 +51,21 @@ pub(crate) async fn handle(
             );
         };
         match state.accounts.get(name).await {
-            Ok(target) => Some(target),
+            Ok(target) => {
+                let caps = crate::account_capabilities::capabilities(&target);
+                if !caps.history
+                    || (verified.intent.action == Action::PlanSwapAccount && !caps.execution)
+                {
+                    return ControlResult::error(
+                        format!(
+                            "target account unavailable for this action: {}",
+                            caps.reason
+                        ),
+                        422,
+                    );
+                }
+                Some(target)
+            }
             Err(error) => return ControlResult::error(format!("target account: {error}"), 422),
         }
     } else {

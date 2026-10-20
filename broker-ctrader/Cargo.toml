@@ -11,6 +11,8 @@ color-eyre = "0.6.5"
 serde_json = "1.0.151"
 tracing = "0.1.44"
 tokio = { version = "1.53.2", features = ["time", "sync"] }
+ctrader-fix = { version = "0.1.0", path = "../../ctrader-fix" }
+serde = { version = "1.0.229", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread"] }

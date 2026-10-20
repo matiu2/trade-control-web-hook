@@ -524,17 +524,9 @@ pub fn validate_ctrader_config(
     metadata_id: Option<&str>,
     config: &ctrader_api::Config,
 ) -> Result<(), BrokerError> {
-    if kind.is_live() != matches!(config.environment, ctrader_api::Environment::Live) {
-        return Err(BrokerError::CtraderConnect(
-            "metadata environment differs from the pinned cTrader environment".into(),
-        ));
-    }
-    if metadata_id.is_some_and(|id| id.parse::<i64>().ok() != Some(config.account_id)) {
-        return Err(BrokerError::CtraderConnect(
-            "metadata account ID differs from the pinned cTrader account ID".into(),
-        ));
-    }
-    Ok(())
+    broker_ctrader::access::Profile::OpenApi(config.clone())
+        .validate(kind.is_live(), metadata_id)
+        .map_err(|error| BrokerError::CtraderConnect(error.to_string()))
 }
 
 /// Acquire the named cTrader account; credentials are independent of MT5 logins.
@@ -547,9 +539,14 @@ pub async fn acquire_ctrader(
             account: meta.broker,
         });
     }
-    let config = ctrader_api::Config::load(&meta.name)
+    let profile = broker_ctrader::access::Profile::load(&meta.name)
         .map_err(|e| BrokerError::CtraderConnect(e.to_string()))?;
-    validate_ctrader_config(meta.kind, meta.oanda_account_id.as_deref(), &config)?;
+    profile
+        .validate(meta.kind.is_live(), meta.oanda_account_id.as_deref())
+        .map_err(|e| BrokerError::CtraderConnect(e.to_string()))?;
+    let config = profile
+        .require_execution()
+        .map_err(|e| BrokerError::CtraderConnect(e.to_string()))?;
     broker_ctrader::CtraderBroker::connect_config(&meta.name, config)
         .await
         .map_err(|e| BrokerError::CtraderConnect(e.to_string()))
