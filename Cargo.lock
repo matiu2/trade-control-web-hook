@@ -4892,6 +4892,7 @@ dependencies = [
  "chrono",
  "clap",
  "color-eyre",
+ "instrument-lookup 0.7.0",
  "mt5-data-source",
  "reqwest 0.13.4",
  "serde",

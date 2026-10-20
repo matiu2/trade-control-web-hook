@@ -35,6 +35,9 @@ pub enum JobKind {
     /// chart read and no re-arm.
     RawReplay,
     DrawGeometry,
+    Accounts,
+    PlanAction,
+    PlanList,
 }
 
 impl JobKind {
@@ -49,6 +52,9 @@ impl JobKind {
             JobKind::Rebless => "re-blessing fixtures",
             JobKind::RawReplay => "running raw replay",
             JobKind::DrawGeometry => "drawing plan geometry",
+            JobKind::Accounts => "loading accounts",
+            JobKind::PlanAction => "updating plan",
+            JobKind::PlanList => "refreshing plans",
         }
     }
 }
@@ -64,6 +70,9 @@ pub struct JobResult {
 /// The payload of a finished job — the loaded data or an error message.
 #[derive(Debug)]
 pub enum JobOutcome {
+    Accounts(Vec<crate::plan_admin::AccountChoice>),
+    PlanAction(String),
+    PlanList(String),
     Direction(String),
     /// `plan export` JSON + `plan timeline` JSON (in that order).
     Timeline {
@@ -94,6 +103,29 @@ pub enum JobOutcome {
     DrawGeometry(String),
     /// The job failed; the string is the error to surface in the footer.
     Failed(String),
+}
+
+pub fn spawn_accounts(tx: Sender<JobResult>, trade_id: String) {
+    spawn(tx, trade_id, JobKind::Accounts, || {
+        Ok(JobOutcome::Accounts(cli::accounts()?))
+    });
+}
+
+pub fn spawn_plan_action(
+    tx: Sender<JobResult>,
+    trade_id: String,
+    action: crate::plan_admin::PlanAction,
+) {
+    spawn(tx, trade_id.clone(), JobKind::PlanAction, move || {
+        let summary = cli::plan_action(&trade_id, &action)?;
+        Ok(JobOutcome::PlanAction(summary.trim().to_string()))
+    });
+}
+
+pub fn spawn_plan_list(tx: Sender<JobResult>, trade_id: String) {
+    spawn(tx, trade_id, JobKind::PlanList, || {
+        Ok(JobOutcome::PlanList(cli::plan_list_yaml()?))
+    });
 }
 
 /// Spawn the timeline-load job: `plan export` then `plan timeline`, both on a

@@ -117,7 +117,11 @@ fn default_config_paths() -> Vec<String> {
 #[derive(Subcommand)]
 enum Command {
     /// List every account in the index (name-ascending), metadata only.
-    List,
+    List {
+        /// Emit non-secret account metadata as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show one account by name.
     Get {
         /// The account name.
@@ -211,7 +215,7 @@ async fn main() -> Result<()> {
     let accounts = PgMetadataStore::from_state_store(&store);
 
     match cli.command {
-        Command::List => list(&accounts).await,
+        Command::List { json } => list(&accounts, json).await,
         Command::Get { name } => get(&accounts, &name).await,
         Command::Add {
             name,
@@ -237,8 +241,12 @@ async fn main() -> Result<()> {
 }
 
 /// Print the index as one line per account: `name  broker  kind  [oanda-id]  [caps]`.
-async fn list(accounts: &PgMetadataStore) -> Result<()> {
+async fn list(accounts: &PgMetadataStore, json: bool) -> Result<()> {
     let rows = accounts.list().await.map_err(meta_err)?;
+    if json {
+        println!("{}", serde_json::to_string(&rows)?);
+        return Ok(());
+    }
     if rows.is_empty() {
         println!("(no accounts)");
         return Ok(());

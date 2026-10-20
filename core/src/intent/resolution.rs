@@ -858,6 +858,7 @@ mod tests {
             blackout_close: crate::intent::BlackoutCloseAction::default(),
             breakeven: None,
             include_archived: false,
+            plan_admin: None,
         }
     }
 

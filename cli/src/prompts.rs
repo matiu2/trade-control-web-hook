@@ -103,6 +103,9 @@ pub fn required_for_action(action: Action) -> &'static [&'static str] {
         | Action::PlanShow
         | Action::PlanTimeline
         | Action::PlanDelete
+        | Action::PlanPaper
+        | Action::PlanSwapAccount
+        | Action::PlanClosedManually
         | Action::PlanPurge
         | Action::PurgeOlderThan => &[],
     }

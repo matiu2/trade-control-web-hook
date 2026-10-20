@@ -25,7 +25,9 @@
 //! `= true` is evaluated and its [`PlanState`] advanced **identically** to a
 //! live plan — same candles, same FSM, same watermark — but its fired intents
 //! are **never dispatched**: each is logged as a `SHADOW would-fire` line
-//! instead (see [`log_shadow_fire`]). This is the safe way to run the engine
+//! instead (see [`log_shadow_fire`]). Paper entries also receive a durable
+//! journal note with their resolved bracket before the watermark advances.
+//! No fills or P&L are simulated. This is the safe way to run the engine
 //! beside the live TradingView alerts on demo (the Stage F gate): both observe
 //! the same bars, but only the TV alert places real orders, so the engine's
 //! decisions can be diffed against the alert without any double-firing.
@@ -48,6 +50,7 @@
 
 mod detector_history;
 mod health;
+mod paper;
 
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{Broker, Candle, CandleError, Granularity, filter_new_candles};
@@ -193,14 +196,34 @@ where
         tracing::info!("cron engine: plan {} {}", plan.trade_id, w);
     }
 
-    // Persist the advanced state (or clear it + the plan when the spine is
+    // Paper entry notes must commit before consuming their signals. Persist
+    // the advanced state (or clear it + the plan when the spine is
     // done) before dispatching, so a dispatch failure can't replay a fired bar.
     // Capture the transition (before/after/success/error) for the tick-bundle.
-    let kv = persist_plan_state(store, &broker, plan, account, &eval, now, &prior).await;
+    let kv = paper::record_then_advance(cron, stored, &eval.fired, now, || {
+        persist_plan_state(store, &broker, plan, account, &eval, now, &prior)
+    })
+    .await?;
     // A hard put failure is still a skip for this tick — but the bundle records
     // the failed transition first, so a replay can see "wanted to advance,
     // couldn't" rather than a silent gap.
     let put_failed = !kv.success && !eval.done;
+
+    if put_failed {
+        let bundle = build_tick_bundle(
+            stored,
+            &prior,
+            &fresh,
+            &detector_window,
+            eval,
+            now,
+            expires_at,
+            Vec::new(),
+            kv.clone(),
+        );
+        cron.record_tick(bundle);
+        return Err(format!("put_plan_state: {}", kv.error.unwrap_or_default()));
+    }
 
     // Shadow plans observe only: the state above advanced exactly as a live
     // plan would, but we never touch the broker or the seen-id index — each
@@ -231,25 +254,6 @@ where
         );
         cron.record_tick(bundle);
         return Ok(());
-    }
-
-    if put_failed {
-        // Record the failed transition before bailing, so a replay sees the
-        // "wanted to advance, couldn't" rather than a silent gap. No dispatch
-        // happened, so `dispatch_outcomes` is empty.
-        let bundle = build_tick_bundle(
-            stored,
-            &prior,
-            &fresh,
-            &detector_window,
-            eval,
-            now,
-            expires_at,
-            Vec::new(),
-            kv.clone(),
-        );
-        cron.record_tick(bundle);
-        return Err(format!("put_plan_state: {}", kv.error.unwrap_or_default()));
     }
 
     let mut dispatch_outcomes = Vec::with_capacity(eval.fired.len());
@@ -342,7 +346,10 @@ where
     // Persist the control state (open_news_windows / blackout) before dispatch,
     // so a dispatch failure can't replay a fired window edge. A control tick
     // never advances the watermark (no bar processed) and is never `done`.
-    let kv = persist_plan_state(store, broker, plan, account, &eval, now, prior).await;
+    let kv = paper::record_then_advance(cron, stored, &eval.fired, now, || {
+        persist_plan_state(store, broker, plan, account, &eval, now, prior)
+    })
+    .await?;
     if !kv.success {
         let bundle = build_tick_bundle(
             stored,
@@ -434,6 +441,9 @@ async fn fetch_plan_settlement<S: StateStore>(
     account: Option<&str>,
     now: DateTime<Utc>,
 ) -> Option<trade_control_core::settlement::Settlement> {
+    if plan.shadow {
+        return None;
+    }
     let attempts = match store.list_entry_attempts(account, &plan.trade_id).await {
         Ok(rows) => rows,
         Err(err) => {

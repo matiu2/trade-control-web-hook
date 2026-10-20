@@ -23,14 +23,15 @@ use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
     AdoptBody, BuildStrictness, KEY_LEN, TradePattern, adopt_trade, build_clear_prep_intent,
-    build_clear_veto_intent, build_market_info_intent, build_plan_delete_intent,
-    build_plan_list_intent, build_plan_purge_intent, build_plan_show_intent,
-    build_plan_timeline_intent, build_prep_intent, build_purge_older_than_intent,
-    build_register_intent, build_status_intent, build_trade_from_spec, build_trade_interactive,
-    build_unlock_intent, build_veto_intent, fill_missing_fields, generate_key_hex, load_cache,
-    load_spec_from_file, pick_pattern_interactive, pick_template_interactive,
-    prompt_save_as_template, record_account_use, record_prep_use, record_veto_use,
-    validate_instrument, wrap_signed, wrap_signed_template, write_trade,
+    build_clear_veto_intent, build_market_info_intent, build_plan_admin_intent,
+    build_plan_delete_intent, build_plan_list_intent, build_plan_purge_intent,
+    build_plan_show_intent, build_plan_timeline_intent, build_prep_intent,
+    build_purge_older_than_intent, build_register_intent, build_status_intent,
+    build_trade_from_spec, build_trade_interactive, build_unlock_intent, build_veto_intent,
+    fill_missing_fields, generate_key_hex, load_cache, load_spec_from_file,
+    pick_pattern_interactive, pick_template_interactive, prompt_save_as_template,
+    record_account_use, record_prep_use, record_veto_use, validate_instrument, wrap_signed,
+    wrap_signed_template, write_trade,
 };
 use trade_control_core::account::{AccountKind, TradeNationKind};
 use trade_control_core::incoming::signed_pairs_from_text;
@@ -170,11 +171,49 @@ enum PlanCmd {
     /// no-op). Use to re-arm a setup after editing its chart: `plan delete
     /// <id>` then re-run `tv-arm`.
     Delete(PlanDeleteArgs),
+    /// Log paper entries using another account for data; detach existing broker management.
+    Paper(PlanPaperArgs),
+    /// Route future execution to a different account (existing exposure is detached).
+    SwapAccount(PlanSwapAccountArgs),
+    /// Record a manually closed trade and retire local management without a broker call.
+    ClosedManually(PlanManualCloseArgs),
     /// Purge **every** trace of a journaled trade — a superset of `delete`.
     /// Also clears the no-TTL per-trade rows (entry-attempt / order-body /
     /// control-event), enumerable trade-scoped controls (pause / news), and the
     /// trade's R2 `ticks/` bundles. Use after the trade is journaled/logged.
     Purge(PlanPurgeArgs),
+}
+
+#[derive(Parser)]
+struct PlanPaperArgs {
+    trade_id: String,
+    /// Explicitly stop managing old broker orders/positions; does not close them.
+    #[arg(long, required = true)]
+    detach_existing: bool,
+    /// Independent account supplying quotes/candles for paper entry logging.
+    #[arg(long)]
+    account: String,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct PlanSwapAccountArgs {
+    trade_id: String,
+    #[arg(long)]
+    account: String,
+    /// Explicitly stop managing old broker exposure; it is not migrated or closed.
+    #[arg(long, required = true)]
+    detach_existing: bool,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct PlanManualCloseArgs {
+    trade_id: String,
+    #[command(flatten)]
+    common: EndpointArgs,
 }
 
 #[derive(Parser)]
@@ -1145,6 +1184,27 @@ fn run_plan(sub: PlanCmd) -> Result<()> {
         PlanCmd::Export(args) => run_plan_export(args),
         PlanCmd::Register(args) => run_plan_register(args),
         PlanCmd::Delete(args) => run_plan_delete(args),
+        PlanCmd::Paper(args) => run_plan_admin(
+            trade_control_core::intent::Action::PlanPaper,
+            &args.trade_id,
+            Some(args.account),
+            args.detach_existing,
+            args.common,
+        ),
+        PlanCmd::SwapAccount(args) => run_plan_admin(
+            trade_control_core::intent::Action::PlanSwapAccount,
+            &args.trade_id,
+            Some(args.account),
+            args.detach_existing,
+            args.common,
+        ),
+        PlanCmd::ClosedManually(args) => run_plan_admin(
+            trade_control_core::intent::Action::PlanClosedManually,
+            &args.trade_id,
+            None,
+            true,
+            args.common,
+        ),
         PlanCmd::Purge(args) => run_plan_purge(args),
     }
 }
@@ -1518,6 +1578,30 @@ fn run_plan_register(args: PlanRegisterArgs) -> Result<()> {
     let intent = build_register_intent(plan, args.account_id.as_deref(), now, &suffix);
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
+    print_raw(&response);
+    Ok(())
+}
+
+fn run_plan_admin(
+    action: trade_control_core::intent::Action,
+    trade_id: &str,
+    target_account: Option<String>,
+    detach_existing: bool,
+    common: EndpointArgs,
+) -> Result<()> {
+    let key = load_key(&common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let intent = build_plan_admin_intent(
+        action,
+        trade_id,
+        target_account,
+        detach_existing,
+        now,
+        &suffix,
+    );
+    let body = wrap_control(&intent, &key, now)?;
+    let response = post_control(&common.endpoint, &body)?;
     print_raw(&response);
     Ok(())
 }

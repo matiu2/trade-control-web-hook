@@ -77,6 +77,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
         breakeven: None,
         include_archived: false,
+        plan_admin: None,
     }
 }
 
@@ -195,6 +196,28 @@ pub fn build_plan_delete_intent(trade_id: &str, now: DateTime<Utc>, suffix: &str
     );
     let mut intent = control_skeleton(Action::PlanDelete, STATUS_INSTRUMENT, id, now);
     intent.trade_id = Some(trade_id.to_string());
+    intent
+}
+
+/// Build an authenticated offline plan administration command.
+pub fn build_plan_admin_intent(
+    action: Action,
+    trade_id: &str,
+    target_account: Option<String>,
+    detach_existing: bool,
+    now: DateTime<Utc>,
+    suffix: &str,
+) -> Intent {
+    let id = format!(
+        "plan-admin-{trade_id}-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    let mut intent = control_skeleton(action, STATUS_INSTRUMENT, id, now);
+    intent.trade_id = Some(trade_id.to_owned());
+    intent.plan_admin = Some(trade_control_core::intent::PlanAdmin {
+        detach_existing,
+        target_account,
+    });
     intent
 }
 
@@ -800,5 +823,32 @@ mod tests {
             matches!(err, trade_control_core::incoming::IncomingError::Sig(_)),
             "expected a signature error, got {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod plan_admin_tests {
+    use super::*;
+    use trade_control_core::incoming::parse_and_verify;
+
+    #[test]
+    fn admin_choices_are_signed_and_survive_wire_parsing() {
+        let now = Utc::now();
+        let key = [42_u8; 32];
+        let intent = build_plan_admin_intent(
+            Action::PlanPaper,
+            "audusd-test",
+            Some("reversals".into()),
+            true,
+            now,
+            "test",
+        );
+        let body = wrap_signed(&intent, &key, now).expect("signed body");
+        let verified = parse_and_verify(&body, &key, now).expect("verify");
+        let options = verified.intent.plan_admin.expect("admin choices");
+        assert_eq!(options.target_account.as_deref(), Some("reversals"));
+        assert!(options.detach_existing);
+        let tampered = body.replace("reversals", "other");
+        assert!(parse_and_verify(&tampered, &key, now).is_err());
     }
 }

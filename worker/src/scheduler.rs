@@ -187,7 +187,12 @@ async fn run_isolated<F>(job: &str, fut: F)
 where
     F: std::future::Future<Output = ()> + 'static,
 {
-    match tokio::task::spawn_local(fut).await {
+    match tokio::task::spawn_local(async move {
+        let _operation_guard = crate::operation_lock::acquire(false).await;
+        fut.await;
+    })
+    .await
+    {
         Ok(()) => {}
         Err(err) if err.is_panic() => {
             // The panic payload is usually a `&str`/`String`; surface whatever we
@@ -384,6 +389,7 @@ async fn reconcile_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Durat
         let (state, cron) = (state.clone(), cron.clone());
         run_isolated("reconcile", async move {
             reconcile(&state.store, &cron, now).await;
+            crate::manual_close_audit::poll(&state.store, &cron).await;
         })
         .await;
     }

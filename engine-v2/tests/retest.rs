@@ -106,6 +106,7 @@ fn intent(instrument: &str) -> Intent {
         blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
         breakeven: None,
         include_archived: false,
+        plan_admin: None,
     }
 }
 

@@ -953,6 +953,20 @@ pub struct Intent {
     /// byte-identical to pre-feature `plan-list` intents.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_archived: bool,
+    /// Signed operator choices for an administrative plan transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_admin: Option<PlanAdmin>,
+}
+
+/// Explicit choices attached to a signed plan administration request.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlanAdmin {
+    /// Acknowledge that old broker exposure is detached, never migrated/closed.
+    #[serde(default)]
+    pub detach_existing: bool,
+    /// New execution account, or the independent feed for a paper plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_account: Option<String>,
 }
 
 /// Skip-serializing predicate for [`Intent::blackout_close`]. Returns true on
@@ -1307,6 +1321,9 @@ impl Intent {
                 | Action::Veto
                 | Action::ClearVeto
                 | Action::PlanDelete
+                | Action::PlanPaper
+                | Action::PlanSwapAccount
+                | Action::PlanClosedManually
                 | Action::PlanPurge
                 | Action::PlanTimeline
         ) && self.trade_id.is_none()
@@ -1799,6 +1816,12 @@ pub enum Action {
     /// editing the chart: `plan delete <id>` then re-run `tv-arm`. Drives
     /// `trade-control plan delete <trade_id>`.
     PlanDelete,
+    /// Convert a plan to simulated execution without sending broker mutations.
+    PlanPaper,
+    /// Route future entries to another account, explicitly detaching old exposure.
+    PlanSwapAccount,
+    /// Archive an operator-confirmed manual close without contacting the broker.
+    PlanClosedManually,
     /// **Purge** every trace of a journaled trade — a superset of
     /// [`Action::PlanDelete`]. Beyond the `plan:` / `plan-state:` /
     /// `archived-plan:` rows that delete drops, purge also clears the no-TTL

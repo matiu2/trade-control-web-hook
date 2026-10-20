@@ -154,6 +154,17 @@ impl CronEnv for NativeCronEnv {
         });
     }
 
+    async fn record_paper_entry(
+        &self,
+        identity: &str,
+        note: trade_control_core::recording::CronNote,
+    ) -> Result<(), String> {
+        crate::paper_entries::record(self.state.store.pool(), identity, &note)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     fn signing_key(&self) -> Option<Vec<u8>> {
         // Decoded once at boot and held on `AppState` (the same key the HTTP
         // receiver verifies with). Always present here — `main` aborts if

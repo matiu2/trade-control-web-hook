@@ -86,6 +86,12 @@ pub trait CronEnv {
     /// alert. Same fire-and-forget, fail-soft contract as `record_tick`.
     fn record_cron_note(&self, note: CronNote);
 
+    /// Await the paper entry's journal write before consuming its signal. The
+    /// native implementation deduplicates retries by account, plan and identity.
+    async fn record_paper_entry(&self, _identity: &str, _note: CronNote) -> Result<(), String> {
+        Err("durable paper-entry recording is unavailable in this runtime".into())
+    }
+
     /// Native runtimes persist changes and retry notification delivery. A
     /// successful evaluation is a recovery observation, never a claimed fill.
     async fn record_engine_health(&self, note: CronNote) {

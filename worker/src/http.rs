@@ -288,6 +288,12 @@ async fn dispatch_inner(
         }
     };
 
+    let exclusive = matches!(
+        verified.intent.action,
+        Action::PlanPaper | Action::PlanSwapAccount | Action::PlanClosedManually
+    );
+    let _operation_guard = crate::operation_lock::acquire(exclusive).await;
+
     // --- Replay protection (shared multi-shot exception). ---
     match state.store.is_seen(&verified.intent.id).await {
         // A multi-shot enter re-fires the same baked id every signal bar; the
@@ -352,7 +358,16 @@ async fn dispatch_control(
         Action::Resume => handle_resume(store, verified, now).await,
         Action::NewsStart => handle_news_start(store, verified, now).await,
         Action::NewsEnd => handle_news_end(store, verified, now).await,
-        Action::Register => handle_register(store, &state.accounts, verified, now).await,
+        Action::Register => {
+            match crate::plan_admin::guard::register_blocked(store, &verified.intent).await {
+                Ok(Some(reason)) => ControlResult::error(reason, 409),
+                Ok(None) => handle_register(store, &state.accounts, verified, now).await,
+                Err(error) => {
+                    tracing::error!(%error, "register plan ownership lookup failed");
+                    ControlResult::error("plan ownership lookup failed", 500)
+                }
+            }
+        }
         Action::PlanList => handle_plan_list(store, verified, now).await,
         Action::PlanShow => handle_plan_show(store, verified, now).await,
         // Recording-backed (reads `request_records`), so it can't be a generic
@@ -361,6 +376,9 @@ async fn dispatch_control(
         // are worker-local.
         Action::PlanTimeline => handle_plan_timeline(store, verified, now).await,
         Action::PlanDelete => handle_plan_delete(store, verified, now).await,
+        Action::PlanPaper | Action::PlanSwapAccount | Action::PlanClosedManually => {
+            crate::plan_admin::handle(state, verified, now).await
+        }
         // Not yet supported natively — these need R2 (the `ticks/` bundles for
         // purge) or the TradeNation market-info call (MarketInfo). The wasm
         // worker dispatches them with `Env` in scope; the native glue is a
@@ -458,6 +476,18 @@ async fn dispatch_broker(
     body: &str,
     now: chrono::DateTime<Utc>,
 ) -> DispatchOutcome {
+    match crate::plan_admin::guard::blocked(&state.store, &verified.intent).await {
+        Ok(Some(reason)) => return DispatchOutcome::plain(StatusCode::CONFLICT, reason),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(%error, "plan ownership guard failed");
+            return DispatchOutcome::plain(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "plan ownership lookup failed",
+            );
+        }
+    }
+
     // Resolve the account metadata. A named account that isn't in the index is a
     // 400; an unnamed account with a broker intent has no credentials to route
     // to (global/default-account routing is a follow-up) — also a 400.
