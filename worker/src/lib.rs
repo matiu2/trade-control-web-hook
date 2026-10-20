@@ -22,7 +22,10 @@ mod scheduler;
 mod secrets;
 mod trade_notifications;
 
-pub use broker_factory::{BrokerError, acquire_ibkr, acquire_mt5, acquire_oanda, acquire_tn};
+pub use broker_factory::{
+    BrokerError, acquire_ctrader, acquire_ibkr, acquire_mt5, acquire_oanda, acquire_tn,
+    validate_ctrader_config,
+};
 pub use config::{Config, ConfigError, DatabaseConfig, HttpConfig, SchedulerConfig};
 pub use dispatch_config_native::build_dispatch_config_native;
 pub use native_cron::NativeCronEnv;

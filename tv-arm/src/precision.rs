@@ -156,7 +156,10 @@ pub fn resolve_broker_precision(
     cat: CatalogPrecision,
     tv: &SymbolInfo,
 ) -> EffectivePrecision {
-    if broker == trade_control_conventions::Broker::Mt5 {
+    if matches!(
+        broker,
+        trade_control_conventions::Broker::Mt5 | trade_control_conventions::Broker::Ctrader
+    ) {
         EffectivePrecision::from_catalog(cat)
     } else {
         resolve_effective_precision(cat, tv)
@@ -201,6 +204,20 @@ mod tests {
         );
         assert_eq!(other.tick_size, 0.00001);
         assert!(other.tick_from_tv);
+    }
+
+    #[test]
+    fn ctrader_live_precision_cannot_be_replaced_by_chart_provider() {
+        let a = asset(AssetClass::Forex, 0.00001, 5, 0.0001);
+        let tv = tv_info(Some(0.001), Some(3));
+        let effective = resolve_broker_precision(
+            trade_control_conventions::Broker::Ctrader,
+            CatalogPrecision::from_asset(&a),
+            &tv,
+        );
+        assert_eq!(effective.tick_size, 0.00001);
+        assert_eq!(effective.pip_size, 0.0001);
+        assert!(!effective.tick_from_tv);
     }
 
     fn asset(class: AssetClass, tick: f64, dp: u8, pip: f64) -> Asset {

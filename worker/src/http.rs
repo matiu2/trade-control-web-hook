@@ -65,7 +65,8 @@ use trade_control_core::state::StateStore;
 
 use crate::dispatch_config_native::build_dispatch_config_native;
 use crate::{
-    PgMetadataStore, PgStateStore, Secrets, acquire_ibkr, acquire_mt5, acquire_oanda, acquire_tn,
+    PgMetadataStore, PgStateStore, Secrets, acquire_ctrader, acquire_ibkr, acquire_mt5,
+    acquire_oanda, acquire_tn,
 };
 
 /// Shared application state owned by the local dispatcher thread. The HMAC
@@ -553,6 +554,16 @@ async fn dispatch_broker(
             Ok(broker) => run_action(&broker, &state.store, verified, &cfg, now, body).await,
             Err(err) => {
                 tracing::error!("mt5 acquire failed: {err}");
+                return DispatchOutcome::plain(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "broker unavailable — check logs",
+                );
+            }
+        },
+        BrokerKind::Ctrader => match acquire_ctrader(&meta).await {
+            Ok(broker) => run_action(&broker, &state.store, verified, &cfg, now, body).await,
+            Err(err) => {
+                tracing::error!("ctrader acquire failed: {err}");
                 return DispatchOutcome::plain(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "broker unavailable — check logs",

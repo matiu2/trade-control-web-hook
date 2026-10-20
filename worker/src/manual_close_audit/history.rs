@@ -44,6 +44,7 @@ pub(super) async fn check(broker: &BrokerHandle, body: &Value) -> Audit {
         BrokerHandle::TradeNation(b) => b.fetch_settlement(instrument, since, &orders, now).await,
         BrokerHandle::Ibkr(b) => b.fetch_settlement(instrument, since, &orders, now).await,
         BrokerHandle::Mt5(b) => b.fetch_settlement(instrument, since, &orders, now).await,
+        BrokerHandle::Ctrader(b) => b.fetch_settlement(instrument, since, &orders, now).await,
     };
     match result {
         Ok(settlement) => Audit::Observed(scoped_history(settlement, &attempts)),

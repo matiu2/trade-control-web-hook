@@ -175,7 +175,7 @@ fn source_for(broker: Broker) -> Option<CandleSource> {
     match broker {
         Broker::TradeNation => Some(CandleSource::TradeNation),
         Broker::Oanda => Some(CandleSource::Oanda),
-        Broker::Ibkr => None,
+        Broker::Ibkr | Broker::Ctrader => None,
         Broker::Mt5 => Some(CandleSource::Mt5),
     }
 }
@@ -301,9 +301,8 @@ pub fn run_replay(
     }
     let source = source_for(broker).ok_or_else(|| {
         eyre!(
-            "--replay: no candle source for {} — replay-candles has no IBKR feed, and \
-             replaying against another broker's prices would report a different \
-             instrument's R-multiples",
+            "--replay: no candle source for {} in replay-candles; another broker's prices \
+             cannot verify this account's signals or fills",
             broker.as_str()
         )
     })?;
@@ -478,6 +477,7 @@ mod tests {
     #[test]
     fn ibkr_has_no_candle_source() {
         assert_eq!(source_for(Broker::Ibkr), None);
+        assert_eq!(source_for(Broker::Ctrader), None);
     }
 
     #[test]

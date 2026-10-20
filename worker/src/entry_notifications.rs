@@ -115,6 +115,7 @@ async fn poll_inner(store: &PgStateStore, cron: &NativeCronEnv) -> color_eyre::R
                 BrokerHandle::TradeNation(b) => observe(store, b, &attempt, activation).await,
                 BrokerHandle::Ibkr(b) => observe(store, b, &attempt, activation).await,
                 BrokerHandle::Mt5(b) => observe(store, b, &attempt, activation).await,
+                BrokerHandle::Ctrader(b) => observe(store, b, &attempt, activation).await,
             }
         }
     }

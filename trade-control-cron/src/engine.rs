@@ -484,6 +484,10 @@ async fn fetch_plan_settlement<S: StateStore>(
             b.fetch_settlement(&plan.instrument, since, &order_ids, now)
                 .await
         }
+        BrokerHandle::Ctrader(b) => {
+            b.fetch_settlement(&plan.instrument, since, &order_ids, now)
+                .await
+        }
     };
 
     match fetched {
@@ -744,6 +748,7 @@ async fn fetch_candles(
         BrokerHandle::TradeNation(b) => b.get_candles(instrument, granularity, since, now).await,
         BrokerHandle::Ibkr(b) => b.get_candles(instrument, granularity, since, now).await,
         BrokerHandle::Mt5(b) => b.get_candles(instrument, granularity, since, now).await,
+        BrokerHandle::Ctrader(b) => b.get_candles(instrument, granularity, since, now).await,
     };
     disposition(result)
 }
@@ -926,6 +931,9 @@ where
         }
         BrokerHandle::Ibkr(b) => dispatch_action(b, store, &verified, cron, granularity, now).await,
         BrokerHandle::Mt5(b) => dispatch_action(b, store, &verified, cron, granularity, now).await,
+        BrokerHandle::Ctrader(b) => {
+            dispatch_action(b, store, &verified, cron, granularity, now).await
+        }
     };
     let outcome = result.describe();
     if verified.intent.action == Action::Enter && !matches!(&result, ActionResult::Ok(_)) {

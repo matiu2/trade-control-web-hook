@@ -31,6 +31,11 @@ pub(super) fn reroute(
         ));
     }
     if source != target.broker {
+        if source == BrokerKind::Ctrader || target.broker == BrokerKind::Ctrader {
+            return Err(eyre!(
+                "cTrader account switches require an audited instrument and sizing mapping; re-arm explicitly"
+            ));
+        }
         reroute_instrument(&mut next, target.broker)?;
     }
     next.shadow |= paper;
@@ -63,7 +68,7 @@ fn reroute_instrument(plan: &mut TradePlan, target: BrokerKind) -> Result<()> {
     let broker = match target {
         BrokerKind::TradeNation => CatalogBroker::TradeNation,
         BrokerKind::Oanda => CatalogBroker::Oanda,
-        BrokerKind::Mt5 | BrokerKind::Ibkr => {
+        BrokerKind::Mt5 | BrokerKind::Ibkr | BrokerKind::Ctrader => {
             return Err(eyre!(
                 "cross-broker target needs an audited broker instrument mapping"
             ));
@@ -136,6 +141,30 @@ pub(super) mod tests {
         assert_eq!(after.rules[0].intent.account.as_deref(), Some("reversals"));
         assert_eq!(after.rules[0].intent.broker, BrokerKind::TradeNation);
         assert_eq!(after.rules[0].intent.instrument, after.instrument);
+    }
+
+    #[test]
+    fn ctrader_cross_broker_swaps_require_audited_mapping_in_both_directions() {
+        let before = plan();
+        let target = AccountMetadata::new("ctrader-test", BrokerKind::Ctrader, AccountKind::Demo);
+        assert!(
+            reroute(&before, &target, false)
+                .unwrap_err()
+                .to_string()
+                .contains("audited")
+        );
+        let mut from_ctrader = before;
+        from_ctrader
+            .rules
+            .iter_mut()
+            .for_each(|rule| rule.intent.broker = BrokerKind::Ctrader);
+        let target = AccountMetadata::new("tn-test", BrokerKind::TradeNation, AccountKind::Demo);
+        assert!(
+            reroute(&from_ctrader, &target, false)
+                .unwrap_err()
+                .to_string()
+                .contains("audited")
+        );
     }
 
     #[test]

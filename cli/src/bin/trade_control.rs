@@ -525,6 +525,7 @@ enum BrokerKindArg {
     Oanda,
     TradeNation,
     Ibkr,
+    Ctrader,
 }
 
 impl From<BrokerKindArg> for BrokerKind {
@@ -533,6 +534,7 @@ impl From<BrokerKindArg> for BrokerKind {
             BrokerKindArg::Oanda => BrokerKind::Oanda,
             BrokerKindArg::TradeNation => BrokerKind::TradeNation,
             BrokerKindArg::Ibkr => BrokerKind::Ibkr,
+            BrokerKindArg::Ctrader => BrokerKind::Ctrader,
         }
     }
 }
@@ -2213,6 +2215,14 @@ fn run_adopt_trade(args: AdoptTradeArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ctrader_broker_cli_value_maps_to_wire_kind() {
+        use clap::ValueEnum;
+        let value = super::BrokerKindArg::from_str("ctrader", false).unwrap();
+        let kind: trade_control_core::intent::BrokerKind = value.into();
+        assert_eq!(kind.as_str(), "ctrader");
+    }
+
     use super::*;
     use std::time::Duration;
     use tradenation_api::{Market, Session};

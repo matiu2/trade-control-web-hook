@@ -1653,6 +1653,8 @@ pub enum BrokerKind {
     Ibkr,
     /// MT5 demo/competition account, selected explicitly by name.
     Mt5,
+    /// cTrader Open API, selected explicitly by named account.
+    Ctrader,
 }
 
 impl BrokerKind {
@@ -1667,6 +1669,7 @@ impl BrokerKind {
         BrokerKind::TradeNation,
         BrokerKind::Ibkr,
         BrokerKind::Mt5,
+        BrokerKind::Ctrader,
     ];
 
     /// The lowercase wire form — the same string serde produces.
@@ -1679,6 +1682,7 @@ impl BrokerKind {
             Self::TradeNation => "tradenation",
             Self::Ibkr => "ibkr",
             Self::Mt5 => "mt5",
+            Self::Ctrader => "ctrader",
         }
     }
 }
@@ -2430,12 +2434,13 @@ mod broker_kind_tests {
     fn all_lists_every_variant() {
         assert_eq!(
             BrokerKind::ALL.len(),
-            4,
+            5,
             "a new broker must be added to ALL"
         );
         assert!(BrokerKind::ALL.contains(&BrokerKind::Oanda));
         assert!(BrokerKind::ALL.contains(&BrokerKind::TradeNation));
         assert!(BrokerKind::ALL.contains(&BrokerKind::Ibkr));
+        assert!(BrokerKind::ALL.contains(&BrokerKind::Ctrader));
     }
 
     #[test]

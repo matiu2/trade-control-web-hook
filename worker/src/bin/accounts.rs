@@ -166,6 +166,7 @@ enum BrokerArg {
     Tradenation,
     Ibkr,
     Mt5,
+    Ctrader,
 }
 
 impl From<BrokerArg> for BrokerKind {
@@ -175,6 +176,7 @@ impl From<BrokerArg> for BrokerKind {
             BrokerArg::Tradenation => BrokerKind::TradeNation,
             BrokerArg::Ibkr => BrokerKind::Ibkr,
             BrokerArg::Mt5 => BrokerKind::Mt5,
+            BrokerArg::Ctrader => BrokerKind::Ctrader,
         }
     }
 }
@@ -280,6 +282,11 @@ async fn add(
     max_risk_pct: Option<f64>,
     max_open_positions: Option<u32>,
 ) -> Result<()> {
+    if broker == BrokerKind::Ctrader {
+        let config = ctrader_api::Config::load(&name)?;
+        trade_control_worker::validate_ctrader_config(kind, oanda_account_id.as_deref(), &config)
+            .map_err(|error| eyre!("{error}"))?;
+    }
     if broker == BrokerKind::Mt5 {
         if kind.is_live() {
             return Err(eyre!("MT5 currently supports demo/competition only"));

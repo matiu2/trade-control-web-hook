@@ -1140,9 +1140,9 @@ fn resolve_with_recovery(
             Ok(resolved) => return Ok(resolved),
             Err(e) => e,
         };
-    // MT5 has no overlay broker column; preserve the account/contract error
+    // Account-native platforms have no overlay broker column; preserve the account/contract error
     // rather than patching another broker's mapping after a read failure.
-    if broker == Broker::Mt5 {
+    if matches!(broker, Broker::Mt5 | Broker::Ctrader) {
         return Err(first_err);
     }
     // Catalog miss — try the recovery path. If anything in here
@@ -1193,7 +1193,7 @@ fn resolve_with_recovery(
         Broker::TradeNation => instrument_lookup::Broker::TradeNation,
         // The catalog has no IBKR column, so there is nothing to recover a
         // futures symbol from. Stage 5 adds `Broker::Ibkr` + rows there.
-        Broker::Ibkr | Broker::Mt5 => {
+        Broker::Ibkr | Broker::Mt5 | Broker::Ctrader => {
             return Err(eyre!(
                 "cannot recover chart symbol {tv_symbol:?} for ibkr: the instrument-lookup \
                  catalog has no IBKR listing yet"

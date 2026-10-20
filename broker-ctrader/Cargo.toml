@@ -1,0 +1,18 @@
+[package]
+name = "broker-ctrader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+trade-control-core = { path = "../core" }
+ctrader-api = { path = "../../ctrader-api" }
+chrono = "0.4.45"
+color-eyre = "0.6.5"
+serde_json = "1.0.151"
+tracing = "0.1.44"
+tokio = { version = "1.53.2", features = ["time", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread"] }
+tracing-error = "0.2.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

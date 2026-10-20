@@ -63,6 +63,12 @@ pub fn resolve_for_account(
     account: Option<&str>,
 ) -> Result<ResolvedInstrument> {
     let bare = strip_exchange(tv_symbol);
+    if broker == ConvBroker::Ctrader {
+        let resolved = crate::ctrader_instrument::resolve(bare, account)?;
+        let account = account.ok_or_else(|| eyre!("cTrader requires an explicit named account"))?;
+        require_spread_coverage(&format!("ctrader:{account}:{}", resolved.broker_symbol))?;
+        return Ok(resolved);
+    }
     let asset = instrument_lookup::resolve(bare)?;
     let asset = if broker == ConvBroker::Mt5 && asset.is_none() {
         instrument_lookup::resolve(&crate::mt5_instrument::catalog_symbol(bare))?
@@ -159,7 +165,9 @@ fn require_spread_coverage(broker_symbol: &str) -> Result<()> {
     if coverage.is_covered() {
         return Ok(());
     }
-    let rebake = if let Some((account, symbol)) = broker_symbol
+    let rebake = if broker_symbol.starts_with("ctrader:") {
+        "cTrader account-scoped spread baseline collection is not implemented yet; validate and collect this account's spreads before unattended arming".to_string()
+    } else if let Some((account, symbol)) = broker_symbol
         .strip_prefix("mt5:")
         .and_then(|key| key.split_once(':'))
     {
@@ -242,7 +250,7 @@ fn to_il_broker(broker: ConvBroker) -> Option<IlBroker> {
         ConvBroker::Oanda => Some(IlBroker::Oanda),
         ConvBroker::TradeNation => Some(IlBroker::TradeNation),
         ConvBroker::Ibkr => Some(IlBroker::Ibkr),
-        ConvBroker::Mt5 => None,
+        ConvBroker::Mt5 | ConvBroker::Ctrader => None,
     }
 }
 

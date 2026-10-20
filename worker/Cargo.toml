@@ -45,6 +45,8 @@ trade-control-cron = { version = "0.1.0", path = "../trade-control-cron" }
 tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.20.0", version = "0.7.0" }
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 instrument-lookup = { version = "0.7.0", path = "../../instrument-lookup" }
+ctrader-api = { version = "0.1.0", path = "../../ctrader-api" }
+broker-ctrader = { version = "0.1.0", path = "../broker-ctrader" }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
