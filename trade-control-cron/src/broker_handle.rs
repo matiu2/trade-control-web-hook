@@ -17,4 +17,5 @@ pub enum BrokerHandle {
     /// answering plausibly — see `broker-ibkr`'s module docs.
     Ibkr(broker_ibkr::IbkrBroker),
     Mt5(broker_mt5::Mt5Broker),
+    Ctrader(broker_ctrader::CtraderBroker),
 }

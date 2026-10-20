@@ -24,7 +24,10 @@ use trade_control_core::tick_bundle::TickBundle;
 use trade_control_cron::{BrokerHandle, CronEnv};
 
 use crate::http::AppState;
-use crate::{acquire_ibkr, acquire_mt5, acquire_oanda, acquire_tn, build_dispatch_config_native};
+use crate::{
+    acquire_ctrader, acquire_ibkr, acquire_mt5, acquire_oanda, acquire_tn,
+    build_dispatch_config_native,
+};
 
 /// Native [`CronEnv`]: resolves the engine's three backend ops from Postgres +
 /// `Secrets`. Cheap to clone (an `Arc` bump); the scheduler holds one and drives
@@ -100,6 +103,13 @@ impl CronEnv for NativeCronEnv {
                 Ok(b) => Some(BrokerHandle::Mt5(b)),
                 Err(err) => {
                     tracing::error!("cron: mt5 acquire failed for '{}': {err}", meta.name);
+                    None
+                }
+            },
+            BrokerKind::Ctrader => match acquire_ctrader(&meta).await {
+                Ok(b) => Some(BrokerHandle::Ctrader(b)),
+                Err(err) => {
+                    tracing::error!("cron: ctrader acquire failed for '{}': {err}", meta.name);
                     None
                 }
             },

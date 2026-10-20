@@ -551,7 +551,9 @@ fn read_setup_from_chart(args: &Args) -> Result<(SetupInputs, Roles)> {
     // `--pip-size` / `--tick-size` flags still override both, downstream in
     // the trade builders.
     let effective = match mcp.get_symbol_info() {
-        Ok(tv_info) => crate::precision::resolve_effective_precision(resolved.precision, &tv_info),
+        Ok(tv_info) => {
+            crate::precision::resolve_broker_precision(broker, resolved.precision, &tv_info)
+        }
         Err(e) => {
             // Reading symbol-info shouldn't ever block arming — fall back to
             // the per-broker catalog precision and note why.
@@ -1138,6 +1140,9 @@ fn resolve_with_recovery(
             Ok(resolved) => return Ok(resolved),
             Err(e) => e,
         };
+    if broker == Broker::Ctrader {
+        return Err(first_err);
+    }
     // Catalog miss — try the recovery path. If anything in here
     // fails, fall through to the original error so the operator sees
     // the actionable "add an overlay entry" hint.
@@ -1186,7 +1191,7 @@ fn resolve_with_recovery(
         Broker::TradeNation => instrument_lookup::Broker::TradeNation,
         // The catalog has no IBKR column, so there is nothing to recover a
         // futures symbol from. Stage 5 adds `Broker::Ibkr` + rows there.
-        Broker::Ibkr | Broker::Mt5 => {
+        Broker::Ibkr | Broker::Mt5 | Broker::Ctrader => {
             return Err(eyre!(
                 "cannot recover chart symbol {tv_symbol:?} for ibkr: the instrument-lookup \
                  catalog has no IBKR listing yet"

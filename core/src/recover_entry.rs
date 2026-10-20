@@ -49,7 +49,8 @@ fn failure_token(err: &EntryError) -> &'static str {
         EntryError::UnitsBelowMinimum => "units-below-minimum",
         EntryError::ContractSizeUnavailable => "contract-size-unavailable",
         EntryError::EntryTooCloseToMarket => "too-close-to-market",
-        EntryError::OrderRejected => "broker-rejected",
+        EntryError::OrderRejected | EntryError::OrderRejectedWithDetail(_) => "broker-rejected",
+        EntryError::CurrencyConversion { .. } => "currency-conversion",
         EntryError::AmbiguousSuccess(_) => "ambiguous-success",
     }
 }
@@ -263,6 +264,22 @@ pub fn recover_entry_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctrader_sizing_and_rejection_diagnostics_keep_their_failure_tokens() {
+        let conversion = outcome_for_entry_error(&EntryError::CurrencyConversion {
+            from: "USD".into(),
+            to: "AUD".into(),
+            detail: "unique conversion quote unavailable".into(),
+        });
+        assert!(conversion.contains("currency-conversion"));
+        assert!(conversion.contains("USD"));
+        let rejection = outcome_for_entry_error(&EntryError::OrderRejectedWithDetail(
+            "Open API market protection unavailable".into(),
+        ));
+        assert!(rejection.contains("broker-rejected"));
+        assert!(rejection.contains("Open API market protection unavailable"));
+    }
 
     fn rec_cfg(
         action: RecoverEntryAction,

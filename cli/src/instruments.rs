@@ -132,6 +132,17 @@ pub fn validate_instrument(
         // is what says whether a futures symbol is real, and the arm-time
         // close-out guard already refuses an unknown contract.
         BrokerKind::Oanda | BrokerKind::Ibkr => Ok(None),
+        BrokerKind::Ctrader => {
+            let account = account
+                .ok_or_else(|| eyre!("cTrader requires an explicit named account"))?
+                .to_owned();
+            let name = name.to_owned();
+            crate::blocking::run_blocking(async move {
+                let broker = broker_ctrader::CtraderBroker::connect(&account).await?;
+                let metadata = broker.instrument_metadata(&name).await?;
+                Ok((metadata.name != name).then_some(metadata.name))
+            })
+        }
         BrokerKind::Mt5 => {
             let account = account.ok_or_else(|| eyre!("MT5 requires an explicit named account"))?;
             let config = mt5_data_source::account_config::AccountConfig::load(account)?;
@@ -180,6 +191,12 @@ mod tests {
     use super::*;
     use tradenation_api::{Market, Session};
     use tradenation_instrument_cache::Catalog;
+
+    #[test]
+    fn ctrader_instrument_requires_named_account_before_network() {
+        let error = validate_instrument(BrokerKind::Ctrader, None, "EURUSD").unwrap_err();
+        assert!(error.to_string().contains("explicit named account"));
+    }
 
     fn stub(market_id: u64, name: &str, symbol: Option<&str>) -> Market {
         Market {

@@ -319,6 +319,7 @@ async fn fetch_candles(
         BrokerHandle::TradeNation(b) => b.get_candles(instrument, granularity, since, now).await,
         BrokerHandle::Ibkr(b) => b.get_candles(instrument, granularity, since, now).await,
         BrokerHandle::Mt5(b) => b.get_candles(instrument, granularity, since, now).await,
+        BrokerHandle::Ctrader(b) => b.get_candles(instrument, granularity, since, now).await,
     };
     match res {
         Ok(c) => Some(c),
@@ -338,6 +339,7 @@ async fn list_positions(
         BrokerHandle::TradeNation(b) => b.list_open_positions(account_id).await,
         BrokerHandle::Ibkr(b) => b.list_open_positions(account_id).await,
         BrokerHandle::Mt5(b) => b.list_open_positions(account_id).await,
+        BrokerHandle::Ctrader(b) => b.list_open_positions(account_id).await,
     };
     res.map_err(|e| e.to_string())
 }
@@ -353,6 +355,7 @@ async fn amend(
         BrokerHandle::TradeNation(b) => b.amend_stop(account_id, id, new_stop).await,
         BrokerHandle::Ibkr(b) => b.amend_stop(account_id, id, new_stop).await,
         BrokerHandle::Mt5(b) => b.amend_stop(account_id, id, new_stop).await,
+        BrokerHandle::Ctrader(b) => b.amend_stop(account_id, id, new_stop).await,
     }
 }
 

@@ -147,6 +147,19 @@ pub fn resolve_effective_precision(cat: CatalogPrecision, tv: &SymbolInfo) -> Ef
     }
 }
 
+/// cTrader protection uses account-native precision even when the chart differs.
+pub fn resolve_broker_precision(
+    broker: trade_control_conventions::Broker,
+    cat: CatalogPrecision,
+    tv: &SymbolInfo,
+) -> EffectivePrecision {
+    if broker == trade_control_conventions::Broker::Ctrader {
+        EffectivePrecision::from_catalog(cat)
+    } else {
+        resolve_effective_precision(cat, tv)
+    }
+}
+
 /// Ticks are floats; treat them equal within a tiny relative epsilon so
 /// `0.00001` from two sources doesn't spuriously "mismatch".
 fn ticks_match(a: f64, b: f64) -> bool {
@@ -158,6 +171,19 @@ fn ticks_match(a: f64, b: f64) -> bool {
 mod tests {
     use super::*;
     use instrument_lookup::{AssetClass, AssetSymbols};
+
+    #[test]
+    fn ctrader_account_precision_cannot_be_replaced_by_chart_provider() {
+        let a = asset(AssetClass::Forex, 0.00001, 5, 0.0001);
+        let effective = resolve_broker_precision(
+            trade_control_conventions::Broker::Ctrader,
+            CatalogPrecision::from_asset(&a),
+            &tv_info(Some(0.001), Some(3)),
+        );
+        assert_eq!(effective.tick_size, 0.00001);
+        assert_eq!(effective.pip_size, 0.0001);
+        assert!(!effective.tick_from_tv);
+    }
 
     fn asset(class: AssetClass, tick: f64, dp: u8, pip: f64) -> Asset {
         Asset {

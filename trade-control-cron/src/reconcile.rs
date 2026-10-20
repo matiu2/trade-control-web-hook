@@ -351,6 +351,10 @@ impl AttemptBroker for BrokerHandle {
                 b.lookup_trade_exit(instrument, broker_order_id, broker_trade_id)
                     .await
             }
+            BrokerHandle::Ctrader(b) => {
+                b.lookup_trade_exit(instrument, broker_order_id, broker_trade_id)
+                    .await
+            }
         }
     }
 
@@ -388,6 +392,10 @@ async fn lookup(
             b.lookup_attempt_state(instrument, broker_order_id, broker_trade_id)
                 .await
         }
+        BrokerHandle::Ctrader(b) => {
+            b.lookup_attempt_state(instrument, broker_order_id, broker_trade_id)
+                .await
+        }
     }
 }
 
@@ -401,6 +409,7 @@ async fn list_positions(
         BrokerHandle::TradeNation(b) => b.list_open_positions(account_id).await,
         BrokerHandle::Ibkr(b) => b.list_open_positions(account_id).await,
         BrokerHandle::Mt5(b) => b.list_open_positions(account_id).await,
+        BrokerHandle::Ctrader(b) => b.list_open_positions(account_id).await,
     };
     res.map_err(|e| e.to_string())
 }

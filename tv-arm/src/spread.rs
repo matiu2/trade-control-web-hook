@@ -92,6 +92,17 @@ async fn read_bid_ask(
     account: Option<&str>,
 ) -> Result<(f64, f64)> {
     match broker {
+        Broker::Ctrader => {
+            use trade_control_core::broker::Broker as _;
+            let account =
+                account.ok_or_else(|| eyre!("cTrader live quotes require a named account"))?;
+            let broker = broker_ctrader::CtraderBroker::connect(account).await?;
+            let quote = broker
+                .get_quote(instrument)
+                .await
+                .map_err(|error| eyre!("cTrader quote: {error:?}"))?;
+            Ok((quote.bid, quote.ask))
+        }
         Broker::Mt5 => {
             let account =
                 account.ok_or_else(|| eyre!("MT5 live quotes require a named account"))?;

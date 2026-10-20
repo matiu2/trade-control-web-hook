@@ -76,6 +76,7 @@ pub enum BrokerError {
     /// or listening elsewhere. Carries the underlying message.
     IbkrConnect(String),
     Mt5Connect(String),
+    CtraderConnect(String),
 }
 
 impl std::fmt::Display for BrokerError {
@@ -95,6 +96,7 @@ impl std::fmt::Display for BrokerError {
             }
             Self::IbkrConnect(msg) => write!(f, "ibkr gateway connect failed: {msg}"),
             Self::Mt5Connect(msg) => write!(f, "MT5 connect failed: {msg}"),
+            Self::CtraderConnect(msg) => write!(f, "cTrader connect failed: {msg}"),
         }
     }
 }
@@ -510,6 +512,101 @@ mod mt5_tests {
             meta.broker = broker;
             assert!(matches!(
                 acquire_mt5(&meta).await,
+                Err(BrokerError::BrokerMismatch { .. })
+            ));
+        }
+    }
+}
+
+/// Validate the pinned cTrader environment and account before any socket opens.
+pub fn validate_ctrader_config(
+    kind: trade_control_core::account::AccountKind,
+    metadata_id: Option<&str>,
+    config: &ctrader_api::Config,
+) -> Result<(), BrokerError> {
+    broker_ctrader::access::Profile::OpenApi(config.clone())
+        .validate(kind.is_live(), metadata_id)
+        .map_err(|error| BrokerError::CtraderConnect(error.to_string()))
+}
+
+/// Acquire the named cTrader account; credentials are independent of MT5 logins.
+pub async fn acquire_ctrader(
+    meta: &AccountMetadata,
+) -> Result<broker_ctrader::CtraderBroker, BrokerError> {
+    if meta.broker != BrokerKind::Ctrader {
+        return Err(BrokerError::BrokerMismatch {
+            intent: BrokerKind::Ctrader,
+            account: meta.broker,
+        });
+    }
+    let profile = broker_ctrader::access::Profile::load(&meta.name)
+        .map_err(|e| BrokerError::CtraderConnect(e.to_string()))?;
+    profile
+        .validate(meta.kind.is_live(), meta.oanda_account_id.as_deref())
+        .map_err(|e| BrokerError::CtraderConnect(e.to_string()))?;
+    let config = profile
+        .require_execution()
+        .map_err(|e| BrokerError::CtraderConnect(e.to_string()))?;
+    broker_ctrader::CtraderBroker::connect_config(&meta.name, config)
+        .await
+        .map_err(|e| BrokerError::CtraderConnect(e.to_string()))
+}
+
+#[cfg(test)]
+mod ctrader_tests {
+    use super::*;
+    use trade_control_core::account::AccountKind;
+
+    #[test]
+    fn ctrader_wire_round_trip() {
+        let parsed: BrokerKind = serde_json::from_str("\"ctrader\"").unwrap();
+        assert_eq!(parsed, BrokerKind::Ctrader);
+        assert_eq!(parsed.as_str(), "ctrader");
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), "\"ctrader\"");
+        assert!(BrokerKind::ALL.contains(&parsed));
+    }
+
+    #[test]
+    fn ctrader_environment_and_pinned_identity_must_match() {
+        let mut config = ctrader_api::Config {
+            client_id: "test-client".into(),
+            client_secret: "test-secret".into(),
+            access_token: "test-token".into(),
+            account_id: 123,
+            environment: ctrader_api::Environment::Demo,
+        };
+        assert!(validate_ctrader_config(AccountKind::Demo, Some("123"), &config).is_ok());
+        assert!(validate_ctrader_config(AccountKind::Demo, None, &config).is_ok());
+        assert!(validate_ctrader_config(AccountKind::Live, Some("123"), &config).is_err());
+        assert!(validate_ctrader_config(AccountKind::Demo, Some("124"), &config).is_err());
+        assert!(validate_ctrader_config(AccountKind::Demo, Some("invalid"), &config).is_err());
+        config.environment = ctrader_api::Environment::Live;
+        assert!(validate_ctrader_config(AccountKind::Demo, Some("123"), &config).is_err());
+        assert!(validate_ctrader_config(AccountKind::Live, Some("123"), &config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn ctrader_rejects_foreign_accounts_before_credentials() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        for &broker in BrokerKind::ALL
+            .iter()
+            .filter(|b| **b != BrokerKind::Ctrader)
+        {
+            let meta = AccountMetadata {
+                name: "missing-ctrader-config".into(),
+                broker,
+                kind: AccountKind::Demo,
+                caps: Default::default(),
+                oanda_account_id: None,
+            };
+            assert!(matches!(
+                acquire_ctrader(&meta).await,
                 Err(BrokerError::BrokerMismatch { .. })
             ));
         }

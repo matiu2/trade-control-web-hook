@@ -21,6 +21,8 @@
 //! OANDA_API_KEY=… trade-control-broker-check testing --instrument EUR/USD
 //! ```
 
+#[path = "broker_check/ctrader.rs"]
+mod ctrader_probe;
 #[path = "broker_check/mt5.rs"]
 mod mt5_probe;
 
@@ -103,6 +105,14 @@ async fn main() -> Result<()> {
 
     // Acquire the broker exactly as the worker does, then one cheap read.
     let quote = match meta.broker {
+        BrokerKind::Ctrader => {
+            if cli.preview_minimum_short || cli.candle_count > 0 {
+                return Err(eyre!(
+                    "MT5-specific diagnostic flags do not apply to cTrader"
+                ));
+            }
+            Ok(ctrader_probe::check(&meta, &cli.instrument).await?)
+        }
         BrokerKind::Mt5 => {
             let broker = acquire_mt5(&meta).await.map_err(|e| eyre!("{e}"))?;
             mt5_probe::check(
@@ -170,7 +180,7 @@ async fn main() -> Result<()> {
                 q.ask,
                 q.spread()
             );
-            println!("broker session is LIVE — this account can place demo trades.");
+            println!("read-only quote access verified; order execution was not tested.");
             Ok(())
         }
         Err(e) => Err(eyre!(

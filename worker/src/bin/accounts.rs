@@ -117,7 +117,11 @@ fn default_config_paths() -> Vec<String> {
 #[derive(Subcommand)]
 enum Command {
     /// List every account in the index (name-ascending), metadata only.
-    List,
+    List {
+        /// Emit non-secret metadata and configured broker capabilities as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show one account by name.
     Get {
         /// The account name.
@@ -162,6 +166,7 @@ enum BrokerArg {
     Tradenation,
     Ibkr,
     Mt5,
+    Ctrader,
 }
 
 impl From<BrokerArg> for BrokerKind {
@@ -171,6 +176,7 @@ impl From<BrokerArg> for BrokerKind {
             BrokerArg::Tradenation => BrokerKind::TradeNation,
             BrokerArg::Ibkr => BrokerKind::Ibkr,
             BrokerArg::Mt5 => BrokerKind::Mt5,
+            BrokerArg::Ctrader => BrokerKind::Ctrader,
         }
     }
 }
@@ -211,7 +217,7 @@ async fn main() -> Result<()> {
     let accounts = PgMetadataStore::from_state_store(&store);
 
     match cli.command {
-        Command::List => list(&accounts).await,
+        Command::List { json } => list(&accounts, json).await,
         Command::Get { name } => get(&accounts, &name).await,
         Command::Add {
             name,
@@ -237,8 +243,16 @@ async fn main() -> Result<()> {
 }
 
 /// Print the index as one line per account: `name  broker  kind  [oanda-id]  [caps]`.
-async fn list(accounts: &PgMetadataStore) -> Result<()> {
+async fn list(accounts: &PgMetadataStore, json: bool) -> Result<()> {
     let rows = accounts.list().await.map_err(meta_err)?;
+    if json {
+        let rows = rows
+            .iter()
+            .map(trade_control_worker::account_capabilities::listing)
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string(&rows)?);
+        return Ok(());
+    }
     if rows.is_empty() {
         println!("(no accounts)");
         return Ok(());
@@ -272,6 +286,10 @@ async fn add(
     max_risk_pct: Option<f64>,
     max_open_positions: Option<u32>,
 ) -> Result<()> {
+    if broker == BrokerKind::Ctrader {
+        broker_ctrader::access::Profile::load(&name)?
+            .validate(kind.is_live(), oanda_account_id.as_deref())?;
+    }
     if broker == BrokerKind::Mt5 {
         if kind.is_live() {
             return Err(eyre!("MT5 currently supports demo/competition only"));
@@ -339,6 +357,13 @@ fn render(m: &AccountMetadata) -> String {
     }
     if let Some(p) = m.caps.max_open_positions {
         s.push_str(&format!("  max_open_positions={p}"));
+    }
+    if m.broker == BrokerKind::Ctrader {
+        let capabilities = trade_control_worker::account_capabilities::capabilities(m);
+        s.push_str(&format!(
+            "  {} ({})",
+            capabilities.readiness, capabilities.reason
+        ));
     }
     s
 }

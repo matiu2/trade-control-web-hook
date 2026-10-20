@@ -29,6 +29,7 @@ pub enum BrokerArg {
     Ibkr,
     /// MT5 demo/competition account.
     Mt5,
+    Ctrader,
 }
 
 impl BrokerArg {
@@ -39,6 +40,7 @@ impl BrokerArg {
             Self::TradeNation => trade_control_conventions::Broker::TradeNation,
             Self::Ibkr => trade_control_conventions::Broker::Ibkr,
             Self::Mt5 => trade_control_conventions::Broker::Mt5,
+            Self::Ctrader => trade_control_conventions::Broker::Ctrader,
         }
     }
 }

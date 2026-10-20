@@ -38,7 +38,7 @@ pub fn instrument_for(broker: Broker, raw_sym: &str) -> String {
         Broker::TradeNation => '/',
         Broker::Oanda => '_',
         Broker::Ibkr => return raw_sym.to_string(),
-        Broker::Mt5 => {
+        Broker::Mt5 | Broker::Ctrader => {
             let compact = raw_sym.replace(['/', '_'], "");
             return if compact.len() == 6 && compact.bytes().all(|b| b.is_ascii_alphabetic()) {
                 compact.to_ascii_uppercase()
@@ -134,5 +134,19 @@ mod mt5_tests {
         assert_eq!(instrument_for(Broker::Mt5, "EUR_CAD"), "EURCAD");
         assert_eq!(instrument_for(Broker::Mt5, "EURCAD.a"), "EURCAD.a");
         assert_eq!(Broker::Mt5.default_account_index(), None);
+    }
+}
+
+#[cfg(test)]
+mod ctrader_tests {
+    #[test]
+    fn ctrader_fx_uses_compact_native_symbol() {
+        use crate::Broker;
+        assert_eq!(super::instrument_for(Broker::Ctrader, "eur/cad"), "EURCAD");
+        assert_eq!(super::instrument_for(Broker::Ctrader, "EUR_CAD"), "EURCAD");
+        assert_eq!(
+            super::instrument_for(Broker::Ctrader, "EURCAD.a"),
+            "EURCAD.a"
+        );
     }
 }

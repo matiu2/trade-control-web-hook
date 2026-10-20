@@ -233,6 +233,12 @@ pub struct EntryRequest<'a> {
 #[derive(Debug)]
 pub enum EntryError {
     AccountFetch,
+    /// Account-native sizing could not establish a currency conversion.
+    CurrencyConversion {
+        from: String,
+        to: String,
+        detail: String,
+    },
     EquityParse,
     RiskCapExceeded {
         requested: f64,
@@ -261,6 +267,8 @@ pub enum EntryError {
     /// **not** the cause.
     EntryTooCloseToMarket,
     OrderRejected,
+    /// Definitive rejection with safe local or broker evidence for operators.
+    OrderRejectedWithDetail(String),
     /// The broker confirmed the HTTP call succeeded but the response body
     /// could not be parsed, so whether an order was actually placed is
     /// **unknown** — unlike every other variant, this is NOT evidence the
@@ -282,6 +290,10 @@ impl core::fmt::Display for EntryError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::AccountFetch => f.write_str("failed to fetch account"),
+            Self::CurrencyConversion { from, to, detail } => write!(
+                f,
+                "failed to convert {from} to {to} for position sizing: {detail}"
+            ),
             Self::EquityParse => f.write_str("failed to parse account equity"),
             Self::RiskCapExceeded { requested, cap } => {
                 write!(f, "risk {requested}% > cap {cap}%")
@@ -295,6 +307,9 @@ impl core::fmt::Display for EntryError {
                 f.write_str("entry trigger too close to (or wrong side of) the market price")
             }
             Self::OrderRejected => f.write_str("broker rejected the order"),
+            Self::OrderRejectedWithDetail(detail) => {
+                write!(f, "broker rejected the order: {detail}")
+            }
             Self::AmbiguousSuccess(detail) => write!(
                 f,
                 "broker confirmed the request but the response could not be \

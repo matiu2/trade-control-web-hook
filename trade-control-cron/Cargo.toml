@@ -14,6 +14,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 trade-control-core = { version = "0.1.0", path = "../core" }
 trade-control-engine = { version = "0.1.0", path = "../engine" }
 broker-ibkr = { version = "0.1.0", path = "../broker-ibkr" }
+broker-ctrader = { version = "0.1.0", path = "../broker-ctrader" }
 
 [dev-dependencies]
 pollster = "1.0.1"

@@ -13,6 +13,8 @@ pub enum Broker {
     Ibkr,
     /// MT5 demo/competition account, selected explicitly by name.
     Mt5,
+    /// cTrader Open API, selected explicitly by named account.
+    Ctrader,
 }
 
 impl Broker {
@@ -25,6 +27,7 @@ impl Broker {
         Broker::TradeNation,
         Broker::Ibkr,
         Broker::Mt5,
+        Broker::Ctrader,
     ];
 
     /// Look up a broker from a TradingView exchange tag (the prefix
@@ -50,6 +53,7 @@ impl Broker {
             "tradenation" => Some(Self::TradeNation),
             "ibkr" => Some(Self::Ibkr),
             "mt5" => Some(Self::Mt5),
+            "ctrader" => Some(Self::Ctrader),
             _ => None,
         }
     }
@@ -61,6 +65,7 @@ impl Broker {
             Self::TradeNation => "tradenation",
             Self::Ibkr => "ibkr",
             Self::Mt5 => "mt5",
+            Self::Ctrader => "ctrader",
         }
     }
 
@@ -75,7 +80,7 @@ impl Broker {
         match self {
             Self::Oanda => Some("m-and-w"),
             Self::TradeNation => Some("reversals"),
-            Self::Ibkr | Self::Mt5 => None,
+            Self::Ibkr | Self::Mt5 | Self::Ctrader => None,
         }
     }
 }
@@ -129,7 +134,7 @@ mod tests {
     /// variant that was left out, so this walks `ALL` and also pins its length.
     #[test]
     fn all_covers_every_variant_and_round_trips() {
-        assert_eq!(Broker::ALL.len(), 4, "a new broker must be added to ALL");
+        assert_eq!(Broker::ALL.len(), 5, "a new broker must be added to ALL");
         for &b in Broker::ALL {
             assert_eq!(Broker::from_wire(b.as_str()), Some(b), "{b:?}");
         }
@@ -149,5 +154,17 @@ mod tests {
         assert_eq!(Broker::from_exchange("IBKR"), None);
         assert_eq!(Broker::from_exchange("COMEX"), None);
         assert_eq!(Broker::from_exchange("CME"), None);
+    }
+}
+
+#[cfg(test)]
+mod ctrader_tests {
+    use super::Broker;
+    #[test]
+    fn ctrader_is_explicit_and_round_trips() {
+        assert_eq!(Broker::from_wire("ctrader"), Some(Broker::Ctrader));
+        assert_eq!(Broker::Ctrader.as_str(), "ctrader");
+        assert_eq!(Broker::Ctrader.default_account_index(), None);
+        assert_eq!(Broker::from_exchange("CTRADER"), None);
     }
 }
