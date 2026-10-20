@@ -39,7 +39,7 @@ use crate::intent::{Direction, RecoverEntryAction, ResolvedRecoverEntry};
 /// Kept deliberately in sync with `EntryError`: adding a variant there
 /// is a **compile error** here until it is given a token, so a new
 /// failure mode cannot silently land in the ledger wearing an existing
-/// label.
+/// label. Detailed rejections deliberately retain the `broker-rejected` label.
 fn failure_token(err: &EntryError) -> &'static str {
     match err {
         EntryError::AccountFetch => "account-fetch",
@@ -52,7 +52,7 @@ fn failure_token(err: &EntryError) -> &'static str {
         EntryError::EntryTooCloseToMarket => "too-close-to-market",
         EntryError::EntryWithinMinimumDistance(_) => "pending-entry-too-close",
         EntryError::MarketRecoveryDeclined(_) => "market-recovery-declined",
-        EntryError::OrderRejected => "broker-rejected",
+        EntryError::OrderRejected | EntryError::OrderRejectedWithDetail(_) => "broker-rejected",
         EntryError::AmbiguousSuccess(_) => "ambiguous-success",
     }
 }

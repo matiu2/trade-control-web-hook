@@ -95,8 +95,8 @@ pub(crate) async fn place(
         comment: "trade-control".into(),
     };
     broker.trader.preview(&order).await.map_err(|e| {
-        tracing::warn!(%e, "MT5 entry validation failed");
-        EntryError::OrderRejected
+        tracing::warn!(symbol = req.instrument, %e, "MT5 entry validation failed");
+        EntryError::OrderRejectedWithDetail(format!("MT5 entry validation before submission: {e}"))
     })?;
     tracing::info!(symbol=req.instrument, %lots, price, stop, take, equity, loss_per_lot=loss, dry_run=req.dry_run, "MT5 entry sized");
     if req.dry_run {
@@ -107,8 +107,8 @@ pub(crate) async fn place(
         });
     }
     let outcome = broker.trader.open(&order).await.map_err(|e| {
-        tracing::error!(%e, "MT5 entry rejected before transmission");
-        EntryError::OrderRejected
+        tracing::error!(symbol = req.instrument, %e, "MT5 entry rejected before transmission");
+        EntryError::OrderRejectedWithDetail(format!("MT5 entry rejected before transmission: {e}"))
     })?;
     mapping::placement(outcome, lots, price)
 }

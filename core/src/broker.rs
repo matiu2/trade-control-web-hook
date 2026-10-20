@@ -275,6 +275,8 @@ pub enum EntryError {
     /// A guarded market recovery could not enforce its price band or R floor.
     MarketRecoveryDeclined(String),
     OrderRejected,
+    /// Definitive rejection with broker or local validation evidence for operators.
+    OrderRejectedWithDetail(String),
     /// The broker confirmed the HTTP call succeeded but the response body
     /// could not be parsed, so whether an order was actually placed is
     /// **unknown** — unlike every other variant, this is NOT evidence the
@@ -317,6 +319,9 @@ impl core::fmt::Display for EntryError {
             Self::EntryWithinMinimumDistance(distance) => distance.fmt(f),
             Self::MarketRecoveryDeclined(reason) => f.write_str(reason),
             Self::OrderRejected => f.write_str("broker rejected the order"),
+            Self::OrderRejectedWithDetail(detail) => {
+                write!(f, "broker rejected the order: {detail}")
+            }
             Self::AmbiguousSuccess(detail) => write!(
                 f,
                 "entry submission outcome is unknown; an order may already exist; \

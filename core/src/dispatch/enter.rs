@@ -3774,6 +3774,34 @@ mod units_below_minimum_tests {
         );
     }
 
+    #[test]
+    fn detailed_broker_rejection_reaches_dispatch_without_parking() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        let store = MemStateStore::default();
+        let out = dispatch(
+            || {
+                EntryError::OrderRejectedWithDetail(
+                    "MT5 request_id=42 result_code=10019 comment=diagnostic".into(),
+                )
+            },
+            &store,
+        );
+        assert!(matches!(out, ActionResult::Failed(ref detail)
+            if detail.starts_with("entry-failed: broker-rejected (")
+                && detail.contains("request_id=42 result_code=10019 comment=diagnostic")));
+        assert!(
+            pollster::block_on(stored_order(&store, "t-1"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// Both arms are a `Skip`, so NEITHER poisons the seen-id and the next bar
     /// may fire again. That is unchanged by this stage and load-bearing: the
     /// park adds a retry *cadence* and an audit trail, it does not change
