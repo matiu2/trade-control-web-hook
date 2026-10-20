@@ -2126,3 +2126,28 @@ impl StateStore for PgStateStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod migration_compatibility_tests {
+    use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn dev_bundle_recognizes_already_applied_operator_migrations() {
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        let migrations = sqlx::migrate!("./migrations");
+        // These tables already exist in deployed dev databases. Keeping their
+        // exact migration records does not enable staging notification behavior.
+        for version in [8, 9] {
+            assert!(
+                migrations
+                    .iter()
+                    .any(|migration| migration.version == version)
+            );
+        }
+    }
+}
