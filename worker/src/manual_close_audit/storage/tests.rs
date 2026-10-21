@@ -1,5 +1,9 @@
 use super::*;
-use trade_control_core::settlement::{SettledTrade, Settlement};
+use trade_control_core::{
+    plan_state::{Phase, PlanState},
+    settlement::{SettledTrade, Settlement},
+    state::StateStore,
+};
 
 #[test]
 fn unfinished_audits_run_before_previously_checked_pending_notes() {
@@ -27,6 +31,43 @@ fn unfinished_audits_run_before_previously_checked_pending_notes() {
     assert_eq!(jobs.iter().map(|job| job.id).collect::<Vec<_>>(), [2, 3, 1]);
 }
 
+/// One connection keeps this audit's candidate queue in its own temporary schema.
+/// PostgreSQL drops it on disconnect; no database CREATE privilege is needed.
+async fn isolated_store(url: &str) -> crate::PgStateStore {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .max_lifetime(None)
+        .idle_timeout(None)
+        .connect(url)
+        .await
+        .expect("isolated audit connection");
+    sqlx::query("CREATE TEMP TABLE audit_test_connection (id INTEGER)")
+        .execute(&pool)
+        .await
+        .expect("initialize private temporary schema");
+    sqlx::query("SET search_path = pg_temp")
+        .execute(&pool)
+        .await
+        .expect("isolate audit tables from concurrent tests");
+    let store = crate::PgStateStore::from_pool(pool);
+    store
+        .migrate()
+        .await
+        .expect("migrate isolated audit schema");
+    store
+}
+
+fn previous_settlement() -> Settlement {
+    serde_json::from_value(json!({
+        "broker": "previous",
+        "fetched_at": Utc::now(),
+        "trades": [{"broker_trade_id": "previous-position", "realized_pl": 42.0}],
+        "ledger": [],
+        "warnings": []
+    }))
+    .expect("valid previous settlement fixture")
+}
+
 #[tokio::test]
 async fn audit_cooldown_failures_and_confirmation_preserve_operator_closure() {
     use tracing_subscriber::prelude::*;
@@ -39,8 +80,7 @@ async fn audit_cooldown_failures_and_confirmation_preserve_operator_closure() {
     let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
         return;
     };
-    let store = crate::PgStateStore::connect(&url).await.unwrap();
-    store.migrate().await.unwrap();
+    let store = isolated_store(&url).await;
     let trade_id = format!("audit-test-{}", Utc::now().timestamp_nanos_opt().unwrap());
     let account = format!("account-{trade_id}");
     let note = CronNote {
@@ -55,13 +95,37 @@ async fn audit_cooldown_failures_and_confirmation_preserve_operator_closure() {
     };
     let mut body = serde_json::to_value(note).unwrap();
     body["admin_snapshot"] = json!({"audit_status":"pending", "detached_attempts":[]});
-    sqlx::query("INSERT INTO archived_plan (account, trade_id, body) VALUES ($1,$2,$3)")
-        .bind(&account)
-        .bind(&trade_id)
-        .bind(json!({"final_state":{"fired":["operator:closed-manually"]}, "settlement":{"broker":"previous", "trades":[{"realized_pl":42.0}]}}))
-        .execute(store.pool())
+    let plan = serde_json::from_value(json!({
+        "trade_id": trade_id,
+        "instrument": "AUDUSD",
+        "direction": "long",
+        "granularity": "h1",
+        "pip_size": 0.0001,
+        "rules": []
+    }))
+    .expect("audit fixture plan");
+    let mut final_state = PlanState::seed(Phase::Done, Utc::now());
+    final_state.fired.insert("operator:closed-manually".into());
+    store
+        .archive_plan(
+            Some(&account),
+            &plan,
+            &final_state,
+            Utc::now(),
+            Some(previous_settlement()),
+        )
         .await
-        .unwrap();
+        .expect("valid archive fixture");
+    // Other worker tasks enumerate archives while this audit is pending.
+    let archives = store
+        .list_all_archived_plans()
+        .await
+        .expect("valid audit archive fixture");
+    assert!(
+        archives
+            .iter()
+            .any(|archive| archive.plan.trade_id == trade_id)
+    );
     sqlx::query("INSERT INTO cron_notes (ts,correlation_id,account,source,severity,message,body) VALUES (now(),$1,$2,'plan-admin','info','operator-confirmed close; management retired',$3)")
         .bind(&trade_id).bind(&account).bind(body).execute(store.pool()).await.unwrap();
     let jobs = claim(store.pool()).await.unwrap();
@@ -176,4 +240,5 @@ async fn audit_cooldown_failures_and_confirmation_preserve_operator_closure() {
         .execute(store.pool())
         .await
         .unwrap();
+    store.pool().close().await;
 }
