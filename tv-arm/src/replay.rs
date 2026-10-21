@@ -175,7 +175,8 @@ fn source_for(broker: Broker) -> Option<CandleSource> {
     match broker {
         Broker::TradeNation => Some(CandleSource::TradeNation),
         Broker::Oanda => Some(CandleSource::Oanda),
-        Broker::Ibkr | Broker::Ctrader => None,
+        Broker::Ibkr => None,
+        Broker::Ctrader => Some(CandleSource::Ctrader),
         Broker::Mt5 => Some(CandleSource::Mt5),
     }
 }
@@ -400,6 +401,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn c_trader_replay_accepts_pinned_account_passthrough() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        let passthrough = vec!["--ctrader-account".into(), "ctrader-demo".into()];
+        let argv = build_argv(
+            "replay-candles",
+            Path::new("plan.json"),
+            source_for(Broker::Ctrader).unwrap(),
+            &passthrough,
+            ArmContext::default(),
+            None,
+        );
+        let parsed = ReplayArgs::try_parse_from(argv).unwrap();
+        assert_eq!(parsed.source, CandleSource::Ctrader);
+        assert_eq!(parsed.ctrader_account.as_deref(), Some("ctrader-demo"));
+    }
+
+    #[test]
     fn frozen_spec_inputs_write_positions_without_enabling_tradingview_annotation() {
         use tracing_subscriber::prelude::*;
         tracing_subscriber::registry()
@@ -477,7 +501,7 @@ mod tests {
     #[test]
     fn ibkr_has_no_candle_source() {
         assert_eq!(source_for(Broker::Ibkr), None);
-        assert_eq!(source_for(Broker::Ctrader), None);
+        assert_eq!(source_for(Broker::Ctrader), Some(CandleSource::Ctrader));
     }
 
     #[test]

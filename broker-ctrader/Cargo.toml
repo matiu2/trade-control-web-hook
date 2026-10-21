@@ -15,6 +15,9 @@ ctrader-fix = { version = "0.1.0", path = "../../ctrader-fix" }
 serde = { version = "1.0.229", features = ["derive"] }
 libc = "0.2.191"
 toml = "1.1.6"
+candle-cache = { version = "0.1.2", path = "../../candle-cache", features = ["ctrader"] }
+ctrader-data-source = { version = "0.1.0", path = "../../ctrader-data-source" }
+candle-model = { version = "0.1.0", path = "../../candle-model" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

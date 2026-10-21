@@ -36,6 +36,8 @@ pub enum CandleSource {
     Oanda,
     /// MT5 cached history; genuine pairs or labelled baked-spread replay estimates.
     Mt5,
+    /// cTrader genuine paired history in the named account cache.
+    Ctrader,
 }
 
 /// Price-history policy applies only to offline MT5 replay.
@@ -60,6 +62,7 @@ impl CandleSource {
             Self::TradeNation => "tradenation",
             Self::Oanda => "oanda",
             Self::Mt5 => "mt5",
+            Self::Ctrader => "ctrader",
         }
     }
 }
@@ -214,6 +217,10 @@ pub struct ReplayArgs {
     /// Named MT5 account; defaults to the account embedded in the plan.
     #[arg(long)]
     pub mt5_account: Option<String>,
+
+    /// Named cTrader profile; inferred only from one unique cTrader plan account.
+    #[arg(long)]
+    pub ctrader_account: Option<String>,
 
     /// MT5 replay history: auto falls back to explicitly labelled estimated
     /// ask/mid using this account's baked spread. Paired requires genuine history;
@@ -651,6 +658,31 @@ mod tests {
         assert_eq!(CandleSource::TradeNation.as_str(), "tradenation");
         assert_eq!(CandleSource::Oanda.as_str(), "oanda");
         assert_eq!(CandleSource::Mt5.as_str(), "mt5");
+        assert_eq!(CandleSource::Ctrader.as_str(), "ctrader");
+    }
+
+    #[test]
+    fn c_trader_source_keeps_the_exact_named_account() {
+        use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        let args = ReplayArgs::try_parse_from([
+            "replay-candles",
+            "--plan",
+            "p.json",
+            "--source",
+            "ctrader",
+            "--ctrader-account",
+            "ctrader-oanda-demo",
+        ])
+        .unwrap();
+        assert_eq!(args.source, CandleSource::Ctrader);
+        assert_eq!(args.ctrader_account.as_deref(), Some("ctrader-oanda-demo"));
+        assert!(args.mt5_account.is_none());
     }
 
     #[test]

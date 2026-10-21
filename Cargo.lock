@@ -357,9 +357,12 @@ dependencies = [
 name = "broker-ctrader"
 version = "0.1.0"
 dependencies = [
+ "candle-cache",
+ "candle-model",
  "chrono",
  "color-eyre",
  "ctrader-api",
+ "ctrader-data-source",
  "ctrader-fix",
  "libc",
  "serde",
@@ -494,11 +497,16 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "color-eyre",
+ "ctrader-data-source",
+ "dirs 7.0.0",
  "instrument-lookup 0.7.0",
  "redb",
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "strategy-common",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1063,6 +1071,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctrader-data-source"
+version = "0.1.0"
+dependencies = [
+ "candle-model",
+ "chrono",
+ "color-eyre",
+ "ctrader-api",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ctrader-fix"
 version = "0.1.0"
 dependencies = [
@@ -1223,6 +1245,15 @@ name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
 dependencies = [
  "dirs-sys",
 ]
@@ -2135,7 +2166,7 @@ dependencies = [
  "color-eyre",
  "csv",
  "dialoguer",
- "dirs",
+ "dirs 6.0.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -2157,7 +2188,7 @@ dependencies = [
  "color-eyre",
  "csv",
  "dialoguer",
- "dirs",
+ "dirs 6.0.0",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -4983,7 +5014,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "color-eyre",
- "dirs",
+ "dirs 6.0.0",
  "dotenvy",
  "futures-util",
  "getrandom 0.4.2",
@@ -5005,7 +5036,7 @@ version = "0.2.0"
 source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.20.0#3769b68bbe712a288591921b487f7a3c88ceb61c"
 dependencies = [
  "chrono",
- "dirs",
+ "dirs 6.0.0",
  "reqwest 0.12.23",
  "serde",
  "serde_json",

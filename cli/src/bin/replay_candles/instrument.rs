@@ -16,9 +16,13 @@ use trade_control_cli::replay_args::CandleSource;
 /// `source` feed expects. Tries a direct broker-symbol hit first, then the
 /// general catalog resolver, exactly like `parse_instrument`.
 pub fn resolve_for(raw: &str, source: CandleSource) -> Result<String> {
-    if source == CandleSource::Mt5 {
+    if matches!(source, CandleSource::Mt5 | CandleSource::Ctrader) {
         return Ok(trade_control_conventions::instrument_for(
-            trade_control_conventions::Broker::Mt5,
+            if source == CandleSource::Ctrader {
+                trade_control_conventions::Broker::Ctrader
+            } else {
+                trade_control_conventions::Broker::Mt5
+            },
             raw,
         ));
     }
@@ -47,7 +51,7 @@ fn broker_of(source: CandleSource) -> Broker {
     match source {
         CandleSource::Oanda => Broker::Oanda,
         CandleSource::TradeNation => Broker::TradeNation,
-        CandleSource::Mt5 => Broker::Oanda, // MT5 exits before catalog lookup above.
+        CandleSource::Mt5 | CandleSource::Ctrader => Broker::Oanda, // Named sources exit before catalog lookup above.
     }
 }
 
@@ -64,6 +68,21 @@ mod tests {
         assert_eq!(
             resolve_for("EUR_CAD", CandleSource::TradeNation).unwrap(),
             "EUR/CAD"
+        );
+    }
+
+    #[test]
+    fn c_trader_uses_native_symbol_mapping_without_other_broker_catalogues() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        assert_eq!(
+            resolve_for("EUR_USD", CandleSource::Ctrader).unwrap(),
+            "EURUSD"
         );
     }
 

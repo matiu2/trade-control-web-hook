@@ -276,7 +276,7 @@ pub async fn fetch_windows(
     finer: super::granularity::ReplayGranularity,
     windows: &[ZoomWindow],
     cache_dir: Option<std::path::PathBuf>,
-    mt5_history: &super::mt5_history::Mt5Replay<'_>,
+    mt5_history: &super::history::SourceHistory<'_>,
 ) -> Vec<BidAskCandle> {
     let mut out = Vec::new();
     for w in coalesce(windows.to_vec()) {

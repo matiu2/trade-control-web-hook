@@ -46,33 +46,6 @@ fn market_order_protects_with_relative_distances() {
     assert_eq!(p["relativeStopLoss"], 100);
     assert_eq!(p["relativeTakeProfit"], 200);
 }
-#[test]
-fn decode_ticks_accumulates_time_and_price_deltas() {
-    init();
-    let ticks=candles::decode(&json!([{"timestamp":1605529960134_i64,"tick":773874},{"timestamp":-8985,"tick":-45},{"timestamp":-1135,"tick":-5}])).unwrap();
-    assert_eq!(
-        ticks,
-        vec![
-            (1605529960134, 7.73874),
-            (1605529951149, 7.73829),
-            (1605529950014, 7.73824)
-        ]
-    );
-}
-#[test]
-fn missing_quote_side_cannot_manufacture_mid_bars() {
-    init();
-    assert!(candles::aggregate(&[(0, 1.0)], &[], 60, 0, 120000).is_err());
-}
-#[test]
-fn true_mid_high_differs_from_mean_of_book_highs() {
-    init();
-    let bid = vec![(0, 1.0), (10000, 1.2), (20000, 1.0)];
-    let ask = vec![(0, 1.3), (30000, 1.5)];
-    let bars = candles::aggregate(&bid, &ask, 60, 0, 120000).unwrap();
-    assert!((bars[0].h - 1.25).abs() < 1e-10);
-    assert!((bars[0].h - (bars[0].bid_h + bars[0].ask_h) / 2.0).abs() > 0.05);
-}
 
 #[test]
 fn volume_invalid_limits_nonfinite_and_oversize_are_refused() {
@@ -153,41 +126,6 @@ fn invalid_geometry_cannot_reach_order_submission() {
     assert!(entry::payload(42, 7, 100000, &req, 1.1).is_err());
     req.stop_loss = f64::NAN;
     assert!(entry::payload(42, 7, 100000, &req, 1.1).is_err());
-}
-#[test]
-fn tick_decode_refuses_positive_time_deltas_and_nonpositive_prices() {
-    init();
-    assert!(
-        candles::decode(&json!([{"timestamp":1000,"tick":110000},{"timestamp":1,"tick":0}]))
-            .is_err()
-    );
-    assert!(candles::decode(&json!([{"timestamp":1000,"tick":0}])).is_err());
-}
-#[test]
-fn bid_and_ask_at_same_millisecond_are_applied_atomically() {
-    init();
-    let bids = vec![(0, 1.0), (1000, 1.2)];
-    let asks = vec![(0, 1.5), (1000, 1.3)];
-    let bars = candles::aggregate(&bids, &asks, 60, 0, 60000).unwrap();
-    assert_eq!(bars[0].o, 1.25);
-    assert_eq!(bars[0].h, 1.25);
-    assert_eq!(bars[0].l, 1.25);
-    assert_eq!(bars[0].c, 1.25);
-}
-#[test]
-fn ticks_at_end_are_excluded_and_no_empty_bars_are_invented() {
-    init();
-    let bids = vec![(0, 1.0), (120000, 1.2)];
-    let asks = vec![(0, 1.3), (120000, 1.5)];
-    let bars = candles::aggregate(&bids, &asks, 60, 0, 120000).unwrap();
-    assert_eq!(bars.len(), 1);
-    assert_eq!(bars[0].time.timestamp_millis(), 0);
-}
-#[test]
-fn missing_initial_book_and_crossed_quotes_are_refused() {
-    init();
-    assert!(candles::aggregate(&[(0, 1.0)], &[(1000, 1.1)], 60, 0, 60000).is_err());
-    assert!(candles::aggregate(&[(0, 1.2)], &[(0, 1.1)], 60, 0, 60000).is_err());
 }
 #[test]
 fn absence_or_partially_filled_cancellation_does_not_prove_dead_attempt() {
@@ -303,11 +241,6 @@ fn successful_entry_reports_requested_units_and_price() {
     assert_eq!(p.order_id, "77");
     assert_eq!(p.size, Some(1000.0));
     assert_eq!(p.price, Some(1.1));
-}
-#[test]
-fn same_side_same_millisecond_multiple_prices_cannot_be_silently_overwritten() {
-    init();
-    assert!(candles::aggregate(&[(0, 1.0), (0, 1.1)], &[(0, 1.2)], 60, 0, 60000).is_err());
 }
 #[test]
 fn stop_amend_preserves_target_and_other_protection_settings() {

@@ -1,61 +1,55 @@
-//! Read-only chart data from the authenticated Open API companion.
-//!
-//! Native trendbars are BID prices, not synthetic MID or bid/ask execution bars.
-//! See <https://help.ctrader.com/open-api/messages/#protoaogettrendbarsreq>.
+//! Read-only views reuse the account binding and shared cache used by trading.
 use super::*;
+use std::sync::Arc;
 
-mod catalogue;
-mod decode;
-mod periods;
-mod ranges;
-#[cfg(test)]
-mod tests;
+pub use ctrader_data_source::{InstrumentSummary, NativeBar, NativePeriod};
 
-pub use periods::NativePeriod;
-
-/// A native broker BID bar. Volume is the actual broker tick count.
-#[derive(Debug, Clone, PartialEq)]
-pub struct NativeBar {
-    pub time: DateTime<Utc>,
-    pub open: f64,
-    pub high: f64,
-    pub low: f64,
-    pub close: f64,
-    pub volume: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct InstrumentSummary {
-    pub id: i64,
-    pub name: String,
-    pub description: Option<String>,
-    pub enabled: Option<bool>,
-}
-
-/// Shared authenticated session exposing only reads to chart consumers.
 pub struct ChartData {
     broker: OpenApiBroker,
-    catalogue: tokio::sync::Mutex<CatalogueCache>,
-    metadata: tokio::sync::Mutex<std::collections::HashMap<String, InstrumentMetadata>>,
 }
-
-type CatalogueCache = Option<(std::time::Instant, Vec<InstrumentSummary>)>;
-
-fn catalogue_is_fresh(created: std::time::Instant, now: std::time::Instant) -> bool {
-    now.saturating_duration_since(created) < std::time::Duration::from_secs(24 * 60 * 60)
-}
-
 impl ChartData {
+    /// Build a cache reader without logging in. A miss performs the same
+    /// authenticated account binding as the trading facade before reading data.
+    pub fn configured_feed(name: &str) -> Result<candle_cache::ctrader::CachedFeed> {
+        Self::configured_profile_feed(name, access::Profile::load(name)?)
+    }
+    pub fn configured_profile_feed(
+        name: &str,
+        profile: access::Profile,
+    ) -> Result<candle_cache::ctrader::CachedFeed> {
+        let config = match &profile {
+            access::Profile::OpenApi(config)
+            | access::Profile::Hybrid {
+                open_api: config, ..
+            } => config.clone(),
+            _ => color_eyre::eyre::bail!(
+                "cTrader historical candles require Open API OAuth; FIX supplies quotes only"
+            ),
+        };
+        config.validate()?;
+        profile.validate(matches!(config.environment, ctrader_api::Environment::Live), None)?;
+        let name = name.to_string();
+        let source = ctrader_data_source::CtraderDataSource::with_connector(config, move || {
+            let name = name.clone();
+            let profile = profile.clone();
+            async move {
+                Ok(Self::connect_profile(&name, profile)
+                    .await?
+                    .broker
+                    .shared
+                    .client
+                    .clone())
+            }
+        });
+        Ok(candle_cache::ctrader::CachedFeed::new(source))
+    }
     pub async fn connect(name: &str) -> Result<Self> {
         Self::connect_profile(name, access::Profile::load(name)?).await
     }
-
     pub async fn connect_config(name: &str, config: Config) -> Result<Self> {
         Self::connect_profile(name, access::Profile::OpenApi(config)).await
     }
-
-    /// Hybrid profiles verify the same broker/login/account binding as trading.
-    /// FIX-only profiles are rejected before any network request.
+    /// Binding checks run before either native or paired history is exposed.
     pub async fn connect_profile(name: &str, profile: access::Profile) -> Result<Self> {
         let broker = match profile {
             access::Profile::OpenApi(config) => OpenApiBroker::connect_config(name, config).await?,
@@ -71,60 +65,38 @@ impl ChartData {
             }
             access::Profile::Fix(_) | access::Profile::FixTrading { .. } => {
                 color_eyre::eyre::bail!(
-                    "cTrader candle history and instrument metadata require Open API OAuth; FIX supplies quotes only"
+                    "cTrader historical candles require Open API OAuth; FIX supplies quotes only"
                 )
             }
         };
-        Ok(Self {
-            broker,
-            catalogue: tokio::sync::Mutex::new(None),
-            metadata: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        })
+        Ok(Self { broker })
     }
-
     pub fn account_id(&self) -> i64 {
         self.broker.account_id()
     }
-
-    /// Allows callers to retire cached readers after a transport disconnect.
-    /// Reconnecting a reader never retries or submits a trading mutation.
     pub fn is_closed(&self) -> bool {
         self.broker.shared.client.is_closed()
     }
-
+    pub async fn cached_feed(&self) -> Result<Arc<candle_cache::ctrader::CachedFeed>> {
+        self.broker.shared.candles().await
+    }
     pub async fn catalogue(&self) -> Result<Vec<InstrumentSummary>> {
-        let mut cache = self.catalogue.lock().await;
-        if let Some((created, symbols)) = &*cache
-            && catalogue_is_fresh(*created, std::time::Instant::now())
-        {
-            return Ok(symbols.clone());
-        }
-        let symbols = catalogue::read(&self.broker).await?;
-        self.metadata.lock().await.clear();
-        *cache = Some((std::time::Instant::now(), symbols.clone()));
-        Ok(symbols)
+        self.cached_feed().await?.source().catalogue().await
     }
-
-    /// Cached until the chart reader reconnects or its catalogue refreshes.
-    /// Trading fetches its own current sizing metadata; this cache must not
-    /// authorize order volume.
     pub async fn instrument_metadata(&self, instrument: &str) -> Result<InstrumentMetadata> {
-        let mut cache = self.metadata.lock().await;
-        if let Some(metadata) = cache.get(instrument) {
-            return Ok(metadata.clone());
-        }
-        let metadata = self.broker.instrument_metadata(instrument).await?;
-        cache.insert(instrument.into(), metadata.clone());
-        Ok(metadata)
+        self.broker.instrument_metadata(instrument).await
     }
-
     pub async fn quote(&self, instrument: &str) -> Result<Quote> {
-        let metadata = self.instrument_metadata(instrument).await?;
-        self.broker.shared.quote(metadata.id).await
+        let id = self
+            .cached_feed()
+            .await?
+            .source()
+            .instrument_metadata(instrument)
+            .await?
+            .id;
+        self.broker.shared.quote(id).await
     }
-
-    /// Native BID bars whose broker opening timestamps fall in `[since, until)`.
-    /// Partial current bars may be included; callers decide cache finalization.
+    /// Raw reads remain available to import tools; chart/engine use the cache.
     pub async fn bid_bars(
         &self,
         instrument: &str,
@@ -132,11 +104,46 @@ impl ChartData {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> Result<Vec<NativeBar>> {
-        let windows = ranges::timestamp_windows(period, since, until)?;
-        if windows.is_empty() {
-            return Ok(Vec::new());
-        }
-        let symbol = self.instrument_metadata(instrument).await?;
-        ranges::read(&self.broker, &symbol, period, windows).await
+        self.cached_feed()
+            .await?
+            .source()
+            .bid_bars(instrument, period, since, until)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn configured_cache_does_not_authenticate_until_a_cache_miss() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry().with(tracing_error::ErrorLayer::default()).with(tracing_subscriber::EnvFilter::from_default_env()).with(tracing_subscriber::fmt::layer().with_test_writer()).try_init().ok();
+        let config = ctrader_api::Config { client_id: "not-active".into(), client_secret: "private".into(), access_token: "not-granted".into(), account_id: 42, environment: ctrader_api::Environment::Demo };
+        let feed = ChartData::configured_profile_feed("personal-demo", access::Profile::OpenApi(config)).unwrap();
+        assert_eq!(feed.source().account_id(), 42);
+    }
+    #[tokio::test]
+    async fn fix_profiles_cannot_open_historical_readers() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        let config = ctrader_fix::Config {
+            host: "unused".into(),
+            port: 5211,
+            sender_comp_id: "demo.example.1".into(),
+            target_comp_id: "cServer".into(),
+            sender_sub_id: "QUOTE".into(),
+            password: "private".into(),
+        };
+        assert!(
+            ChartData::connect_profile("demo", access::Profile::Fix(config))
+                .await
+                .is_err()
+        );
     }
 }
