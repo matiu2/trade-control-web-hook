@@ -27,7 +27,10 @@ impl ChartData {
             ),
         };
         config.validate()?;
-        profile.validate(matches!(config.environment, ctrader_api::Environment::Live), None)?;
+        profile.validate(
+            matches!(config.environment, ctrader_api::Environment::Live),
+            None,
+        )?;
         let name = name.to_string();
         let source = ctrader_data_source::CtraderDataSource::with_connector(config, move || {
             let name = name.clone();
@@ -118,9 +121,22 @@ mod tests {
     #[test]
     fn configured_cache_does_not_authenticate_until_a_cache_miss() {
         use tracing_subscriber::prelude::*;
-        tracing_subscriber::registry().with(tracing_error::ErrorLayer::default()).with(tracing_subscriber::EnvFilter::from_default_env()).with(tracing_subscriber::fmt::layer().with_test_writer()).try_init().ok();
-        let config = ctrader_api::Config { client_id: "not-active".into(), client_secret: "private".into(), access_token: "not-granted".into(), account_id: 42, environment: ctrader_api::Environment::Demo };
-        let feed = ChartData::configured_profile_feed("personal-demo", access::Profile::OpenApi(config)).unwrap();
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        let config = ctrader_api::Config {
+            client_id: "not-active".into(),
+            client_secret: "private".into(),
+            access_token: "not-granted".into(),
+            account_id: 42,
+            environment: ctrader_api::Environment::Demo,
+        };
+        let feed =
+            ChartData::configured_profile_feed("personal-demo", access::Profile::OpenApi(config))
+                .unwrap();
         assert_eq!(feed.source().account_id(), 42);
     }
     #[tokio::test]
