@@ -8,8 +8,9 @@ use trade_control_core::{
 pub(super) async fn check(meta: &AccountMetadata, instrument: &str) -> Result<Quote> {
     let profile = Profile::load(&meta.name)?;
     profile.validate(meta.kind.is_live(), meta.oanda_account_id.as_deref())?;
+    let hybrid = matches!(&profile, Profile::Hybrid { .. });
     match profile {
-        Profile::OpenApi(_) => {
+        Profile::OpenApi(_) | Profile::Hybrid { .. } => {
             let broker = trade_control_worker::acquire_ctrader(meta).await?;
             let symbol = broker.instrument_metadata(instrument).await?;
             let equity = broker.equity().await?;
@@ -17,12 +18,49 @@ pub(super) async fn check(meta: &AccountMetadata, instrument: &str) -> Result<Qu
                 "cTrader Open API authenticated: equity={equity}; symbol={} pip_size={} min_units={} step_units={}",
                 symbol.name, symbol.pip_size, symbol.min_units, symbol.step_units
             );
+            if hybrid {
+                let positions = broker
+                    .list_open_positions(&meta.name)
+                    .await
+                    .map_err(|error| eyre!("cTrader companion position read failed: {error:?}"))?;
+                let pending = broker
+                    .list_pending_orders(&meta.name)
+                    .await
+                    .map_err(|error| eyre!("cTrader companion pending read failed: {error:?}"))?;
+                println!(
+                    "cTrader FIX/Open API companion identity verified: positions={} pending={}; protected entries and risk data use Open API",
+                    positions.len(),
+                    pending.len()
+                );
+            }
             broker
                 .get_quote(instrument)
                 .await
                 .map_err(|error| eyre!("cTrader quote failed: {error:?}"))
         }
         Profile::Fix(config) => fix_quote(config, instrument).await,
+        Profile::FixTrading { .. } => {
+            let reason = profile.capabilities().reason;
+            let broker = trade_control_worker::acquire_ctrader(meta).await?;
+            let positions = broker
+                .list_open_positions(&meta.name)
+                .await
+                .map_err(|error| eyre!("cTrader FIX position read failed: {error:?}"))?;
+            let pending = broker
+                .list_pending_orders(&meta.name)
+                .await
+                .map_err(|error| eyre!("cTrader FIX pending read failed: {error:?}"))?;
+            let quote = broker
+                .get_quote(instrument)
+                .await
+                .map_err(|error| eyre!("cTrader FIX quote failed: {error:?}"))?;
+            println!(
+                "cTrader FIX demo management authenticated: positions={} pending={}; {reason}",
+                positions.len(),
+                pending.len()
+            );
+            Ok(quote)
+        }
     }
 }
 

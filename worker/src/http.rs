@@ -43,6 +43,8 @@
 
 use std::sync::Arc;
 
+mod registration;
+
 use axum::{
     Router,
     extract::State,
@@ -360,6 +362,9 @@ async fn dispatch_control(
         Action::NewsStart => handle_news_start(store, verified, now).await,
         Action::NewsEnd => handle_news_end(store, verified, now).await,
         Action::Register => {
+            if let Some(refusal) = registration::unavailable(state, verified).await {
+                return Some(refusal);
+            }
             match crate::plan_admin::guard::register_blocked(store, &verified.intent).await {
                 Ok(Some(reason)) => ControlResult::error(reason, 409),
                 Ok(None) => handle_register(store, &state.accounts, verified, now).await,

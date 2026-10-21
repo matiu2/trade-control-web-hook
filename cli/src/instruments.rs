@@ -140,8 +140,8 @@ pub fn validate_instrument(
             let name = name.to_owned();
             run_blocking(async move {
                 let broker = broker_ctrader::CtraderBroker::connect(&account).await?;
-                let metadata = broker.instrument_metadata(&name).await?;
-                Ok((metadata.name != name).then_some(metadata.name))
+                let canonical = broker.canonical_instrument(&name).await?;
+                Ok((canonical != name).then_some(canonical))
             })
         }
         BrokerKind::Mt5 => {

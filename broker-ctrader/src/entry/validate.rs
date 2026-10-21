@@ -1,6 +1,6 @@
 use super::*;
 pub(super) async fn account(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     req: &EntryRequest<'_>,
     symbol: &InstrumentMetadata,
 ) -> std::result::Result<Value, EntryError> {

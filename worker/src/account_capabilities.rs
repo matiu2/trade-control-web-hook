@@ -14,6 +14,7 @@ pub fn capabilities(meta: &AccountMetadata) -> Capabilities {
     if meta.broker != BrokerKind::Ctrader {
         return Capabilities {
             quotes: true,
+            management: true,
             execution: true,
             history: true,
             readiness: "existing-broker".into(),
