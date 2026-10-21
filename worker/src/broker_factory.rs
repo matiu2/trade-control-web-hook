@@ -544,10 +544,7 @@ pub async fn acquire_ctrader(
     profile
         .validate(meta.kind.is_live(), meta.oanda_account_id.as_deref())
         .map_err(|e| BrokerError::CtraderConnect(e.to_string()))?;
-    let config = profile
-        .require_execution()
-        .map_err(|e| BrokerError::CtraderConnect(e.to_string()))?;
-    broker_ctrader::CtraderBroker::connect_config(&meta.name, config)
+    broker_ctrader::CtraderBroker::connect_profile(&meta.name, profile)
         .await
         .map_err(|e| BrokerError::CtraderConnect(e.to_string()))
 }

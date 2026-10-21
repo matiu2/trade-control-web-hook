@@ -22,10 +22,20 @@ pub(crate) fn validate_entry_kind(req: &EntryRequest<'_>) -> std::result::Result
     Ok(())
 }
 pub(crate) async fn place(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     cap: f64,
     max_positions: u32,
     req: &EntryRequest<'_>,
+) -> std::result::Result<Placement, EntryError> {
+    place_with_client_id(broker, cap, max_positions, req, None).await
+}
+
+pub(crate) async fn place_with_client_id(
+    broker: &OpenApiBroker,
+    cap: f64,
+    max_positions: u32,
+    req: &EntryRequest<'_>,
+    client_id: Option<&str>,
 ) -> std::result::Result<Placement, EntryError> {
     validate_entry_kind(req)?;
     if !cap.is_finite() || cap <= 0.0 {
@@ -55,7 +65,10 @@ pub(crate) async fn place(
         .map_err(|_| EntryError::AccountFetch)?;
     let price = geometry::price(req, quote)?;
     let (cents, implied) = sizing::size(broker, req, &symbol, &trader, price, cap).await?;
-    let payload = payload(broker.account_id(), symbol.id, cents, req, price)?;
+    let payload = with_client_id(
+        payload(broker.account_id(), symbol.id, cents, req, price)?,
+        client_id,
+    )?;
     if req.dry_run {
         tracing::info!(account=%broker.account_name,instrument=%symbol.name,units=cents as f64/100.0,price,implied_risk_pct=implied,"cTrader dry run; no order submitted");
     }
@@ -116,4 +129,24 @@ pub(crate) fn response(
         size: Some(cents as f64 / 100.0),
         price: Some(price),
     })
+}
+
+pub(crate) fn with_client_id(
+    mut payload: Value,
+    client_id: Option<&str>,
+) -> std::result::Result<Value, EntryError> {
+    if let Some(id) = client_id {
+        if id.is_empty()
+            || id.len() > 50
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+        {
+            return Err(reject(
+                "Open API client order ID must contain 1–50 safe ASCII characters",
+            ));
+        }
+        payload["clientOrderId"] = json!(id);
+    }
+    Ok(payload)
 }

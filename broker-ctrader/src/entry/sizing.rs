@@ -22,7 +22,7 @@ pub(crate) fn volume(
     Ok(volume)
 }
 async fn conversion(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     from: i64,
     to: i64,
 ) -> std::result::Result<f64, EntryError> {
@@ -61,7 +61,7 @@ async fn conversion(
     })
 }
 pub(super) async fn size(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     req: &EntryRequest<'_>,
     symbol: &InstrumentMetadata,
     trader: &Value,

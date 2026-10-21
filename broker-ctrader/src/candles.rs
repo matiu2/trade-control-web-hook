@@ -34,7 +34,7 @@ pub(crate) fn decode(rows: &Value) -> Result<Vec<Tick>> {
         .collect()
 }
 async fn page(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     symbol: i64,
     side: i64,
     start: i64,
@@ -57,7 +57,7 @@ async fn page(
     Ok((decode(&rows)?, more))
 }
 async fn ticks(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     symbol: i64,
     side: i64,
     start: i64,
@@ -102,7 +102,7 @@ async fn ticks(
     );
     Ok(result)
 }
-async fn seed(broker: &CtraderBroker, symbol: i64, side: i64, before: i64) -> Result<Tick> {
+async fn seed(broker: &OpenApiBroker, symbol: i64, side: i64, before: i64) -> Result<Tick> {
     let (rows, _) = page(broker, symbol, side, (before - WEEK).max(0), before).await?;
     rows.first().copied().ok_or_else(|| {
         eyre!("cTrader historical quote side {side} has no seed within preceding week")
@@ -220,7 +220,7 @@ pub(crate) fn aggregate(
     Ok(result)
 }
 pub(crate) async fn read(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     instrument: &str,
     gran: Granularity,
     since: DateTime<Utc>,

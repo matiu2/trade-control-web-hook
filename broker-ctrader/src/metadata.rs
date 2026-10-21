@@ -14,7 +14,7 @@ pub struct InstrumentMetadata {
     pub(crate) quote_asset: i64,
     pub(crate) raw: Value,
 }
-pub(crate) async fn symbols(broker: &CtraderBroker) -> Result<Vec<Value>> {
+pub(crate) async fn symbols(broker: &OpenApiBroker) -> Result<Vec<Value>> {
     Ok(array(
         &broker
             .read(2114, 2115, json!({"includeArchivedSymbols":false}))
@@ -29,7 +29,7 @@ fn normalize(name: &str) -> String {
         .flat_map(char::to_uppercase)
         .collect()
 }
-pub(crate) async fn instrument(broker: &CtraderBroker, name: &str) -> Result<InstrumentMetadata> {
+pub(crate) async fn instrument(broker: &OpenApiBroker, name: &str) -> Result<InstrumentMetadata> {
     let symbols = symbols(broker).await?;
     let exact = symbols
         .iter()
@@ -73,7 +73,7 @@ pub(crate) async fn instrument(broker: &CtraderBroker, name: &str) -> Result<Ins
         raw: full.clone(),
     })
 }
-pub(crate) async fn trader(broker: &CtraderBroker) -> Result<Value> {
+pub(crate) async fn trader(broker: &OpenApiBroker) -> Result<Value> {
     let data = broker.read(2121, 2122, json!({})).await?;
     let t = data["trader"].clone();
     ensure!(
@@ -82,7 +82,7 @@ pub(crate) async fn trader(broker: &CtraderBroker) -> Result<Value> {
     );
     Ok(t)
 }
-pub(crate) async fn equity(broker: &CtraderBroker) -> Result<f64> {
+pub(crate) async fn equity(broker: &OpenApiBroker) -> Result<f64> {
     let trader = trader(broker).await?;
     let data = broker.read(2187, 2188, json!({})).await?;
     wire::array_shape(&data, "positionUnrealizedPnL")?;
@@ -102,15 +102,15 @@ pub(crate) async fn equity(broker: &CtraderBroker) -> Result<f64> {
     );
     Ok(result)
 }
-pub(crate) async fn assets(broker: &CtraderBroker) -> Result<Vec<Value>> {
+pub(crate) async fn assets(broker: &OpenApiBroker) -> Result<Vec<Value>> {
     Ok(array(&broker.read(2112, 2113, json!({})).await?, "asset").to_vec())
 }
-pub(crate) async fn quote(broker: &CtraderBroker, instrument: &str) -> Result<Quote> {
+pub(crate) async fn quote(broker: &OpenApiBroker, instrument: &str) -> Result<Quote> {
     let symbol = instrument_metadata_id(broker, instrument).await?;
     broker.shared.quote(symbol).await
 }
 
-pub(crate) async fn instrument_metadata_id(broker: &CtraderBroker, name: &str) -> Result<i64> {
+pub(crate) async fn instrument_metadata_id(broker: &OpenApiBroker, name: &str) -> Result<i64> {
     Ok(instrument(broker, name).await?.id)
 }
 pub(crate) fn currency(name: &str) -> bool {

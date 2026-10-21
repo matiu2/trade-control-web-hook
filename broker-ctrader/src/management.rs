@@ -1,7 +1,7 @@
 use super::*;
 use wire::{array, direction, integer, is_enum, optional_number};
 
-pub(crate) async fn positions(broker: &CtraderBroker, account: &str) -> Result<Vec<OpenPosition>> {
+pub(crate) async fn positions(broker: &OpenApiBroker, account: &str) -> Result<Vec<OpenPosition>> {
     ensure!(broker.account_matches(account), "cTrader account mismatch");
     let snapshot = broker.snapshot().await?;
     let symbols = metadata::symbols(broker).await?;
@@ -41,7 +41,7 @@ pub(crate) fn symbol_name(symbols: &[Value], id: i64) -> Result<String> {
         .map(str::to_owned)
         .ok_or_else(|| eyre!("cTrader symbol ID {id} missing from account catalog"))
 }
-pub(crate) async fn pending(broker: &CtraderBroker, account: &str) -> Result<Vec<PendingOrder>> {
+pub(crate) async fn pending(broker: &OpenApiBroker, account: &str) -> Result<Vec<PendingOrder>> {
     ensure!(broker.account_matches(account), "cTrader account mismatch");
     let snapshot = broker.snapshot().await?;
     let symbols = metadata::symbols(broker).await?;
@@ -65,7 +65,7 @@ pub(crate) async fn pending(broker: &CtraderBroker, account: &str) -> Result<Vec
         })
         .collect()
 }
-pub(crate) async fn cancel(broker: &CtraderBroker, account: &str, id: &str) -> Result<()> {
+pub(crate) async fn cancel(broker: &OpenApiBroker, account: &str, id: &str) -> Result<()> {
     ensure!(broker.account_matches(account), "cTrader account mismatch");
     let id: i64 = id.parse()?;
     ensure!(id > 0, "invalid cTrader order ID");
@@ -78,7 +78,7 @@ pub(crate) async fn cancel(broker: &CtraderBroker, account: &str, id: &str) -> R
     );
     Ok(())
 }
-pub(crate) async fn cancel_instrument(broker: &CtraderBroker, instrument: &str) -> usize {
+pub(crate) async fn cancel_instrument(broker: &OpenApiBroker, instrument: &str) -> usize {
     let symbol = match metadata::instrument_metadata_id(broker, instrument).await {
         Ok(symbol) => symbol,
         Err(error) => {
@@ -112,7 +112,7 @@ pub(crate) async fn cancel_instrument(broker: &CtraderBroker, instrument: &str) 
     }
     count
 }
-pub(crate) async fn close(broker: &CtraderBroker, instrument: &str) -> CloseOutcome {
+pub(crate) async fn close(broker: &OpenApiBroker, instrument: &str) -> CloseOutcome {
     let operation = async {
         let symbol = metadata::instrument_metadata_id(broker, instrument).await?;
         let snapshot = broker.snapshot().await?;
@@ -217,7 +217,7 @@ pub(crate) fn resolve_amend<'a>(
         .map(|p| (true, p)))
 }
 pub(crate) async fn amend(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     account: &str,
     id: &str,
     stop: f64,

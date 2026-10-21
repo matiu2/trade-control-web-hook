@@ -41,6 +41,8 @@
 //! * Global / default-account routing for a `None`-account broker intent is a
 //!   follow-up — such an intent currently returns `400 account required`.
 
+mod registration;
+
 use std::sync::Arc;
 
 use axum::{
@@ -353,7 +355,12 @@ async fn dispatch_control(
         Action::Resume => handle_resume(store, verified, now).await,
         Action::NewsStart => handle_news_start(store, verified, now).await,
         Action::NewsEnd => handle_news_end(store, verified, now).await,
-        Action::Register => handle_register(store, &state.accounts, verified, now).await,
+        Action::Register => {
+            if let Some(refusal) = registration::unavailable(state, verified).await {
+                return Some(refusal);
+            }
+            handle_register(store, &state.accounts, verified, now).await
+        }
         Action::PlanList => handle_plan_list(store, verified, now).await,
         Action::PlanShow => handle_plan_show(store, verified, now).await,
         // Recording-backed (reads `request_records`), so it can't be a generic

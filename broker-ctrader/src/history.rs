@@ -6,7 +6,7 @@ use trade_control_core::{
 use wire::{array, integer, is_enum, money, number, optional_number};
 
 pub(crate) async fn position_orders(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     position: i64,
     now: DateTime<Utc>,
 ) -> Result<Vec<Value>> {
@@ -22,7 +22,7 @@ pub(crate) async fn position_orders(
     .await
 }
 async fn position_deals(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     position: i64,
     now: DateTime<Utc>,
 ) -> Result<Vec<Value>> {
@@ -38,7 +38,7 @@ async fn position_deals(
     .await
 }
 async fn position_history(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     position: i64,
     now: DateTime<Utc>,
     request: u32,
@@ -101,7 +101,7 @@ pub(crate) fn origin(orders: &[Value], position: i64) -> Result<Option<&Value>> 
     Ok(openings.first().copied())
 }
 async fn details(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     instrument: &str,
     id: &str,
     position: Option<&str>,
@@ -138,7 +138,7 @@ async fn details(
     Ok((order, symbol))
 }
 pub(crate) async fn attempt(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     instrument: &str,
     id: &str,
     position: Option<&str>,
@@ -259,7 +259,7 @@ pub(crate) fn closed(deals: &[Value]) -> Result<Option<Closed>> {
             .ok_or_else(|| eyre!("invalid cTrader deal timestamp"))?,
     }))
 }
-async fn account_currency(broker: &CtraderBroker) -> Result<String> {
+async fn account_currency(broker: &OpenApiBroker) -> Result<String> {
     let trader = metadata::trader(broker).await?;
     let asset = integer(&trader, "depositAssetId")?;
     metadata::assets(broker)
@@ -271,7 +271,7 @@ async fn account_currency(broker: &CtraderBroker) -> Result<String> {
         .ok_or_else(|| eyre!("cTrader account currency name unavailable"))
 }
 async fn exit_from_order(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     order: &Value,
     symbol: i64,
     now: DateTime<Utc>,
@@ -319,7 +319,7 @@ async fn exit_from_order(
     }))
 }
 pub(crate) async fn trade_exit(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     instrument: &str,
     id: &str,
     position: Option<&str>,
@@ -328,7 +328,7 @@ pub(crate) async fn trade_exit(
     exit_from_order(broker, &order, symbol, Utc::now()).await
 }
 pub(crate) async fn settlement(
-    broker: &CtraderBroker,
+    broker: &OpenApiBroker,
     instrument: &str,
     _since: DateTime<Utc>,
     ids: &[String],
