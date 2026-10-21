@@ -7,16 +7,9 @@
 //! the same [`PgMetadataStore`] the worker uses, so list/add/remove behave
 //! byte-for-byte like the dispatch path reads them — no HTTP, no admin route.
 //!
-//! It manages **metadata only** (name, broker, kind, caps, optional OANDA
-//! sub-account id). Credentials are deliberately *not* here:
-//!
-//!   * **TradeNation** logins live in the enc store
-//!     (`~/.config/tradenation/accounts.enc`, by name) — manage them with the
-//!     TradeNation tooling (`create_account` / `delete_account`). `add` only
-//!     records the metadata row; the account name must match an enc-store entry
-//!     for a broker action to resolve.
-//!   * **OANDA** uses the shared `OANDA_API_KEY` env token + the per-account
-//!     `oanda_account_id` recorded here (an id, not a secret).
+//! Metadata lives in Postgres. MT5 `add` and `credentials` also maintain the
+//! named local profile and its private credential file. TradeNation credentials
+//! remain in the enc store; OANDA uses OANDA_API_KEY and its sub-account id.
 //!
 //! DB connection: `--database-url` / `DATABASE_URL` env win; otherwise the URL
 //! is read from a `trade-control.toml` — an explicit `--config <path>`, else
@@ -33,7 +26,7 @@
 //! trade-control-accounts remove testing
 //! ```
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Context, Result, eyre};
 
 use trade_control_core::account::{
@@ -42,14 +35,19 @@ use trade_control_core::account::{
 use trade_control_core::intent::BrokerKind;
 use trade_control_worker::{Config, PgMetadataStore, PgStateStore};
 
+#[path = "accounts/mt5.rs"]
+mod mt5;
+#[path = "accounts/registration.rs"]
+mod registration;
+
 #[derive(Parser)]
 #[command(name = "trade-control-accounts")]
-#[command(about = "Manage the native (Postgres) account index — metadata only, no credentials")]
+#[command(about = "Manage the native account index and local MT5 credentials")]
 struct Cli {
     /// Path to the worker's `trade-control.toml` to read `database.url` from.
     /// When omitted, the CLI resolves the DB URL via (in order): `--database-url`,
-    /// the `DATABASE_URL` env var, `./trade-control.toml`, then
-    /// `~/.config/trade-control/trade-control.toml`. Ignored when
+    /// the `DATABASE_URL` env var, `~/.config/trade-control/trade-control.toml`,
+    /// then `./trade-control.toml`. Ignored when
     /// `--database-url` is given.
     #[arg(long, global = true)]
     config: Option<String>,
@@ -69,8 +67,8 @@ struct Cli {
 /// 1. `--database-url` / `DATABASE_URL` env (clap already merged these).
 /// 2. an explicit `--config <path>` (a missing file here IS an error — the
 ///    operator named it).
-/// 3. `./trade-control.toml` if it exists (the worker's working-dir convention).
-/// 4. `~/.config/trade-control/trade-control.toml` if it exists.
+/// 3. `~/.config/trade-control/trade-control.toml` if it exists.
+/// 4. `./trade-control.toml` if it exists (the worker's working-dir convention).
 ///
 /// If none resolve, the error lists every option so the fix is obvious.
 fn resolve_db_url(cli: &Cli) -> Result<String> {
@@ -127,35 +125,46 @@ enum Command {
         /// The account name.
         name: String,
     },
-    /// Add a new account. Fails if the name already exists.
-    Add {
-        /// Stable account name — must match the enc-store entry (TradeNation)
-        /// and the name the enter intent carries. `kebab-case`, unique.
+    /// Add a new account. MT5 also writes its profile and prompts for a password.
+    Add(AddArgs),
+    /// Replace an existing MT5 account's credentials and pinned identity.
+    Credentials {
         name: String,
-        /// Which broker this account trades on.
-        #[arg(long)]
-        broker: BrokerArg,
-        /// Demo or live.
-        #[arg(long)]
-        kind: KindArg,
-        /// Broker sub-account id. **Required** for `--broker oanda` (the
-        /// sub-account under the shared API key) and for `--broker ibkr` (the
-        /// account under the Gateway login, e.g. `DUR300718` for paper).
-        /// Ignored for TradeNation, where the session identifies the account.
-        #[arg(long)]
-        oanda_account_id: Option<String>,
-        /// Optional per-account max risk % (tighter than the worker-wide cap).
-        #[arg(long)]
-        max_risk_pct: Option<f64>,
-        /// Optional per-account max simultaneous open positions.
-        #[arg(long)]
-        max_open_positions: Option<u32>,
+        #[command(flatten)]
+        mt5: mt5::Options,
     },
     /// Remove an account by name. Fails if it doesn't exist.
     Remove {
         /// The account name to remove.
         name: String,
     },
+}
+
+#[derive(Args)]
+struct AddArgs {
+    /// Stable account name — must match the enc-store entry (TradeNation)
+    /// and the name the enter intent carries. `kebab-case`, unique.
+    name: String,
+    /// Which broker this account trades on.
+    #[arg(long)]
+    broker: BrokerArg,
+    /// Demo or live.
+    #[arg(long)]
+    kind: KindArg,
+    /// Broker sub-account id. **Required** for `--broker oanda` (the
+    /// sub-account under the shared API key) and for `--broker ibkr` (the
+    /// account under the Gateway login, e.g. `DUR300718` for paper).
+    /// Ignored for TradeNation, where the session identifies the account.
+    #[arg(long)]
+    oanda_account_id: Option<String>,
+    /// Optional per-account max risk % (tighter than the worker-wide cap).
+    #[arg(long)]
+    max_risk_pct: Option<f64>,
+    /// Optional per-account max simultaneous open positions.
+    #[arg(long)]
+    max_open_positions: Option<u32>,
+    #[command(flatten)]
+    mt5: mt5::Options,
 }
 
 /// CLI mirror of [`BrokerKind`] so clap can derive
@@ -219,24 +228,13 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::List { json } => list(&accounts, json).await,
         Command::Get { name } => get(&accounts, &name).await,
-        Command::Add {
-            name,
-            broker,
-            kind,
-            oanda_account_id,
-            max_risk_pct,
-            max_open_positions,
-        } => {
-            add(
-                &accounts,
-                name,
-                broker.into(),
-                kind.into(),
-                oanda_account_id,
-                max_risk_pct,
-                max_open_positions,
-            )
-            .await
+        Command::Add(args) => add(&accounts, args).await,
+        Command::Credentials { name, mt5 } => {
+            let path = mt5::config_path()?;
+            registration::credentials(&accounts, &name, &mt5, &path, || mt5.password()).await?;
+            println!("updated MT5 credentials: {name}");
+            print_mt5_restart();
+            Ok(())
         }
         Command::Remove { name } => remove(&accounts, &name).await,
     }
@@ -277,24 +275,24 @@ async fn get(accounts: &PgMetadataStore, name: &str) -> Result<()> {
 
 /// Add a new account row. OANDA requires a sub-account id (a broker action would
 /// fail without it), so reject the obvious misconfiguration up front.
-async fn add(
-    accounts: &PgMetadataStore,
-    name: String,
-    broker: BrokerKind,
-    kind: AccountKind,
-    oanda_account_id: Option<String>,
-    max_risk_pct: Option<f64>,
-    max_open_positions: Option<u32>,
-) -> Result<()> {
+async fn add(accounts: &impl MetadataStore, args: AddArgs) -> Result<()> {
+    let AddArgs {
+        name,
+        broker,
+        kind,
+        oanda_account_id,
+        max_risk_pct,
+        max_open_positions,
+        mt5,
+    } = args;
+    let broker: BrokerKind = broker.into();
+    let kind: AccountKind = kind.into();
+    if broker != BrokerKind::Mt5 && mt5.is_present() {
+        return Err(eyre!("MT5 credential options require --broker mt5"));
+    }
     if broker == BrokerKind::Ctrader {
         broker_ctrader::access::Profile::load(&name)?
             .validate(kind.is_live(), oanda_account_id.as_deref())?;
-    }
-    if broker == BrokerKind::Mt5 {
-        if kind.is_live() {
-            return Err(eyre!("MT5 currently supports demo/competition only"));
-        }
-        mt5_data_source::account_config::AccountConfig::load(&name)?;
     }
     if broker == BrokerKind::Oanda && oanda_account_id.is_none() {
         return Err(eyre!(
@@ -311,22 +309,31 @@ async fn add(
         },
         oanda_account_id,
     };
-    match accounts.add(meta.clone()).await {
-        Ok(()) => {
-            println!("added: {}", render(&meta));
-            if broker == BrokerKind::TradeNation {
-                println!(
-                    "note: TradeNation credentials resolve from the enc store by name — \
-                     ensure '{name}' exists there (TradeNation create_account)."
-                );
-            }
-            Ok(())
-        }
-        Err(MetadataError::AlreadyExists(_)) => Err(eyre!(
-            "account '{name}' already exists — remove it first, or pick another name"
-        )),
-        Err(e) => Err(meta_err(e)),
+    let path = if broker == BrokerKind::Mt5 {
+        Some(mt5::config_path()?)
+    } else {
+        None
+    };
+    registration::add(accounts, meta.clone(), &mt5, path.as_deref(), || {
+        mt5.password()
+    })
+    .await?;
+    println!("added: {}", render(&meta));
+    if broker == BrokerKind::TradeNation {
+        println!(
+            "note: TradeNation credentials resolve from the enc store by name — ensure '{name}' exists there (TradeNation create_account)."
+        );
     }
+    if broker == BrokerKind::Mt5 {
+        print_mt5_restart();
+    }
+    Ok(())
+}
+
+fn print_mt5_restart() {
+    println!(
+        "MT5 profile and private credentials saved locally. Restart local-chart and any workers using this account to load the changes. Log the desktop MT5 terminal into the same account for CandleBridge history."
+    );
 }
 
 /// Remove an account row by name.
@@ -372,3 +379,7 @@ fn render(m: &AccountMetadata) -> String {
 fn meta_err(e: MetadataError) -> color_eyre::eyre::Error {
     eyre!("account store error: {e}")
 }
+
+#[cfg(test)]
+#[path = "accounts/tests.rs"]
+mod tests;

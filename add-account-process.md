@@ -20,8 +20,8 @@ directory. Inspect the selected database before writing account metadata.
 
 | Location | Purpose | What we changed for MT5 |
 |---|---|---|
-| `~/.config/trade-control/mt5-accounts.toml` | Named MT5 profiles | Added `the5ers-competition`, pinned login/server/clock and absolute credential/mailbox paths. `MT5_ACCOUNTS_FILE` can override this file. |
-| `.mt5-creds.toml` in this checkout | Private WebTerminal credentials | Reused the existing `[creds] username/password` file; ignored it in Git. Never copy credentials into documentation or PostgreSQL metadata. |
+| `~/.config/trade-control/mt5-accounts.toml` | Named MT5 profiles | `trade-control-accounts add` / `credentials` maintain the pinned login/server/clock and absolute credential/mailbox paths. `MT5_ACCOUNTS_FILE` can override this file. |
+| Profile's `credentials_file` (originally `.mt5-creds.toml` in this checkout) | Private WebTerminal credentials | The same commands write `[creds] username/password` with owner-only permissions on Unix. Existing paths are reused; new profiles default to `mt5-credentials/<name>.toml` beside the profile configuration. Never copy credentials into documentation or PostgreSQL metadata. |
 | MT5 under Bottles, `MQL5/Experts/CandleBridge` and `MQL5/Files/mt5-read-only` | Historical tick access | Kept the compiled EA attached to one chart. One attachment serves requests for all instruments. The named profile points to the existing mailbox. |
 | PostgreSQL `accounts`, database `trade_control_staging` | Staging broker routing and caps | Added the named MT5 demo/competition account. |
 | PostgreSQL `accounts`, database `trade_control_dev` | Default operator account listing and dev routing | Added the same named account after updating the active dev worker to understand `mt5`. |
@@ -61,6 +61,52 @@ For an already registered account, use `get`; `add` rejects duplicates. Choose
 per-account risk and position caps deliberately (`--max-risk-pct` and
 `--max-open-positions`); omitted values inherit worker-wide caps. The MT5
 implementation currently refuses real/live accounts.
+
+### MT5 credentials and account changes
+
+MT5 `add` now prompts for a hidden trading password and writes both the named
+profile and its private credential file. Existing profiles supply defaults for
+login, server, clock, mailbox and credential path. A new profile needs explicit
+identity, server clock and CandleBridge mailbox settings:
+
+```sh
+trade-control-accounts add another-competition --broker mt5 --kind demo \
+  --login 12345678 --server FivePercentOnline-Experience \
+  --server-time +03:00 \
+  --mailbox '/absolute/path/to/MetaTrader 5/MQL5/Files/mt5-read-only'
+```
+
+Use the account's verified current clock; the example offset is not permanent.
+Pass `--credentials-file /absolute/path/to/private.toml` to select another
+credential location. Passwords are entered at the prompt, never as command-line
+arguments. Automation can supply one password line with `--password-stdin`;
+spaces are preserved and the line terminator is removed.
+
+To rotate a password or replace a competition login, update the existing account
+without removing its metadata or risk caps:
+
+```sh
+trade-control-accounts credentials the5ers-competition --login 12345678
+# For staging metadata, add the global config option:
+trade-control-accounts --config ~/.config/trade-control/staging-worker.toml \
+  credentials the5ers-competition --login 12345678
+```
+
+The `credentials` command checks the account in the selected database and
+updates local files only. It accepts the same `--server`, `--server-time`,
+`--mailbox` and `--credentials-file` overrides. Omit `--login` only when the
+account number is unchanged. The pinned profile login and credential username
+are written together. A credential file shared by another named profile is
+rejected; select a separate file instead. Other profiles and their credentials
+are preserved. The CLI serializes profile updates, stages file replacements,
+and restores previous files on ordinary write/metadata errors; the file pair
+and PostgreSQL are not a single crash-atomic transaction.
+
+Restart `local-chart` and workers using the account after changing its profile
+or credentials; running clients retain the previous identity. Also log desktop
+MT5 into the matching account so CandleBridge can supply uncached paired history.
+The CLI does not modify the desktop terminal's saved login or place any trades.
+New login/server identities automatically use separate candle-cache namespaces.
 
 ## Update local recall
 

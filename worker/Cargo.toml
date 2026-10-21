@@ -48,6 +48,9 @@ instrument-lookup = { version = "0.7.0", path = "../../instrument-lookup" }
 ctrader-api = { version = "0.1.0", path = "../../ctrader-api" }
 broker-ctrader = { version = "0.1.0", path = "../broker-ctrader" }
 ctrader-fix = { version = "0.1.0", path = "../../ctrader-fix" }
+rpassword = "7.5.4"
+tempfile = "3.27.0"
+toml_edit = "0.25.15"
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
