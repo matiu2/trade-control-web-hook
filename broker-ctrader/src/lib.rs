@@ -1,10 +1,12 @@
 //! cTrader platform adapter. Broker-neutral protocol lives in `ctrader-api`.
-//! Prices are reconstructed from paired historical quotes, never bid-only bars.
+//! Strategy prices are reconstructed from paired historical quotes. Native BID
+//! chart bars are exposed separately by [`market_data`] with their tick volume.
 pub mod access;
 mod candles;
 mod entry;
 mod history;
 mod management;
+pub mod market_data;
 mod metadata;
 mod session;
 #[cfg(test)]

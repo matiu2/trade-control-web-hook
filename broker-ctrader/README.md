@@ -3,6 +3,63 @@
 `CtraderBroker` selects the named account's configured transport. The protocol
 clients remain in the separate root `ctrader-api` and `ctrader-fix` crates.
 
+The reusable reader lives in the root `ctrader-data-source` crate and implements
+the standard `candle_model` data-source traits. `candle_cache::ctrader::CachedFeed`
+adds the account/environment-scoped PostgreSQL cache. Native BID bars (`ctn_`)
+and genuine paired MID/bid/ask bars (`ctp_`) stay separate; both preserve the
+broker's actual opening timestamps and tick volume. No generic FX grid or fixed
+spread is substituted. Paired weekly/monthly reads explicitly require further
+broker calendar support; native weekly/monthly chart bars are available.
+
+`market_data::ChartData` preserves authenticated Hybrid account binding and the
+shared session. `configured_feed()` constructs a lazy reader: warm cache hits
+need no broker login, and a miss authenticates/verifies the selected account
+before fetching. Worker candle reads use that same paired cache, retaining the
+engine's exclusive watermark and completed-bar contract. Read-only metadata is
+cached separately from current order-sizing metadata.
+
+## Tools using the shared cache
+
+| Tool | cTrader history |
+| --- | --- |
+| local-chart | Native BID by default; explicit MID uses genuine paired ticks |
+| trade-control worker | Genuine paired history for entries and protections |
+| replay-candles / tv-arm replay | Genuine paired history, including zoom/upkeep |
+| candle-cache preload | Native BID or explicitly selected paired history |
+| strategy-data | `DATA_SOURCE=ctrader-demo`, or `ctrader:<profile>` |
+
+`ctrader-demo` is the complete named profile; it is never shortened to `demo`.
+Bare `DATA_SOURCE=ctrader` requires `CTRADER_ACCOUNT`. Legacy `broker-trait`
+trading construction remains an explicit unsupported operation; strategy candle
+reads use `strategy-data`, and order management uses trade-control's adapter.
+
+From the parent trading-libraries checkout, preview a preload without accessing
+credentials, the broker or PostgreSQL:
+
+```sh
+cargo run --manifest-path candle-cache/Cargo.toml --features preload --bin preload -- \
+  --broker ctrader --account ctrader-demo --symbol AUDUSD --timeframe h1 --dry-run
+```
+
+After OAuth activation, omit `--dry-run` to warm native BID bars. Select
+`--price-basis paired` for the execution cache; dates use UTC calendar days.
+Preload defaults to the last 30 days and bounds a run to 366 days.
+
+```sh
+replay-candles-staging --source ctrader --ctrader-account ctrader-demo \
+  --plan /path/to/plan.json --start 2026-10-01T00:00Z --end 2026-10-02T00:00Z
+```
+
+Replay can infer one unique cTrader account from the plan. Saved fixtures retain
+the source account, and a conflicting override is refused before refetching.
+Custom `--cache-dir` is refused for cTrader because its account namespace is
+pinned. No MT5 estimated-spread policy applies to cTrader history.
+
+History integration does not bypass tv-arm's existing spread-coverage gate.
+There is no measured cTrader account baseline yet, and the cTrader-specific
+calibration/bake command is not implemented. Unattended arming still requires
+that activation work; another broker's spread forecast is never substituted.
+
 ## Capabilities
 
 | Configuration | Quotes | Positions / pending orders | Cancel / close | Protected strategy entries | Candles / equity / deal history |

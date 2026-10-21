@@ -53,6 +53,7 @@ mod replay_candles {
     pub mod futures_caveats;
     pub mod golden_eq;
     pub mod granularity;
+    pub mod history;
     pub mod instrument;
     pub mod lazy_zoom;
     pub mod lifecycle;
@@ -179,16 +180,21 @@ async fn run() -> Result<()> {
         ))
     })?;
     let plan = load_plan(&plan_path)?;
-    if args.source == CandleSource::Mt5 && args.mt5_account.is_none() {
-        let accounts: std::collections::BTreeSet<_> = plan
-            .rules
-            .iter()
-            .filter(|r| r.intent.broker == trade_control_core::intent::BrokerKind::Mt5)
-            .filter_map(|r| r.intent.account.clone())
-            .collect();
-        if accounts.len() == 1 {
-            args.mt5_account = accounts.into_iter().next();
-        }
+    if args.source == CandleSource::Mt5 {
+        args.mt5_account = replay_candles::history::resolve_account(
+            args.source,
+            args.mt5_account.as_deref(),
+            None,
+            &plan,
+        )?;
+    }
+    if args.source == CandleSource::Ctrader {
+        args.ctrader_account = replay_candles::history::resolve_account(
+            args.source,
+            args.ctrader_account.as_deref(),
+            None,
+            &plan,
+        )?;
     }
 
     // Granularity comes from the plan; `--granularity` only overrides, and an
@@ -214,8 +220,10 @@ async fn run() -> Result<()> {
 
     let raw_instrument = window.instrument.as_deref().unwrap_or(&plan.instrument);
     let symbol = instrument::resolve_for(raw_instrument, args.source)?;
-    let mt5_history = replay_candles::mt5_history::Mt5Replay::new(
+    let mt5_history = replay_candles::history::SourceHistory::new(
+        args.source,
         args.mt5_account.as_deref(),
+        args.ctrader_account.as_deref(),
         args.mt5_history,
         plan.pip_size,
     );
@@ -481,7 +489,7 @@ async fn run() -> Result<()> {
             // chart the consumer draws the positions on.
             &local_chart_client::chart_feed(
                 args.source.as_str(),
-                args.mt5_account.as_deref().unwrap_or_default(),
+                mt5_history.account().unwrap_or_default(),
             ),
             &fires,
         );
@@ -498,6 +506,7 @@ async fn run() -> Result<()> {
             instrument: symbol.clone(),
             granularity: gran.engine(),
             source: args.source,
+            account: mt5_history.account().map(str::to_owned),
             estimated_spread: mt5_history.provenance(),
             start,
             end,
@@ -631,7 +640,7 @@ async fn pull_with_warmup(
     bar_secs: i64,
     want_warmup: usize,
     cache_dir: Option<PathBuf>,
-    mt5_history: &replay_candles::mt5_history::Mt5Replay<'_>,
+    mt5_history: &replay_candles::history::SourceHistory<'_>,
 ) -> Result<Vec<EngineCandle>> {
     let mut pull_from = start - Duration::seconds(bar_secs * want_warmup as i64);
     let mut attempt: u32 = 0;
@@ -1054,7 +1063,7 @@ async fn pull_upkeep(
     plan_gran: Granularity,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-    mt5_history: &replay_candles::mt5_history::Mt5Replay<'_>,
+    mt5_history: &replay_candles::history::SourceHistory<'_>,
 ) -> Result<Option<upkeep::UpkeepTicks>> {
     let Some(raw) = &args.upkeep else {
         return Ok(None);
@@ -1112,19 +1121,29 @@ async fn replay_one_fixture(args: &Args, dir: &std::path::Path, name: &str) -> F
     // the missing window from the broker/candle-cache rather than silently
     // scoring it as a stop. The fixture's own `meta` says which source and symbol
     // it came from, so the refetch targets the same feed that produced it.
-    let fixture_account = args.mt5_account.clone().or_else(|| {
-        inputs
-            .plan
-            .rules
-            .iter()
-            .find(|rule| rule.intent.broker == trade_control_core::intent::BrokerKind::Mt5)
-            .and_then(|rule| rule.intent.account.clone())
-    });
-    let mt5_history = replay_candles::mt5_history::Mt5Replay::from_saved(
+    let explicit_account = match inputs.meta.source {
+        CandleSource::Mt5 => args.mt5_account.as_deref(),
+        CandleSource::Ctrader => args.ctrader_account.as_deref(),
+        _ => None,
+    };
+    let fixture_account = match replay_candles::history::resolve_account(
+        inputs.meta.source,
+        explicit_account,
+        inputs.meta.account.as_deref(),
+        &inputs.plan,
+    ) {
+        Ok(account) => account,
+        Err(error) => return FixtureRun::failed(name, error),
+    };
+    let mt5_history = match replay_candles::history::SourceHistory::from_saved(
+        inputs.meta.source,
         fixture_account.as_deref(),
         inputs.plan.pip_size,
         inputs.meta.estimated_spread.clone(),
-    );
+    ) {
+        Ok(history) => history,
+        Err(error) => return FixtureRun::failed(name, error),
+    };
     let refetch = FixtureRefetch {
         source: inputs.meta.source,
         symbol: &inputs.meta.instrument,
@@ -1400,7 +1419,7 @@ async fn run_frozen(
 /// under `cargo test` with no credentials), so reaching the network is opt-in
 /// per call site rather than assumed.
 struct FixtureRefetch<'a> {
-    mt5_history: &'a replay_candles::mt5_history::Mt5Replay<'a>,
+    mt5_history: &'a replay_candles::history::SourceHistory<'a>,
     source: CandleSource,
     symbol: &'a str,
     cache_dir: Option<PathBuf>,
@@ -2063,6 +2082,7 @@ mod tests {
             granularity: None,
             source: CandleSource::TradeNation,
             mt5_account: None,
+            ctrader_account: None,
             mt5_history: trade_control_cli::replay_args::Mt5HistoryMode::Auto,
             start: None,
             end: None,

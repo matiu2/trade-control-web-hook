@@ -102,6 +102,9 @@ pub struct FixtureMeta {
     pub granularity: Granularity,
     /// Which broker the candles came from (recorded for provenance).
     pub source: CandleSource,
+    /// Exact named account for future history refetches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     /// Offline estimated ask/mid provenance. Absent for genuine historical books.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_spread: Option<super::mt5_history::EstimatedSpread>,
@@ -962,6 +965,7 @@ mod tests {
             instrument: "EUR_USD".into(),
             granularity: Granularity::H1,
             source: CandleSource::TradeNation,
+            account: None,
             estimated_spread: None,
             start: Utc.with_ymd_and_hms(2026, 6, 18, 11, 0, 0).unwrap(),
             end: Utc.with_ymd_and_hms(2026, 6, 18, 23, 0, 0).unwrap(),
@@ -1337,6 +1341,33 @@ mod tests {
     }
 
     /// A `--message` note survives a `save` → `load` round-trip in the meta.
+    #[test]
+    fn c_trader_account_provenance_survives_fixture_metadata_round_trip() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        let meta = FixtureMeta {
+            source: CandleSource::Ctrader,
+            account: Some("ctrader-demo".into()),
+            ..sample_meta()
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: FixtureMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, meta);
+        let legacy = serde_json::to_value(sample_meta()).unwrap();
+        assert!(legacy.get("account").is_none());
+        assert_eq!(
+            serde_json::from_value::<FixtureMeta>(legacy)
+                .unwrap()
+                .account,
+            None
+        );
+    }
+
     #[test]
     fn meta_message_round_trips() {
         let meta = FixtureMeta {

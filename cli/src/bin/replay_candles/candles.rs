@@ -35,12 +35,12 @@ pub async fn pull(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     cache_dir: Option<PathBuf>,
-    mt5_history: &super::mt5_history::Mt5Replay<'_>,
+    mt5_history: &super::history::SourceHistory<'_>,
 ) -> Result<Vec<EngineCandle>> {
-    if source == CandleSource::Mt5 {
+    if matches!(source, CandleSource::Mt5 | CandleSource::Ctrader) {
         color_eyre::eyre::ensure!(
             cache_dir.is_none(),
-            "MT5 uses its pinned candle_cache_mt5 namespace; --cache-dir is unsupported"
+            "{source:?} uses its pinned account cache namespace; --cache-dir is unsupported"
         );
         return mt5_history.pull(symbol, granularity, from, to).await;
     }
@@ -62,7 +62,9 @@ pub async fn pull(
                 .await
                 .wrap_err("pull OANDA bid/ask candles")?
         }
-        CandleSource::Mt5 => return Err(eyre!("MT5 source must use its pinned cache")),
+        CandleSource::Mt5 | CandleSource::Ctrader => {
+            return Err(eyre!("named account source must use its pinned cache"));
+        }
         CandleSource::TradeNation => {
             let client = CacheClient::new(config, tradenation_source()?)
                 .await
@@ -116,6 +118,7 @@ fn default_cache_dir(source: CandleSource) -> PathBuf {
         CandleSource::Oanda => base.join("candle_cache_oanda"),
         CandleSource::TradeNation => base.join("candle_cache_tradenation"),
         CandleSource::Mt5 => base.join("candle_cache_mt5"),
+        CandleSource::Ctrader => base.join("candle_cache_ctrader"),
     }
 }
 

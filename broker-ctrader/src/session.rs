@@ -5,10 +5,12 @@ use std::{
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
 
 pub(crate) struct Shared {
     pub client: Client,
+    config: Config,
+    candles: OnceCell<Arc<candle_cache::ctrader::CachedFeed>>,
     quotes: RwLock<HashMap<i64, Book>>,
     subscriptions: Mutex<HashSet<i64>>,
     changed: Notify,
@@ -54,6 +56,8 @@ pub(crate) async fn acquire(config: Config) -> Result<Arc<Shared>> {
     let mut events = client.events();
     let shared = Arc::new(Shared {
         client,
+        config: config.clone(),
+        candles: OnceCell::new(),
         quotes: RwLock::new(HashMap::new()),
         subscriptions: Mutex::new(HashSet::new()),
         changed: Notify::new(),
@@ -109,6 +113,21 @@ pub(crate) async fn acquire(config: Config) -> Result<Arc<Shared>> {
     Ok(shared)
 }
 impl Shared {
+    pub async fn candles(&self) -> Result<Arc<candle_cache::ctrader::CachedFeed>> {
+        Ok(self
+            .candles
+            .get_or_try_init(|| async {
+                let source = ctrader_data_source::CtraderDataSource::from_client(
+                    self.config.clone(),
+                    self.client.clone(),
+                )?;
+                Ok::<_, color_eyre::Report>(Arc::new(candle_cache::ctrader::CachedFeed::new(
+                    source,
+                )))
+            })
+            .await?
+            .clone())
+    }
     pub async fn quote(&self, symbol: i64) -> Result<Quote> {
         let mut subscribed = self.subscriptions.lock().await;
         if !subscribed.contains(&symbol) {

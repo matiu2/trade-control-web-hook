@@ -105,6 +105,9 @@ impl<'a> Mt5Replay<'a> {
             estimate: RefCell::new(saved),
         }
     }
+    pub fn account(&self) -> Option<&str> {
+        self.account
+    }
     pub fn provenance(&self) -> Option<EstimatedSpread> {
         self.estimate.borrow().clone()
     }
