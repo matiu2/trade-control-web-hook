@@ -3,6 +3,16 @@
 `CtraderBroker` selects the named account's configured transport. The protocol
 clients remain in the separate root `ctrader-api` and `ctrader-fix` crates.
 
+`market_data::ChartData` is a read-only companion view for native BID charts. It
+reuses authenticated sessions and explicit Hybrid account binding, and exposes
+catalogues, per-reader metadata, quotes and native trendbars with actual tick
+volume. Its metadata cache does not feed order sizing. Native candles preserve
+their broker opening timestamps and never masquerade as MID/bid-ask execution
+history. Requests use Spotware's period-specific history limits and paginate
+truncated responses; failed/incomplete pages return an error rather than partial
+history. `is_closed()` lets a caller deliberately acquire a new read-only session
+on its next request after disconnection. No broker mutations are exposed.
+
 ## Capabilities
 
 | Configuration | Quotes | Positions / pending orders | Cancel / close | Protected strategy entries | Candles / equity / deal history |
