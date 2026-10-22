@@ -104,6 +104,24 @@ pub fn render(report: &Report, identity: &Identity) -> Result<String> {
         rows.join("")
     ))
 }
+/// Revalidate the account's exact broker-native symbol/pip convention before promotion.
+pub fn verify_broker_metadata(
+    row: &InstrumentReport,
+    id: i64,
+    name: &str,
+    pip_size: f64,
+) -> Result<()> {
+    ensure!(
+        pip_size.is_finite()
+            && pip_size > 0.0
+            && id == row.symbol_id
+            && name == row.measurement.symbol
+            && pip_size == row.measurement.pip_size,
+        "broker symbol identity/pip metadata changed since calibration"
+    );
+    Ok(())
+}
+
 fn validate_row(row: &crate::mt5::InstrumentReport) -> Result<()> {
     let symbol = &row.symbol;
     let profile = &row.profile;
@@ -120,13 +138,17 @@ fn validate_row(row: &crate::mt5::InstrumentReport) -> Result<()> {
     );
     let asset = super::asset(symbol)?;
     ensure!(
+        asset.class == instrument_lookup::AssetClass::Forex,
+        "cTrader spread calibration supports recognized spot FX only"
+    );
+    ensure!(
         asset.spread_schedule == row.schedule
             && asset.spread_schedule_tz().as_deref() == Some(row.timezone.as_str()),
         "spread schedule metadata changed for {symbol}"
     );
     ensure!(
-        row.pip_size.is_finite() && row.pip_size > 0.0 && row.pip_size == asset.pip_size,
-        "pip size metadata changed for {symbol}"
+        row.pip_size.is_finite() && row.pip_size > 0.0,
+        "invalid broker-native pip size for {symbol}"
     );
     let values = profile
         .hour_widen_frac

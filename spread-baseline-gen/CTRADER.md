@@ -61,17 +61,24 @@ existing source request gate. Every completed window is cached and logged.
 
 The report records account profile, demo endpoint/environment, Open API account
 ID, broker name and terminal login from the authenticated trader response.
-Each instrument records its native symbol ID, actual broker pip size, matching
-instrument-lookup pip units, market-local schedule/timezone and measurement
+Each instrument records its native symbol ID, actual broker-native pip size,
+instrument-lookup market-local schedule/timezone and measurement
 bounds. Instruments outside recognized broker spot FX are listed as exclusions;
 transient metadata/network failures abort catalogue discovery instead of being
 silently classified as unsupported.
+
+Broker-native pip conventions may differ from the generic instrument catalogue
+(for example EURCZK, EURHUF and GBPZAR). Calibration logs that difference and
+uses the account's actual pip unit, matching cTrader entry/spread comparisons.
+Prices, spread fractions and schedule-hour statistics keep their original scale.
+The baker re-reads native metadata and rejects a changed symbol ID, name or pip
+unit before writing the table. Existing successful report rows remain compatible.
 
 ## Promotion and uncovered symbols
 
 Baking requires at least 90 calendar days, the existing spread quality thresholds,
 finite ordered percentiles, matching hour masks/forecasts and unchanged schedule,
-identity and pip metadata. The generated table uses account-scoped keys such as
+identity and broker-native pip metadata. The generated table uses account-scoped keys such as
 `ctrader:ctrader-demo:EURUSD`; demo evidence never becomes a live-account default.
 The reducer is shared with the MT5 measurement path, so its statistical gates
 remain the same.

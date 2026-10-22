@@ -1,7 +1,7 @@
 //! Verify a completed paired report against the current demo identity, then bake.
 use broker_ctrader::{access::Profile, market_data::ChartData};
 use clap::Parser;
-use color_eyre::{Result, eyre::ensure};
+use color_eyre::Result;
 use spread_baseline_gen::ctrader::{self, Report};
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -43,12 +43,7 @@ async fn main() -> Result<()> {
         let metadata = data
             .forex_instrument_metadata(&row.measurement.symbol)
             .await?;
-        ensure!(
-            metadata.id == row.symbol_id
-                && metadata.name == row.measurement.symbol
-                && metadata.pip_size == row.measurement.pip_size,
-            "broker symbol identity/pip metadata changed since calibration"
-        );
+        ctrader::bake::verify_broker_metadata(row, metadata.id, &metadata.name, metadata.pip_size)?;
     }
     ctrader::output::write(&args.out, &args.account, &table)?;
     tracing::info!(account=args.account,rows=report.instruments.len(),output=%args.out.display(),"baked verified cTrader paired spread profiles; broker trading is untouched");

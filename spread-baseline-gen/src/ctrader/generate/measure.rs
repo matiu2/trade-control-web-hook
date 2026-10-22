@@ -26,9 +26,20 @@ pub(super) async fn measure(
     let asset = asset_for_fx(symbol)?;
     let metadata = data.forex_instrument_metadata(symbol).await?;
     ensure!(
-        metadata.name == symbol && metadata.id > 0 && metadata.pip_size == asset.pip_size,
-        "broker symbol/pip units differ from instrument-lookup for {symbol}"
+        metadata.name == symbol
+            && metadata.id > 0
+            && metadata.pip_size.is_finite()
+            && metadata.pip_size > 0.0,
+        "invalid broker symbol identity/pip metadata for {symbol}"
     );
+    if metadata.pip_size != asset.pip_size {
+        tracing::info!(
+            symbol,
+            broker_pip_size = metadata.pip_size,
+            catalogue_pip_size = asset.pip_size,
+            "cTrader spread calibration uses the account's broker-native pip convention"
+        );
+    }
     let timezone = asset
         .spread_schedule_tz()
         .ok_or_else(|| eyre!("missing schedule timezone for {symbol}"))?
