@@ -53,15 +53,15 @@ pub fn instrument_report(
         pip_size.is_finite() && pip_size > 0.0,
         "invalid pip size for {symbol}"
     );
-    ensure!(!candles.is_empty(), "no MT5 minute candles for {symbol}");
+    ensure!(!candles.is_empty(), "no minute candles for {symbol}");
     ensure!(
         candles.windows(2).all(|c| c[0].timestamp < c[1].timestamp),
-        "MT5 minute candles must be ascending and unique for {symbol}"
+        "minute candles must be ascending and unique for {symbol}"
     );
     let bars = minutes_from_cache(candles, timezone);
     ensure!(
         bars.len() == candles.len(),
-        "invalid MT5 closing quotes for {symbol}"
+        "invalid closing quotes for {symbol}"
     );
     let profile = profile_from_minutes(&bars, pip_size);
     Ok(InstrumentReport {

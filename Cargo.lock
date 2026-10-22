@@ -4025,17 +4025,20 @@ dependencies = [
 name = "spread-baseline-gen"
 version = "0.1.0"
 dependencies = [
+ "broker-ctrader",
  "candle-cache",
  "candle-model",
  "chrono",
  "chrono-tz",
  "clap",
  "color-eyre",
+ "ctrader-api",
  "instrument-lookup 0.7.0",
  "mt5-data-source",
  "oanda-client",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",
