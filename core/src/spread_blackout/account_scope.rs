@@ -1,4 +1,4 @@
-//! MT5 spread measurements belong to the named supplier account.
+//! Platform spread measurements belong to the named supplier account.
 use std::borrow::Cow;
 
 /// Qualify a native MT5 symbol without changing broker requests or stored symbols.
@@ -6,17 +6,21 @@ pub fn mt5_spread_key(account: &str, instrument: &str) -> String {
     format!("mt5:{account}:{instrument}")
 }
 
+pub fn ctrader_spread_key(account: &str, instrument: &str) -> String {
+    format!("ctrader:{account}:{instrument}")
+}
+
 /// Prefer this account's measured profile, retaining the existing non-MT5 keys.
 /// MT5 rows are always qualified, so a missing account never borrows another
 /// account's measurement. Uncovered symbols retain the usual coverage refusal.
 pub fn spread_lookup_key<'a>(instrument: &'a str, account: Option<&str>) -> Cow<'a, str> {
-    if super::baseline_mt5::SPREAD_BASELINE_MT5.is_empty() {
-        return Cow::Borrowed(instrument);
-    }
     scoped_key(
         instrument,
         account,
-        super::baseline_mt5::SPREAD_BASELINE_MT5.iter().map(|r| r.1),
+        super::baseline_ctrader::SPREAD_BASELINE_CTRADER
+            .iter()
+            .chain(super::baseline_mt5::SPREAD_BASELINE_MT5.iter())
+            .map(|r| r.1),
     )
 }
 
@@ -28,12 +32,21 @@ fn scoped_key<'a>(
     let Some(account) = account else {
         return Cow::Borrowed(instrument);
     };
-    let key = mt5_spread_key(account, instrument);
-    if rows.into_iter().any(|symbol| symbol == key) {
-        Cow::Owned(key)
-    } else {
-        Cow::Borrowed(instrument)
-    }
+    let mt5_key = mt5_spread_key(account, instrument);
+    let ctrader_prefix = format!("ctrader:{account}:");
+    rows.into_iter()
+        .find_map(|symbol| {
+            if symbol.starts_with(&ctrader_prefix) {
+                // Every symbol for a measured cTrader account stays qualified,
+                // including uncovered symbols. Never borrow a global profile.
+                Some(Cow::Owned(ctrader_spread_key(account, instrument)))
+            } else if symbol == mt5_key {
+                Some(Cow::Owned(mt5_key.clone()))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(Cow::Borrowed(instrument))
 }
 
 #[cfg(test)]
@@ -65,6 +78,27 @@ mod tests {
     }
 
     #[test]
+    fn ctrader_account_rows_never_share_quotes_with_other_accounts_or_plain_symbols() {
+        let rows = ["ctrader:ctrader-demo:EURUSD", "mt5:five:EURUSD"];
+        assert_eq!(
+            scoped_key("EURUSD", Some("ctrader-demo"), rows.into_iter()),
+            "ctrader:ctrader-demo:EURUSD"
+        );
+        assert_eq!(
+            scoped_key("EUR/USD", Some("ctrader-demo"), rows.into_iter()),
+            "ctrader:ctrader-demo:EUR/USD"
+        );
+        assert_eq!(
+            scoped_key("EURUSD", Some("future-live"), rows.into_iter()),
+            "EURUSD"
+        );
+        assert_eq!(
+            scoped_key("EURUSD", Some("five"), rows.into_iter()),
+            "mt5:five:EURUSD"
+        );
+    }
+
+    #[test]
     fn every_baked_mt5_profile_is_reachable_only_through_its_account_key() {
         use chrono::{TimeZone, Timelike};
         for row in super::super::baseline_mt5::SPREAD_BASELINE_MT5 {
@@ -90,6 +124,40 @@ mod tests {
                 super::super::spread_forecast_frac(row.1, instant),
                 (expected(hour), expected((hour + 1) % 24))
             );
+        }
+    }
+
+    #[test]
+    fn baked_ctrader_profiles_reach_every_shared_runtime_reader() {
+        use chrono::{TimeZone, Timelike};
+        for row in super::super::baseline_ctrader::SPREAD_BASELINE_CTRADER {
+            let (account, native) = row
+                .1
+                .strip_prefix("ctrader:")
+                .unwrap()
+                .split_once(':')
+                .unwrap();
+            assert_eq!(spread_lookup_key(native, Some(account)), row.1);
+            assert!(super::super::coverage(row.1).is_covered());
+            assert_eq!(
+                super::super::baked_baseline(row.1),
+                Some((row.7, row.8, row.6))
+            );
+            let timezone = super::super::schedule_tz(row.2).unwrap();
+            let instant = chrono::Utc.with_ymd_and_hms(2026, 10, 9, 12, 0, 0).unwrap();
+            let hour = instant.with_timezone(&timezone).hour() as usize;
+            let expected = |h: usize| {
+                if row.4 & (1_u32 << h) == 0 {
+                    row.9[h]
+                } else {
+                    0.0
+                }
+            };
+            assert_eq!(
+                super::super::spread_forecast_frac(row.1, instant),
+                (expected(hour), expected((hour + 1) % 24))
+            );
+            assert_ne!(spread_lookup_key(native, Some("future-live")), row.1);
         }
     }
 }
