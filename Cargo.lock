@@ -1059,6 +1059,8 @@ dependencies = [
  "color-eyre",
  "futures-util",
  "reqwest 0.12.23",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "tokio",
