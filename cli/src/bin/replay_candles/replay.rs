@@ -1579,6 +1579,7 @@ mod tests {
             armed_at: None,
             armed_sentiment: None,
             screenshot_url: None,
+            entry_conditions: Default::default(),
         };
         let candles: Vec<EngineCandle> = (0..20)
             .map(|i| candle(i * 3600, 1.30 + i as f64 * 0.001))
@@ -1622,6 +1623,7 @@ mod tests {
             armed_at: None,
             armed_sentiment: None,
             screenshot_url: None,
+            entry_conditions: Default::default(),
         };
         let replay = run(
             &plan,

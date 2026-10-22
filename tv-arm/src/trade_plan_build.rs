@@ -52,7 +52,8 @@ pub struct PullbackArm {
 /// wires). A distinct type makes the transposition a compile error.
 ///
 /// What it changes: the **pcl-exhausted** veto (the computed ~80%-to-TP fib
-/// level) becomes close-confirmed instead of wick-triggered. See
+/// level) becomes close-confirmed instead of wick-triggered. A drawn neckline
+/// becomes an optional close-confirmed retracement gate, with no retest. See
 /// [`invalidation_or_pcl_trigger`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TrendFollow(pub bool);
@@ -193,6 +194,18 @@ pub fn build_trade_plan(
         .collect();
 
     TradePlan {
+        entry_conditions: trade_control_core::trade_plan::EntryConditions {
+            must_touch: Vec::new(),
+            retrace: if trend.0 && !is_mw {
+                geom.neckline
+                    .map(|line| trade_control_core::trade_plan::RetraceLine {
+                        a: line.a.to_line_point(),
+                        b: line.b.to_line_point(),
+                    })
+            } else {
+                None
+            },
+        },
         trade_id: trade_id.to_string(),
         instrument: instrument.to_string(),
         direction: to_core_direction(direction),
