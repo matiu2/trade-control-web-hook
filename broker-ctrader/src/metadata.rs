@@ -103,7 +103,9 @@ pub(crate) async fn equity(broker: &OpenApiBroker) -> Result<f64> {
     Ok(result)
 }
 pub(crate) async fn assets(broker: &OpenApiBroker) -> Result<Vec<Value>> {
-    Ok(array(&broker.read(2112, 2113, json!({})).await?, "asset").to_vec())
+    let response = broker.read(2112, 2113, json!({})).await?;
+    wire::array_shape(&response, "asset")?;
+    Ok(array(&response, "asset").to_vec())
 }
 pub(crate) async fn quote(broker: &OpenApiBroker, instrument: &str) -> Result<Quote> {
     let symbol = instrument_metadata_id(broker, instrument).await?;

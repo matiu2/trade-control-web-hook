@@ -14,6 +14,8 @@
 
 #[path = "trade_control/control_validation.rs"]
 mod control_validation;
+#[path = "trade_control/ctrader_instruments.rs"]
+mod ctrader_instruments;
 use control_validation::{
     canonicalize_instrument, canonicalize_instrument_or_force, scope_ctrader_control,
 };
@@ -326,20 +328,25 @@ struct PurgeArgs {
 
 #[derive(Subcommand)]
 enum InstrumentsCmd {
-    /// Force-refresh the on-disk catalog (re-walks the broker's market
-    /// tree, ~1200 entries for TradeNation, takes a few seconds).
+    /// Refresh the broker catalogue. TradeNation updates its on-disk cache;
+    /// cTrader reads the selected account's current Open API catalogue.
     Refresh {
-        #[arg(long, value_enum, default_value_t = BrokerKindArg::TradeNation)]
-        broker: BrokerKindArg,
+        #[arg(long, value_enum, default_value_t = ctrader_instruments::BrokerArg::TradeNation)]
+        broker: ctrader_instruments::BrokerArg,
+        /// Named local account profile. Required for cTrader Open API.
+        #[arg(long)]
+        account: Option<String>,
     },
-    /// Resolve a user-supplied name. Exit 0 on hit (prints canonical
-    /// name + market_id), exit 2 on miss (prints candidate list to
-    /// stderr).
+    /// Resolve a name on the selected broker. Exit 0 on a match (prints
+    /// the canonical name and broker instrument ID), or 2 on a miss.
     Resolve {
         /// Name to resolve, e.g. "XAG/USD", "Spot Gold", "EURUSD".
         name: String,
-        #[arg(long, value_enum, default_value_t = BrokerKindArg::TradeNation)]
-        broker: BrokerKindArg,
+        #[arg(long, value_enum, default_value_t = ctrader_instruments::BrokerArg::TradeNation)]
+        broker: ctrader_instruments::BrokerArg,
+        /// Named local account profile. Required for cTrader Open API.
+        #[arg(long)]
+        account: Option<String>,
         /// Emit machine-readable JSON instead of plain text. Used by
         /// `tv_arm_hs.py` and other tooling.
         #[arg(long)]
@@ -348,8 +355,14 @@ enum InstrumentsCmd {
     /// Print every known instrument name (one per line). Drives the zsh
     /// completion hook on the control subcommands' `instrument` positional.
     List {
-        #[arg(long, value_enum, default_value_t = BrokerKindArg::TradeNation)]
-        broker: BrokerKindArg,
+        /// Emit the selected account identity and full catalogue as JSON.
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_enum, default_value_t = ctrader_instruments::BrokerArg::TradeNation)]
+        broker: ctrader_instruments::BrokerArg,
+        /// Named local account profile. Required for cTrader Open API.
+        #[arg(long)]
+        account: Option<String>,
     },
 }
 
@@ -992,45 +1005,56 @@ _trade_control_tn_instruments() {
 "#;
 
 fn run_instruments(sub: InstrumentsCmd) -> Result<()> {
-    match sub {
-        InstrumentsCmd::Refresh { broker } => match broker.into() {
-            BrokerKind::TradeNation => {
-                // No --account-id on this admin command; fall back to
-                // the default-demo login. The catalog is account-
-                // agnostic, so any working demo produces the same data.
-                let cache = load_cache(true, None, None)?;
+    use ctrader_instruments::Operation;
+    let (broker, account, operation) = match sub {
+        InstrumentsCmd::Refresh { broker, account } => (broker, account, Operation::Refresh),
+        InstrumentsCmd::Resolve {
+            name,
+            broker,
+            account,
+            json,
+        } => (broker, account, Operation::Resolve { name, json }),
+        InstrumentsCmd::List {
+            broker,
+            account,
+            json,
+        } => (broker, account, Operation::List { json }),
+    };
+    let (broker, account) = broker.select(account)?;
+    match (broker, operation) {
+        (BrokerKind::Ctrader, operation) => ctrader_instruments::run(operation, account.as_deref()),
+        (BrokerKind::TradeNation, Operation::Refresh) => {
+            let cache = load_cache(true, account.as_deref(), None)?;
+            println!(
+                "refreshed: {} markets at {}",
+                cache.catalog().markets.len(),
+                cache.path().display()
+            );
+            Ok(())
+        }
+        (BrokerKind::TradeNation, Operation::Resolve { name, json }) => {
+            run_resolve_tradenation(&name, json, account.as_deref())
+        }
+        (BrokerKind::TradeNation, Operation::List { json }) => {
+            let cache = load_cache(false, account.as_deref(), None)?;
+            if json {
                 println!(
-                    "refreshed: {} markets at {}",
-                    cache.catalog().markets.len(),
-                    cache.path().display(),
+                    "{}",
+                    serde_json::json!({"broker":"tradenation", "account":account, "instruments": cache.names().collect::<Vec<_>>()})
                 );
-                Ok(())
+            } else {
+                cache.names().for_each(|name| println!("{name}"));
             }
-            other => Err(no_catalog(other)),
-        },
-        InstrumentsCmd::Resolve { name, broker, json } => match broker.into() {
-            BrokerKind::TradeNation => run_resolve_tradenation(&name, json),
-            other => Err(no_catalog(other)),
-        },
-        InstrumentsCmd::List { broker } => match broker.into() {
-            BrokerKind::TradeNation => {
-                let cache = load_cache(false, None, None)?;
-                for name in cache.names() {
-                    println!("{name}");
-                }
-                Ok(())
-            }
-            other => Err(no_catalog(other)),
-        },
+            Ok(())
+        }
+        (other, _) => Err(no_catalog(other)),
     }
 }
 
-/// The `instruments` subcommands all read the TradeNation market catalog;
-/// no other broker has one wired up. One message rather than a copy per
-/// subcommand, which is how the OANDA arm came to be repeated three times.
+/// Broker catalogues are only wired through their verified native integrations.
 fn no_catalog(broker: BrokerKind) -> color_eyre::eyre::Report {
     eyre!(
-        "no instrument catalog for {}; only --broker tradenation is supported",
+        "no instrument catalog for {}; supported brokers: tradenation, ctrader (--account required)",
         broker.as_str()
     )
 }
@@ -1039,10 +1063,10 @@ fn no_catalog(broker: BrokerKind) -> color_eyre::eyre::Report {
 /// uses a machine-readable shape consumed by `tv_arm_hs.py`. Exit code 2 on
 /// miss (distinct from "broker / cache failed" → exit 1) so callers can
 /// distinguish a clean "not found" from an infra problem.
-fn run_resolve_tradenation(name: &str, json: bool) -> Result<()> {
+fn run_resolve_tradenation(name: &str, json: bool, account: Option<&str>) -> Result<()> {
     use tradenation_instrument_cache::ResolveError;
 
-    let cache = load_cache(false, None, None)?;
+    let cache = load_cache(false, account, None)?;
     match cache.resolve(name) {
         Ok(market) => {
             if json {
