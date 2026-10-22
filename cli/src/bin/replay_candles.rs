@@ -48,6 +48,7 @@ mod replay_candles {
     pub mod cadence;
     pub mod candles;
     pub mod economics;
+    pub mod entry_history;
     pub mod fill_sim;
     pub mod fixture;
     pub mod futures_caveats;
@@ -272,12 +273,7 @@ async fn run() -> Result<()> {
     // ATR-warmup depths are one number, and a low `--warmup-bars` can't silently
     // re-introduce the golden-starvation divergence. The default (200) already
     // clears every ATR length; this only bites when an operator lowers it.
-    let warmup_bars = {
-        use trade_control_core::signals::{DetectorConfig, detector_lookback_bars};
-        let cfg = DetectorConfig::pine_defaults(gran.engine());
-        args.warmup_bars
-            .max(detector_lookback_bars(&cfg, gran.engine()))
-    };
+    let warmup_bars = replay_candles::entry_history::warmup_bars(&plan, start, args.warmup_bars)?;
     let candles = pull_with_warmup(
         args.source,
         &symbol,

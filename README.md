@@ -3512,44 +3512,74 @@ rejected). It conflicts with `--quasimodo`, `--entry-market`,
 
 ### Trend-follow arm — `--trend`
 
-Most H&S/iH&S setups are **reversals**: price breaks a neckline and turns. A
-**trend-follow** setup is a continuation — there is no neckline break-and-close
-+ retest sequence to wait for, and price is expected to keep running in the
-direction it is already going. `--trend` arms that shape:
+`--trend` removes the normal H&S break-and-close and retest requirements.
+The optional **neckline drawing becomes a retracement line**:
 
-1. **It implies `--skip-bcr`** — both preps (`03-prep-break-and-close`,
-   `04-prep-retest`) are dropped; the enter fires on the first qualifying
-   signal.
-2. **It makes the pcl-exhausted veto close-confirmed.** The ~80%-to-TP fib
-   level (`too-low` on a short, `too-high` on a long — the names swap with
-   direction) is normally a **wick-through**: any bar whose range straddles the
-   level aborts the setup. A trend runs further and wicks deeper than a
-   reversal, so that straddle kills trend setups on spikes that close back
-   inside. Under `--trend` the bar must **close** past the level.
+| Drawing | Entry preparation under `--trend` |
+|---|---|
+| No neckline | No BCR preparation; wait for a qualifying signal. |
+| Neckline present, short | Wait for a candle to close at or above the line, then a bearish signal. |
+| Neckline present, long | Wait for a candle to close at or below the line, then a bullish signal. |
+
+A wick alone is insufficient. The line can mark halfway back through the prior
+push, or another minimum retracement chosen on the chart. Its price is projected
+at each candle using the same traded-bar interpolation as other trendlines.
+The threshold has no BCR buffer or golden requirement. A first post-arm close
+already beyond the line also qualifies; a new edge crossing is not required.
+
+Once satisfied, retracement stays satisfied across ticks and restarts. There is
+**no retest**, and price need not remain beyond the line. The entry signal may
+print on the retracement candle or later; a signal printed earlier cannot
+qualify by confirming afterward. Signal quality, optional confirmation and the
+entry order type retain their existing rules. With no `--trend`, ordinary H&S
+BCR behaviour is unchanged.
 
 ```sh
-tv-arm-staging --trend register        # was: tv-arm-staging --skip-bcr register
+tv-arm-staging --spec-url='http://localhost:8790/arm-setup?...' --trend register
 ```
 
-The **drawn** invalidation cap is untouched — it is the operator's line and is
-already close-confirmed in both directions. So `--trend` changes exactly one
-rule's confirm mode, never a level:
+`--trend` also keeps the **exhaustion veto close-confirmed**. The level is fib
+**1.8** (head = 0, neckline = 1, TP = 2): 80% from neckline toward TP. For a
+reversal, a wick through that level consumes enough of the projected move to
+block further entries. For a trend, a wick through which closes back inside
+leaves room for a possible retracement and later signal. A close through still
+blocks further entries. This is an entry policy, not a promise of another push
+and not an instruction to close an open position.
 
-| veto | short | long | default | under `--trend` |
+| Veto | Short | Long | Default | Under `--trend` |
 |---|---|---|---|---|
-| drawn invalidation (CLOSE-VETO) | `too-high` | `too-low` | `OnClose` | `OnClose` (unchanged) |
-| pcl-exhausted (VETO) | `too-low` | `too-high` | `Intrabar` / `Either` (wick) | **`OnClose`** |
+| Drawn invalidation | `too-high` | `too-low` | Close | Close |
+| Computed exhaustion | `too-low` | `too-high` | Wick | Close |
 
-Mechanically this is *only* a `BarEvent` on the emitted
-`PriceValueCross` trigger — no new plan field and no engine change. The
-engine's settled/origin `OnClose` arm already reads `CrossDir::Either` as
-"origin on one side of the line, close past the opposite far edge", which is
-exactly "closed through the level" for both directions. Because the switch
-rides the signed plan as the trigger it produced, replay and live read it
-identically for free.
+The exhaustion change is encoded in the signed trigger; the optional retracement
+line is stored in signed `entry_conditions`. Live and replay evaluate both in the
+same engine. `--trend` still conflicts with `--strategy-v2` and `--save-matrix`.
 
-`--trend` implies `--skip-bcr`, so it conflicts with `--strategy-v2` and
-`--save-matrix` for the same reasons `--skip-bcr` does.
+### Require an MA touch — `--must-touch` / `--ma-touch-required`
+
+```sh
+tv-arm-staging --spec-url='http://localhost:8790/arm-setup?...' \
+  --trend --must-touch '9 ema|20 sma|200 sma' register
+# Equivalent MA list:
+tv-arm-staging --spec-url='http://localhost:8790/arm-setup?...' \
+  --trend --ma-touch-required register
+```
+
+The signal pattern must touch **any one** listed close-based average on the
+setup timeframe. A wick counts. For a multi-candle pattern, each constituent
+candle is checked against its own contemporaneous MA; an earlier unrelated
+candle or the later confirmation candle cannot supply the touch. A missing or
+insufficiently warmed average cannot satisfy the filter. Another listed average
+may still qualify.
+
+This filter works independently of `--trend`, including on ordinary H&S BCR
+entries. If both retracement and MA touch are required, both must pass. M/W
+geometry entries do not have a signal pattern and reject the MA filter.
+
+SMA uses the last N closes. EMA uses an N-close SMA seed followed by exponential
+smoothing over a fixed ten-period tail. That fixed warmup keeps the value at a
+particular candle identical across live and replay history depths. Both drivers
+request enough history for the requested averages, pattern depth and confirmation.
 
 ### Server-side engine registration (`register`)
 
