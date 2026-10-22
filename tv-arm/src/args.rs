@@ -475,13 +475,15 @@ pub struct Args {
     /// 1. Expands to `--skip-bcr` (both H&S preps dropped — there is no
     ///    break-and-close/retest sequence to wait for). Expanded by
     ///    `apply_aliases`.
-    /// 2. Makes the **pcl-exhausted** veto (the computed ~80%-to-TP fib
-    ///    level — `too-low` on a short, `too-high` on a long)
-    ///    **close-confirmed** instead of wick-triggered. A trend runs
-    ///    further and wicks deeper than a reversal, so the default
-    ///    `Intrabar`/`Either` straddle kills the setup on a spike that
-    ///    closes back. Under `--trend` the bar must **close** past the
-    ///    level. The **drawn** invalidation cap is unaffected — it is
+    /// 2. Makes the **pcl-exhausted** veto (fib 1.8: 80% from neckline to TP
+    ///    — `too-low` on a short, `too-high` on a long)
+    ///    **close-confirmed** instead of wick-triggered. For a reversal, a wick
+    ///    reaching the level consumes the projected move and retires the setup.
+    ///    For a trend, a wick through that closes back inside leaves the setup
+    ///    alive for a possible retracement and later signal. A **close** through
+    ///    still retires it: stop waiting once the projected move is consumed.
+    ///    This veto blocks new entries; it does not close an open position.
+    ///    The **drawn** invalidation cap is unaffected — it is
     ///    already `OnClose`.
     ///
     /// It does *not* touch the retest tolerance, the cross buffer, or the
