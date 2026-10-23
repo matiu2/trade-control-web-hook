@@ -176,6 +176,7 @@ fn generated_table_and_calibration_artifacts_are_checked_outside_source_guard() 
     let source = Source::pin(root, false, &[]).unwrap();
     for path in [
         "src/spread_profiles/ctrader.rs",
+        "src/spread_profiles/ctrader.rs.lock",
         "validation/report.json",
         "target/nested/src/generated.rs",
     ] {

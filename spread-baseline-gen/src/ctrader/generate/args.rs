@@ -19,6 +19,7 @@ pub struct Args {
     #[arg(long, conflicts_with = "resume")]
     pub to: Option<DateTime<Utc>>,
     /// Native broker symbols; default is all enabled, recognized spot-FX pairs.
+    /// Explicit --only XPDUSD additionally permits read-only palladium calibration.
     #[arg(long, value_delimiter = ',', conflicts_with = "resume")]
     pub only: Vec<String>,
     #[arg(long)]

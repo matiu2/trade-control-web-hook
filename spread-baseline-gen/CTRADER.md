@@ -63,7 +63,7 @@ The report records account profile, demo endpoint/environment, Open API account
 ID, broker name and terminal login from the authenticated trader response.
 Each instrument records its native symbol ID, actual broker-native pip size,
 instrument-lookup market-local schedule/timezone and measurement
-bounds. Instruments outside recognized broker spot FX are listed as exclusions;
+bounds. Default discovery lists instruments outside recognized broker spot FX as exclusions;
 transient metadata/network failures abort catalogue discovery instead of being
 silently classified as unsupported.
 
@@ -92,3 +92,39 @@ with another account's rows are refused rather than overwritten.
 
 Baking changes source data only. Build and deploy consumers separately to activate
 the new rows. No estimated spread is installed while calibration is incomplete.
+
+
+## Add palladium without repeating the FX collection
+
+The default universe and `finish-ctrader` remain FX-only. Explicit
+`--only XPDUSD` also permits read-only palladium spread calibration using its
+exact enabled broker symbol, native ID and native pip precision. No other
+commodity class is enabled by this exception, and no contract sizing or live
+non-FX order support is implied.
+
+Use a **new report**, pinned to the same dates as the completed FX table:
+
+```sh
+target/release/generate-ctrader --account ctrader-demo --only XPDUSD \
+  --from 2026-07-24T16:26:00Z --to 2026-10-22T16:26:00Z \
+  --out spread-baseline-gen/validation/ctrader-demo-xpdusd-90d-report.json
+
+# Add only the new measured row; retain the 54 FX row strings byte-for-byte.
+target/release/bake-ctrader --account ctrader-demo --merge \
+  --report spread-baseline-gen/validation/ctrader-demo-xpdusd-90d-report.json
+```
+
+The original report is never rewritten. The same genuine paired M1 history,
+90-day minimum, statistical quality gates and fresh broker identity/pip checks
+apply to palladium. An incomplete or insufficient report is refused.
+
+`--merge` requires matching verified identity and sampling-window headers, adds
+only previously absent keys and refuses duplicate replacement. It cannot combine
+with `--allow-partial`. Both ordinary and additive bakes share an advisory output
+lock; its empty `.rs.lock` sidecar remains for stable lock identity. The source
+guard excludes this exact generated lock artifact alongside the generated table.
+
+An ordinary replacement also refuses to remove any already measured symbol.
+After palladium is added, a later FX-only table cannot silently erase it: a full
+replacement report must include every existing profile, while `--merge` is only
+for new symbols. Rebuild and deploy consumers after the measured row is added.

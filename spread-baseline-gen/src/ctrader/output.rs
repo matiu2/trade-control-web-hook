@@ -1,26 +1,50 @@
 //! Atomic writes preserve other accounts' generated rows.
 use color_eyre::{Result, eyre::ensure};
-use std::path::Path;
+use std::{fs::File, path::Path};
+
+mod merge;
+#[cfg(test)]
+mod test_table;
 
 pub fn write(path: &Path, account: &str, table: &str) -> Result<()> {
-    let previous = match std::fs::read_to_string(path) {
+    let _guard = lock(path)?;
+    let previous = read(path)?;
+    merge::preserves(&previous, account, table)?;
+    save(path, table)
+}
+
+/// Append newly measured symbols without replacing any existing account profile.
+pub fn merge(path: &Path, account: &str, table: &str) -> Result<()> {
+    ensure!(
+        std::fs::symlink_metadata(path)?.file_type().is_file(),
+        "additive cTrader bake requires an existing regular table file"
+    );
+    let _guard = lock(path)?;
+    let previous = read(path)?;
+    let combined = merge::tables(&previous, account, table)?;
+    save(path, &combined)
+}
+
+fn lock(path: &Path) -> Result<File> {
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("rs.lock"))?;
+    lock.try_lock()?;
+    Ok(lock)
+}
+
+fn read(path: &Path) -> Result<String> {
+    Ok(match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error.into()),
-    };
-    ensure!(
-        previous
-            .lines()
-            .filter_map(|line| line.trim_start().strip_prefix('('))
-            .all(|row| {
-                row.trim_start()
-                    .strip_prefix("\"ctrader-")
-                    .and_then(|tag| tag.split_once('"'))
-                    .is_some_and(|(owner, _)| owner == account)
-                    && row.contains(&format!("\"ctrader:{account}:"))
-            }),
-        "cTrader table includes another account; merge its profiles before replacement"
-    );
+    })
+}
+
+fn save(path: &Path, table: &str) -> Result<()> {
     let temporary = path.with_extension("rs.tmp");
     std::fs::write(&temporary, table)?;
     std::fs::rename(temporary, path)?;
@@ -28,33 +52,31 @@ pub fn write(path: &Path, account: &str, table: &str) -> Result<()> {
 }
 #[cfg(test)]
 mod tests {
+    use super::test_table::table;
+
     #[test]
     fn another_account_cannot_be_erased() {
-        crate::ctrader::test_logging();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ctrader.rs");
-        super::write(
-            &path,
-            "demo",
-            "( \"ctrader-demo\", \"ctrader:demo:EURUSD\")",
-        )
-        .unwrap();
-        assert!(super::write(&path, "other", "replacement").is_err());
-        assert!(
-            std::fs::read_to_string(&path)
-                .unwrap()
-                .contains("ctrader:demo")
-        );
-        super::write(&path, "demo", "updated own rows").unwrap();
+        let original = table(&["EURUSD"]);
+        super::write(&path, "demo", &original).unwrap();
+        assert!(super::write(&path, "other", &table(&["AUDUSD"])).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        super::write(&path, "demo", &table(&["EURUSD", "AUDUSD"])).unwrap();
     }
+
     #[test]
     fn identity_header_with_ctrader_named_profile_does_not_block_own_updates() {
-        crate::ctrader::test_logging();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ctrader.rs");
-        let table = "// Identity={\"profile\":\"ctrader-demo\"}\n(\"ctrader-ctrader-demo\", \"ctrader:ctrader-demo:EURUSD\")";
-        super::write(&path, "ctrader-demo", table).unwrap();
-        super::write(&path, "ctrader-demo", table).unwrap();
-        assert!(super::write(&path, "other", table).is_err());
+        let original = table(&["EURUSD"])
+            .replace("\"profile\":\"demo\"", "\"profile\":\"ctrader-demo\"")
+            .replace(
+                "(\"ctrader-demo\", \"ctrader:demo:",
+                "(\"ctrader-ctrader-demo\", \"ctrader:ctrader-demo:",
+            );
+        super::write(&path, "ctrader-demo", &original).unwrap();
+        super::write(&path, "ctrader-demo", &original).unwrap();
+        assert!(super::write(&path, "other", &original).is_err());
     }
 }

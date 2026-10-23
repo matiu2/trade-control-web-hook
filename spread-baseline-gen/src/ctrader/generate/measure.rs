@@ -6,13 +6,9 @@ use color_eyre::{
     Result,
     eyre::{Context, ensure, eyre},
 };
-pub(super) fn asset_for_fx(symbol: &str) -> Result<&'static instrument_lookup::Asset> {
-    let asset = crate::ctrader::asset(symbol)?;
-    ensure!(
-        asset.class == instrument_lookup::AssetClass::Forex,
-        "not a recognized spot FX instrument"
-    );
-    Ok(asset)
+#[cfg(test)]
+fn asset_for_fx(symbol: &str) -> Result<&'static instrument_lookup::Asset> {
+    super::super::calibration::asset(symbol, false)
 }
 
 pub(super) async fn measure(
@@ -23,8 +19,8 @@ pub(super) async fn measure(
     to: DateTime<Utc>,
     window_hours: u32,
 ) -> Result<InstrumentReport> {
-    let asset = asset_for_fx(symbol)?;
-    let metadata = data.forex_instrument_metadata(symbol).await?;
+    let asset = super::super::calibration::asset(symbol, true)?;
+    let metadata = super::super::calibration::metadata(data, symbol, true).await?;
     ensure!(
         metadata.name == symbol
             && metadata.id > 0

@@ -257,3 +257,24 @@ fn invalid_broker_native_units_and_non_fx_reports_still_cannot_be_baked() {
     r.instruments[0].measurement.symbol = "XAUUSD".into();
     assert!(render(&r, &r.identity).is_err());
 }
+
+#[test]
+fn explicit_palladium_report_uses_native_quotes_without_enabling_other_commodities() {
+    crate::ctrader::test_logging();
+    let mut r = report();
+    r.requested_symbols = vec!["XPDUSD".into()];
+    let row = &mut r.instruments[0];
+    row.symbol_id = 22346;
+    row.measurement.symbol = "XPDUSD".into();
+    row.measurement.pip_size = 0.01;
+    let table = render(&r, &r.identity).unwrap();
+    assert!(table.contains("ctrader:demo:XPDUSD"));
+    verify_broker_metadata(&r.instruments[0], 22346, "XPDUSD", 0.01).unwrap();
+    assert!(verify_broker_metadata(&r.instruments[0], 22346, "XPDUSD", 0.001).is_err());
+    assert!(verify_broker_metadata(&r.instruments[0], 22346, "XPD_USD", 0.01).is_err());
+    r.instruments[0].measurement.profile.review = ReviewStatus::InsufficientData;
+    assert!(render(&r, &r.identity).is_err());
+    r.instruments[0].measurement.profile.review = ReviewStatus::Reviewed;
+    r.complete = false;
+    assert!(render(&r, &r.identity).is_err());
+}

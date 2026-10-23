@@ -17,6 +17,9 @@ struct Args {
     /// Explicitly promote eligible measured pairs while keeping failures uncovered in the report.
     #[arg(long)]
     allow_partial: bool,
+    /// Add new same-account/window profiles without rewriting or deleting existing rows.
+    #[arg(long, conflicts_with = "allow_partial")]
+    merge: bool,
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,12 +43,36 @@ async fn main() -> Result<()> {
         ctrader::bake::render(&report, &identity)?
     };
     for row in &report.instruments {
-        let metadata = data
-            .forex_instrument_metadata(&row.measurement.symbol)
-            .await?;
+        let metadata = ctrader::calibration::metadata(&data, &row.measurement.symbol, true).await?;
         ctrader::bake::verify_broker_metadata(row, metadata.id, &metadata.name, metadata.pip_size)?;
     }
-    ctrader::output::write(&args.out, &args.account, &table)?;
-    tracing::info!(account=args.account,rows=report.instruments.len(),output=%args.out.display(),"baked verified cTrader paired spread profiles; broker trading is untouched");
+    if args.merge {
+        ctrader::output::merge(&args.out, &args.account, &table)?;
+    } else {
+        ctrader::output::write(&args.out, &args.account, &table)?;
+    }
+    tracing::info!(account=args.account,rows=report.instruments.len(),append_only=args.merge,output=%args.out.display(),"baked verified cTrader paired spread profiles; broker trading is untouched");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn additive_promotion_is_explicit_and_cannot_promote_partial_reports() {
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer())
+            .try_init()
+            .ok();
+        let base = ["bake-ctrader", "--account", "demo", "--report", "xpd.json"];
+        let args = Args::try_parse_from(base.into_iter().chain(["--merge"])).unwrap();
+        assert!(args.merge);
+        assert!(!args.allow_partial);
+        assert!(
+            Args::try_parse_from(base.into_iter().chain(["--merge", "--allow-partial"])).is_err()
+        );
+    }
 }

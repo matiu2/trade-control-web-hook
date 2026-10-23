@@ -4,6 +4,7 @@ use color_eyre::{Result, eyre::ensure};
 use serde::{Deserialize, Serialize};
 
 pub mod bake;
+pub mod calibration;
 pub mod checkpoint;
 pub mod generate;
 pub mod output;

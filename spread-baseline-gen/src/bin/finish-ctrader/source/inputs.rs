@@ -24,6 +24,11 @@ pub(super) fn inventory(directory: &Path, cache: bool, artifacts: &[PathBuf]) ->
                 .canonicalize()?
                 .join("src/spread_profiles/ctrader.rs"),
         );
+        excluded.insert(
+            directory
+                .canonicalize()?
+                .join("src/spread_profiles/ctrader.rs.lock"),
+        );
     }
     for package in packages {
         let head = output(&package, &["rev-parse", "HEAD"])?;
@@ -91,6 +96,7 @@ fn packages(directory: &Path) -> Result<PackageInputs> {
             // This table is deliberately replaced by the baker and checked
             // separately by the finisher, including when reached transitively.
             excluded.insert(directory.join("src/spread_profiles/ctrader.rs"));
+            excluded.insert(directory.join("src/spread_profiles/ctrader.rs.lock"));
         }
         packages.insert(directory);
     }

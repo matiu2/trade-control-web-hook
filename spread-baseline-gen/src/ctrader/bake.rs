@@ -136,11 +136,7 @@ fn validate_row(row: &crate::mt5::InstrumentReport) -> Result<()> {
         ) && profile.n_bars >= MIN_INSTRUMENT_BARS,
         "insufficient reviewed data for {symbol}"
     );
-    let asset = super::asset(symbol)?;
-    ensure!(
-        asset.class == instrument_lookup::AssetClass::Forex,
-        "cTrader spread calibration supports recognized spot FX only"
-    );
+    let asset = super::calibration::asset(symbol, true)?;
     ensure!(
         asset.spread_schedule == row.schedule
             && asset.spread_schedule_tz().as_deref() == Some(row.timezone.as_str()),
