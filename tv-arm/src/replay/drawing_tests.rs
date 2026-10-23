@@ -28,6 +28,15 @@ async fn read_request(stream: &mut TcpStream) -> String {
 }
 
 async fn draw_fixture(positions: Value) -> Vec<String> {
+    draw_fixture_for(positions, "oanda", "EUR_USD", "h1").await
+}
+
+async fn draw_fixture_for(
+    positions: Value,
+    broker: &str,
+    instrument: &str,
+    granularity: &str,
+) -> Vec<String> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .with(tracing_error::ErrorLayer::default())
@@ -59,8 +68,8 @@ async fn draw_fixture(positions: Value) -> Vec<String> {
     std::fs::write(
         &path,
         json!({
-            "version": 1, "instrument": "EUR_USD", "granularity": "h1",
-            "broker": "oanda", "positions": positions
+            "version": 1, "instrument": instrument, "granularity": granularity,
+            "broker": broker, "positions": positions
         })
         .to_string(),
     )
@@ -75,6 +84,15 @@ async fn draw_fixture(positions: Value) -> Vec<String> {
     let mut requests = Vec::new();
     while let Ok(request) = receiver.try_recv() {
         requests.push(request);
+    }
+    for request in &requests {
+        let route = request.lines().next().expect("HTTP request line");
+        assert!(route.contains(&format!("broker={broker}")), "{route}");
+        assert!(
+            route.contains(&format!("instrument={instrument}")),
+            "{route}"
+        );
+        assert!(route.contains(&format!("tf={granularity}")), "{route}");
     }
     assert!(
         requests
@@ -92,6 +110,28 @@ async fn draw_fixture(positions: Value) -> Vec<String> {
         .into_iter()
         .filter(|r| r.starts_with("POST "))
         .collect()
+}
+
+#[tokio::test]
+async fn palladium_drawings_keep_the_named_ctrader_feed_and_native_prices() {
+    let requests = draw_fixture_for(
+        json!([{
+            "direction":"short", "fill_at":1792130400_i64, "until":1792670400_i64,
+            "entry_price":1124.123, "stop_loss":1149.340, "take_profit":1039.480,
+            "outcome":"reversal", "taken":true
+        }]),
+        "ctrader-ctrader-demo",
+        "XPDUSD",
+        "h1",
+    )
+    .await;
+    assert_eq!(requests.len(), 1);
+    let (_, body) = requests[0].split_once("\r\n\r\n").unwrap();
+    let drawing: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(drawing["id"], "replay-pos-short-1792130400-reversal");
+    assert_eq!(drawing["anchors"][0]["price"], json!(1124.123));
+    assert_eq!(drawing["anchors"][1]["price"], json!(1149.340));
+    assert_eq!(drawing["anchors"][2]["price"], json!(1039.480));
 }
 
 fn position(taken: bool, outcome: &str, fill_at: i64, until: i64) -> Value {

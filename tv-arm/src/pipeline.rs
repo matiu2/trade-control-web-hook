@@ -52,6 +52,8 @@ use crate::trade_plan_build::resolution_to_granularity;
 use trading_view::drawings::Drawing;
 use trading_view::mcp::TvMcp;
 
+mod routing;
+
 /// Output root for built bundles. Matches the Python `ARM_OUT_ROOT`
 /// so a side-by-side run reuses the same paths.
 const ARM_OUT_ROOT: &str = "/tmp/trade-control-arm";
@@ -426,10 +428,11 @@ fn setup_from_frozen(
 
     let broker = resolve_broker(args, &frozen.chart_symbol)?;
     let account = resolve_account(args, broker, &frozen.chart_symbol)?;
-    let resolved = crate::instrument_resolution::resolve_for_account(
+    let resolved = crate::instrument_resolution::resolve_for_purpose(
         &frozen.chart_symbol,
         broker,
         Some(&account),
+        crate::instrument_resolution::ResolutionPurpose::for_args(args),
     )?;
     let instrument = resolved.broker_symbol.clone();
     // No live chart, so no TV Symbol-info to prefer — the catalog precision is
@@ -532,7 +535,7 @@ fn read_setup_from_chart(args: &Args) -> Result<(SetupInputs, Roles)> {
     // resolve directly. If that also misses, we error with a
     // copy-pasteable TOML snippet built from the chart info.
     let account = resolve_account(args, broker, &state.symbol)?;
-    let resolved = resolve_with_recovery(&state.symbol, broker, &mcp, Some(&account))?;
+    let resolved = resolve_with_recovery(args, &state.symbol, broker, &mcp, Some(&account))?;
     let instrument = resolved.broker_symbol.clone();
 
     info!(
@@ -1103,25 +1106,12 @@ fn resolve_control_windows(
 
 /// Resolve `--broker` > `TRADE_CONTROL_BROKER` env > chart exchange.
 fn resolve_broker(args: &Args, full_symbol: &str) -> Result<Broker> {
-    if let Some(arg) = args.broker {
-        return Ok(arg.into_conventions());
-    }
-    if let Ok(env_val) = env::var("TRADE_CONTROL_BROKER") {
-        let trimmed = env_val.trim();
-        if !trimmed.is_empty() {
-            if let Some(b) = Broker::from_wire(trimmed) {
-                return Ok(b);
-            }
-            return Err(eyre!("unsupported TRADE_CONTROL_BROKER {trimmed:?}"));
-        }
-    }
-    if local_chart_client::mt5_chart_account(full_symbol).is_some() {
-        return Ok(Broker::Mt5);
-    }
-    let (exchange, _) = split_symbol(full_symbol);
-    Ok(exchange
-        .and_then(Broker::from_exchange)
-        .unwrap_or(Broker::Oanda))
+    let environment = env::var("TRADE_CONTROL_BROKER").ok();
+    routing::broker(
+        args.broker.map(|broker| broker.into_conventions()),
+        environment.as_deref(),
+        full_symbol,
+    )
 }
 
 /// Resolve via the catalog; on miss, ask tv-mcp for the chart's
@@ -1136,16 +1126,21 @@ fn resolve_broker(args: &Args, full_symbol: &str) -> Result<Broker> {
 /// supplemented with a copy-pasteable TOML snippet built from the
 /// chart info.
 fn resolve_with_recovery(
+    args: &Args,
     tv_symbol: &str,
     broker: Broker,
     mcp: &TvMcp,
     account: Option<&str>,
 ) -> Result<crate::instrument_resolution::ResolvedInstrument> {
-    let first_err =
-        match crate::instrument_resolution::resolve_for_account(tv_symbol, broker, account) {
-            Ok(resolved) => return Ok(resolved),
-            Err(e) => e,
-        };
+    let first_err = match crate::instrument_resolution::resolve_for_purpose(
+        tv_symbol,
+        broker,
+        account,
+        crate::instrument_resolution::ResolutionPurpose::for_args(args),
+    ) {
+        Ok(resolved) => return Ok(resolved),
+        Err(e) => e,
+    };
     // Account-native platforms have no overlay broker column; preserve the account/contract error
     // rather than patching another broker's mapping after a read failure.
     if matches!(broker, Broker::Mt5 | Broker::Ctrader) {
@@ -1236,36 +1231,19 @@ fn resolve_with_recovery(
     })
 }
 
-/// `--account-id` > `TRADE_CONTROL_ACCOUNT` env > per-broker default.
+/// `--account-id` > `TRADE_CONTROL_ACCOUNT` env > named chart > per-broker default.
 ///
 /// Errors when the broker has no default and the operator named no account.
 /// Substituting a placeholder would put a blank account name on the plan and
 /// fail at dispatch instead of here, where the cause is obvious.
 fn resolve_account(args: &Args, broker: Broker, chart_symbol: &str) -> Result<String> {
-    if let Some(a) = &args.account_id {
-        return Ok(a.clone());
-    }
-    if let Ok(env_val) = env::var("TRADE_CONTROL_ACCOUNT") {
-        let trimmed = env_val.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-    }
-    if broker == Broker::Mt5
-        && let Some(account) = local_chart_client::mt5_chart_account(chart_symbol)
-    {
-        return Ok(account.to_string());
-    }
-    broker
-        .default_account_index()
-        .map(str::to_string)
-        .ok_or_else(|| {
-            eyre!(
-                "{} has no default account, so one must be named explicitly: \
-             pass --account-id <name> or set TRADE_CONTROL_ACCOUNT",
-                broker.as_str()
-            )
-        })
+    let environment = env::var("TRADE_CONTROL_ACCOUNT").ok();
+    routing::account(
+        args.account_id.as_deref(),
+        environment.as_deref(),
+        broker,
+        chart_symbol,
+    )
 }
 
 /// H&S / IH&S path: validate the constellation of drawings, read

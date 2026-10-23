@@ -24,6 +24,9 @@ use trade_control_conventions::Broker as ConvBroker;
 
 use crate::precision::CatalogPrecision;
 
+mod replay;
+pub(crate) use replay::{ResolutionPurpose, resolve_for_purpose};
+
 /// One chart-symbol → broker-canonical-symbol resolution result.
 ///
 /// Holds a static reference back into the catalog (the catalog is
@@ -166,7 +169,7 @@ fn require_spread_coverage(broker_symbol: &str) -> Result<()> {
         return Ok(());
     }
     let rebake = if broker_symbol.starts_with("ctrader:") {
-        "cTrader account-scoped spread baseline collection is not implemented yet; validate and collect this account's spreads before unattended arming".to_string()
+        "collect account-bound paired M1 evidence with generate-ctrader, then verify and merge the profile with bake-ctrader --merge; preserve the existing table's UTC sampling bounds when extending it".to_string()
     } else if let Some((account, symbol)) = broker_symbol
         .strip_prefix("mt5:")
         .and_then(|key| key.split_once(':'))
