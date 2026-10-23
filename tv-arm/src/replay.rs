@@ -324,9 +324,9 @@ pub fn run_replay(
 
     // Validate the full invocation against the shared clap definition before
     // shelling out, so a bad passthrough flag fails with replay-candles' own
-    // error rather than an opaque non-zero exit. (We discard the parsed value —
-    // the actual run is the subprocess, which reparses identically.)
-    ReplayArgs::try_parse_from(&argv)
+    // error rather than an opaque non-zero exit. Keep its selected output path:
+    // an explicit --positions overrides the temporary default above.
+    let parsed = ReplayArgs::try_parse_from(&argv)
         .map_err(|e| eyre!("--replay: invalid replay-candles arguments: {e}"))?;
 
     info!(
@@ -357,8 +357,15 @@ pub fn run_replay(
     // The replay succeeded; draw what it recorded. Only under `--new-tv` —
     // without it, nothing above wrote a positions file and this is skipped
     // entirely.
-    if let (Some(url), Some(path)) = (new_tv, positions_path.as_deref()) {
-        draw_positions_on_local_chart(url, path)?;
+    if let Some(url) = new_tv {
+        draw_replay_output(url, &parsed, !sets_flag(passthrough, "--positions"))?;
+    }
+    Ok(())
+}
+
+fn draw_replay_output(url: &str, parsed: &ReplayArgs, remove_after_draw: bool) -> Result<()> {
+    if let Some(path) = parsed.positions.as_deref() {
+        draw_positions_on_local_chart(url, path, remove_after_draw)?;
     }
     Ok(())
 }
@@ -372,7 +379,7 @@ pub fn run_replay(
 /// `Ok`, rather than turning a successful arm-and-replay into a non-zero exit.
 /// The one thing it must not do is fail *silently*, hence the warning naming
 /// the cause.
-fn draw_positions_on_local_chart(url: &str, path: &Path) -> Result<()> {
+fn draw_positions_on_local_chart(url: &str, path: &Path, remove_after_draw: bool) -> Result<()> {
     let doc = match local_chart_client::read_positions(path) {
         Ok(doc) => doc,
         Err(err) => {
@@ -389,7 +396,9 @@ fn draw_positions_on_local_chart(url: &str, path: &Path) -> Result<()> {
         }
         Err(err) => warn!(%err, url, "could not draw positions on local-chart"),
     }
-    std::fs::remove_file(path).ok();
+    if remove_after_draw {
+        std::fs::remove_file(path).ok();
+    }
     Ok(())
 }
 

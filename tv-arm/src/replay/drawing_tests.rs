@@ -1,4 +1,5 @@
-use super::draw_positions_on_local_chart;
+use super::{ReplayArgs, draw_replay_output};
+use clap::Parser;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -28,7 +29,7 @@ async fn read_request(stream: &mut TcpStream) -> String {
 }
 
 async fn draw_fixture(positions: Value) -> Vec<String> {
-    draw_fixture_for(positions, "oanda", "EUR_USD", "h1").await
+    draw_fixture_for(positions, "oanda", "EUR_USD", "h1", true).await
 }
 
 async fn draw_fixture_for(
@@ -36,6 +37,7 @@ async fn draw_fixture_for(
     broker: &str,
     instrument: &str,
     granularity: &str,
+    remove_after_draw: bool,
 ) -> Vec<String> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_default_env())
@@ -74,13 +76,24 @@ async fn draw_fixture_for(
         .to_string(),
     )
     .expect("write positions");
-    let consumed_path = path.clone();
-    tokio::task::spawn_blocking(move || draw_positions_on_local_chart(&url, &consumed_path))
+    let parsed = ReplayArgs::try_parse_from([
+        "replay-candles",
+        "--plan",
+        "/tmp/unused-drawing-test-plan.json",
+        "--positions",
+        path.to_str().expect("positions path"),
+    ])
+    .expect("explicit replay output");
+    tokio::task::spawn_blocking(move || draw_replay_output(&url, &parsed, remove_after_draw))
         .await
         .expect("drawing task")
         .expect("draw replay");
     server.abort();
-    assert!(!path.exists(), "consumed positions file is removed");
+    assert_eq!(
+        path.exists(),
+        !remove_after_draw,
+        "only an internally generated temporary output may be removed"
+    );
     let mut requests = Vec::new();
     while let Ok(request) = receiver.try_recv() {
         requests.push(request);
@@ -123,6 +136,7 @@ async fn palladium_drawings_keep_the_named_ctrader_feed_and_native_prices() {
         "ctrader-ctrader-demo",
         "XPDUSD",
         "h1",
+        true,
     )
     .await;
     assert_eq!(requests.len(), 1);
@@ -132,6 +146,19 @@ async fn palladium_drawings_keep_the_named_ctrader_feed_and_native_prices() {
     assert_eq!(drawing["anchors"][0]["price"], json!(1124.123));
     assert_eq!(drawing["anchors"][1]["price"], json!(1149.340));
     assert_eq!(drawing["anchors"][2]["price"], json!(1039.480));
+}
+
+#[tokio::test]
+async fn explicit_positions_output_is_drawn_and_preserved() {
+    let requests = draw_fixture_for(
+        json!([position(true, "tp", 10, 20)]),
+        "ctrader-ctrader-demo",
+        "XPDUSD",
+        "h1",
+        false,
+    )
+    .await;
+    assert_eq!(requests.len(), 1);
 }
 
 fn position(taken: bool, outcome: &str, fill_at: i64, until: i64) -> Value {
