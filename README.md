@@ -3581,6 +3581,47 @@ smoothing over a fixed ten-period tail. That fixed warmup keeps the value at a
 particular candle identical across live and replay history depths. Both drivers
 request enough history for the requested averages, pattern depth and confirmation.
 
+### Enable after an MA touch — `--enable-on-ma-touch`
+
+Use this when price must first visit an average, but the eventual entry signal
+may form elsewhere:
+
+```sh
+tv-arm-staging --spec-url='http://localhost:8790/arm-setup?...' \
+  --trend --enable-on-ma-touch '200 sma' register
+```
+
+The first fully post-arm closed candle whose range touches the average enables
+entry. A wick counts; no close through the MA is required. The touch is remembered
+across subsequent candles and restarts. A qualifying signal on that candle or
+later can enter without touching again. A pre-touch signal cannot qualify just
+because it confirms later. With a list such as `'20 sma|200 sma'`, touching either
+average enables entry; unavailable/cold averages cannot supply a touch.
+
+Warmup history does not enable the setup. The candle already forming at arm time
+is also excluded: its OHLC cannot prove whether the touch happened before or
+after arming. The engine observes closed candles on the setup timeframe.
+
+| Option | Required touch |
+|---|---|
+| `--must-touch '200 sma'` | Each entry signal pattern itself touches the 200 SMA. |
+| `--enable-on-ma-touch '200 sma'` | A post-arm candle touches the 200 SMA once; later signals can form elsewhere. |
+
+They can be combined independently:
+
+```sh
+tv-arm-staging --spec-url='http://localhost:8790/arm-setup?...' \
+  --trend --enable-on-ma-touch '200 sma' --must-touch '9 ema|20 sma|200 sma' register
+```
+
+This requires the initial 200 SMA touch, then an entry pattern touching the
+9 EMA, 20 SMA or 200 SMA. `--ma-touch-required` is shorthand for that same
+three-average entry filter and can be combined with `--enable-on-ma-touch`.
+Retracement/BCR, signal quality, confirmation, risk, expiry
+and invalidation rules still apply. Re-arming starts with a fresh touch milestone.
+Like the per-pattern MA filter, this option requires a candle-pattern entry;
+direct position and M/W geometry entries reject it.
+
 ### Server-side engine registration (`register`)
 
 Trades are armed **server-side**: the worker evaluates every trigger itself on

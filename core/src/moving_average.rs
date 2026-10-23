@@ -61,6 +61,13 @@ impl MovingAverage {
         value.is_finite().then_some(value)
     }
 
+    pub fn touches_at(self, candles: &[Candle], index: usize) -> bool {
+        candles.get(index).is_some_and(|bar| {
+            self.value_at(candles, index)
+                .is_some_and(|value| bar.l <= value && value <= bar.h)
+        })
+    }
+
     pub fn touches_pattern(
         self,
         candles: &[Candle],
@@ -78,10 +85,7 @@ impl MovingAverage {
             .iter()
             .enumerate()
             .filter(|(_, bar)| bar.time >= start && bar.time <= print)
-            .any(|(index, bar)| {
-                self.value_at(candles, index)
-                    .is_some_and(|value| bar.l <= value && value <= bar.h)
-            })
+            .any(|(index, _)| self.touches_at(candles, index))
     }
 }
 
