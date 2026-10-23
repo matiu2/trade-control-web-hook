@@ -206,6 +206,7 @@ mod tests {
             direction: None,
             granularity: "h1".into(),
             phase: None,
+            entries_blocked: false,
             shadow: false,
             archived_at: None,
             watermark: None,

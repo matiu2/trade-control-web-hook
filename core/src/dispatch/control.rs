@@ -758,6 +758,8 @@ struct PlanSummary {
     /// state row).
     #[serde(skip_serializing_if = "Option::is_none")]
     phase: Option<crate::plan_state::Phase>,
+    /// Entries may be blocked while the phase remains active for exit guards.
+    entries_blocked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     watermark: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -873,6 +875,7 @@ fn plan_summary(stored: &StoredPlan, state: Option<crate::plan_state::PlanState>
         shadow: plan.shadow,
         rules: plan.rules.len(),
         phase: state.as_ref().map(|s| s.phase),
+        entries_blocked: state.as_ref().is_some_and(|s| s.entries_blocked),
         watermark: state.as_ref().and_then(|s| s.watermark),
         fired: state
             .as_ref()
@@ -898,6 +901,7 @@ fn archived_plan_summary(archived: &ArchivedPlan) -> PlanSummary {
         shadow: plan.shadow,
         rules: plan.rules.len(),
         phase: Some(state.phase),
+        entries_blocked: state.entries_blocked,
         watermark: state.watermark,
         fired: state.fired.iter().cloned().collect(),
         retest_seen_at: state.retest_seen_at,
@@ -1092,6 +1096,9 @@ pub async fn handle_plan_delete<S: StateStore>(
 
 #[cfg(test)]
 mod register_tests;
+
+#[cfg(test)]
+mod summary_tests;
 
 #[cfg(test)]
 mod plan_show_tests {

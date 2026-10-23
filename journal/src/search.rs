@@ -98,7 +98,7 @@ fn haystack(row: &PlanRow) -> String {
         row.instrument,
         row.direction.as_deref().unwrap_or(""),
         row.granularity,
-        row.phase.as_deref().unwrap_or(""),
+        row.phase_label(),
         row.account,
         if row.is_archived() { "archived" } else { "" },
     );
@@ -123,6 +123,7 @@ mod tests {
             direction: None,
             granularity: granularity.to_string(),
             phase: Some(phase.to_string()),
+            entries_blocked: false,
             shadow: false,
             archived_at: None,
             watermark: None,

@@ -376,3 +376,14 @@ should accept either and normalise internally.
       operator's own pasted URL armed `TRADENATION:GBPJPY` h4, H&S short,
       8 alerts, `source=…/arm-setup?instrument=GBP_JPY&tf=h4&broker=tradenation`
 - [ ] committed + pushed, parent pointer bumped
+
+# TODO — AUDNZD completion-state investigation (2026-10-23)
+
+- [x] Read staging state and recordings: too-low fired at 13:15 Brisbane,
+      entries are blocked, and evaluation continues. A broker close was recorded
+      at 14:35 with net P&L +333.72; MT5 exit details are unavailable.
+- [x] Add regressions for blocked-entry summaries and journal labels.
+- [x] Expose the entry-blocking latch in plan summaries and the journal list.
+- [x] All 1,861 core/journal/engine/cron tests pass; clippy with warnings as
+      errors, fmt and both independent reviews pass.
+- [x] Commit and push the journal status fix.

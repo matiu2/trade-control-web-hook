@@ -1822,6 +1822,7 @@ mod tests {
             direction: None,
             granularity: "h1".into(),
             phase: Some("await_entry".into()),
+            entries_blocked: false,
             shadow: false,
             archived_at: None,
             watermark: None,
