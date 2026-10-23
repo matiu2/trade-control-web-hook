@@ -338,6 +338,7 @@ pub fn evaluate_plan(
             continue;
         }
         crate::entry_conditions::stamp_retrace(plan, &mut state, candle, detector_window);
+        crate::ma_enablement::stamp(plan, &mut state, candle, detector_window);
         match state.phase {
             Phase::AwaitBreakAndClose => {
                 evaluate_break_and_close(plan, &mut state, candle, detector_window, &mut fired);
@@ -876,7 +877,11 @@ fn evaluate_one_entry(
     if plan.entry_conditions.retrace.is_some() && state.retrace_seen_at.is_none() {
         return;
     }
-    if !plan.entry_conditions.must_touch.is_empty()
+    if !crate::ma_enablement::satisfied(plan, state) {
+        return;
+    }
+    if (!plan.entry_conditions.must_touch.is_empty()
+        || !plan.entry_conditions.enable_on_ma_touch.is_empty())
         && !matches!(rule.trigger, Trigger::PinePattern { .. })
     {
         tracing::warn!(rule_id = %rule.rule_id, "MA touch requires a candle-pattern entry; declining non-pattern entry");
@@ -969,12 +974,10 @@ fn evaluate_one_entry(
         }
     };
 
-    // A pre-retracement signal cannot become eligible just because it confirms
-    // later. The retracement candle itself may also print the entry signal.
+    // A signal from before the latest required preparation cannot qualify by
+    // confirming later. The preparation candle may also print the entry signal.
     if signal.as_ref().is_some_and(|sig| {
-        state
-            .retrace_seen_at
-            .is_some_and(|floor| sig.signal_bar_time < floor)
+        crate::ma_enablement::signal_floor(state).is_some_and(|floor| sig.signal_bar_time < floor)
     }) {
         return;
     }
@@ -2086,7 +2089,7 @@ fn confirmed_setup_floor(
     };
     [
         break_floor,
-        state.retrace_seen_at,
+        crate::ma_enablement::signal_floor(state),
         plan.replay_start
             .and_then(|s| chrono::DateTime::from_timestamp(s, 0)),
     ]
@@ -2157,6 +2160,8 @@ fn leg_has_confirmed_signal(
 /// phase (break-and-close) → confirmation → retest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnterBlock {
+    /// The optional one-time MA touch has not occurred since arming.
+    NeedsEnablingMaTouch,
     /// An optional trend retracement line has not seen a qualifying close.
     NeedsRetracement,
     /// The spine is still `AwaitBreakAndClose`: the neckline break-and-close prep
@@ -2176,6 +2181,7 @@ impl EnterBlock {
     /// A short operator-facing reason, worded for the replay's `not-taken:` line.
     pub fn reason(self) -> &'static str {
         match self {
+            Self::NeedsEnablingMaTouch => "requires MA touch (entry not enabled yet)",
             Self::NeedsRetracement => "requires retracement (no close beyond the line yet)",
             Self::NeedsBreakAndClose => "requires break-and-close (prep not satisfied yet)",
             Self::NeedsConfirmation => "requires confirmation (no confirmed signal yet)",
@@ -2243,6 +2249,9 @@ pub fn enter_preconditions_by_leg(
         .filter(|r| !state.fired.contains(&r.rule_id))
     {
         let mut leg = Vec::new();
+        if !crate::ma_enablement::satisfied(plan, state) {
+            leg.push(EnterBlock::NeedsEnablingMaTouch);
+        }
         if plan.entry_conditions.retrace.is_some() && state.retrace_seen_at.is_none() {
             leg.push(EnterBlock::NeedsRetracement);
         }
@@ -3073,6 +3082,7 @@ fn armed_in_rule(rule: &ConditionRule, phase: Phase, entries_blocked: bool) -> b
 #[cfg(test)]
 mod tests {
     mod entry_conditions;
+    mod ma_enablement;
     use super::*;
     use std::collections::BTreeMap;
 

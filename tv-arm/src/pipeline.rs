@@ -806,9 +806,9 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
     //    and the worker computes entry/SL/TP from baked params. The
     //    `?`-returning resolver hard-errors on a bad setup; a clean
     //    operator-facing rejection returns Ok(1).
-    if geom.mw_path.is_some() && !args.must_touch.is_empty() {
+    if geom.mw_path.is_some() && !args.ma_requirements().is_empty() {
         color_eyre::eyre::bail!(
-            "--must-touch requires a candle-pattern entry; M/W uses a geometry entry"
+            "MA touch options require a candle-pattern entry; M/W uses a geometry entry"
         );
     }
     let resolved_spec = if geom.mw_path.is_some() {
@@ -982,7 +982,7 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
             args.bcr_require_golden,
             armed_sentiment,
             crate::trade_plan_build::TrendFollow(args.trend),
-            &args.must_touch,
+            args.ma_requirements(),
         )?;
     }
 
