@@ -3,6 +3,7 @@
 //! thin render/input loop.
 
 mod plan_actions;
+mod reports;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, channel};

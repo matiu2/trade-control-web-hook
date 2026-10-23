@@ -96,8 +96,9 @@ fn timeline(app: &App) -> String {
 
 /// The replay report — already plain text (ANSI-stripped at capture).
 fn replay(app: &App) -> String {
-    app.current_data()
-        .and_then(|d| d.replay_report.clone())
+    app.current_report()
+        .0
+        .map(str::to_string)
         .unwrap_or_else(|| "(no replay report)".to_string())
 }
 
@@ -179,7 +180,7 @@ fn pretty_json(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, PlanData};
+    use crate::app::{App, PlanData, ReportKind};
     use crate::plan::{parse_plan_export, parse_plan_list};
 
     const LIST: &str = include_str!("../tests/fixtures/plan_list.yaml");
@@ -188,6 +189,8 @@ mod tests {
     const REPLAY: &str = include_str!("../tests/fixtures/replay_report.txt");
 
     fn seeded_app(screen: Screen) -> App {
+        static TRACING: std::sync::Once = std::sync::Once::new();
+        TRACING.call_once(crate::init_tracing);
         let rows = parse_plan_list(LIST).unwrap();
         let mut app = App::from_rows(rows);
         app.select_to("hs-aud-cad-a07622da");
@@ -231,6 +234,66 @@ mod tests {
         let app = seeded_app(Screen::Replay);
         let text = current(&app);
         assert!(text.contains("Done:"), "full report copied:\n{text}");
+    }
+
+    #[test]
+    fn replay_copies_the_selected_report_in_full() {
+        let mut app = seeded_app(Screen::Replay);
+        let raw = "stored-plan replay\nlast raw line";
+        let rebless = "fixture re-bless\nlast re-bless line";
+        for (shown_report, expected) in [
+            (ReportKind::Replay, REPLAY),
+            (ReportKind::RawReplay, raw),
+            (ReportKind::Rebless, rebless),
+        ] {
+            app.seed_current(PlanData {
+                replay_report: Some(REPLAY.to_string()),
+                raw_replay_report: Some(raw.to_string()),
+                rebless_report: Some(rebless.to_string()),
+                shown_report,
+                ..Default::default()
+            });
+            app.scroll_replay_end();
+            assert_eq!(current(&app), expected, "selected {shown_report:?}");
+        }
+    }
+
+    #[test]
+    fn replay_copies_the_available_fallback_report() {
+        let mut app = seeded_app(Screen::Replay);
+        for (replay_report, raw_replay_report, rebless_report, shown_report, expected) in [
+            (
+                None,
+                Some("raw replay"),
+                None,
+                ReportKind::Replay,
+                "raw replay",
+            ),
+            (None, None, Some("re-bless"), ReportKind::Replay, "re-bless"),
+            (
+                Some(REPLAY),
+                Some("raw replay"),
+                None,
+                ReportKind::Rebless,
+                REPLAY,
+            ),
+            (
+                None,
+                Some("raw replay"),
+                Some("re-bless"),
+                ReportKind::Replay,
+                "raw replay",
+            ),
+        ] {
+            app.seed_current(PlanData {
+                replay_report: replay_report.map(str::to_string),
+                raw_replay_report: raw_replay_report.map(str::to_string),
+                rebless_report: rebless_report.map(str::to_string),
+                shown_report,
+                ..Default::default()
+            });
+            assert_eq!(current(&app), expected, "fallback for {shown_report:?}");
+        }
     }
 
     #[test]

@@ -7,11 +7,11 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Text;
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, ReportKind};
+use crate::app::App;
 use crate::jobs::JobKind;
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let (report, label) = current_report(app);
+    let (report, label) = app.current_report();
     let loading = app.is_current_loading(JobKind::Replay)
         || app.is_current_loading(JobKind::RawReplay)
         || app.is_current_loading(JobKind::Rebless);
@@ -63,48 +63,4 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .block(crate::ui::titled_block(&title))
         .scroll((scroll, 0));
     f.render_widget(para, area);
-}
-
-/// Which report the pane shows, and what to call it.
-///
-/// Read from [`crate::app::PlanData::shown_report`], set by whichever job
-/// landed most recently — deliberately NOT a fixed precedence over the three
-/// `Option`s. A precedence looks equivalent and is not: with one, a re-bless
-/// would shadow every later `r` for the rest of the session, so the operator
-/// would re-run a replay and be shown the old re-bless under a confident
-/// title. Recording which one landed last is the only version that can be
-/// right in both directions.
-///
-/// A selected report that has not run yet falls back to whatever HAS, so an
-/// empty pane only ever means "nothing has run for this plan".
-fn current_report(app: &App) -> (Option<&str>, &'static str) {
-    let Some(d) = app.current_data() else {
-        return (None, "Replay report");
-    };
-    let chosen = match d.shown_report {
-        ReportKind::Rebless => (d.rebless_report.as_deref(), "Re-bless report"),
-        ReportKind::RawReplay => (
-            d.raw_replay_report.as_deref(),
-            "Raw replay report (stored plan)",
-        ),
-        ReportKind::Replay => (d.replay_report.as_deref(), "Replay report (re-armed)"),
-    };
-    if chosen.0.is_some() {
-        return chosen;
-    }
-    // Fall back to any report that exists, so the pane is never blank while
-    // the plan holds something worth reading.
-    for (body, label) in [
-        (d.replay_report.as_deref(), "Replay report (re-armed)"),
-        (
-            d.raw_replay_report.as_deref(),
-            "Raw replay report (stored plan)",
-        ),
-        (d.rebless_report.as_deref(), "Re-bless report"),
-    ] {
-        if body.is_some() {
-            return (body, label);
-        }
-    }
-    (None, "Replay report")
 }
