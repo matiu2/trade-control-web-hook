@@ -8,6 +8,10 @@ use crate::moving_average::MovingAverage;
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntryConditions {
+    /// A post-arm candle touching any listed MA enables subsequent signals.
+    /// Unlike `must_touch`, this is a one-time milestone, persisted in state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enable_on_ma_touch: Vec<MovingAverage>,
     /// The signal pattern must touch at least one listed close-based average.
     /// Evaluated at each constituent candle, never at its later confirmation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -20,12 +24,13 @@ pub struct EntryConditions {
 
 impl EntryConditions {
     pub fn is_empty(&self) -> bool {
-        self.retrace.is_none() && self.must_touch.is_empty()
+        self.retrace.is_none() && self.must_touch.is_empty() && self.enable_on_ma_touch.is_empty()
     }
 
     pub fn history_bars(&self) -> usize {
         self.must_touch
             .iter()
+            .chain(self.enable_on_ma_touch.iter())
             .map(|ma| ma.history_bars())
             .max()
             .unwrap_or(0)

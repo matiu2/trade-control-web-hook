@@ -499,6 +499,14 @@ pub struct Args {
     #[arg(long, value_delimiter = '|', conflicts_with = "ma_touch_required")]
     pub must_touch: Vec<trade_control_core::moving_average::MovingAverage>,
 
+    /// Enable entry once a post-arm closed candle touches ANY listed MA,
+    /// e.g. '200 sma'. Wicks count. The touch is remembered across candles
+    /// and restarts; a signal on that candle or later may enter away from the
+    /// MA. Warmup and the partly formed arming candle cannot supply the touch.
+    /// Independent of --must-touch: combining them requires both conditions.
+    #[arg(long, value_delimiter = '|')]
+    pub enable_on_ma_touch: Vec<trade_control_core::moving_average::MovingAverage>,
+
     /// Convenience alias for --must-touch '9 ema|20 sma|200 sma'.
     #[arg(long)]
     pub ma_touch_required: bool,
@@ -998,6 +1006,12 @@ impl Command {
 }
 
 impl Args {
+    pub fn ma_requirements(&self) -> crate::ma_requirements::MaRequirements<'_> {
+        crate::ma_requirements::MaRequirements {
+            signal_touch: &self.must_touch,
+            enabling_touch: &self.enable_on_ma_touch,
+        }
+    }
     /// Expand convenience aliases into the concrete flags the pipeline
     /// reads. `--quasimodo` is shorthand for `--skip-break-and-close
     /// --skip-retest --require-confirmation`; `--skip-bcr` for
@@ -1127,9 +1141,9 @@ impl Args {
     /// order). The mutual exclusions with `--quasimodo` / `--entry-market` /
     /// `--skip-*` are enforced by clap's `conflicts_with_all` at parse time.
     pub fn validate(&self) -> color_eyre::eyre::Result<()> {
-        if self.position_entry_mode().is_some() && !self.must_touch.is_empty() {
+        if self.position_entry_mode().is_some() && !self.ma_requirements().is_empty() {
             color_eyre::eyre::bail!(
-                "--must-touch requires a candle-pattern entry; direct position entries have no signal pattern"
+                "MA touch options require a candle-pattern entry; direct position entries have no signal pattern"
             );
         }
         // `--save-fixture` saves fixtures, and only the `replay` subcommand can
