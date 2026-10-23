@@ -472,22 +472,36 @@ pub struct Args {
     ///
     /// Two effects:
     ///
-    /// 1. Expands to `--skip-bcr` (both H&S preps dropped — there is no
-    ///    break-and-close/retest sequence to wait for). Expanded by
-    ///    `apply_aliases`.
-    /// 2. Makes the **pcl-exhausted** veto (the computed ~80%-to-TP fib
-    ///    level — `too-low` on a short, `too-high` on a long)
-    ///    **close-confirmed** instead of wick-triggered. A trend runs
-    ///    further and wicks deeper than a reversal, so the default
-    ///    `Intrabar`/`Either` straddle kills the setup on a spike that
-    ///    closes back. Under `--trend` the bar must **close** past the
-    ///    level. The **drawn** invalidation cap is unaffected — it is
+    /// 1. Drops the normal BCR preps. If a neckline is drawn, it becomes a
+    ///    minimum retracement line: a short needs a close above it, a long a
+    ///    close below it, then a signal at or after that close. No retest.
+    ///    Without a neckline, this is simply `--skip-bcr`.
+    /// 2. Makes the **pcl-exhausted** veto (fib 1.8: 80% from neckline to TP
+    ///    — `too-low` on a short, `too-high` on a long)
+    ///    **close-confirmed** instead of wick-triggered. For a reversal, a wick
+    ///    reaching the level consumes the projected move and retires the setup.
+    ///    For a trend, a wick through that closes back inside leaves the setup
+    ///    alive for a possible retracement and later signal. A **close** through
+    ///    still retires it: stop waiting once the projected move is consumed.
+    ///    This veto blocks new entries; it does not close an open position.
+    ///    The **drawn** invalidation cap is unaffected — it is
     ///    already `OnClose`.
     ///
-    /// It does *not* touch the retest tolerance, the cross buffer, or the
-    /// entry gate.
+    /// The optional retracement threshold is exact (no BCR cross buffer or
+    /// golden requirement). Entry signal quality and order type stay separate.
     #[arg(long)]
     pub trend: bool,
+
+    /// Require the entry signal pattern to touch ANY listed close-based MA on
+    /// the setup timeframe, e.g. '9 ema|20 sma|200 sma'. A wick counts. For a
+    /// multi-candle pattern, any constituent candle can touch at its own MA
+    /// value. The later confirmation candle cannot supply the touch.
+    #[arg(long, value_delimiter = '|', conflicts_with = "ma_touch_required")]
+    pub must_touch: Vec<trade_control_core::moving_average::MovingAverage>,
+
+    /// Convenience alias for --must-touch '9 ema|20 sma|200 sma'.
+    #[arg(long)]
+    pub ma_touch_required: bool,
 
     /// Drop the golden-signal-candle requirement on entry. By default
     /// a golden signal candle is required (`needs_golden: true` on the
@@ -994,6 +1008,9 @@ impl Args {
     /// (never clear them), so combining them with the underlying flags is
     /// harmless. Call once after `parse`, before the pipeline runs.
     pub fn apply_aliases(mut self) -> Self {
+        if self.ma_touch_required {
+            self.must_touch = trade_control_core::moving_average::MovingAverage::standard_set();
+        }
         // --skip-all is the broadest alias; expand it into --skip-bcr +
         // --skip-calendar-bars first so the --skip-bcr expansion below covers
         // both.
@@ -1110,6 +1127,11 @@ impl Args {
     /// order). The mutual exclusions with `--quasimodo` / `--entry-market` /
     /// `--skip-*` are enforced by clap's `conflicts_with_all` at parse time.
     pub fn validate(&self) -> color_eyre::eyre::Result<()> {
+        if self.position_entry_mode().is_some() && !self.must_touch.is_empty() {
+            color_eyre::eyre::bail!(
+                "--must-touch requires a candle-pattern entry; direct position entries have no signal pattern"
+            );
+        }
         // `--save-fixture` saves fixtures, and only the `replay` subcommand can
         // do that. Without it there is nothing to save, so the run would do a
         // full chart read and then silently produce no corpus entry — the exact
@@ -2023,3 +2045,5 @@ mod tests {
         }
     }
 }
+#[cfg(test)]
+mod entry_conditions_tests;

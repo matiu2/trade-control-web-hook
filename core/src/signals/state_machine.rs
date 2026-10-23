@@ -611,6 +611,19 @@ pub fn first_confirmed_signal_at(
     cfg: &DetectorConfig,
     crit: &SignalCriteria,
 ) -> Option<LatchedSignal> {
+    first_confirmed_signal_matching_at(candles, as_of, cfg, crit, |_, _| true)
+}
+
+/// Apply an entry-specific pattern predicate before a signal claims the
+/// first-confirmed slot. Rejecting only after selection would let a signal
+/// that missed its MA hide every later qualifying signal.
+pub fn first_confirmed_signal_matching_at(
+    candles: &[Candle],
+    as_of: usize,
+    cfg: &DetectorConfig,
+    crit: &SignalCriteria,
+    mut accepts_pattern: impl FnMut(DateTime<Utc>, DateTime<Utc>) -> bool,
+) -> Option<LatchedSignal> {
     if as_of >= candles.len() {
         return None;
     }
@@ -656,7 +669,10 @@ pub fn first_confirmed_signal_at(
                 // added there, not re-derived at every call site.
                 let freshly_valid =
                     t.state == SigState::Valid && !was_valid.get(i).copied().unwrap_or(false);
-                if freshly_valid && crit.admits(t, candles[t.signal_bar].time) {
+                if freshly_valid
+                    && crit.admits(t, candles[t.signal_bar].time)
+                    && accepts_pattern(t.start_time, candles[t.signal_bar].time)
+                {
                     first_confirmed_bar = Some(t.signal_bar);
                     confirmed_on = Some(bar);
                     break;

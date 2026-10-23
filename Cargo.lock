@@ -4930,6 +4930,8 @@ dependencies = [
  "pollster 1.0.1",
  "serde_json",
  "tracing",
+ "tracing-error",
+ "tracing-subscriber",
  "trade-control-core",
  "trade-control-engine",
  "tradenation-api",
@@ -4942,6 +4944,8 @@ dependencies = [
  "chrono",
  "serde_json",
  "tracing",
+ "tracing-error",
+ "tracing-subscriber",
  "trade-control-core",
 ]
 

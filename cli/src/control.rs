@@ -742,6 +742,7 @@ mod tests {
             armed_at: None,
             armed_sentiment: None,
             screenshot_url: None,
+            entry_conditions: Default::default(),
         }
     }
 

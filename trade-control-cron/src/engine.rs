@@ -46,6 +46,8 @@
 //! anchor math) are unit-tested here. End-to-end behaviour is exercised on the
 //! demo deploy, run in parallel with the live TV alerts (Stage F gate).
 
+mod detector_history;
+
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{Broker, Candle, CandleError, Granularity, filter_new_candles};
 use trade_control_core::dispatch::{
@@ -804,19 +806,11 @@ async fn detector_window_for(
         return Ok(fresh.to_vec());
     };
 
-    let window = fetch_candles(broker, &plan.instrument, plan.granularity, since, now).await?;
-
-    // Merge fetched history with `fresh` and dedup by open-time so every new
-    // candle is present even if the history fetch's closed-bar cutoff dropped the
-    // most recent one. Ascending by time.
-    let mut merged = window;
-    for c in fresh {
-        if !merged.iter().any(|w| w.time == c.time) {
-            merged.push(*c);
-        }
-    }
-    merged.sort_by_key(|c| c.time);
-    Ok(merged)
+    let want_history = pine_since.map_or(0, |_| plan.detector_history_bars());
+    detector_history::fetch_window(since, fresh, want_history, |from| {
+        fetch_candles(broker, &plan.instrument, plan.granularity, from, now)
+    })
+    .await
 }
 
 /// The fetch start a `PinePattern` entry needs: [`detector_lookback_bars`] of
@@ -841,7 +835,9 @@ fn pine_lookback_since(
     if !has_pine {
         return None;
     }
-    let lookback = pine_lookback_bars(plan.granularity) as i64;
+    let lookback = plan
+        .detector_history_bars()
+        .max(pine_lookback_bars(plan.granularity)) as i64;
     Some(earliest_fresh - chrono::Duration::seconds(plan.granularity.seconds() * lookback))
 }
 
@@ -863,7 +859,18 @@ fn pine_lookback_bars(granularity: Granularity) -> usize {
 fn trendline_anchor_since(
     plan: &trade_control_core::trade_plan::TradePlan,
 ) -> Option<DateTime<Utc>> {
-    let earliest_anchor = earliest_trendline_anchor_epoch(plan.rules.iter().map(|r| &r.trigger))?;
+    let retrace_anchor = plan
+        .entry_conditions
+        .retrace
+        .as_ref()
+        .map(|line| line.a.at_epoch.min(line.b.at_epoch));
+    let earliest_anchor = [
+        earliest_trendline_anchor_epoch(plan.rules.iter().map(|r| &r.trigger)),
+        retrace_anchor,
+    ]
+    .into_iter()
+    .flatten()
+    .min()?;
     // One bar of slack before the anchor.
     let slack = plan.granularity.seconds();
     DateTime::from_timestamp(earliest_anchor - slack, 0)
@@ -1123,6 +1130,7 @@ fn seed_since(granularity: Granularity, now: DateTime<Utc>) -> DateTime<Utc> {
 
 #[cfg(test)]
 mod tests {
+    mod entry_conditions;
     use super::*;
 
     fn ts(s: &str) -> DateTime<Utc> {

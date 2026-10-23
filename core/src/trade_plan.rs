@@ -45,6 +45,8 @@ pub use trade_control_conventions::RuleKind;
 
 mod broker_check;
 pub use broker_check::*;
+mod entry_conditions;
+pub use entry_conditions::{EntryConditions, RetraceLine};
 
 use crate::broker::Granularity;
 use crate::intent::{Direction, Intent};
@@ -98,6 +100,10 @@ fn default_retest_atr_step() -> f64 {
 /// whole-body HMAC like any other intent field, so the plan can't be tampered.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TradePlan {
+    /// Additional entry gates. Absent on legacy plans, which retain their
+    /// existing break/retest and signal behaviour.
+    #[serde(default, skip_serializing_if = "EntryConditions::is_empty")]
+    pub entry_conditions: EntryConditions,
     /// Mints alongside the trade; ties every rule's fired-state and the plan's
     /// KV row together. Matches the `trade_id` the embedded intents carry.
     pub trade_id: String,

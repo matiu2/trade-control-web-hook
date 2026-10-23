@@ -52,7 +52,8 @@ pub struct PullbackArm {
 /// wires). A distinct type makes the transposition a compile error.
 ///
 /// What it changes: the **pcl-exhausted** veto (the computed ~80%-to-TP fib
-/// level) becomes close-confirmed instead of wick-triggered. See
+/// level) becomes close-confirmed instead of wick-triggered. A drawn neckline
+/// becomes an optional close-confirmed retracement gate, with no retest. See
 /// [`invalidation_or_pcl_trigger`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TrendFollow(pub bool);
@@ -65,10 +66,24 @@ impl TrendFollow {
 
     /// Which [`BarEvent`] the pcl-exhausted fib level is read with.
     ///
-    /// A trend runs further and wicks deeper than a reversal, so the default
-    /// straddle aborts the setup on a spike that closes back inside (the
-    /// 2026-08-07 short: `01-veto-too-low` fired off a wick). Under `--trend`
-    /// the bar must **close** past the level.
+    /// The level is fib `1.8` (head = 0, neckline = 1, TP = 2): 80% of the
+    /// projected neckline-to-TP move. On a short this is `too-low`; `too-high`
+    /// is the separate drawn invalidation cap. Longs mirror those names.
+    ///
+    /// Reversal policy: even a wick reaching the exhaustion level means enough
+    /// of the projected H&S move has happened without an entry. Retire the
+    /// setup rather than chase the remaining move.
+    ///
+    /// Trend policy: a wick through that level which closes back inside may
+    /// leave room for another retracement and a later continuation signal.
+    /// Keep the setup alive; the wick does not prove that another entry will
+    /// occur or qualify. A close through the level still retires the setup:
+    /// treat the projected move as consumed and stop waiting for an entry.
+    /// This changes the evidence required to retire, not the level or TP, and
+    /// does not itself permit entry at an exhausted price or close a position.
+    ///
+    /// The motivating case was the 2026-08-07 trend short: `01-veto-too-low`
+    /// retired the setup off a wick that closed back inside.
     fn pcl_bar_event(self) -> BarEvent {
         if self.0 {
             BarEvent::OnClose
@@ -179,6 +194,18 @@ pub fn build_trade_plan(
         .collect();
 
     TradePlan {
+        entry_conditions: trade_control_core::trade_plan::EntryConditions {
+            must_touch: Vec::new(),
+            retrace: if trend.0 && !is_mw {
+                geom.neckline
+                    .map(|line| trade_control_core::trade_plan::RetraceLine {
+                        a: line.a.to_line_point(),
+                        b: line.b.to_line_point(),
+                    })
+            } else {
+                None
+            },
+        },
         trade_id: trade_id.to_string(),
         instrument: instrument.to_string(),
         direction: to_core_direction(direction),
@@ -447,13 +474,12 @@ fn invalidation_or_pcl_trigger(
         // **wick-through** (`Intrabar`, `Either`): any straddle aborts — if the
         // move ran ~80% to TP without us, a wick alone is reason enough.
         //
-        // `--trend` flips it to `OnClose`. A trend-continuation setup runs
-        // further and wicks deeper than a reversal, so the straddle aborts on a
-        // spike that closes back inside — which is what killed the 2026-08-07
-        // short (`01-veto-too-low` off a wick, ~30 min after arming). Under
-        // `--trend` the bar must *close* past the level. `CrossDir::Either`
-        // carries over unchanged: the engine's settled/origin `OnClose` arm
-        // reads `Either` as "origin one side, close past the opposite far
+        // `--trend` flips it to `OnClose`: allow a wick excursion that closes
+        // back inside to leave the setup alive for a possible retracement and
+        // later signal. A close through still consumes the projected move.
+        // See `TrendFollow::pcl_bar_event` for the reversal vs trend rationale.
+        // `CrossDir::Either` carries over unchanged: the engine's settled/origin
+        // `OnClose` arm reads `Either` as "origin one side, close past the opposite far
         // edge", which is exactly "closed through the level" for both
         // directions — so this needs no direction handling here and no engine
         // change.

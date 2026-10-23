@@ -162,9 +162,15 @@ pub(crate) fn register_trade_plan(
     bcr_require_golden: bool,
     armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
     trend: crate::trade_plan_build::TrendFollow,
+    must_touch: &[trade_control_core::moving_average::MovingAverage],
 ) -> Result<()> {
     use cli::TradePattern;
     let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
+    if is_mw && !must_touch.is_empty() {
+        color_eyre::eyre::bail!(
+            "--must-touch requires a candle-pattern entry; M/W uses a geometry entry"
+        );
+    }
     let granularity = resolution_to_granularity(resolution).ok_or_else(|| {
         eyre!(
             "chart resolution {resolution:?} has no engine granularity; \
@@ -223,6 +229,10 @@ pub(crate) fn register_trade_plan(
         screenshot_url,
         trend,
     );
+    plan.entry_conditions.must_touch = must_touch.to_vec();
+    info!(retrace_line = ?plan.entry_conditions.retrace,
+        must_touch = ?plan.entry_conditions.must_touch,
+        "resolved entry conditions (retracement requires a close; MA touch accepts wicks)");
     // Unwrap the tv-arm bundle wrappers to the cli `BuiltPause`/`BuiltNews` the
     // appender reads (each carries the signed intents + window times).
     let pauses: Vec<&cli::BuiltPause> = pause_bundles.iter().map(|b| &b.built).collect();
@@ -299,6 +309,15 @@ mod tests {
     /// `tag` names the caller, so two tests running in parallel don't share a
     /// scratch directory (one would delete it while the other was writing).
     fn plan_json_for(trend: bool, tag: &str) -> serde_json::Value {
+        plan_json_with(trend, tag, false, &[])
+    }
+
+    fn plan_json_with(
+        trend: bool,
+        tag: &str,
+        with_neckline: bool,
+        extra: &[&str],
+    ) -> serde_json::Value {
         use crate::args::Args;
         use clap::Parser;
         use trade_control_conventions::Direction as ConvDirection;
@@ -308,10 +327,15 @@ mod tests {
         if trend {
             argv.push("--trend");
         }
+        argv.extend_from_slice(extra);
         let args = Args::try_parse_from(argv).expect("parse").apply_aliases();
 
         // Fib head 1.2000 / neckline 1.1000 => TP 1.0000, pcl-exhausted 1.0200.
         let geom = crate::plan_geometry::PlanGeometry {
+            neckline: with_neckline.then_some(crate::plan_geometry::Line {
+                a: crate::plan_geometry::Anchor::new(now.timestamp() - 7200, 1.15),
+                b: crate::plan_geometry::Anchor::new(now.timestamp() - 3600, 1.15),
+            }),
             invalidation: Some(1.2000),
             fib_head_neckline: Some((1.2000, 1.1000)),
             trade_expiry_epoch: Some(now.timestamp() + 86_400),
@@ -360,6 +384,7 @@ mod tests {
             false, // bcr_require_golden
             None,  // armed_sentiment
             crate::trade_plan_build::TrendFollow(args.trend),
+            &args.must_touch,
         )
         .expect("build + write plan offline");
 
@@ -400,6 +425,48 @@ mod tests {
             off["level"], on["level"],
             "--trend moves the confirm mode, never the level"
         );
+    }
+
+    #[test]
+    fn drawn_neckline_becomes_retrace_only_for_trend_arms() {
+        let trend = plan_json_with(true, "retrace", true, &[]);
+        assert_eq!(trend["entry_conditions"]["retrace"]["a"]["price"], 1.15);
+        let ids: Vec<_> = trend["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["rule_id"].as_str().unwrap())
+            .collect();
+        assert!(
+            !ids.iter()
+                .any(|id| id.contains("prep-break-and-close") || id.contains("prep-retest"))
+        );
+        let no_line = plan_json_with(true, "no-retrace", false, &[]);
+        assert!(no_line.get("entry_conditions").is_none());
+        let normal = plan_json_with(false, "normal-line", true, &[]);
+        assert!(
+            normal.get("entry_conditions").is_none(),
+            "normal H&S retains normal BCR"
+        );
+        assert!(
+            normal["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["rule_id"] == "03-prep-break-and-close")
+        );
+    }
+
+    #[test]
+    fn ma_requirements_reach_the_signed_plan_with_or_without_trend() {
+        for trend in [false, true] {
+            let json = plan_json_with(trend, "ma-wire", true, &["--ma-touch-required"]);
+            let averages = json["entry_conditions"]["must_touch"].as_array().unwrap();
+            assert_eq!(averages.len(), 3);
+            assert_eq!(averages[0], serde_json::json!({"kind":"ema","period":9}));
+            assert_eq!(averages[2], serde_json::json!({"kind":"sma","period":200}));
+            assert_eq!(json["entry_conditions"].get("retrace").is_some(), trend);
+        }
     }
 
     /// `--trend` is also a `--skip-bcr`, and the plan is where that shows: the
