@@ -56,6 +56,7 @@ pub use trade_control_core::trade_plan::{
     BarEvent, ConditionRule, CrossDir, FireMode, LinePoint, TradePlan, Trigger,
 };
 
+mod entry_conditions;
 pub mod pullback;
 
 mod evaluate;

@@ -51,6 +51,10 @@ pub enum Phase {
 /// idempotent re-tick produces a byte-identical row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanState {
+    /// First post-arm candle that closed beyond the trend retracement line.
+    /// Latched across ticks; a later signal need not remain beyond the line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrace_seen_at: Option<DateTime<Utc>>,
     /// Open-time of the last candle the engine has processed. The next fetch
     /// asks for candles strictly `> watermark` (mirrors
     /// [`filter_new_candles`](crate::broker::filter_new_candles)). `None` means
@@ -194,7 +198,8 @@ impl PlanState {
     /// `break_close_at` / `retest_seen_at` lookback stamps, and the reserved
     /// `mw` slot.
     pub fn advanced_vs(&self, prior: &PlanState) -> bool {
-        self.phase != prior.phase
+        self.retrace_seen_at != prior.retrace_seen_at
+            || self.phase != prior.phase
             || self.fired != prior.fired
             || self.break_close_at != prior.break_close_at
             || self.retest_seen_at != prior.retest_seen_at
@@ -209,6 +214,7 @@ impl PlanState {
     /// `fired` empty, so nothing fires retroactively.
     pub fn seed(phase: Phase, expires_at: DateTime<Utc>) -> Self {
         Self {
+            retrace_seen_at: None,
             watermark: None,
             phase,
             fired: BTreeSet::new(),

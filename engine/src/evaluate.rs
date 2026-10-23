@@ -65,8 +65,7 @@ use trade_control_core::intent::{Action, Direction, PrepReqSliceExt, SignalKind}
 use trade_control_core::plan_eval::{EntryDecline, FiredIntent, PlanEval};
 use trade_control_core::plan_state::{Phase, PlanState};
 use trade_control_core::signals::{
-    DetectorConfig, LatchedSignal, atr_length_for, first_confirmed_signal_at, latched_signal_at,
-    wilder_atr,
+    DetectorConfig, LatchedSignal, atr_length_for, latched_signal_at, wilder_atr,
 };
 use trade_control_core::trade_plan::{
     BarEvent, ConditionRule, CrossDir, LinePoint, RuleKind, TradePlan, Trigger,
@@ -338,6 +337,7 @@ pub fn evaluate_plan(
             state.watermark = Some(candle.time);
             continue;
         }
+        crate::entry_conditions::stamp_retrace(plan, &mut state, candle, detector_window);
         match state.phase {
             Phase::AwaitBreakAndClose => {
                 evaluate_break_and_close(plan, &mut state, candle, detector_window, &mut fired);
@@ -873,6 +873,15 @@ fn evaluate_one_entry(
     fired: &mut Vec<FiredIntent>,
     declines: &mut Vec<EntryDecline>,
 ) {
+    if plan.entry_conditions.retrace.is_some() && state.retrace_seen_at.is_none() {
+        return;
+    }
+    if !plan.entry_conditions.must_touch.is_empty()
+        && !matches!(rule.trigger, Trigger::PinePattern { .. })
+    {
+        tracing::warn!(rule_id = %rule.rule_id, "MA touch requires a candle-pattern entry; declining non-pattern entry");
+        return;
+    }
     // Replay-start entry floor (journaling only). When a plan carries a
     // `replay_start` cursor (baked by `tv-arm --start`), the bars before it are
     // warmup/context — "live now" begins at the cursor — so no enter may fire on
@@ -937,6 +946,7 @@ fn evaluate_one_entry(
                 // signal occurs, not on a later bar it retroactively confirms.
                 // A `needs_confirmed` enter opts INTO confirmation-firing.
                 !rule.intent.needs_confirmed,
+                Some(&plan.entry_conditions),
             ) {
                 Some(sig) => Some(sig),
                 None => return,
@@ -958,6 +968,16 @@ fn evaluate_one_entry(
             None
         }
     };
+
+    // A pre-retracement signal cannot become eligible just because it confirms
+    // later. The retracement candle itself may also print the entry signal.
+    if signal.as_ref().is_some_and(|sig| {
+        state
+            .retrace_seen_at
+            .is_some_and(|floor| sig.signal_bar_time < floor)
+    }) {
+        return;
+    }
 
     // Pre-flight a `PinePattern` enter before firing (bug #13). The detector
     // firing is necessary but not sufficient: the candle-quality gate
@@ -1077,6 +1097,7 @@ fn eval_pine_entry(
     confirmed_floor: Option<chrono::DateTime<chrono::Utc>>,
     confirmed_after: Option<chrono::DateTime<chrono::Utc>>,
     print_only: bool,
+    entry_conditions: Option<&trade_control_core::trade_plan::EntryConditions>,
 ) -> Option<LatchedSignal> {
     let Some(idx) = detector_window.iter().position(|c| c.time == candle.time) else {
         tracing::debug!(
@@ -1120,7 +1141,17 @@ fn eval_pine_entry(
             not_before: scan_floor,
             after: confirmed_after,
         };
-        first_confirmed_signal_at(detector_window, idx, cfg, &crit)
+        trade_control_core::signals::first_confirmed_signal_matching_at(
+            detector_window,
+            idx,
+            cfg,
+            &crit,
+            |start, print| {
+                entry_conditions.is_none_or(|conditions| {
+                    conditions.pattern_touches(detector_window, start, print)
+                })
+            },
+        )
     } else {
         latched_signal_at(detector_window, idx, cfg)
     };
@@ -1191,6 +1222,12 @@ fn eval_pine_entry(
             "pine-enter: plain enter — signal validated here but printed on an \
              earlier bar; print-only path declines (not an occurrence)"
         );
+        return None;
+    }
+    if entry_conditions.is_some_and(|conditions| {
+        !conditions.pattern_touches(detector_window, sig.signal_start_time, sig.signal_bar_time)
+    }) {
+        tracing::debug!(bar = %candle.time, "pine-enter: signal pattern did not touch a required moving average");
         return None;
     }
     Some(sig)
@@ -1267,6 +1304,7 @@ fn eval_pine_guard(
         // `print_only: false` — the reversal-close guard wants "a reversal
         // printed OR validated *now*", not print-only (see the doc above).
         false,
+        None,
     )?;
 
     // Contextual window gate — the pure mirror of the worker's
@@ -2048,6 +2086,7 @@ fn confirmed_setup_floor(
     };
     [
         break_floor,
+        state.retrace_seen_at,
         plan.replay_start
             .and_then(|s| chrono::DateTime::from_timestamp(s, 0)),
     ]
@@ -2094,7 +2133,17 @@ fn leg_has_confirmed_signal(
         not_before: scan_floor,
         after: state.last_confirmed_enter_at,
     };
-    first_confirmed_signal_at(detector_window, idx, &cfg, &crit).is_some()
+    trade_control_core::signals::first_confirmed_signal_matching_at(
+        detector_window,
+        idx,
+        &cfg,
+        &crit,
+        |start, print| {
+            plan.entry_conditions
+                .pattern_touches(detector_window, start, print)
+        },
+    )
+    .is_some()
 }
 
 /// Why a `PinePattern` enter did **not** fire on a bar where its signal was
@@ -2108,6 +2157,8 @@ fn leg_has_confirmed_signal(
 /// phase (break-and-close) → confirmation → retest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnterBlock {
+    /// An optional trend retracement line has not seen a qualifying close.
+    NeedsRetracement,
     /// The spine is still `AwaitBreakAndClose`: the neckline break-and-close prep
     /// hasn't fired, so the enter isn't even considered yet.
     NeedsBreakAndClose,
@@ -2125,6 +2176,7 @@ impl EnterBlock {
     /// A short operator-facing reason, worded for the replay's `not-taken:` line.
     pub fn reason(self) -> &'static str {
         match self {
+            Self::NeedsRetracement => "requires retracement (no close beyond the line yet)",
             Self::NeedsBreakAndClose => "requires break-and-close (prep not satisfied yet)",
             Self::NeedsConfirmation => "requires confirmation (no confirmed signal yet)",
             Self::NeedsRetest => "requires retest/pullback (no milestone stamped yet)",
@@ -2191,6 +2243,9 @@ pub fn enter_preconditions_by_leg(
         .filter(|r| !state.fired.contains(&r.rule_id))
     {
         let mut leg = Vec::new();
+        if plan.entry_conditions.retrace.is_some() && state.retrace_seen_at.is_none() {
+            leg.push(EnterBlock::NeedsRetracement);
+        }
         // Break-and-close: while AwaitBreakAndClose the enter code never runs for
         // ANY enter rule. It's phase-wide, but it gates each leg that requires it.
         if state.phase == Phase::AwaitBreakAndClose && has_break_and_close(plan) {
@@ -2770,7 +2825,7 @@ fn level_crossed(
 /// `bar_seconds` is the fallback bar spacing used to estimate a bar-index when
 /// an anchor predates `window` (so its bar can't be counted directly); `0`
 /// means "no fallback" and such an out-of-window anchor yields `None`.
-fn line_price_at(
+pub(crate) fn line_price_at(
     a: &LinePoint,
     b: &LinePoint,
     t: &Candle,
@@ -3017,6 +3072,7 @@ fn armed_in_rule(rule: &ConditionRule, phase: Phase, entries_blocked: bool) -> b
 
 #[cfg(test)]
 mod tests {
+    mod entry_conditions;
     use super::*;
     use std::collections::BTreeMap;
 
@@ -3217,6 +3273,7 @@ mod tests {
             armed_at: None,
             armed_sentiment: None,
             screenshot_url: None,
+            entry_conditions: Default::default(),
         }
     }
 
