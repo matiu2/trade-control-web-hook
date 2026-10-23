@@ -51,6 +51,10 @@ pub enum Phase {
 /// idempotent re-tick produces a byte-identical row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanState {
+    /// First fully post-arm candle to touch an enabling MA. This milestone
+    /// survives ticks and restarts; later signals need not touch the MA again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ma_touch_seen_at: Option<DateTime<Utc>>,
     /// First post-arm candle that closed beyond the trend retracement line.
     /// Latched across ticks; a later signal need not remain beyond the line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -198,7 +202,8 @@ impl PlanState {
     /// `break_close_at` / `retest_seen_at` lookback stamps, and the reserved
     /// `mw` slot.
     pub fn advanced_vs(&self, prior: &PlanState) -> bool {
-        self.retrace_seen_at != prior.retrace_seen_at
+        self.ma_touch_seen_at != prior.ma_touch_seen_at
+            || self.retrace_seen_at != prior.retrace_seen_at
             || self.phase != prior.phase
             || self.fired != prior.fired
             || self.break_close_at != prior.break_close_at
@@ -214,6 +219,7 @@ impl PlanState {
     /// `fired` empty, so nothing fires retroactively.
     pub fn seed(phase: Phase, expires_at: DateTime<Utc>) -> Self {
         Self {
+            ma_touch_seen_at: None,
             retrace_seen_at: None,
             watermark: None,
             phase,

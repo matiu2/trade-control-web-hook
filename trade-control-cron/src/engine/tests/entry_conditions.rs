@@ -30,6 +30,18 @@ fn live_history_request_covers_ma_warmup_and_pattern_confirmation() {
 }
 
 #[test]
+fn enabling_average_alone_gets_full_live_history() {
+    let mut p = plan();
+    p.entry_conditions.enable_on_ma_touch = vec!["200 sma".parse().unwrap()];
+    let now = ts("2026-06-17T20:00:00Z");
+    assert!(p.entry_conditions.must_touch.is_empty());
+    assert_eq!(
+        pine_lookback_since(&p, now),
+        Some(now - chrono::Duration::hours(205))
+    );
+}
+
+#[test]
 fn retrace_anchors_are_fetched_even_without_bcr_rules() {
     let mut p = plan();
     assert_eq!(trendline_anchor_since(&p), None);

@@ -39,3 +39,31 @@ fn direct_position_entry_rejects_a_signal_only_ma_requirement() {
             .contains("candle-pattern")
     );
 }
+
+#[test]
+fn enabling_ma_is_independent_of_the_signal_touch_filter() {
+    let args = Args::try_parse_from([
+        "tv-arm",
+        "--enable-on-ma-touch",
+        "200 sma",
+        "--ma-touch-required",
+    ])
+    .unwrap()
+    .apply_aliases();
+    assert_eq!(args.enable_on_ma_touch[0].to_string(), "200 sma");
+    assert_eq!(args.must_touch.len(), 3);
+    assert_eq!(args.must_touch[2].to_string(), "200 sma");
+    assert!(!args.skip_bcr);
+    assert!(!args.trend);
+    assert!(args.validate().is_ok());
+    assert!(Args::try_parse_from(["tv-arm", "--enable-on-ma-touch", "200 ma"]).is_err());
+    let direct = Args::try_parse_from([
+        "tv-arm",
+        "--market-entry",
+        "--enable-on-ma-touch",
+        "200 sma",
+    ])
+    .unwrap()
+    .apply_aliases();
+    assert!(direct.validate().is_err());
+}

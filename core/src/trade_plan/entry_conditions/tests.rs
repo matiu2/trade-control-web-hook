@@ -107,6 +107,7 @@ fn legacy_conditions_are_empty_and_the_ma_history_floor_covers_200_sma() {
             .is_none()
     );
     plan.entry_conditions = EntryConditions {
+        enable_on_ma_touch: Vec::new(),
         must_touch: MovingAverage::standard_set(),
         retrace: None,
     };
@@ -117,4 +118,22 @@ fn legacy_conditions_are_empty_and_the_ma_history_floor_covers_200_sma() {
         plan.entry_conditions.must_touch,
         loaded.entry_conditions.must_touch
     );
+}
+
+#[test]
+fn enabling_200_sma_alone_requests_full_history_without_a_signal_filter() {
+    let conditions = EntryConditions {
+        enable_on_ma_touch: vec!["200 sma".parse().unwrap()],
+        ..Default::default()
+    };
+    assert_eq!(conditions.history_bars(), 200);
+    assert!(!conditions.is_empty());
+    assert!(
+        conditions.pattern_touches(&[], Utc::now(), Utc::now()),
+        "an enabling average must not become a signal-location filter"
+    );
+    let encoded = serde_json::to_string(&conditions).unwrap();
+    assert!(!encoded.contains("must_touch"));
+    let decoded: EntryConditions = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded.enable_on_ma_touch, conditions.enable_on_ma_touch);
 }

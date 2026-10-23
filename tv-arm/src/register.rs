@@ -162,13 +162,13 @@ pub(crate) fn register_trade_plan(
     bcr_require_golden: bool,
     armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
     trend: crate::trade_plan_build::TrendFollow,
-    must_touch: &[trade_control_core::moving_average::MovingAverage],
+    ma_requirements: crate::ma_requirements::MaRequirements<'_>,
 ) -> Result<()> {
     use cli::TradePattern;
     let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
-    if is_mw && !must_touch.is_empty() {
+    if is_mw && !ma_requirements.is_empty() {
         color_eyre::eyre::bail!(
-            "--must-touch requires a candle-pattern entry; M/W uses a geometry entry"
+            "MA touch options require a candle-pattern entry; M/W uses a geometry entry"
         );
     }
     let granularity = resolution_to_granularity(resolution).ok_or_else(|| {
@@ -229,9 +229,11 @@ pub(crate) fn register_trade_plan(
         screenshot_url,
         trend,
     );
-    plan.entry_conditions.must_touch = must_touch.to_vec();
+    plan.entry_conditions.must_touch = ma_requirements.signal_touch.to_vec();
+    plan.entry_conditions.enable_on_ma_touch = ma_requirements.enabling_touch.to_vec();
     info!(retrace_line = ?plan.entry_conditions.retrace,
         must_touch = ?plan.entry_conditions.must_touch,
+        enable_on_ma_touch = ?plan.entry_conditions.enable_on_ma_touch,
         "resolved entry conditions (retracement requires a close; MA touch accepts wicks)");
     // Unwrap the tv-arm bundle wrappers to the cli `BuiltPause`/`BuiltNews` the
     // appender reads (each carries the signed intents + window times).
@@ -384,7 +386,7 @@ mod tests {
             false, // bcr_require_golden
             None,  // armed_sentiment
             crate::trade_plan_build::TrendFollow(args.trend),
-            &args.must_touch,
+            args.ma_requirements(),
         )
         .expect("build + write plan offline");
 
@@ -466,6 +468,30 @@ mod tests {
             assert_eq!(averages[0], serde_json::json!({"kind":"ema","period":9}));
             assert_eq!(averages[2], serde_json::json!({"kind":"sma","period":200}));
             assert_eq!(json["entry_conditions"].get("retrace").is_some(), trend);
+        }
+    }
+
+    #[test]
+    fn enabling_ma_and_signal_ma_reach_the_plan_as_separate_requirements() {
+        for trend in [false, true] {
+            let json = plan_json_with(
+                trend,
+                "enable-ma-wire",
+                true,
+                &[
+                    "--enable-on-ma-touch",
+                    "200 sma",
+                    "--must-touch",
+                    "9 ema|20 sma|200 sma",
+                ],
+            );
+            let requirements = &json["entry_conditions"];
+            assert_eq!(
+                requirements["enable_on_ma_touch"],
+                serde_json::json!([{"kind":"sma","period":200}])
+            );
+            assert_eq!(requirements["must_touch"].as_array().unwrap().len(), 3);
+            assert_eq!(requirements.get("retrace").is_some(), trend);
         }
     }
 
