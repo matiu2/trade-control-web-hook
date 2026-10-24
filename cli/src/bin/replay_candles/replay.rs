@@ -59,6 +59,8 @@ pub struct Fire {
     /// Bid/ask candles at or after the firing bar (ascending) — the fill
     /// simulator's input (it fills each leg on the relevant book side).
     pub forward: Vec<EngineCandle>,
+    /// Pre-fire warmup used only by MA stop management, never for fills.
+    pub ma_warmup: Vec<EngineCandle>,
     /// The unified entry decision the real `run_enter` reached for this fire.
     /// For an enter it's `Placed` / `Rejected`; for anything else `NotAnEnter`.
     /// The report reads this directly instead of re-deriving any gate.
@@ -881,7 +883,8 @@ pub async fn run_with_upkeep(
             // report's forward-path lines). The held broker owns the fill/exit
             // outcome via `advance()`/`held_realized_outcome` — no forward-geometry
             // ledger to attach (S8: the old `record_order` ledger path is gone).
-            let forward = candles[i..].to_vec();
+            let fire_index = candles.partition_point(|c| c.time < fired.candle.time);
+            let forward = candles[fire_index..].to_vec();
             // Read back the concrete placed bracket so the report's display lines
             // annotate the same floored stop the broker rests on.
             let placed_bracket = if let EnterGateOutcome::Placed {
@@ -893,6 +896,17 @@ pub async fn run_with_upkeep(
                 None
             };
             fires.push(Fire {
+                ma_warmup: if fired
+                    .intent
+                    .breakeven
+                    .is_some_and(|be| be.trigger.includes_ma_cross())
+                {
+                    candles[fire_index.saturating_sub(trade_control_core::ma_cross::HISTORY_BARS)
+                        ..fire_index]
+                        .to_vec()
+                } else {
+                    Vec::new()
+                },
                 fired,
                 forward,
                 gate_outcome,
@@ -1473,6 +1487,7 @@ async fn inject_control_ticks(
             fires.push(Fire {
                 fired,
                 forward: forward.to_vec(),
+                ma_warmup: Vec::new(),
                 gate_outcome: EnterGateOutcome::NotAnEnter,
                 superseded: false,
                 placed_bracket: None,
@@ -5225,6 +5240,50 @@ mod catch_up_tests {
             "and the entry places, exactly as at PER_BAR cadence: {:?}",
             enter.gate_outcome
         );
+    }
+
+    #[tokio::test]
+    async fn ma_cross_report_paths_start_at_each_fire_even_in_catch_up_batches() {
+        let mut plan = ordered_prep_plan();
+        for rule in &mut plan.rules {
+            if rule.intent.action == Action::Enter {
+                rule.intent.breakeven = Some(trade_control_core::intent::Breakeven {
+                    trigger: trade_control_core::intent::BreakevenTrigger::MaCrossOnly,
+                    ..Default::default()
+                });
+            }
+        }
+        let candles = break_retest_enter_candles();
+        let r = super::run(
+            &plan,
+            &candles,
+            Granularity::H1,
+            all_live(),
+            expires(),
+            no_marks(),
+            None,
+            CronCadence::new(6),
+        )
+        .await;
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.intent.action == Action::Enter)
+            .unwrap();
+        assert_eq!(enter.forward.first().unwrap().time, enter.fired.candle.time);
+        assert!(
+            enter
+                .ma_warmup
+                .iter()
+                .all(|c| c.time < enter.fired.candle.time)
+        );
+        let times: Vec<_> = enter
+            .ma_warmup
+            .iter()
+            .chain(&enter.forward)
+            .map(|c| c.time)
+            .collect();
+        assert!(times.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     /// The batching must not change *which* bars the engine sees, only how many

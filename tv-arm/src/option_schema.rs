@@ -181,7 +181,8 @@ fn group(long: &str) -> &'static str {
         | "reversal-band-pct"
         | "tp-resistance-fib-level"
         | "skip-tp-resistance"
-        | "veto-on-reversal" => "Exit rules",
+        | "veto-on-reversal"
+        | "ma-cross-veto" => "Exit rules",
         "replace" | "shadow" => "Registration",
         "simulate"
         | "verbose"
@@ -222,6 +223,14 @@ mod tests {
         init();
         let schema = options();
         assert!(schema.arm.iter().any(|d| d.long == "enable-on-ma-touch"));
+        let cross = schema
+            .arm
+            .iter()
+            .find(|d| d.long == "ma-cross-veto")
+            .unwrap();
+        assert_eq!(cross.kind, "boolean");
+        assert_eq!(cross.group, "Exit rules");
+        assert!(cross.help.contains("actual fill"));
         assert!(schema.replay.iter().any(|d| d.long == "bless-baseline"));
         assert!(
             schema

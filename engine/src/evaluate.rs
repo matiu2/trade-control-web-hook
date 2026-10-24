@@ -673,6 +673,15 @@ fn evaluate_guards(
         // candle detector over the back-window, not a level cross. Every other
         // guard trigger is the plain per-candle predicate.
         let signal = match &rule.trigger {
+            Trigger::AdverseMaCross { .. }
+                if plan.armed_at.is_some_and(|arm| {
+                    candle.time + chrono::Duration::seconds(plan.granularity.seconds()) <= arm
+                }) || plan.replay_start.is_some_and(|start| {
+                    candle.time.timestamp() + plan.granularity.seconds() <= start
+                }) =>
+            {
+                continue;
+            }
             Trigger::PinePattern { pattern, dir } => {
                 // Spread-hour "rubbish candle": a reversal-close detector match on
                 // a learned spread hour is a liquidity-vacuum wick — don't flatten
@@ -874,6 +883,15 @@ fn evaluate_one_entry(
     fired: &mut Vec<FiredIntent>,
     declines: &mut Vec<EntryDecline>,
 ) {
+    if plan.has_ma_cross_veto()
+        && !detector_window
+            .iter()
+            .position(|c| c.time == candle.time)
+            .is_some_and(|i| trade_control_core::ma_cross::ready_at(detector_window, i))
+    {
+        tracing::warn!("MA-cross veto has insufficient history; entry blocked");
+        return;
+    }
     if plan.entry_conditions.retrace.is_some() && state.retrace_seen_at.is_none() {
         return;
     }
@@ -1074,7 +1092,11 @@ fn evaluate_one_entry(
     ) && !multi_shot
     {
         state.fired.insert(rule.rule_id.clone());
-        state.phase = Phase::Done;
+        // Consume the entry once while retaining guards for its resting order
+        // and open position. Cross policy must survive --max-retries 0 too.
+        if !plan.has_ma_cross_veto() {
+            state.phase = Phase::Done;
+        }
     }
 }
 
@@ -2538,16 +2560,19 @@ fn reseat_origin_on_dip(
 fn trigger_uses_close(trigger: &Trigger) -> bool {
     matches!(
         trigger,
-        Trigger::HorizontalCross {
-            bar: BarEvent::OnClose,
-            ..
-        } | Trigger::PriceValueCross {
-            bar: BarEvent::OnClose,
-            ..
-        } | Trigger::TrendlineCross {
-            bar: BarEvent::OnClose,
-            ..
-        }
+        Trigger::AdverseMaCross { .. }
+            | Trigger::HorizontalCross {
+                bar: BarEvent::OnClose,
+                ..
+            }
+            | Trigger::PriceValueCross {
+                bar: BarEvent::OnClose,
+                ..
+            }
+            | Trigger::TrendlineCross {
+                bar: BarEvent::OnClose,
+                ..
+            }
     )
 }
 
@@ -2584,6 +2609,10 @@ fn eval_trigger(
             };
             level_crossed(level, *dir, *bar, candle, refs, buffer)
         }
+        Trigger::AdverseMaCross { dir } => window
+            .iter()
+            .position(|bar| bar.time == candle.time)
+            .is_some_and(|i| trade_control_core::ma_cross::adverse_cross_at(window, i, *dir)),
         Trigger::TimeReached { at_epoch } => candle.time.timestamp() >= *at_epoch,
         // The M/W heartbeat fires on every closed bar — the wrapper feeds only
         // closed candles, so any candle is a heartbeat tick.
@@ -3015,6 +3044,10 @@ fn guard_is_terminal(rule: &ConditionRule) -> bool {
 /// worker's `dispatch_action`.
 fn veto_retires_plan(rule: &ConditionRule) -> bool {
     use trade_control_core::intent::VetoLevel;
+    // Cancel resting orders without retiring monitoring for a filled position.
+    if matches!(rule.trigger, Trigger::AdverseMaCross { .. }) {
+        return false;
+    }
     !matches!(
         rule.intent.level.unwrap_or_default(),
         VetoLevel::StopNextEntry
@@ -3082,6 +3115,7 @@ fn armed_in_rule(rule: &ConditionRule, phase: Phase, entries_blocked: bool) -> b
 #[cfg(test)]
 mod tests {
     mod entry_conditions;
+    mod ma_cross;
     mod ma_enablement;
     use super::*;
     use std::collections::BTreeMap;

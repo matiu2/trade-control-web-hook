@@ -21,7 +21,7 @@ pub use blackout::{
     baked_market_hours, is_inside_any, is_inside_window, market_hours_blocked, weekend_blocked,
     windows_from_session,
 };
-pub use breakeven::{Breakeven, DEFAULT_BREAKEVEN_THRESHOLD};
+pub use breakeven::{Breakeven, BreakevenTrigger, DEFAULT_BREAKEVEN_THRESHOLD};
 pub use entry_dedup::EntryDedup;
 use entry_dedup::effective_entry_dedup;
 pub use entry_level_veto::{EntryLevelVeto, VetoSide};

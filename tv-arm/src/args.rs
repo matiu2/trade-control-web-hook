@@ -499,6 +499,14 @@ pub struct Args {
     #[arg(long)]
     pub trend: bool,
 
+    /// Veto further entries on an adverse closed 9 EMA / 20 SMA cross:
+    /// below for longs, above for shorts. Cancel unfilled orders. For an open
+    /// position, tighten SL to its actual fill only while the exit price is
+    /// profitable. Never loosen a better stop. Independent of --trend and
+    /// --no-breakeven (which disables only the percentage-based trigger).
+    #[arg(long, visible_alias = "trend-reverse-veto")]
+    pub ma_cross_veto: bool,
+
     /// Require the entry signal pattern to touch ANY listed close-based MA on
     /// the setup timeframe, e.g. '9 ema|20 sma|200 sma'. A wick counts. For a
     /// multi-candle pattern, any constituent candle can touch at its own MA
@@ -1017,6 +1025,7 @@ impl Args {
         crate::ma_requirements::MaRequirements {
             signal_touch: &self.must_touch,
             enabling_touch: &self.enable_on_ma_touch,
+            cross_veto: self.ma_cross_veto,
         }
     }
     /// Expand convenience aliases into the concrete flags the pipeline
@@ -1150,7 +1159,7 @@ impl Args {
     pub fn validate(&self) -> color_eyre::eyre::Result<()> {
         if self.position_entry_mode().is_some() && !self.ma_requirements().is_empty() {
             color_eyre::eyre::bail!(
-                "MA touch options require a candle-pattern entry; direct position entries have no signal pattern"
+                "MA touch/cross options require a candle-pattern entry; direct position entries have no signal pattern"
             );
         }
         // `--save-fixture` saves fixtures, and only the `replay` subcommand can

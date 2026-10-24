@@ -52,7 +52,9 @@
 //! [`StateStore`] and passes it in, exactly as the engine tick does.
 
 use chrono::{DateTime, Duration, Utc};
-use trade_control_core::broker::{AmendError, Broker, Candle, Granularity, OpenPosition};
+use trade_control_core::broker::{
+    AmendError, BidAskCandle, Broker, Candle, Granularity, OpenPosition,
+};
 use trade_control_core::order_control::join_position_to_attempt;
 use trade_control_core::state::{EntryAttempt, StateStore};
 
@@ -151,6 +153,15 @@ async fn watch_account<C: CronEnv>(
 /// thing that actually matters: *did the broker's stop move, and to what*.
 #[allow(async_fn_in_trait)]
 trait PositionBroker {
+    async fn exit_price(&self, position: &OpenPosition) -> Option<f64>;
+    async fn bidask_candles(
+        &self,
+        instrument: &str,
+        granularity: Granularity,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<Vec<BidAskCandle>>;
+
     async fn candles(
         &self,
         instrument: &str,
@@ -164,6 +175,62 @@ trait PositionBroker {
 }
 
 impl PositionBroker for BrokerHandle {
+    async fn bidask_candles(
+        &self,
+        instrument: &str,
+        granularity: Granularity,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<Vec<BidAskCandle>> {
+        let result = match self {
+            BrokerHandle::Oanda(b) => {
+                b.get_bidask_candles(instrument, granularity, since, now)
+                    .await
+            }
+            BrokerHandle::TradeNation(b) => {
+                b.get_bidask_candles(instrument, granularity, since, now)
+                    .await
+            }
+            BrokerHandle::Ibkr(b) => {
+                b.get_bidask_candles(instrument, granularity, since, now)
+                    .await
+            }
+            BrokerHandle::Mt5(b) => {
+                b.get_bidask_candles(instrument, granularity, since, now)
+                    .await
+            }
+            BrokerHandle::Ctrader(b) => {
+                b.get_bidask_candles(instrument, granularity, since, now)
+                    .await
+            }
+        };
+        match result {
+            Ok(candles) => Some(candles),
+            Err(error) => {
+                tracing::error!(%error, "MA-cross stop needs bid/ask history; leaving cross stop unchanged");
+                None
+            }
+        }
+    }
+    async fn exit_price(&self, position: &OpenPosition) -> Option<f64> {
+        let quote = match self {
+            BrokerHandle::TradeNation(b) => b.get_quote(&position.instrument).await,
+            BrokerHandle::Oanda(b) => b.get_quote(&position.instrument).await,
+            BrokerHandle::Mt5(b) => b.get_quote(&position.instrument).await,
+            BrokerHandle::Ctrader(b) => b.get_quote(&position.instrument).await,
+            BrokerHandle::Ibkr(b) => b.get_quote(&position.instrument).await,
+        };
+        match quote {
+            Ok(q) => Some(match position.direction {
+                trade_control_core::intent::Direction::Long => q.bid,
+                trade_control_core::intent::Direction::Short => q.ask,
+            }),
+            Err(error) => {
+                tracing::error!(%error, "MA-cross break-even quote failed; leaving cross stop unchanged");
+                None
+            }
+        }
+    }
     async fn candles(
         &self,
         instrument: &str,
@@ -212,6 +279,22 @@ async fn watch_one<B: PositionBroker>(
     // of these bars may *arm* is decided by `breakeven_decision`, against the
     // fill time.
     let since = now - Duration::seconds(snap.granularity.seconds() * BREAKEVEN_LOOKBACK_BARS);
+    // Include the position's full lifetime plus MA warmup. A fixed recent
+    // window could otherwise lose a cross after a prolonged worker outage.
+    let since = if snap.rule.trigger.includes_ma_cross() {
+        position
+            .opened_at
+            .map(|fill| {
+                fill - Duration::seconds(
+                    snap.granularity.seconds()
+                        * trade_control_core::ma_cross::HISTORY_BARS as i64
+                        * 3,
+                )
+            })
+            .map_or(since, |warmup| warmup.min(since))
+    } else {
+        since
+    };
     let Some(candles) = broker
         .candles(&position.instrument, snap.granularity, since, now)
         .await
@@ -225,9 +308,32 @@ async fn watch_one<B: PositionBroker>(
         position,
         current_stop,
     };
-    let (new_stop, armed_by, armed_at) = match crate::breakeven_decision::decide_for_account(
-        &inputs, candles, now, account,
-    ) {
+    let cross = if snap.rule.trigger.includes_ma_cross() {
+        match (
+            broker.exit_price(position).await,
+            broker
+                .bidask_candles(&position.instrument, snap.granularity, since, now)
+                .await,
+        ) {
+            (Some(exit), Some(books)) => {
+                crate::breakeven_decision::decide_ma_cross(&inputs, &books, now, account, exit)
+            }
+            _ => {
+                tracing::warn!(
+                    "MA-cross stop needs an executable quote and bid/ask history; retrying on next tick"
+                );
+                BreakevenDecision::Hold
+            }
+        }
+    } else {
+        BreakevenDecision::Hold
+    };
+    let decision = if matches!(cross, BreakevenDecision::Hold) {
+        crate::breakeven_decision::decide_for_account(&inputs, candles, now, account)
+    } else {
+        cross
+    };
+    let (new_stop, armed_by, armed_at) = match decision {
         BreakevenDecision::Hold => return,
         BreakevenDecision::Blocked(BreakevenBlock::NoFillTime) => {
             tracing::error!(
@@ -366,6 +472,8 @@ async fn amend(
 /// Pure & unit-testable.
 #[cfg(test)]
 mod tests {
+    mod ma_cross_tests;
+
     use super::*;
     use std::cell::RefCell;
     use trade_control_core::intent::{Breakeven, Direction};
@@ -429,11 +537,34 @@ mod tests {
     struct SpyBroker {
         candles: Vec<Candle>,
         amends: RefCell<Vec<f64>>,
+        exit_price: Option<f64>,
+        cross_books: Option<Vec<BidAskCandle>>,
     }
 
     impl SpyBroker {
         fn with(candles: Vec<Candle>) -> Self {
             Self {
+                exit_price: candles.last().map(|c| c.c),
+                cross_books: Some(
+                    candles
+                        .iter()
+                        .map(|c| BidAskCandle {
+                            time: c.time,
+                            o: c.o,
+                            h: c.h,
+                            l: c.l,
+                            c: c.c,
+                            bid_o: c.o,
+                            bid_h: c.h,
+                            bid_l: c.l,
+                            bid_c: c.c,
+                            ask_o: c.o,
+                            ask_h: c.h,
+                            ask_l: c.l,
+                            ask_c: c.c,
+                        })
+                        .collect(),
+                ),
                 candles,
                 amends: RefCell::new(Vec::new()),
             }
@@ -441,6 +572,18 @@ mod tests {
     }
 
     impl PositionBroker for SpyBroker {
+        async fn bidask_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Option<Vec<BidAskCandle>> {
+            self.cross_books.clone()
+        }
+        async fn exit_price(&self, _position: &OpenPosition) -> Option<f64> {
+            self.exit_price
+        }
         async fn candles(
             &self,
             _instrument: &str,

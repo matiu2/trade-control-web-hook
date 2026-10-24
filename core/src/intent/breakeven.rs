@@ -41,6 +41,10 @@ pub const DEFAULT_BREAKEVEN_THRESHOLD: f64 = 0.5;
 /// candle closes past [`Breakeven::arms_at`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Breakeven {
+    /// The default retains historical percentage management. MA-only allows
+    /// --no-breakeven to disable the percentage trigger while keeping the cross.
+    #[serde(default, skip_serializing_if = "BreakevenTrigger::is_default")]
+    pub trigger: BreakevenTrigger,
     /// Fraction of the entry→TP distance a candle must close past before the
     /// stop moves to break-even. `0.5` = halfway. Must be in `(0, 1)`; values
     /// outside that are clamped by [`Breakeven::sane`] at use time so a
@@ -52,6 +56,7 @@ impl Default for Breakeven {
     fn default() -> Self {
         Self {
             threshold: DEFAULT_BREAKEVEN_THRESHOLD,
+            trigger: BreakevenTrigger::default(),
         }
     }
 }
@@ -88,6 +93,9 @@ impl Breakeven {
     /// - Long: arms when `close_price >= level` (price ran up toward TP).
     /// - Short: arms when `close_price <= level` (price ran down toward TP).
     pub fn close_arms(&self, direction: Direction, level: f64, close_price: f64) -> bool {
+        if self.trigger == BreakevenTrigger::MaCrossOnly {
+            return false;
+        }
         match direction {
             Direction::Long => close_price >= level,
             Direction::Short => close_price <= level,
@@ -172,7 +180,10 @@ mod tests {
 
     #[test]
     fn arms_at_honours_a_custom_threshold() {
-        let be = Breakeven { threshold: 0.8 };
+        let be = Breakeven {
+            threshold: 0.8,
+            ..Default::default()
+        };
         // 80% of the way from 1.0 to 1.2 = 1.16.
         assert!((be.arms_at(1.0, 1.2) - 1.16).abs() < 1e-9);
     }
@@ -234,7 +245,10 @@ mod tests {
         // 0, >=1, and non-finite all fall back to 0.5 so a bad baked value can
         // never disable the SL (>=1 → never arm) or arm on the entry bar (0).
         for bad in [0.0, 1.0, 1.5, -0.2, f64::NAN, f64::INFINITY] {
-            let be = Breakeven { threshold: bad };
+            let be = Breakeven {
+                threshold: bad,
+                ..Default::default()
+            };
             assert!(
                 (be.arms_at(1.0, 1.2) - 1.1).abs() < 1e-9,
                 "threshold {bad} should clamp to 0.5"
@@ -295,9 +309,30 @@ mod tests {
 
     #[test]
     fn round_trips_through_json() {
-        let be = Breakeven { threshold: 0.6 };
+        let be = Breakeven {
+            threshold: 0.6,
+            ..Default::default()
+        };
         let json = serde_json::to_string(&be).expect("serialise");
         let back: Breakeven = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(be, back);
+    }
+}
+
+/// Additional break-even evidence; old signed intents remain byte-for-byte unchanged.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BreakevenTrigger {
+    #[default]
+    PriceProgress,
+    PriceProgressOrMaCross,
+    MaCrossOnly,
+}
+impl BreakevenTrigger {
+    pub fn is_default(&self) -> bool {
+        *self == Self::PriceProgress
+    }
+    pub fn includes_ma_cross(self) -> bool {
+        self != Self::PriceProgress
     }
 }
