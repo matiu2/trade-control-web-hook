@@ -9,64 +9,12 @@
 //! the worker's server-side engine (the legacy TradingView-alert POST
 //! path has been retired).
 
-// Some library-style helpers (`horizontal_price`,
-// `DrawShapeResult.shape`/`.entity_id`, etc.) aren't consumed by the
-// current pipeline but are public API for downstream tools; suppress
-// the dead-code warnings rather than dropping useful surface.
-#![allow(dead_code)]
-
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use color_eyre::eyre::Result;
-
-mod args;
-mod broker_kind;
-mod broker_read;
-mod calendar;
-mod clipboard;
-mod control_bundle;
-mod control_windows;
-mod ctrader_instrument;
-mod frozen_position;
-mod frozen_setup;
-mod geometry;
-mod hs_resolve;
-mod instrument_recovery;
-mod instrument_resolution;
-mod ma_requirements;
-mod mt5_instrument;
-mod mw_geometry;
-mod mw_resolve;
-mod news_marker;
-mod news_window;
-mod pattern_banner;
-mod pipeline;
-mod plan_geometry;
-mod position_entry;
-mod position_trade;
-mod precision;
-mod register;
-mod register_post;
-mod replay;
-mod resolve_error;
-mod roles;
-mod save_fixture;
-mod save_matrix;
-mod sentiment;
-mod setup_inputs;
-mod sl_anchor;
-mod sl_note;
-mod spec_url;
-mod spread;
-mod start_note;
-#[cfg(test)]
-mod test_drawings;
-mod timeframe;
-mod trade_plan_build;
-
-use crate::args::Args;
+use tv_arm::{args::Args, run};
 
 /// Hand-rolled zsh helper appended after the clap-generated tv-arm
 /// completion. Mirrors the pattern in `trade-control` for
@@ -133,6 +81,6 @@ fn main() -> Result<ExitCode> {
 
     let parsed = parsed.apply_aliases();
     parsed.validate()?;
-    let code = pipeline::run(parsed)?;
+    let code = run(parsed)?;
     Ok(ExitCode::from(code as u8))
 }

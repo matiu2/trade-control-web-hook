@@ -112,6 +112,20 @@ pub fn run(args: Args) -> Result<i32> {
     arm_from_inputs(&args, setup, roles.as_ref())
 }
 
+/// In-process frozen input: no HTTP round trip to the chart server.
+pub(crate) fn run_frozen(args: Args, frozen: crate::frozen_setup::FrozenSetup) -> Result<i32> {
+    frozen.validate_version("chart panel")?;
+    let setup = setup_from_frozen(&args, frozen.clone(), "chart panel")?;
+    let args = expand_save_fixture(args, &setup);
+    if let Some(path) = args.spec_out.as_deref() {
+        frozen.write(path)?;
+    }
+    if args.save_matrix {
+        return arm_the_matrix(&args, setup, None);
+    }
+    arm_from_inputs(&args, setup, None)
+}
+
 /// Expand `--save-fixture` into the flags it stands for.
 ///
 /// A no-op unless the flag is set. When it is, it turns on `--save-matrix`,
@@ -276,6 +290,14 @@ fn arm_the_matrix(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Res
             info!(cell = %variant.fixture_suffix(), "arming matrix cell");
             let result =
                 arm_from_inputs(&cell_args, cell_setup, roles).map_err(|e| format!("{e:#}"));
+            let result = match (result, args.execution.as_ref()) {
+                (Ok(code), Some(execution)) if code != 0 => Err(match execution.take_error() {
+                    Ok(Some(message)) => message,
+                    Ok(None) => format!("arm rejected (code {code})"),
+                    Err(error) => format!("{error:#}"),
+                }),
+                (result, _) => result,
+            };
             if let Err(e) = &result {
                 // Loud per-cell, so a failure isn't only visible in the summary
                 // at the very end of a long run.
@@ -288,7 +310,27 @@ fn arm_the_matrix(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Res
         })
         .collect();
 
-    println!("\n{}", save_matrix::summarise(&outcomes));
+    let summary = save_matrix::summarise(&outcomes);
+    println!("\n{summary}");
+    if let Some(execution) = args.execution.as_ref() {
+        execution.update(|outcome| {
+            outcome.report.push_str(&summary);
+            let errors: Vec<String> = outcomes
+                .iter()
+                .filter_map(|cell| match &cell.result {
+                    Ok(0) => None,
+                    Ok(code) => Some(format!(
+                        "{}: rejected (code {code})",
+                        cell.variant.fixture_suffix()
+                    )),
+                    Err(error) => Some(format!("{}: {error}", cell.variant.fixture_suffix())),
+                })
+                .collect();
+            if !errors.is_empty() {
+                outcome.error = Some(errors.join("\n"));
+            }
+        })?;
+    }
     // Non-zero when any cell is missing: a partial grid is not a grid, and a
     // driver that only checks the exit code must not read it as complete.
     Ok(if outcomes.iter().all(save_matrix::CellOutcome::armed) {
@@ -753,7 +795,7 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
         prune_as_of,
     } = setup;
 
-    let key = read_key()?;
+    let key = read_key(args)?;
     let account = resolve_account(args, broker, &chart_symbol)?;
     let out_dir = arm_out_dir(&raw_symbol)?;
     let now = Utc::now();
@@ -838,6 +880,9 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
         Ok(ds) => ds,
         Err(ResolveError::Reject(msg)) => {
             eprintln!("ERROR: {msg}");
+            if let Some(execution) = args.execution.as_ref() {
+                execution.update(|outcome| outcome.error = Some(msg))?;
+            }
             return Ok(1);
         }
         Err(ResolveError::Fatal(e)) => return Err(e),
@@ -935,7 +980,13 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
         if args.register_plan()
             && let Some(replace_target) = args.replace()
         {
-            replace_existing_plan(replace_target, &built_trade.instrument, &key, now)?;
+            replace_existing_plan(
+                replace_target,
+                &built_trade.instrument,
+                &key,
+                now,
+                args.execution.as_ref(),
+            )?;
         }
         // Arm-time news-sentiment snapshot: computed as of the *effective* arm
         // time (`--start` cursor when journaling, else `now`), printed for the
@@ -986,7 +1037,15 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
             armed_sentiment,
             crate::trade_plan_build::TrendFollow(args.trend),
             args.ma_requirements(),
+            args.execution.as_ref(),
         )?;
+        if let Some(execution) = args.execution.as_ref() {
+            execution.update(|outcome| {
+                if let Some(last) = outcome.executions.last_mut() {
+                    last.output_dir = Some(out_dir.clone());
+                }
+            })?;
+        }
     }
 
     // The TradingView-alert creation path (build payloads → POST via tv-mcp) was
@@ -1005,7 +1064,13 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
         // chart symbol (`TRADENATION:EURUSD`) — recorded qualified on purpose: a
         // bare symbol silently resolves to the OANDA feed, so an unqualified
         // capture can be off the wrong price data and look perfectly plausible.
-        let arm = arm_context(args, &chart_symbol, &instrument);
+        let cursor = start
+            .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
+            .map(|date| date.to_rfc3339());
+        let mut arm = arm_context(args, &chart_symbol, &instrument);
+        if args.execution.is_some() && arm.start.is_none() {
+            arm.start = cursor.as_deref();
+        }
         crate::replay::run_replay(
             effective_plan_out.as_deref(),
             &trade_id,
@@ -1015,6 +1080,7 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
             // `new_tv_url()`, not the raw field: `--new-tv` typed after the
             // `replay` subcommand lands in the passthrough, not the field.
             args.new_tv_url(),
+            args.execution.as_ref(),
         )
         .wrap_err("replay after arm (--replay)")?;
     }
@@ -1237,6 +1303,9 @@ fn resolve_with_recovery(
 /// Substituting a placeholder would put a blank account name on the plan and
 /// fail at dispatch instead of here, where the cause is obvious.
 fn resolve_account(args: &Args, broker: Broker, chart_symbol: &str) -> Result<String> {
+    if args.execution.is_some() {
+        return routing::account(args.account_id.as_deref(), None, broker, chart_symbol);
+    }
     let environment = env::var("TRADE_CONTROL_ACCOUNT").ok();
     routing::account(
         args.account_id.as_deref(),
@@ -1278,8 +1347,11 @@ fn resolve_account(args: &Args, broker: Broker, chart_symbol: &str) -> Result<St
 /// relocate the same fields.
 /// Load the signing key from `TRADE_CONTROL_KEY_FILE` env or the
 /// default `~/.config/trade-control/key.hex`.
-fn read_key() -> Result<[u8; KEY_LEN]> {
-    let path = key_path_resolved()?;
+fn read_key(args: &Args) -> Result<[u8; KEY_LEN]> {
+    let path = match args.execution.as_ref() {
+        Some(execution) => execution.context.key_file.clone(),
+        None => key_path_resolved()?,
+    };
     let hex_str =
         fs::read_to_string(&path).with_context(|| format!("read key file {}", path.display()))?;
     let bytes = hex::decode(hex_str.trim())

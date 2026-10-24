@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::Parser as _;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, WrapErr, eyre};
 use tracing::{info, warn};
 use trade_control_cli::replay_args::{CandleSource, ReplayArgs};
 use trade_control_conventions::Broker;
@@ -291,6 +291,7 @@ pub fn run_replay(
     // failure in the tv-mcp bridge can no longer abort the replay before the
     // local-chart drawing runs. An explicit `--annotate` still paints both.
     new_tv: Option<&str>,
+    execution: Option<&crate::api::Execution>,
 ) -> Result<()> {
     let bin = replay_binary();
     let plan = plan_path(plan_out, trade_id);
@@ -311,8 +312,9 @@ pub fn run_replay(
     // can read them back. A temp file keyed on the trade id: it is an
     // intermediate between two processes in one run, not an artefact the
     // operator keeps.
-    let positions_path =
-        new_tv.map(|_| std::env::temp_dir().join(format!("tv-arm-positions-{trade_id}.json")));
+    let positions_path = new_tv
+        .filter(|_| execution.is_none())
+        .map(|_| std::env::temp_dir().join(format!("tv-arm-positions-{trade_id}.json")));
     let argv = build_argv(
         &bin,
         &plan,
@@ -326,8 +328,24 @@ pub fn run_replay(
     // shelling out, so a bad passthrough flag fails with replay-candles' own
     // error rather than an opaque non-zero exit. Keep its selected output path:
     // an explicit --positions overrides the temporary default above.
-    let parsed = ReplayArgs::try_parse_from(&argv)
+    let mut parsed = ReplayArgs::try_parse_from(&argv)
         .map_err(|e| eyre!("--replay: invalid replay-candles arguments: {e}"))?;
+
+    if let Some(execution) = execution {
+        parsed.annotate = false;
+        parsed.annotate_unfilled = false;
+        parsed.positions = None;
+        if parsed.test_mode {
+            return run_corpus(parsed, execution);
+        }
+        if parsed.start.is_none() {
+            parsed.start = arm.start.map(str::to_string);
+        }
+        let runtime =
+            tokio::runtime::Runtime::new().wrap_err("starting in-process replay runtime")?;
+        let result = runtime.block_on(trade_control_cli::replay_driver::run(parsed))?;
+        return record_completed_replay(execution, result);
+    }
 
     info!(
         binary = %bin,
@@ -359,6 +377,67 @@ pub fn run_replay(
     // entirely.
     if let Some(url) = new_tv {
         draw_replay_output(url, &parsed, !sets_flag(passthrough, "--positions"))?;
+    }
+    Ok(())
+}
+
+fn record_completed_replay(
+    execution: &crate::api::Execution,
+    result: trade_control_cli::replay_driver::ReplayResult,
+) -> Result<()> {
+    let positions =
+        serde_json::to_value(result.positions).wrap_err("serialize replay positions")?;
+    let replay_outcome =
+        serde_json::to_value(result.outcome).wrap_err("serialize replay outcome")?;
+    execution.update(|outcome| {
+        outcome.report.push_str(&result.report);
+        outcome.positions = Some(positions.clone());
+        if let Some(last) = outcome.executions.last_mut() {
+            last.report = Some(result.report);
+            last.positions = Some(positions);
+            last.replay_outcome = Some(replay_outcome);
+        }
+    })?;
+    if !result.success {
+        let error = result
+            .error
+            .as_deref()
+            .unwrap_or("replay artifact write failed");
+        let code = result.exit_code;
+        return Err(eyre!(
+            "replay completed with an error (exit {code}): {error}"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn run_corpus(parsed: ReplayArgs, execution: &crate::api::Execution) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().wrap_err("starting corpus replay runtime")?;
+    let result = runtime.block_on(trade_control_cli::replay_driver::run_corpus(parsed));
+    let success = result.success;
+    let error = result.error.clone();
+    execution.record(crate::api::ArmExecution {
+        pattern: "corpus".into(),
+        ..Default::default()
+    })?;
+    execution.update(|outcome| {
+        outcome.report.push_str(&result.report);
+        if let Some(last) = outcome.executions.last_mut() {
+            last.report = Some(result.report);
+            last.replay_outcome = Some(serde_json::json!({
+                "summary": result.summary,
+                "baseline_diff": result.baseline_diff,
+                "exit_code": result.exit_code,
+                "success": result.success,
+                "error": result.error,
+            }));
+        }
+    })?;
+    if !success {
+        return Err(eyre!(
+            "{}",
+            error.as_deref().unwrap_or("corpus replay failed")
+        ));
     }
     Ok(())
 }
@@ -408,6 +487,55 @@ mod drawing_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_measurements_survive_an_artifact_write_failure() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .with(tracing_error::ErrorLayer::default())
+            .try_init()
+            .ok();
+        let execution = crate::api::Execution::new(crate::api::ArmContext {
+            worker_url: "http://127.0.0.1:8788".into(),
+            key_file: "/unused-key".into(),
+            broker: crate::args::BrokerArg::Oanda,
+            account_id: None,
+        });
+        execution
+            .record(crate::api::ArmExecution {
+                trade_id: "measured-trade".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let result = trade_control_cli::replay_driver::ReplayResult {
+            report: "Measured trade: -1.00R".into(),
+            positions: serde_json::from_value(serde_json::json!({
+                "version": 1, "instrument": "EUR_USD", "granularity": "1h", "broker": "oanda", "positions": [],
+            })).unwrap(),
+            outcome: serde_json::from_value(serde_json::json!({
+                "fires": [], "done": true, "final_phase": "done", "warnings": [],
+            })).unwrap(),
+            success: false, error: Some("could not save fixture: permission denied".into()), exit_code: 4,
+        };
+        let error = record_completed_replay(&execution, result).unwrap_err();
+        assert!(error.to_string().contains("could not save fixture"));
+        execution
+            .update(|outcome| {
+                assert_eq!(outcome.report, "Measured trade: -1.00R");
+                assert!(outcome.positions.is_some());
+                assert_eq!(
+                    outcome.executions[0].report.as_deref(),
+                    Some("Measured trade: -1.00R")
+                );
+                assert_eq!(
+                    outcome.executions[0].replay_outcome.as_ref().unwrap()["done"],
+                    true
+                );
+            })
+            .unwrap();
+    }
 
     #[test]
     fn c_trader_replay_accepts_pinned_account_passthrough() {

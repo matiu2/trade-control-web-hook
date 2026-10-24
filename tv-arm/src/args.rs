@@ -122,12 +122,19 @@ pub enum PositionEntry {
 /// Arm a reversal setup from the active TradingView chart.
 #[derive(Debug, Clone, Parser)]
 #[command(version = env!("GIT_VERSION"), about, long_about = None)]
+#[command(
+    after_help = "TradingView chart transport is deprecated. Prefer the local-chart panel or --spec-in / --spec-url; existing TradingView CLI options remain compatible."
+)]
 #[command(group(
     clap::ArgGroup::new("position_entry")
         .args(["market_entry", "stop_entry", "limit_entry"])
         .multiple(false)
 ))]
 pub struct Args {
+    /// Explicit caller routing and result collection for the shared library.
+    #[arg(skip)]
+    pub(crate) execution: Option<crate::api::Execution>,
+
     /// Broker to target. Defaults to the chart's exchange (also
     /// `TRADE_CONTROL_BROKER` env).
     #[arg(long)]
@@ -1006,7 +1013,7 @@ impl Command {
 }
 
 impl Args {
-    pub fn ma_requirements(&self) -> crate::ma_requirements::MaRequirements<'_> {
+    pub(crate) fn ma_requirements(&self) -> crate::ma_requirements::MaRequirements<'_> {
         crate::ma_requirements::MaRequirements {
             signal_touch: &self.must_touch,
             enabling_touch: &self.enable_on_ma_touch,

@@ -46,9 +46,19 @@ pub fn post_register_blocking(signed_body: String) -> Result<()> {
 /// A non-2xx status or transport failure is an `Err` carrying the worker's
 /// message.
 pub fn post_intent_blocking(signed_body: String) -> Result<String> {
+    post_intent_with_context(signed_body, None)
+}
+
+pub(crate) fn post_intent_with_context(
+    signed_body: String,
+    execution: Option<&crate::api::Execution>,
+) -> Result<String> {
     let runtime =
         tokio::runtime::Runtime::new().wrap_err("starting tokio runtime for worker POST")?;
-    runtime.block_on(post_intent(signed_body))
+    let webhook = execution
+        .map(|execution| execution.context.worker_url.as_str())
+        .unwrap_or(BAKED_WEBHOOK);
+    runtime.block_on(post_intent_to(webhook, signed_body))
 }
 
 /// Async POST of the signed body, returning the worker's response text on 2xx.

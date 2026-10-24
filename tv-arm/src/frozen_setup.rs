@@ -190,16 +190,21 @@ impl FrozenSetup {
     pub fn parse(text: &str, source: &str) -> Result<Self> {
         let setup: Self =
             serde_json::from_str(text).wrap_err_with(|| format!("parse frozen setup {source}"))?;
-        if setup.version > SPEC_VERSION {
+        setup.validate_version(source)?;
+        Ok(setup)
+    }
+
+    pub(crate) fn validate_version(&self, source: &str) -> Result<()> {
+        if self.version > SPEC_VERSION {
             return Err(eyre!(
                 "frozen setup {} is version {} but this tv-arm understands up to {}; \
                  upgrade tv-arm rather than arming from a spec it can't read",
                 source,
-                setup.version,
+                self.version,
                 SPEC_VERSION,
             ));
         }
-        Ok(setup)
+        Ok(())
     }
 }
 

@@ -52,3 +52,21 @@ async fn preserves_worker_rejection_details() {
         "{error}"
     );
 }
+
+#[tokio::test]
+async fn explicit_library_endpoint_receives_the_signed_intent() {
+    let webhook = response_server("200 OK", "staging accepted", Duration::ZERO).await;
+    let response = tokio::task::spawn_blocking(move || {
+        let execution = crate::api::Execution::new(crate::api::ArmContext {
+            worker_url: webhook,
+            key_file: "/unused-key".into(),
+            broker: crate::args::BrokerArg::Oanda,
+            account_id: None,
+        });
+        post_intent_with_context("signed-payload".into(), Some(&execution))
+    })
+    .await
+    .expect("blocking adapter")
+    .expect("explicit worker response");
+    assert_eq!(response, "staging accepted");
+}
