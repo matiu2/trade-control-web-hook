@@ -7,10 +7,11 @@
 //! depending on that crate would drag the whole worker tree into this tool.
 
 use chrono::{DateTime, FixedOffset, Utc};
+use serde::Serialize;
 use serde_json::Value;
 
 /// One line in the rendered timeline.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Event {
     /// Brisbane-formatted timestamp.
     pub ts: String,

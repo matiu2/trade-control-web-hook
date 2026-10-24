@@ -2305,15 +2305,18 @@ dependencies = [
  "clap",
  "color-eyre",
  "crossterm",
+ "getrandom 0.4.2",
  "instrument-lookup 0.7.0",
  "local-chart-client",
  "ratatui",
+ "reqwest 0.12.23",
  "serde",
  "serde_json",
  "serde_yaml",
  "tracing",
  "tracing-error",
  "tracing-subscriber",
+ "trade-control-cli",
  "trade-control-core",
 ]
 
