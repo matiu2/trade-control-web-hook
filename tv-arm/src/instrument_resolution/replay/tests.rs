@@ -35,15 +35,16 @@ fn only_pattern_replay_can_use_non_executable_contract_metadata() {
 }
 
 #[test]
-fn commodity_replay_requires_its_own_account_spread_profile() {
+fn every_non_fx_replay_requires_its_own_account_spread_profile() {
     logging();
-    let error = require_calibrated_replay("unmeasured-test-account", "XPDUSD").unwrap_err();
-    let message = error.to_string();
-    assert!(
-        message.contains("ctrader:unmeasured-test-account:XPDUSD"),
-        "{message}"
-    );
-    assert!(message.contains("calibrat"), "{message}");
+    for symbol in ["XAUEUR", "AU200", "DE10YB", "XPDUSD", "BTCUSD", "3I"] {
+        let error = require_calibrated_replay("unmeasured-test-account", symbol).unwrap_err();
+        let message = error.to_string();
+        let key = format!("ctrader:unmeasured-test-account:{symbol}");
+        assert!(message.contains(&key), "{message}");
+        assert!(message.contains("calibrat"), "{message}");
+        assert!(message.contains("cTrader replay requires"), "{message}");
+    }
 }
 
 #[test]

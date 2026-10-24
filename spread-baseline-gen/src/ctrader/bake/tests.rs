@@ -245,7 +245,7 @@ fn fresh_broker_metadata_must_match_the_native_units_recorded_in_each_row() {
 }
 
 #[test]
-fn invalid_broker_native_units_and_non_fx_reports_still_cannot_be_baked() {
+fn invalid_broker_native_units_and_unknown_symbols_still_cannot_be_baked() {
     crate::ctrader::test_logging();
     for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         let mut r = report();
@@ -253,8 +253,8 @@ fn invalid_broker_native_units_and_non_fx_reports_still_cannot_be_baked() {
         assert!(render(&r, &r.identity).is_err());
     }
     let mut r = report();
-    r.requested_symbols = vec!["XAUUSD".into()];
-    r.instruments[0].measurement.symbol = "XAUUSD".into();
+    r.requested_symbols = vec!["NO_SUCH_SYMBOL".into()];
+    r.instruments[0].measurement.symbol = "NO_SUCH_SYMBOL".into();
     assert!(render(&r, &r.identity).is_err());
 }
 
@@ -277,4 +277,20 @@ fn explicit_palladium_report_uses_native_quotes_without_enabling_other_commoditi
     r.instruments[0].measurement.profile.review = ReviewStatus::Reviewed;
     r.complete = false;
     assert!(render(&r, &r.identity).is_err());
+}
+
+#[test]
+fn gold_cross_uses_native_identity_without_a_class_specific_exemption() {
+    crate::ctrader::test_logging();
+    let mut r = report();
+    r.requested_symbols = vec!["XAUEUR".into()];
+    let row = &mut r.instruments[0];
+    row.symbol_id = 22312;
+    row.measurement.symbol = "XAUEUR".into();
+    row.measurement.pip_size = 0.01;
+    let table = render(&r, &r.identity).unwrap();
+    assert!(table.contains("ctrader:demo:XAUEUR"));
+    verify_broker_metadata(&r.instruments[0], 22312, "XAUEUR", 0.01).unwrap();
+    assert!(verify_broker_metadata(&r.instruments[0], 22312, "XAU_EUR", 0.01).is_err());
+    assert!(verify_broker_metadata(&r.instruments[0], 22312, "XAUEUR", 0.1).is_err());
 }

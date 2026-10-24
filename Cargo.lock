@@ -364,6 +364,7 @@ dependencies = [
  "ctrader-api",
  "ctrader-data-source",
  "ctrader-fix",
+ "instrument-lookup 0.7.0",
  "libc",
  "serde",
  "serde_json",

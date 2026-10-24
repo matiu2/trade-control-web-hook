@@ -7,18 +7,50 @@ use broker_ctrader::{
 use color_eyre::{Result, eyre::ensure};
 use instrument_lookup::{Asset, AssetClass};
 
-/// The default discovery remains FX-only. Palladium must be explicitly requested.
+/// Keep legacy FX discovery; explicit selection uses the audited native non-stock catalogue.
 pub fn asset(symbol: &str, explicit: bool) -> Result<&'static Asset> {
-    let asset = catalog_asset(symbol)?;
-    ensure!(
-        asset.class == AssetClass::Forex
-            || (explicit && symbol == "XPDUSD" && asset.class == AssetClass::Commodity),
-        "not a supported read-only cTrader calibration instrument"
-    );
+    let asset = if explicit {
+        broker_ctrader::catalogue::replay_asset(symbol)?
+    } else {
+        catalog_asset(symbol)?
+    };
+    validate_asset(asset, explicit)?;
     Ok(asset)
 }
 
-/// Preserve FX leg validation; palladium only needs its exact quote identity.
+/// Broad discovery is the non-stock rollout; explicit symbols remain deliberate.
+pub fn discovery_asset(symbol: &str, all_instruments: bool) -> Result<&'static Asset> {
+    let legacy = instrument_lookup::resolve(symbol)?;
+    ensure!(
+        !all_instruments || legacy.is_none_or(|asset| asset.class != AssetClass::Stock),
+        "stock calibration is excluded from the current non-stock rollout"
+    );
+    asset(symbol, all_instruments)
+}
+
+fn validate_asset(asset: &Asset, explicit: bool) -> Result<()> {
+    ensure!(
+        asset.class == AssetClass::Forex || explicit,
+        "default cTrader discovery is FX-only; use --only or --all-instruments for other classes"
+    );
+    timezone(asset)?;
+    Ok(())
+}
+
+/// A schedule is required by the runtime; never invent a market timezone.
+pub fn timezone(asset: &Asset) -> Result<chrono_tz::Tz> {
+    let timezone = asset.spread_schedule_tz().ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "{} has no resolvable spread schedule timezone; native schedule metadata is required before calibration",
+            asset.id
+        )
+    })?;
+    timezone.parse().map_err(|error| {
+        color_eyre::eyre::eyre!("invalid spread schedule timezone for {}: {error}", asset.id)
+    })
+}
+
+/// Preserve FX currency-leg validation; every other class needs exact enabled quote identity.
 pub async fn metadata(
     data: &ChartData,
     symbol: &str,
@@ -28,11 +60,11 @@ pub async fn metadata(
     let metadata = if asset.class == AssetClass::Forex {
         data.forex_instrument_metadata(symbol).await?
     } else {
-        let expected_id = available_palladium(&data.catalogue().await?, symbol)?;
+        let expected_id = available_symbol(&data.catalogue().await?, symbol)?;
         let metadata = data.instrument_metadata(symbol).await?;
         ensure!(
             metadata.id == expected_id,
-            "cTrader palladium symbol ID changed"
+            "cTrader native symbol ID changed"
         );
         metadata
     };
@@ -46,14 +78,14 @@ pub async fn metadata(
     Ok(metadata)
 }
 
-fn available_palladium(catalogue: &[InstrumentSummary], symbol: &str) -> Result<i64> {
+fn available_symbol(catalogue: &[InstrumentSummary], symbol: &str) -> Result<i64> {
     let matches = catalogue
         .iter()
         .filter(|row| row.name == symbol)
         .collect::<Vec<_>>();
     ensure!(
         matches.len() == 1 && matches[0].id > 0 && matches[0].enabled == Some(true),
-        "cTrader palladium symbol is missing, disabled or ambiguous"
+        "cTrader native symbol is missing, disabled or ambiguous"
     );
     Ok(matches[0].id)
 }
@@ -71,14 +103,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn palladium_is_explicit_and_does_not_broaden_default_fx_discovery() {
+    fn every_catalogued_class_can_be_explicitly_calibrated_with_a_known_schedule() {
         crate::ctrader::test_logging();
-        assert!(asset("EURUSD", false).is_ok());
-        assert!(asset("XPDUSD", false).is_err());
-        assert_eq!(asset("XPDUSD", true).unwrap().class, AssetClass::Commodity);
-        for symbol in ["XAUUSD", "BTCUSD", "EURUSD*t", "NO_SUCH_SYMBOL"] {
-            assert!(asset(symbol, true).is_err(), "accepted {symbol}");
+        let mut sample = catalog_asset("EURUSD").unwrap().clone();
+        for class in [
+            AssetClass::Forex,
+            AssetClass::Index,
+            AssetClass::Gold,
+            AssetClass::Bond,
+            AssetClass::Commodity,
+            AssetClass::Crypto,
+            AssetClass::Stock,
+        ] {
+            sample.class = class;
+            validate_asset(&sample, true).unwrap();
+            assert_eq!(
+                validate_asset(&sample, false).is_ok(),
+                class == AssetClass::Forex
+            );
         }
+        assert_eq!(asset("XAUEUR", true).unwrap().class, AssetClass::Gold);
+        assert!(asset("XAUEUR", false).is_err());
+        assert!(asset("EURUSD*t", true).is_err());
+        assert!(asset("NO_SUCH_SYMBOL", true).is_err());
+    }
+
+    #[test]
+    fn absent_or_unknown_schedule_is_not_guessed_from_the_asset_class() {
+        crate::ctrader::test_logging();
+        let mut sample = catalog_asset("EURUSD").unwrap().clone();
+        for schedule in ["none", "not-a-real-schedule"] {
+            sample.spread_schedule = schedule.into();
+            let error = validate_asset(&sample, true).unwrap_err().to_string();
+            assert!(error.contains("schedule"), "{error}");
+        }
+    }
+
+    #[test]
+    fn broad_discovery_explicitly_excludes_stocks_for_this_rollout() {
+        crate::ctrader::test_logging();
+        let stock = instrument_lookup::all()
+            .unwrap()
+            .iter()
+            .find(|asset| asset.class == AssetClass::Stock)
+            .unwrap();
+        let error = discovery_asset(&stock.id, true).unwrap_err().to_string();
+        assert!(error.contains("stock calibration"), "{error}");
+        assert!(discovery_asset("XAUEUR", true).is_ok());
+        assert!(discovery_asset("XAUEUR", false).is_err());
+    }
+
+    #[test]
+    fn broad_discovery_covers_every_audited_native_non_stock_without_forex_guesses() {
+        crate::ctrader::test_logging();
+        let symbols = broker_ctrader::catalogue::non_stock_symbols().unwrap();
+        assert_eq!(symbols.len(), 93);
+        for symbol in symbols {
+            let asset = discovery_asset(symbol, true).unwrap();
+            assert_ne!(asset.class, AssetClass::Stock);
+            timezone(asset).unwrap();
+        }
+        assert_eq!(asset("NOKJPY", true).unwrap().pip_size, 0.0001);
+        assert!(asset("NOKJPY", false).is_err());
+        assert!(asset("AMP", true).is_err());
+        assert!(asset("APA", true).is_err());
     }
 
     #[test]
@@ -102,15 +190,12 @@ mod tests {
             description: None,
             enabled: Some(true),
         };
-        assert_eq!(
-            available_palladium(&[row.clone()], "XPDUSD").unwrap(),
-            22346
-        );
-        assert!(available_palladium(&[], "XPDUSD").is_err());
-        assert!(available_palladium(&[row.clone(), row.clone()], "XPDUSD").is_err());
+        assert_eq!(available_symbol(&[row.clone()], "XPDUSD").unwrap(), 22346);
+        assert!(available_symbol(&[], "XPDUSD").is_err());
+        assert!(available_symbol(&[row.clone(), row.clone()], "XPDUSD").is_err());
         for enabled in [None, Some(false)] {
             row.enabled = enabled;
-            assert!(available_palladium(&[row.clone()], "XPDUSD").is_err());
+            assert!(available_symbol(&[row.clone()], "XPDUSD").is_err());
         }
     }
 }

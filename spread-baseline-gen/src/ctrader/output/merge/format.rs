@@ -82,7 +82,8 @@ fn row<'a>(line: &'a str, account: &str) -> Result<Row<'a>> {
     ensure!(
         provider == format!("ctrader-{account}")
             && !symbol.is_empty()
-            && symbol.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            && symbol.is_ascii()
+            && !symbol.chars().any(char::is_control)
             && rest.trim_start().starts_with(',')
             && line.trim_end().ends_with("),"),
         "invalid cTrader generated account row"

@@ -107,3 +107,24 @@ fn normal_and_additive_writers_share_the_same_exclusive_lock() {
             .contains("ctrader:demo:XPDUSD")
     );
 }
+
+#[test]
+fn verified_native_symbols_keep_spaces_dots_and_other_printable_punctuation() {
+    crate::ctrader::test_logging();
+    let old = table(&["EURUSD"]);
+    for symbol in [
+        "BRK.B",
+        "Wall Street 30",
+        "US30.cash",
+        "Silver/EUR",
+        "A-B_C",
+    ] {
+        let incoming = table(&[symbol]);
+        let merged = tables(&old, "demo", &incoming).unwrap();
+        assert!(merged.contains(&format!("ctrader:demo:{symbol}")));
+        assert!(merged.starts_with(old.strip_suffix("];\n").unwrap()));
+    }
+    for symbol in ["bad\nrow", "bad\trow", "non-ascii-£"] {
+        assert!(tables(&old, "demo", &table(&[symbol])).is_err());
+    }
+}

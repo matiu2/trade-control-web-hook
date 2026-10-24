@@ -35,7 +35,7 @@ pub(crate) fn resolve_for_purpose(
         tracing::warn!(
             account,
             instrument = resolved.broker_symbol,
-            "read-only commodity replay reports price/R outcomes; broker order size, margin and commissions are not simulated, and live cTrader commodity trading remains unavailable"
+            "read-only cTrader replay reports price/R outcomes; broker order size, margin and commissions are not simulated, and live cTrader non-FX trading remains unavailable"
         );
     }
     Ok(resolved)
@@ -46,7 +46,7 @@ fn require_calibrated_replay(account: &str, symbol: &str) -> Result<()> {
     let coverage = trade_control_core::spread_blackout::coverage(&key);
     color_eyre::eyre::ensure!(
         coverage.is_covered(),
-        "cTrader commodity replay requires a calibrated account spread profile: {key:?} is {}. Collect and bake this instrument's paired history before replay; another broker's profile or legacy flat thresholds cannot establish coverage",
+        "cTrader replay requires a calibrated account spread profile: {key:?} is {}. Collect and bake this instrument's paired history before replay; another broker's profile or legacy flat thresholds cannot establish coverage",
         coverage.reason()
     );
     Ok(())

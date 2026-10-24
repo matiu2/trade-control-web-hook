@@ -8,7 +8,7 @@ pub async fn verify_full_universe(account: &str, report: &Report) -> Result<()> 
     demo_config(&profile)?;
     let data = ChartData::connect_profile(account, profile).await?;
     let identity = identity(account, &data).await?;
-    let (requested, _) = super::universe::select(&data, &[]).await?;
+    let (requested, _) = super::universe::select(&data, &[], false).await?;
     validate(report, &identity, &requested)
 }
 

@@ -4,7 +4,7 @@ use candle_model::Granularity;
 use chrono::{DateTime, Duration, Utc};
 use color_eyre::{
     Result,
-    eyre::{Context, ensure, eyre},
+    eyre::{Context, ensure},
 };
 #[cfg(test)]
 fn asset_for_fx(symbol: &str) -> Result<&'static instrument_lookup::Asset> {
@@ -36,10 +36,7 @@ pub(super) async fn measure(
             "cTrader spread calibration uses the account's broker-native pip convention"
         );
     }
-    let timezone = asset
-        .spread_schedule_tz()
-        .ok_or_else(|| eyre!("missing schedule timezone for {symbol}"))?
-        .parse()?;
+    let timezone = super::super::calibration::timezone(asset)?;
     let mut candles = Vec::new();
     let mut cursor = from;
     while cursor < to {

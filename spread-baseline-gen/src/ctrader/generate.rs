@@ -32,7 +32,7 @@ pub async fn run(args: Args) -> Result<()> {
         .as_ref()
         .map(|r| r.requested_symbols.as_slice())
         .unwrap_or(&args.only);
-    let (requested, excluded) = universe::select(&data, only).await?;
+    let (requested, excluded) = universe::select(&data, only, args.all_instruments).await?;
     let end = closed_minute(args.to.unwrap_or_else(Utc::now));
     let start = args
         .from
