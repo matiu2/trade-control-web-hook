@@ -853,8 +853,15 @@ impl ReplayBroker {
     /// `as_of`. Index 0 is the fire bar — the sim's `find_fill` excludes it (a
     /// resting order isn't live until its fire bar closes), so `advance()` gets
     /// the fire-bar skip (and the spread-hour fill skip, sub-bar zoom, break-even,
-    /// System-2 widen) for free from `simulate_fill_resolved_zoom`.
-    fn prefix_from_fire(&self, shell: &Shell, up_to: DateTime<Utc>) -> Vec<BidAskCandle> {
+    /// System-2 widen) for free from `simulate_fill_resolved_zoom`. MA-cross
+    /// trades additionally retain pre-fire warmup; `find_fill` excludes that
+    /// history before searching for an entry, so it can only seed averages.
+    fn prefix_from_fire(
+        &self,
+        shell: &Shell,
+        up_to: DateTime<Utc>,
+        ma_cross: bool,
+    ) -> Vec<BidAskCandle> {
         // Bound at `up_to` (the current bar's OPEN time), inclusive — NOT the
         // shared `as_of`, which the loop sets to the bar CLOSE (`now`). Because
         // candle timestamps are bar-open times and a bar's close equals the NEXT
@@ -866,7 +873,7 @@ impl ReplayBroker {
         // firing bar's OPEN (`fired.candle.time`); `advance` matches that.
         self.candles
             .iter()
-            .filter(|c| c.time >= shell.time && c.time <= up_to)
+            .filter(|c| (ma_cross || c.time >= shell.time) && c.time <= up_to)
             .cloned()
             .collect()
     }
@@ -883,7 +890,13 @@ impl ReplayBroker {
         placed: &Option<PlacedLevels>,
         up_to: DateTime<Utc>,
     ) -> Option<(Resolved, SimOutcome)> {
-        let prefix = self.prefix_from_fire(shell, up_to);
+        let prefix = self.prefix_from_fire(
+            shell,
+            up_to,
+            intent
+                .breakeven
+                .is_some_and(|be| be.trigger.includes_ma_cross()),
+        );
         // Build a throwaway attempt so `resolved_for_sim` (which reads
         // `attempt.placed` / `attempt.intent` / `attempt.shell`) applies the SAME
         // stored-levels-or-floor logic the re-sim path uses. No ledger/cancel
@@ -1659,6 +1672,7 @@ impl Broker for ReplayBroker {
 
 #[cfg(test)]
 mod tests {
+    mod ma_cross_broker_tests;
     use super::*;
     use chrono::TimeZone;
 

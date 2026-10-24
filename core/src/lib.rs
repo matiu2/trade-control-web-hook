@@ -46,3 +46,5 @@ pub mod sweep_gate;
 pub mod tick_bundle;
 pub mod trade_plan;
 pub mod tunable;
+
+pub mod ma_cross;

@@ -808,7 +808,7 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
     //    operator-facing rejection returns Ok(1).
     if geom.mw_path.is_some() && !args.ma_requirements().is_empty() {
         color_eyre::eyre::bail!(
-            "MA touch options require a candle-pattern entry; M/W uses a geometry entry"
+            "MA touch/cross options require a candle-pattern entry; M/W uses a geometry entry"
         );
     }
     let resolved_spec = if geom.mw_path.is_some() {
