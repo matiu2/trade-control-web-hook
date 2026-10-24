@@ -203,6 +203,13 @@ impl InForceStop {
         self.armed
     }
 
+    /// Record an independently validated tightening to break-even. The caller
+    /// obtains this target from the shared MA-cross policy and the widen gate.
+    pub fn tighten_to_break_even(&mut self, stop: f64) {
+        self.level = stop;
+        self.armed = true;
+    }
+
     /// Consider arming break-even off a bar that closed at `close_price`.
     ///
     /// `gate` is [`breakeven_arm_gate`] for this bar: a bar inside an active

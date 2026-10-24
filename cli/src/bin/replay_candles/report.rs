@@ -820,12 +820,33 @@ fn render_fire(
 
     // Break-even arming: the bar whose close runs past 50%-to-TP. The live cron
     // (`breakeven_watch`) amends the broker SL to entry here.
+    let with_warmup: Vec<_> = if fire.ma_warmup.is_empty() {
+        Vec::new()
+    } else {
+        fire.ma_warmup
+            .iter()
+            .chain(lifetime.iter())
+            .cloned()
+            .collect()
+    };
+    let lifetime = if fire.ma_warmup.is_empty() {
+        lifetime
+    } else {
+        &with_warmup
+    };
     if let Some(armed_at) =
         breakeven_armed_at_resolved(placed, intent, &shell, plan.pip_size, lifetime)
     {
         events.push(EntryEvent {
             at: armed_at,
-            note: format!("{ev} SL→break-even (a candle closed past 50%-to-TP)"),
+            note: if intent
+                .breakeven
+                .is_some_and(|be| be.trigger.includes_ma_cross())
+            {
+                format!("{ev} SL→break-even (configured MA-cross/profit rule)")
+            } else {
+                format!("{ev} SL→break-even (a candle closed past 50%-to-TP)")
+            },
             close: bar_close(&fire.forward, armed_at),
         });
     }
@@ -1500,6 +1521,7 @@ mod tests {
         Fire {
             fired,
             forward,
+            ma_warmup: Vec::new(),
             gate_outcome,
             superseded: false,
             placed_bracket,

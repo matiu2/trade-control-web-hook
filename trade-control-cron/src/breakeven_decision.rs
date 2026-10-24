@@ -811,3 +811,6 @@ mod tests {
         );
     }
 }
+
+mod ma_cross;
+pub use ma_cross::decide_ma_cross;

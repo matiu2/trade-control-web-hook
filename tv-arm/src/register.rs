@@ -168,7 +168,7 @@ pub(crate) fn register_trade_plan(
     let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
     if is_mw && !ma_requirements.is_empty() {
         color_eyre::eyre::bail!(
-            "MA touch options require a candle-pattern entry; M/W uses a geometry entry"
+            "MA touch/cross options require a candle-pattern entry; M/W uses a geometry entry"
         );
     }
     let granularity = resolution_to_granularity(resolution).ok_or_else(|| {
@@ -229,6 +229,9 @@ pub(crate) fn register_trade_plan(
         screenshot_url,
         trend,
     );
+    if ma_requirements.cross_veto {
+        crate::ma_cross_veto::configure(&mut plan)?;
+    }
     plan.entry_conditions.must_touch = ma_requirements.signal_touch.to_vec();
     plan.entry_conditions.enable_on_ma_touch = ma_requirements.enabling_touch.to_vec();
     info!(retrace_line = ?plan.entry_conditions.retrace,
@@ -457,6 +460,49 @@ mod tests {
                 .iter()
                 .any(|r| r["rule_id"] == "03-prep-break-and-close")
         );
+    }
+
+    #[test]
+    fn ma_cross_policy_reaches_cli_and_gui_signed_plans() {
+        for flag in ["--ma-cross-veto", "--trend-reverse-veto"] {
+            for no_percentage in [false, true] {
+                let mut options = vec![flag];
+                if no_percentage {
+                    options.push("--no-breakeven");
+                }
+                let json = plan_json_with(true, "cross-wire", true, &options);
+                let rules = json["rules"].as_array().unwrap();
+                let guard = rules
+                    .iter()
+                    .find(|r| r["rule_id"] == "01-veto-ma-cross")
+                    .unwrap();
+                assert_eq!(guard["trigger"]["type"], "adverse_ma_cross");
+                assert_eq!(guard["intent"]["level"], "cancel-pending");
+                let entry = rules
+                    .iter()
+                    .find(|r| r["intent"]["action"] == "enter")
+                    .unwrap();
+                assert_eq!(
+                    entry["intent"]["breakeven"]["trigger"],
+                    if no_percentage {
+                        "ma_cross_only"
+                    } else {
+                        "price_progress_or_ma_cross"
+                    }
+                );
+                assert!(
+                    entry["intent"]["vetos"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|v| v == "ma-cross")
+                );
+                let plan: trade_control_core::trade_plan::TradePlan =
+                    serde_json::from_value(json).unwrap();
+                assert!(plan.has_ma_cross_veto());
+                assert!(plan.detector_history_bars() >= 91);
+            }
+        }
     }
 
     #[test]

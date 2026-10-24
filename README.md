@@ -3622,6 +3622,37 @@ and invalidation rules still apply. Re-arming starts with a fresh touch mileston
 Like the per-pattern MA filter, this option requires a candle-pattern entry;
 direct position and M/W geometry entries reject it.
 
+### Veto an adverse MA cross — `--ma-cross-veto`
+
+```sh
+tv-arm-staging --spec-url='http://localhost:8790/arm-setup?...' \
+  --trend --ma-cross-veto --enable-on-ma-touch '200 sma' \
+  --must-touch '9 ema|20 sma|200 sma' register
+```
+
+`--trend-reverse-veto` is an alias. On the setup timeframe, a **closed** 9 EMA
+crossing below the 20 SMA is adverse for a long; crossing above is adverse for
+a short. A wick, an already-adverse ordering when armed, or a favourable cross
+does not trigger this policy. Pre-arm candles only warm the averages.
+
+The first adverse cross permanently blocks further entries for this arm and
+cancels pending orders. It leaves open positions and their exit monitoring
+running. After a fill, an adverse cross can tighten SL to the **actual fill**
+price when the exit quote is still profitable (bid above fill for longs, ask
+below fill for shorts). An existing break-even or better stop stays unchanged.
+MA crosses use the existing spread-widen arming exclusions for stop management;
+they cannot retrospectively tighten a stop during an earlier candle.
+
+This is independent of `--trend`, the retracement gate and both MA touch
+filters. Percentage-based break-even continues alongside it; `--no-breakeven`
+disables only that percentage trigger, leaving cross-based break-even enabled.
+Missing MA history blocks entry; missing fill metadata or quotes prevents an
+MA stop amendment and is logged. Re-arm to start a fresh setup after a veto.
+Direct position and M/W geometry entries currently reject MA touch/cross
+options. In local-chart, the same option is the **ma cross veto** checkbox under
+**Exit rules** in both Register and Replay; the UI and CLI share the plan builder,
+core MA calculations, engine and replay policy.
+
 ### Server-side engine registration (`register`)
 
 Trades are armed **server-side**: the worker evaluates every trigger itself on

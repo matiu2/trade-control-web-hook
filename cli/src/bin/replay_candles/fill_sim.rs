@@ -54,6 +54,10 @@
 //! a caller with no finer data ([`NoZoom`]) still gets, and where even the finest
 //! grain we hold is itself ambiguous.
 
+#[path = "fill_sim/ma_cross.rs"]
+mod ma_cross;
+use ma_cross::CrossHistory;
+
 use trade_control_core::broker::BidAskCandle;
 use trade_control_core::intent::{
     Direction, Intent, Resolved, ResolvedEntry, Shell, SlWiden, widen_sl_to_spread_floor,
@@ -408,6 +412,7 @@ pub fn simulate_fill_resolved_zoom(
     // original (or already-moved) stop still applies, mirroring the broker's
     // resting stop. We therefore test the exit against `active_stop` first, then
     // arm BE from this candle's close for subsequent bars.
+    let cross_history = CrossHistory::new(resolved, candles, shell.time);
     let exit_book = book_for(Leg::Exit, dir);
     let be_arms_at = resolved
         .breakeven
@@ -538,6 +543,11 @@ pub fn simulate_fill_resolved_zoom(
         // FIXTURE IS EVIDENCE about it — the whole corpus is expected to be
         // unchanged — and the tests that prove it works construct deliberately
         // absurd targets instead.
+        if trade_control_core::order_control::breakeven_arm_gate(&widen_episodes, c.time).armable()
+            && let Some(stop) = cross_history.stop(resolved, c, entry_price, active_stop)
+        {
+            active_stop = stop;
+        }
         if let (Some(be), Some(level)) = (resolved.breakeven, be_arms_at)
             && trade_control_core::order_control::breakeven_arm_gate(&widen_episodes, c.time)
                 .armable()
@@ -787,6 +797,14 @@ fn find_fill<'a>(
     dir: Direction,
     candles: &'a [BidAskCandle],
 ) -> Option<Fill<'a>> {
+    let candles = if intent
+        .breakeven
+        .is_some_and(|be| be.trigger.includes_ma_cross())
+    {
+        &candles[candles.partition_point(|c| c.time < shell.time)..]
+    } else {
+        candles
+    };
     let entry_book = book_for(Leg::Entry, dir);
     match resolved.entry {
         ResolvedEntry::Market { reference_price } => Some(Fill {
@@ -936,6 +954,7 @@ pub fn breakeven_armed_at_resolved(
     let dir = resolved.direction;
     let fill = find_fill(resolved, intent, shell, dir, candles)?;
 
+    let cross_history = CrossHistory::new(resolved, candles, shell.time);
     let exit_book = book_for(Leg::Exit, dir);
     let level = be.arms_at(fill.entry_price, resolved.take_profit);
     // Rule 2 must reach this walk too, or the JOURNAL and the SCORED OUTCOME
@@ -969,7 +988,12 @@ pub fn breakeven_armed_at_resolved(
             return None;
         }
         let gate = trade_control_core::order_control::breakeven_arm_gate(&widen_episodes, c.time);
-        if gate.armable() && be.close_arms(dir, level, c.c) {
+        if gate.armable()
+            && (cross_history
+                .stop(resolved, c, fill.entry_price, resolved.stop_loss)
+                .is_some()
+                || be.close_arms(dir, level, c.c))
+        {
             return Some(c.time);
         }
     }
@@ -1336,6 +1360,7 @@ pub fn widen_episodes_at_resolved(
     let Some(fill) = find_fill(resolved, intent, shell, dir, candles) else {
         return Vec::new();
     };
+    let cross_history = CrossHistory::new(resolved, candles, shell.time);
     let exit_book = book_for(Leg::Exit, dir);
 
     // The stop IN FORCE, bar by bar — the placement stop until break-even arms,
@@ -1424,6 +1449,7 @@ pub fn widen_episodes_at_resolved(
         // on. Capturing first is what keeps this scan and `simulate_fill` in
         // agreement about that one bar.
         let original_stop = in_force_stop.level();
+        let cross_stop = cross_history.stop(resolved, c, fill.entry_price, original_stop);
         // Per-instrument spread-hour gate — mirror the live cron's System 2
         // (`widen_open_stops_for_spread_hours`). `spread_hour_widen_instant`
         // returns `Some(baked_p90)` iff this bar's instrument is in (or leading
@@ -1463,6 +1489,7 @@ pub fn widen_episodes_at_resolved(
                 dir,
                 c.c,
                 fill.entry_price,
+                cross_stop,
             );
             continue;
         }
@@ -1475,6 +1502,7 @@ pub fn widen_episodes_at_resolved(
                 dir,
                 c.c,
                 fill.entry_price,
+                cross_stop,
             );
             continue;
         }
@@ -1497,6 +1525,7 @@ pub fn widen_episodes_at_resolved(
                     dir,
                     c.c,
                     fill.entry_price,
+                    cross_stop,
                 );
                 continue;
             }
@@ -1554,7 +1583,11 @@ fn arm_breakeven_on_ordinary_bar(
     dir: trade_control_core::intent::Direction,
     close_price: f64,
     entry_price: f64,
+    cross_stop: Option<f64>,
 ) {
+    if let Some(stop) = cross_stop {
+        in_force_stop.tighten_to_break_even(stop);
+    }
     if let (Some(be), Some(level)) = (resolved.breakeven, be_arms_at) {
         in_force_stop.consider_arm(
             // The caller has already established this bar is not inside an
@@ -1700,6 +1733,7 @@ fn book_reaches(c: &BidAskCandle, book: Book, level: f64, approach: Approach) ->
 
 #[cfg(test)]
 mod tests {
+    mod ma_cross_tests;
     use super::*;
     use chrono::{DateTime, Utc};
     use trade_control_core::intent::{
@@ -2603,7 +2637,10 @@ mod tests {
         // 1.1000, i.e. 0.00010 from the close that armed it.
         let mut intent = short_stop_intent();
         i_set_levels(&mut intent, 1.1000, 1.1040, 1.0900);
-        intent.breakeven = Some(Breakeven { threshold: 0.001 });
+        intent.breakeven = Some(Breakeven {
+            threshold: 0.001,
+            ..Default::default()
+        });
         let shell = Shell::from_candle(
             &candle("2026-06-17T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
         );
@@ -2740,7 +2777,10 @@ mod tests {
 
         let mut intent = short_stop_intent();
         i_set_levels(&mut intent, 1.1000, 1.1040, 1.0900);
-        intent.breakeven = Some(Breakeven { threshold: 0.001 });
+        intent.breakeven = Some(Breakeven {
+            threshold: 0.001,
+            ..Default::default()
+        });
         let shell = Shell::from_candle(
             &candle("2026-06-17T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
         );

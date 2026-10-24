@@ -53,10 +53,21 @@ impl EntryConditions {
 impl super::TradePlan {
     /// Shared live/replay history floor. MA history must reach the first
     /// constituent of a signal which may confirm several candles later.
+    pub fn has_ma_cross_veto(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|r| matches!(r.trigger, super::Trigger::AdverseMaCross { .. }))
+    }
+
     pub fn detector_history_bars(&self) -> usize {
         let cfg = crate::signals::DetectorConfig::pine_defaults(self.granularity);
         crate::signals::detector_lookback_bars(&cfg, self.granularity)
             .max(self.entry_conditions.history_bars() + cfg.confirm_bars + 3)
+            .max(if self.has_ma_cross_veto() {
+                crate::ma_cross::HISTORY_BARS
+            } else {
+                0
+            })
     }
 }
 
