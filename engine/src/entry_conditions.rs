@@ -17,11 +17,7 @@ pub(crate) fn stamp_retrace(
         || plan.armed_at.is_some_and(|armed| {
             candle.time + chrono::Duration::seconds(plan.granularity.seconds()) <= armed
         })
-        || trade_control_core::spread_blackout::suppress_on_spread_hour(
-            &plan.instrument,
-            candle.time,
-            plan.granularity,
-        )
+        || crate::spread_identity::suppress_plan(plan, candle.time)
     {
         return;
     }

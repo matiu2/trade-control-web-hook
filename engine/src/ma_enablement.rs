@@ -32,11 +32,7 @@ pub(crate) fn stamp(plan: &TradePlan, state: &mut PlanState, candle: &Candle, wi
     // OHLC cannot prove whether a wick happened before or after arming inside
     // the same candle. Only fully post-arm candles may enable the setup.
     if start.is_some_and(|start| candle.time < start)
-        || trade_control_core::spread_blackout::suppress_on_spread_hour(
-            &plan.instrument,
-            candle.time,
-            plan.granularity,
-        )
+        || crate::spread_identity::suppress_plan(plan, candle.time)
     {
         return;
     }
