@@ -331,6 +331,8 @@ pub struct ConditionRule {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Trigger {
+    /// A fresh adverse close-confirmed swap of 9 EMA and 20 SMA.
+    AdverseMaCross { dir: Direction },
     /// Price crosses a fixed horizontal level (`01-veto-too-high/low` on a
     /// horizontal invalidation line). The `level` is an absolute MID price.
     HorizontalCross {

@@ -653,7 +653,10 @@ fn default_breakeven_pct() -> Option<f64> {
 /// Build the [`Breakeven`] rule for an enter from a spec's `breakeven_pct`:
 /// `Some(f)` → armed at `f`; `None` → no break-even (operator opted out).
 fn breakeven_from_pct(breakeven_pct: Option<f64>) -> Option<trade_control_core::intent::Breakeven> {
-    breakeven_pct.map(|threshold| trade_control_core::intent::Breakeven { threshold })
+    breakeven_pct.map(|threshold| trade_control_core::intent::Breakeven {
+        threshold,
+        ..Default::default()
+    })
 }
 
 /// Skip-serializing predicate for [`TradeSpec::blackout_close`] — keeps a
