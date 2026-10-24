@@ -33,8 +33,8 @@
 //! fixtures and would train the reader to skip it — so the block renders only
 //! when the plan's instrument actually parses as a futures contract.
 
+use crate::close_out_check::{self, CloseOutVerdict};
 use chrono::{Datelike, NaiveDate};
-use trade_control_cli::close_out_check::{self, CloseOutVerdict};
 use trade_control_core::intent::Direction;
 
 use super::economics::{Leg, RISK_FRACTION};
@@ -290,9 +290,9 @@ fn contracts_for(budget: f64, stop_distance: f64, multiplier: f64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::futures_symbol::FuturesContract;
     use crate::replay_candles::economics::ExitReason;
     use chrono::{TimeZone, Utc};
-    use trade_control_cli::futures_symbol::FuturesContract;
 
     fn day(s: &str) -> NaiveDate {
         s.parse().expect("test date")

@@ -27,7 +27,7 @@ use trade_control_core::signals::{
 use super::cadence::CronCadence;
 use super::replay_broker::{ExitReason, QuoteSample, RealizedOutcome, ReplayBroker};
 use super::verbose::{BarTrace, DetectedMark};
-use trade_control_cli::replay_args::DetectorMarkConfig;
+use crate::replay_args::DetectorMarkConfig;
 use trade_control_core::broker::Broker;
 
 /// The entry decision the **real** dispatch (`trade_control_core::dispatch::run_enter`)
@@ -1487,8 +1487,8 @@ async fn inject_control_ticks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replay_args::{DirectionFilter, GoldenFilter};
     use chrono::TimeZone;
-    use trade_control_cli::replay_args::{DirectionFilter, GoldenFilter};
     use trade_control_engine::intent::Direction;
 
     /// [`super::run`] at the DEFAULT cadence (`CronCadence::PER_BAR`), shadowing
@@ -1787,7 +1787,7 @@ mod tests {
         );
 
         // And the report must show the skip, not a fabricated fill.
-        let report = crate::report::render(
+        let report = crate::replay_candles::report::render(
             &paused_enter_plan(pause_epoch, resume_epoch),
             &r,
             true,
@@ -2732,7 +2732,7 @@ mod tests {
             enter.suppressed_by().is_empty(),
             "no active pause at the enter bar → not suppressed"
         );
-        let report = crate::report::render(
+        let report = crate::replay_candles::report::render(
             &paused_enter_plan(3600, 2 * 3600),
             &r,
             true,
@@ -3010,7 +3010,7 @@ mod tests {
         // The report must reflect this: the superseded stop shows SUPERSEDED (no
         // fabricated fill), and exactly one trade is tallied (the limit's TP) —
         // not two overlapping positions.
-        let report = crate::report::render(
+        let report = crate::replay_candles::report::render(
             &two_enter_v2_plan(),
             &r,
             true,
@@ -3154,7 +3154,9 @@ mod tests {
              no realized outcome; got {:?}",
             enter.realized
         );
-        let report = crate::report::render(&plan, &r, true, false, None, &no_marks(), None).text;
+        let report =
+            crate::replay_candles::report::render(&plan, &r, true, false, None, &no_marks(), None)
+                .text;
         assert!(
             report.contains("TP: 0  SL: 0"),
             "the cancelled order books no trade at all:\n{report}"
@@ -3362,7 +3364,9 @@ mod tests {
         );
 
         // The replay report shows the short CLOSED ON REVERSAL, not held open.
-        let report = crate::report::render(&plan, &r, true, false, None, &no_marks(), None).text;
+        let report =
+            crate::replay_candles::report::render(&plan, &r, true, false, None, &no_marks(), None)
+                .text;
         assert!(
             report.contains("CLOSED ON REVERSAL"),
             "the open short must close on the reversal candle:\n{report}"
@@ -3461,9 +3465,16 @@ mod tests {
         assert_eq!(m[0].direction, Direction::Long, "bullish → Long");
 
         // And the always-on summary counts it.
-        let report =
-            crate::report::render(&never_firing_long_plan(), &r, true, false, None, &cfg, None)
-                .text;
+        let report = crate::replay_candles::report::render(
+            &never_firing_long_plan(),
+            &r,
+            true,
+            false,
+            None,
+            &cfg,
+            None,
+        )
+        .text;
         assert!(
             report.contains("1 golden"),
             "summary reports the golden mark:\n{report}"
@@ -3508,7 +3519,7 @@ mod tests {
         )
         .await;
         assert!(marks(&r_off).is_empty(), "none disables marking");
-        let report = crate::report::render(
+        let report = crate::replay_candles::report::render(
             &never_firing_long_plan(),
             &r_off,
             true,
@@ -3584,12 +3595,14 @@ mod tests {
 
         // The always-on report surfaces it (no --verbose needed), and --verbose
         // shows the ✗ line right under the ◆ GOLDEN mark on the same bar.
-        let plain = crate::report::render(&plan, &r, true, false, None, &cfg, None).text;
+        let plain =
+            crate::replay_candles::report::render(&plan, &r, true, false, None, &cfg, None).text;
         assert!(
             plain.contains("Entry declines:"),
             "always-on decline rollup present:\n{plain}"
         );
-        let verbose = crate::report::render(&plan, &r, true, true, None, &cfg, None).text;
+        let verbose =
+            crate::replay_candles::report::render(&plan, &r, true, true, None, &cfg, None).text;
         assert!(
             verbose.contains("◆ GOLDEN") && verbose.contains("✗ not entered:"),
             "verbose joins the golden mark and the decline on the bar:\n{verbose}"
@@ -3705,7 +3718,9 @@ mod tests {
             "not-golden decline suppressed from traces under golden-only"
         );
         // …and from the always-on rollup + verbose bar lines.
-        let report = crate::report::render(&plan, &r, true, true, None, &golden_only, None).text;
+        let report =
+            crate::replay_candles::report::render(&plan, &r, true, true, None, &golden_only, None)
+                .text;
         assert!(
             !report.contains("needs golden but signal is not golden"),
             "not-golden decline absent from the report under golden-only:\n{report}"
@@ -3805,7 +3820,8 @@ mod tests {
         );
 
         // And it renders under --verbose right beneath the ◆ mark.
-        let verbose = crate::report::render(&plan, &r, true, true, None, &cfg, None).text;
+        let verbose =
+            crate::replay_candles::report::render(&plan, &r, true, true, None, &cfg, None).text;
         assert!(
             verbose.contains("◆ GOLDEN") && verbose.contains("✗ not taken:"),
             "verbose joins the golden mark and the not-taken reason:\n{verbose}"
@@ -4020,7 +4036,7 @@ mod tests {
             .expect("the restored order must have a realized outcome (cancel→restore→fill)");
         assert_eq!(
             realized.kind,
-            crate::report::FillKind::TookProfit,
+            crate::replay_candles::report::FillKind::TookProfit,
             "the restored order fills on the clean bar and runs to TP, got {:?}",
             realized.kind
         );
@@ -4036,7 +4052,7 @@ mod tests {
         );
 
         // The report reflects the taken TP (exactly one win, no loss).
-        let report = crate::report::render(
+        let report = crate::replay_candles::report::render(
             &eurusd_spread_hour_plan(),
             &r,
             true,
@@ -4292,7 +4308,7 @@ mod tests {
             .expect("the restored order must have a realized outcome (cancel→restore→fill)");
         assert_eq!(
             realized.kind,
-            crate::report::FillKind::TookProfit,
+            crate::replay_candles::report::FillKind::TookProfit,
             "the restored order fills on the clean bar and runs to TP, got {:?}",
             realized.kind
         );
@@ -4304,7 +4320,7 @@ mod tests {
 
         // REPORT TEXT agrees with the ledger — the split-brain guard. Exactly one
         // taken position (the restored order's TP), no loss, positive Net R.
-        let report = crate::report::render(
+        let report = crate::replay_candles::report::render(
             &eurusd_spread_hour_plan_multishot(),
             &r,
             true,
@@ -4514,7 +4530,7 @@ mod tests {
 
         // REPORT TEXT: a taken position with a positive Net R, NOT a 0R no-fill (the
         // old flat-3h-TTL bug expired the record mid-block → NO FILL / 0R).
-        let report = crate::report::render(
+        let report = crate::replay_candles::report::render(
             &audchf_spread_block_plan_multishot(),
             &r,
             true,
@@ -4998,8 +5014,8 @@ mod tests {
 mod catch_up_tests {
     use super::tests::*;
     use super::*;
+    use crate::replay_args::{DirectionFilter, GoldenFilter};
     use chrono::TimeZone;
-    use trade_control_cli::replay_args::{DirectionFilter, GoldenFilter};
     use trade_control_engine::intent::Direction;
 
     fn no_marks() -> DetectorMarkConfig {

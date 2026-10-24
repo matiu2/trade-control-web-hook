@@ -7,11 +7,8 @@
 //! text, and validation; no arg drift between `replay-candles` and the
 //! `tv-arm` pre-flight parse.
 //!
-//! The heavier replay machinery (candle pulling, the engine loop, the
-//! report) stays bin-local under `cli/src/bin/replay_candles/`. Only the
-//! CLI surface — [`ReplayArgs`] plus the value-enums its fields reference
-//! ([`CandleSource`], [`DirectionFilter`], [`GoldenFilter`]) and the
-//! resolved [`DetectorMarkConfig`] — is shared here.
+//! Replay execution is shared through [`crate::replay_driver`], including
+//! structured reports and positions for in-process chart integrations.
 
 use std::path::PathBuf;
 

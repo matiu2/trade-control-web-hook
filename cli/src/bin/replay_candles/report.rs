@@ -33,7 +33,7 @@ use super::brisbane::bne;
 use super::economics::ReplayEconomics;
 use super::futures_caveats::FuturesContext;
 use super::replay::{Fire, Replay};
-use trade_control_cli::replay_args::DetectorMarkConfig;
+use crate::replay_args::DetectorMarkConfig;
 
 /// The tick size the replay report rounds order prices to — the baked
 /// `Intent::tick_size` when present, else the plan's `pip_size`. Mirrors the
@@ -1234,8 +1234,8 @@ fn describe_control_action(action: Action, rule_id: &str) -> String {
 mod tests {
     use super::super::replay::EnterGateOutcome;
     use super::*;
+    use crate::replay_args::{DirectionFilter, GoldenFilter};
     use chrono::{Duration, TimeZone, Utc};
-    use trade_control_cli::replay_args::{DirectionFilter, GoldenFilter};
 
     /// Detector marking off — the summary line is empty, so report assertions
     /// that predate this feature stay byte-stable.

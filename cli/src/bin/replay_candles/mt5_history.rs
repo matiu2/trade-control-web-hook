@@ -1,5 +1,6 @@
 //! Offline MT5 estimates never enter the genuine paired candle cache.
 use super::granularity::ReplayGranularity;
+use crate::replay_args::Mt5HistoryMode;
 use candle_model::CandleData;
 use chrono::{DateTime, Utc};
 use color_eyre::{
@@ -9,7 +10,6 @@ use color_eyre::{
 use mt5_data_source::cached_feed::{CachedFeed, History, HistoryMode};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use trade_control_cli::replay_args::Mt5HistoryMode;
 use trade_control_core::broker::BidAskCandle;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

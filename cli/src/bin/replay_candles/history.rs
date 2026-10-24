@@ -3,6 +3,7 @@ use super::{
     granularity::ReplayGranularity,
     mt5_history::{EstimatedSpread, Mt5Replay},
 };
+use crate::replay_args::{CandleSource, Mt5HistoryMode};
 use candle_cache::ctrader::CachedFeed;
 use chrono::{DateTime, Utc};
 use color_eyre::{
@@ -11,7 +12,6 @@ use color_eyre::{
 };
 use std::{collections::BTreeSet, sync::Arc};
 use tokio::sync::OnceCell;
-use trade_control_cli::replay_args::{CandleSource, Mt5HistoryMode};
 use trade_control_core::intent::BrokerKind;
 use trade_control_engine::{BidAskCandle, TradePlan};
 

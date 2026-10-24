@@ -19,12 +19,12 @@
 //! miss — an uncatalogued instrument, a forex-factory fetch failure — logs a
 //! `WARN` and returns `None`. The replay behaves exactly as before.
 
+use crate::fetch_events_for_range;
 use chrono::{DateTime, Local, Utc};
 use color_eyre::eyre::{Result, eyre};
 use instrument_lookup::resolve;
 use news_sentiment_tv::{analyze_sentiment, sentiment_lookback_start};
 use tracing::warn;
-use trade_control_cli::fetch_events_for_range;
 use trade_control_core::plan_sentiment::PlanSentiment;
 use trade_control_core::trade_plan::TradePlan;
 
