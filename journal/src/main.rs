@@ -12,17 +12,12 @@ mod cli;
 mod clipboard;
 mod content;
 mod directions;
-mod divergence;
-mod fixtures;
 mod jobs;
 mod keys;
 mod opener;
-mod plan;
 mod plan_admin;
 mod prompt;
 mod screen;
-mod search;
-mod timeline;
 mod tv;
 mod ui;
 
@@ -40,6 +35,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::app::App;
+use journal::{divergence, fixtures, plan, search, timeline};
 
 /// The baked git version (see `build.rs`).
 const VERSION: &str = env!("GIT_VERSION");
