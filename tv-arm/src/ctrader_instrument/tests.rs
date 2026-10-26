@@ -42,37 +42,74 @@ fn named_account_required_before_network() {
 }
 
 #[test]
-fn trading_still_refuses_commodity_before_connecting() {
+fn trading_still_refuses_every_non_fx_class_before_connecting() {
     init_tracing();
-    let error = resolve("XPDUSD", Some("never-connect")).unwrap_err();
-    assert!(error.to_string().contains("catalogued FX only"));
+    for symbol in [
+        "XAUEUR", "AU200", "DE10YB", "XPDUSD", "BTCUSD", "3I", "BTCEUR", "ITALY 40",
+    ] {
+        let error = resolve(symbol, Some("never-connect")).unwrap_err();
+        assert!(
+            error.to_string().contains("catalogued FX only"),
+            "{symbol}: {error}"
+        );
+    }
 }
 
 #[test]
-fn only_read_only_replay_permits_forex_and_commodity() {
+fn replay_class_policy_defers_metadata_readiness_to_audited_catalogue() {
     init_tracing();
-    for class in [AssetClass::Forex, AssetClass::Commodity] {
-        Mode::Replay
-            .validate_class(class)
-            .expect("supported replay class");
-    }
     for class in [
+        AssetClass::Forex,
         AssetClass::Index,
         AssetClass::Gold,
         AssetClass::Bond,
+        AssetClass::Commodity,
         AssetClass::Crypto,
         AssetClass::Stock,
     ] {
-        assert!(Mode::Replay.validate_class(class).is_err(), "{class}");
-        assert!(Mode::Trading.validate_class(class).is_err(), "{class}");
+        Mode::Replay
+            .validate_class(class)
+            .expect("supported replay class");
+        assert_eq!(
+            Mode::Trading.validate_class(class).is_ok(),
+            class == AssetClass::Forex,
+            "{class}"
+        );
     }
-    assert!(Mode::Trading.validate_class(AssetClass::Commodity).is_err());
-    let error = resolve_replay("SPOTGOLD", Some("never-connect")).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("FX and commodity instruments only")
+}
+
+#[test]
+fn gold_eur_replay_uses_the_native_symbol_and_precision_without_contract_sizing() {
+    init_tracing();
+    let symbol = trade_control_conventions::instrument_for(
+        trade_control_conventions::Broker::Ctrader,
+        "XAU/EUR",
     );
+    assert_eq!(symbol, "XAUEUR");
+    let asset = Mode::Replay.asset(&symbol).unwrap();
+    assert_eq!(asset.class, AssetClass::Gold);
+    let metadata = metadata::NativeMetadata {
+        name: "XAUEUR".into(),
+        id: 22312,
+        digits: 2,
+        pip_size: 0.1,
+        ..native()
+    };
+    let resolved = metadata::resolve(asset, &symbol, &metadata).unwrap();
+    assert_eq!(resolved.broker_symbol, "XAUEUR");
+    assert_eq!(resolved.precision.class, AssetClass::Gold);
+    assert_eq!(resolved.precision.decimal_places, 2);
+    assert_eq!(resolved.precision.tick_size, 0.01);
+    assert_eq!(resolved.precision.pip_size, 0.1);
+    assert!(resolved.precision.contract_multiplier.is_none());
+}
+
+#[test]
+fn missing_catalogue_metadata_still_fails_before_connecting() {
+    init_tracing();
+    let error =
+        resolve_replay("NONEXISTENT_CTRADER_TEST_SYMBOL", Some("never-connect")).unwrap_err();
+    assert!(error.to_string().contains("not ready for replay metadata"));
 }
 
 #[test]
@@ -167,4 +204,108 @@ fn invalid_pip_and_volume_metadata_are_refused() {
     ] {
         assert!(metadata::resolve(palladium(), "XPDUSD", &row).is_err());
     }
+}
+
+#[test]
+fn replay_uses_audited_native_nonstock_underlyings() {
+    init_tracing();
+    let nok_jpy = Mode::Replay.asset("NOKJPY").unwrap();
+    assert_eq!(nok_jpy.class, AssetClass::Forex);
+    assert_eq!(nok_jpy.pip_size, 0.0001);
+    let bitcoin_eur = Mode::Replay.asset("BTCEUR").unwrap();
+    assert_eq!(bitcoin_eur.class, AssetClass::Crypto);
+    assert_eq!(bitcoin_eur.news_currencies, ["BTC", "EUR"]);
+    let dow = Mode::Replay.asset("US 30").unwrap();
+    assert_eq!(dow.id, "US30");
+    assert_eq!(dow.class, AssetClass::Index);
+    let native = metadata::NativeMetadata {
+        name: "US 30".into(),
+        id: 100,
+        digits: 2,
+        pip_size: 0.1,
+        ..native()
+    };
+    let resolved = metadata::resolve(dow, "US 30", &native).unwrap();
+    assert_eq!(resolved.broker_symbol, "US 30");
+    assert!(resolved.precision.contract_multiplier.is_none());
+}
+
+#[test]
+fn unaudited_stocks_and_aliases_fail_before_connecting() {
+    init_tracing();
+    for symbol in ["MSFT", "3I", "AMP", "APA", "US30"] {
+        let error = resolve_replay(symbol, Some("never-connect")).unwrap_err();
+        assert!(
+            error.to_string().contains("not ready for replay metadata"),
+            "{symbol}: {error}"
+        );
+    }
+}
+
+#[test]
+fn trading_accepts_audited_forex_missing_from_the_shared_catalogue() {
+    init_tracing();
+    for symbol in [
+        "AUDZAR", "CADMXN", "CHFSGD", "EURCNH", "EURMXN", "GBPDKK", "GBPNOK", "GBPSEK", "GBPTRY",
+        "NOKJPY", "NOKSEK", "NZDSEK", "SEKJPY",
+    ] {
+        assert!(instrument_lookup::resolve(symbol).unwrap().is_none());
+        let asset = Mode::Trading.asset(symbol).expect("audited cTrader forex");
+        assert_eq!(asset, Mode::Replay.asset(symbol).unwrap());
+        assert_eq!(asset.class, AssetClass::Forex);
+    }
+}
+
+#[test]
+fn trading_fallback_preserves_native_precision_symbol_and_news_currencies() {
+    init_tracing();
+    for (symbol, currencies, digits, pip_size) in [
+        ("AUDZAR", ["AUD", "ZAR"], 5, 0.0001),
+        ("NOKJPY", ["NOK", "JPY"], 5, 0.0001),
+        ("SEKJPY", ["SEK", "JPY"], 3, 0.01),
+    ] {
+        let asset = Mode::Trading.asset(symbol).expect("audited cTrader forex");
+        let native = metadata::NativeMetadata {
+            name: symbol.into(),
+            digits,
+            pip_size,
+            ..native()
+        };
+        let resolved = metadata::resolve(asset, symbol, &native).expect("native forex metadata");
+        assert_eq!(resolved.broker_symbol, symbol);
+        assert_eq!(resolved.asset.news_currencies, currencies);
+        assert_eq!(resolved.precision.class, AssetClass::Forex);
+        assert_eq!(u32::from(resolved.precision.decimal_places), digits);
+        assert_eq!(resolved.precision.tick_size, 10_f64.powi(-(digits as i32)));
+        assert_eq!(resolved.precision.pip_size, pip_size);
+        assert!(resolved.precision.contract_multiplier.is_none());
+    }
+}
+
+#[test]
+fn audzar_trading_uses_its_calibrated_account_spread_profile() {
+    init_tracing();
+    let asset = Mode::Trading
+        .asset("AUDZAR")
+        .expect("audited cTrader forex");
+    let measured =
+        trade_control_core::spread_blackout::ctrader_spread_key("ctrader-demo", &asset.id);
+    assert_eq!(measured, "ctrader:ctrader-demo:AUDZAR");
+    assert!(trade_control_core::spread_blackout::coverage(&measured).is_covered());
+    let unmeasured = trade_control_core::spread_blackout::ctrader_spread_key(
+        "unmeasured-test-account",
+        &asset.id,
+    );
+    assert!(!trade_control_core::spread_blackout::coverage(&unmeasured).is_covered());
+}
+
+#[test]
+fn unknown_trading_symbols_fail_before_connecting_with_catalogue_context() {
+    init_tracing();
+    let symbol = "NONEXISTENT_CTRADER_TEST_SYMBOL";
+    let error = resolve(symbol, Some("never-connect")).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains(symbol), "{message}");
+    assert!(message.contains("no catalogued underlying"), "{message}");
+    assert!(message.contains("audited cTrader"), "{message}");
 }

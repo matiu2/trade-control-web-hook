@@ -3,6 +3,7 @@
 //! chart bars are exposed separately by [`market_data`] with their tick volume.
 pub mod access;
 mod candles;
+pub mod catalogue;
 mod entry;
 mod history;
 mod management;

@@ -48,7 +48,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// How far a fixture's window start may sit from the plan's arm time and still
 /// be considered the same setup. A capture's `start` is the replay window's
@@ -71,7 +71,7 @@ struct CellMeta {
 }
 
 /// One saved fixture cell on disk.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Cell {
     /// Directory name, e.g. `aud-cad-h1-2026-07-22-normal-news-off`.
     pub name: String,
@@ -138,7 +138,7 @@ fn strip_entry_rule(head: &str, fallback_dash: usize) -> &str {
 }
 
 /// A plan's fixture status, as shown in the info bar.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Status {
     /// No cell matched this plan.
     None,

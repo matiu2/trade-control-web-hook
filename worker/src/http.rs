@@ -217,7 +217,7 @@ async fn dispatch_request(state: &Arc<AppState>, body: &str) -> (StatusCode, Str
 /// For most paths `record == body` (the body is already a fine short outcome —
 /// `"replay"`, `"declined: intent-expired"`, `"ok"`). They diverge for a broker
 /// [`ActionResult`]: the caller sees the human-facing `body` (e.g. the long
-/// "entry blocked: SL too close to spread …" prose or a flat "action failed"),
+/// "entry blocked: SL too close to spread …" prose or "action failed: …"),
 /// but the record keeps the concise, information-rich gate verdict
 /// ([`ActionResult::record_outcome`]) — the same string the offline replay
 /// surfaces on its `BLOCKED — …` line — so a later `plan timeline` / `status`
@@ -240,9 +240,8 @@ impl DispatchOutcome {
     }
 
     /// Map a broker [`ActionResult`] to its HTTP response while keeping the
-    /// rich outcome string for the record. The status/body mapping matches the
-    /// wasm worker (`action_to_parts`); the `record` diverges for
-    /// `Failed`/`Rejected` (see the struct doc).
+    /// rich outcome string for the record. The `record` remains independent of
+    /// the HTTP response wording for `Failed`/`Rejected` (see the struct doc).
     fn from_action(result: &ActionResult) -> Self {
         let (status, body) = action_to_parts(result);
         Self {
@@ -616,9 +615,9 @@ fn control_to_parts(c: ControlResult) -> (StatusCode, String) {
     (status, c.body)
 }
 
-/// Map a broker [`ActionResult`] to an HTTP `(status, body)`, matching the wasm
-/// worker (`Ok` → 200 "ok", `Failed` → 502 "action failed", `Rejected` → its
-/// own status + body).
+/// Map a broker [`ActionResult`] to an HTTP `(status, body)`: `Ok` uses 200
+/// "ok", `Failed` uses 502 with its reason, and `Rejected` keeps its own
+/// status and body.
 ///
 /// `AmbiguousSuccess` deliberately does NOT reuse `Failed`'s body. Both are
 /// 502s (neither is a confirmed success), but a caller that strips the status
@@ -629,7 +628,9 @@ fn control_to_parts(c: ControlResult) -> (StatusCode, String) {
 fn action_to_parts(result: &ActionResult) -> (StatusCode, String) {
     match result {
         ActionResult::Ok(_) => (StatusCode::OK, "ok".to_string()),
-        ActionResult::Failed(_) => (StatusCode::BAD_GATEWAY, "action failed".to_string()),
+        ActionResult::Failed(reason) => {
+            (StatusCode::BAD_GATEWAY, format!("action failed: {reason}"))
+        }
         ActionResult::Rejected { status, body, .. } => (
             StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             body.clone(),
@@ -778,12 +779,15 @@ mod tests {
     }
 
     #[test]
-    fn action_result_maps_like_the_wasm_worker() {
+    fn action_result_preserves_status_and_failure_reason() {
         let (s, b) = action_to_parts(&ActionResult::Ok("entered".into()));
         assert_eq!((s, b.as_str()), (StatusCode::OK, "ok"));
 
         let (s, b) = action_to_parts(&ActionResult::Failed("broker 500".into()));
-        assert_eq!((s, b.as_str()), (StatusCode::BAD_GATEWAY, "action failed"));
+        assert_eq!(
+            (s, b.as_str()),
+            (StatusCode::BAD_GATEWAY, "action failed: broker 500")
+        );
 
         let (s, b) = action_to_parts(&ActionResult::Rejected {
             status: 412,
@@ -804,8 +808,24 @@ mod tests {
             "entry-failed: ambiguous-success".into(),
         ));
         assert_eq!(s, StatusCode::BAD_GATEWAY);
-        assert_ne!(b, "action failed");
+        assert!(!b.contains("action failed"), "{b}");
         assert!(b.contains("check the broker"), "{b}");
+    }
+
+    #[test]
+    fn ctrader_market_failure_reason_reaches_the_caller_and_request_record() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        let reason = "entry-failed: broker-rejected (broker rejected the order: cTrader market entries are unavailable until post-fill absolute SL/TP normalization is verified; use stop or limit entries)";
+        let out = DispatchOutcome::from_action(&ActionResult::Failed(reason.into()));
+        assert_eq!(out.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(out.body, format!("action failed: {reason}"));
+        assert_eq!(out.record, reason);
     }
 
     #[test]
@@ -838,10 +858,10 @@ mod tests {
              r_at_widen=0.35 < min_r=1.00)"
         );
 
-        // Failed: body is the flat "action failed", record keeps the reason.
+        // Failed: body includes its reason, record keeps the unprefixed outcome.
         let failed = ActionResult::Failed("broker 500".into());
         let out = DispatchOutcome::from_action(&failed);
-        assert_eq!(out.body, "action failed");
+        assert_eq!(out.body, "action failed: broker 500");
         assert_eq!(out.record, "broker 500");
 
         // Ok: body "ok", record the success outcome.

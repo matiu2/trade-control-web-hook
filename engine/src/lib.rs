@@ -59,6 +59,7 @@ pub use trade_control_core::trade_plan::{
 mod entry_conditions;
 mod ma_enablement;
 pub mod pullback;
+pub mod spread_identity;
 
 mod evaluate;
 pub use evaluate::{

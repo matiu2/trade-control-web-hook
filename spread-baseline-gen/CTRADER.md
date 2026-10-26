@@ -32,6 +32,15 @@ target/release/bake-ctrader --account ctrader-demo \
 ```
 
 `--only EURUSD,AUDUSD` restricts a fresh run to exact native broker names.
+Explicit selection uses the 93 audited native non-stock mappings in
+`broker_ctrader::catalogue`, each with a verified spread schedule. Stocks, ETFs
+and unverified aliases are refused, even if a generic catalogue recognises the
+name. This does not enable broker order sizing or live trading.
+`--all-instruments` explicitly discovers enabled, recognized **non-stock**
+markets for this rollout. Stocks, missing mappings and missing/unknown schedule
+timezones remain explicit exclusions; no class-derived calendar is guessed.
+This flag cannot combine with `--only` or `--resume`. Resume uses the original
+report's fixed symbol list and sampling dates.
 `--from` and `--to` accept RFC3339 UTC timestamps; explicit starts must be minute
 aligned, ends are rounded down to a completed minute. `--from` overrides `--days`.
 A run is bounded to 366 days and `--window-hours` accepts 1–24, default 24.
@@ -94,13 +103,15 @@ Baking changes source data only. Build and deploy consumers separately to activa
 the new rows. No estimated spread is installed while calibration is incomplete.
 
 
-## Add palladium without repeating the FX collection
+## Add measured instruments without repeating the FX collection
 
-The default universe and `finish-ctrader` remain FX-only. Explicit
-`--only XPDUSD` also permits read-only palladium spread calibration using its
-exact enabled broker symbol, native ID and native pip precision. No other
-commodity class is enabled by this exception, and no contract sizing or live
-non-FX order support is implied.
+The default universe and `finish-ctrader` remain FX-only. Explicit `--only`
+accepts audited native non-stock names with verified schedule metadata, including
+Gold (`XAUEUR`), indices, energy markets, crypto and FX. The same exact enabled broker name,
+native ID and native pip checks apply to every non-FX instrument; FX additionally
+retains broker currency-leg validation. No contract sizing or live non-FX order
+support is implied. A class being supported does not mean that every native
+broker name has a trustworthy catalogue mapping or schedule yet.
 
 Use a **new report**, pinned to the same dates as the completed FX table:
 
@@ -116,10 +127,21 @@ target/release/bake-ctrader --account ctrader-demo --merge \
 
 The original report is never rewritten. The same genuine paired M1 history,
 90-day minimum, statistical quality gates and fresh broker identity/pip checks
-apply to palladium. An incomplete or insufficient report is refused.
+apply to every class. An incomplete or insufficient report is refused.
+
+For Gold/EUR, use `--only XAUEUR` and a new report such as
+`ctrader-demo-xaueur-90d-report.json`, preserving the table's UTC sampling bounds.
+For a non-stock batch, obtain the ready native names from catalogue inventory and
+subtract already measured account keys, then pass that explicit list via
+`--only`. This avoids downloading the 55 completed profiles again. The direct
+baker's `--merge` handles missing-only batch reports; `finish-ctrader` intentionally
+continues to require the entire default FX universe and is not a missing-only
+batch finisher.
 
 `--merge` requires matching verified identity and sampling-window headers, adds
-only previously absent keys and refuses duplicate replacement. It cannot combine
+only previously absent keys and refuses duplicate replacement. Verified printable
+ASCII native names retain their punctuation and spaces; keys are JSON-quoted
+and stay scoped to their exact account. It cannot combine
 with `--allow-partial`. Both ordinary and additive bakes share an advisory output
 lock; its empty `.rs.lock` sidecar remains for stable lock identity. The source
 guard excludes this exact generated lock artifact alongside the generated table.
@@ -128,3 +150,57 @@ An ordinary replacement also refuses to remove any already measured symbol.
 After palladium is added, a later FX-only table cannot silently erase it: a full
 replacement report must include every existing profile, while `--merge` is only
 for new symbols. Rebuild and deploy consumers after the measured row is added.
+
+
+## Durable missing-only non-stock completion
+
+Build the dedicated runner beside the generator and baker:
+
+```sh
+cargo build --release -p spread-baseline-gen --bin generate-ctrader \
+  --bin bake-ctrader --bin finish-ctrader-nonstocks
+
+# Example only: replace the --only list with the actual missing native keys.
+# Use a new batch report/status; existing matching reports resume automatically.
+target/release/finish-ctrader-nonstocks --account ctrader-demo \
+  --workspace . --only XAUEUR \
+  --from 2026-07-24T16:26:00Z --to 2026-10-22T16:26:00Z \
+  --report spread-baseline-gen/validation/ctrader-demo-missing-nonstocks-90d-report.json \
+  --status spread-baseline-gen/validation/ctrader-demo-missing-nonstocks-status.json
+```
+
+Select exact native names from the current audited inventory and subtract the
+latest table's account-qualified keys **after any ongoing bake finishes**. Quote
+`--only` values containing spaces. The runner accepts only audited non-stock
+names and explicit closed-minute bounds of 90–366 days. Before collection, it
+reauthenticates the demo account and verifies selected symbols are enabled and
+unambiguous, the existing table has the same identity and exact UTC window, and
+every selected key is missing. Existing reports must match that identity, subset
+and window before resume; unrelated reports are never selected for overwrite.
+
+On completion it rechecks account/catalogue identity, requires every selected
+profile to pass the strict quality gates, and invokes `bake-ctrader --merge`
+without partial promotion. A report lock spans verification, merge and checks.
+The original table bytes must remain unchanged during collection. Source and
+dependency snapshots include existing drafts; any later source change stops
+activation while retaining the report and cached windows. The runner reuses the
+FX finisher's release tests, strict Clippy and formatting gates. It does not retry
+failed collection automatically: fix the cause and rerun the same command to
+resume. No Git writes or broker orders are performed.
+
+Append `--deploy-staging` only when running from the staging branch to deploy
+after all gates and verify the staging worker is active. Deployment is otherwise
+absent. Status JSON records source hashes, progress and failure reasons; run the
+command in a persistent user service for a long collection. The original
+`finish-ctrader` continues to verify the full default FX universe.
+
+If the additive merge succeeds but a later check or deployment fails, rerun the
+same account, dates, `--only`, report and status arguments with `--verify-baked`.
+This explicit recovery mode requires the complete exact-scope report and every
+selected row already present **byte-for-byte** as freshly rendered from that
+quality-checked report, with matching table identity and sampling window. It
+reauthenticates the current demo account and verifies native symbol IDs and pip
+metadata, then reruns the release/deployment gates under source and table guards.
+It never invokes collection or baking, and accepts neither mixed present/missing
+coverage nor an incomplete, stale or different report. Ordinary missing-only
+mode continues to refuse already measured keys.

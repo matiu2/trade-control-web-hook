@@ -21,10 +21,11 @@
 
 use crate::fetch_events_for_range;
 use chrono::{DateTime, Local, Utc};
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, ensure, eyre};
 use instrument_lookup::resolve;
 use news_sentiment_tv::{analyze_sentiment, sentiment_lookback_start};
 use tracing::warn;
+use trade_control_core::intent::BrokerKind;
 use trade_control_core::plan_sentiment::PlanSentiment;
 use trade_control_core::trade_plan::TradePlan;
 
@@ -36,7 +37,7 @@ pub async fn resolve_replay_sentiment(
     start: DateTime<Utc>,
 ) -> Option<PlanSentiment> {
     let at = plan.armed_at.unwrap_or(start);
-    match compute(&plan.instrument, at).await {
+    match compute(plan, at).await {
         Ok(snap) => snap,
         Err(e) => {
             warn!(error = %e, instrument = %plan.instrument, "replay sentiment: unavailable; skipping");
@@ -48,10 +49,8 @@ pub async fn resolve_replay_sentiment(
 /// Resolve the instrument's news currencies, fetch events over the lookback
 /// window ending at `at`, and analyze. `Ok(None)` when the instrument has no
 /// news currencies (nothing to score).
-async fn compute(instrument: &str, at: DateTime<Utc>) -> Result<Option<PlanSentiment>> {
-    let asset = resolve(instrument)
-        .map_err(|e| eyre!("instrument-lookup overlay error resolving {instrument:?}: {e}"))?
-        .ok_or_else(|| eyre!("instrument {instrument:?} not in the instrument-lookup catalog"))?;
+async fn compute(plan: &TradePlan, at: DateTime<Utc>) -> Result<Option<PlanSentiment>> {
+    let asset = asset_for_plan(plan)?;
     if asset.news_currencies.is_empty() {
         return Ok(None);
     }
@@ -65,3 +64,27 @@ async fn compute(instrument: &str, at: DateTime<Utc>) -> Result<Option<PlanSenti
     let analysis = analyze_sentiment(&asset.news_currencies, &events, at_local);
     Ok(Some(analysis.to_plan_sentiment()))
 }
+
+fn asset_for_plan(plan: &TradePlan) -> Result<&'static instrument_lookup::Asset> {
+    let instrument = &plan.instrument;
+    let brokers: Vec<_> = plan
+        .rules
+        .iter()
+        .filter(|rule| rule.intent.instrument == *instrument)
+        .map(|rule| rule.intent.broker)
+        .collect();
+    if brokers.contains(&BrokerKind::Ctrader) {
+        ensure!(
+            brokers.iter().all(|broker| *broker == BrokerKind::Ctrader),
+            "replay sentiment cannot select cTrader metadata for mixed broker rules"
+        );
+        return broker_ctrader::catalogue::replay_asset(instrument);
+    }
+    resolve(instrument)
+        .map_err(|e| eyre!("instrument-lookup overlay error resolving {instrument:?}: {e}"))?
+        .ok_or_else(|| eyre!("instrument {instrument:?} not in the instrument-lookup catalog"))
+}
+
+#[cfg(test)]
+#[path = "sentiment/tests.rs"]
+mod tests;

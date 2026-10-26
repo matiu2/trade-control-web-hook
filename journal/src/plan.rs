@@ -10,12 +10,12 @@
 //! (the plan format evolves often) doesn't break the journal.
 
 use color_eyre::eyre::{Result, eyre};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use trade_control_core::screenshot::ScreenshotUrl;
 
 /// One plan as summarised by `plan list --yaml`. Terminated (archived) plans
 /// carry `archived_at`; live plans leave it `None`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct PlanRow {
     pub trade_id: String,
     #[serde(default)]
@@ -95,7 +95,8 @@ fn sort_oldest_event_first(rows: &mut [PlanRow]) {
 }
 
 /// How the trade enters — classified from which enter rules the plan carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EntryMode {
     /// `05-enter` only — the H&S break-and-close-then-retest stop entry.
     Normal,
@@ -124,7 +125,7 @@ impl EntryMode {
 /// `--skip-retest` halves) omit them so the enter fires directly on the pine
 /// pattern. This is derived from the presence of the `03-prep-break-and-close`
 /// and `04-prep-retest` rules — the plan's `preps` list isn't reliably present.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct BcrPreps {
     /// `03-prep-break-and-close` is present.
     pub break_and_close: bool,
@@ -164,7 +165,8 @@ impl BcrPreps {
 }
 
 /// The order type of one enter leg, from the intent's `entry.type`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OrderType {
     Market,
     Stop,
@@ -193,7 +195,7 @@ impl OrderType {
 }
 
 /// The info-bar facts distilled from `plan export`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PlanDetail {
     pub trade_id: String,
     pub instrument: String,

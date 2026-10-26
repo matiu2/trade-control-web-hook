@@ -20,6 +20,7 @@
 //! a different bar — is comparable.
 
 use chrono::DateTime;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::timeline::ts_to_bne;
@@ -27,7 +28,7 @@ use crate::timeline::ts_to_bne;
 /// One rule fire, reduced to the fields the diff joins on. `rule_id` is the join
 /// key; `action` is informational (`pause`, `enter`, …); `ts` is normalised
 /// Brisbane `YYYY-MM-DD HH:MM` so the two sides' timings line up for comparison.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FireFact {
     pub rule_id: String,
     pub action: Option<String>,
@@ -48,7 +49,7 @@ pub struct FireFact {
 /// Outcome-level facts parsed from the replay summary line, for a coarse
 /// sanity-check alongside the per-fire diff. All optional — a non-`--simulate`
 /// report has no TP/SL/Net-R.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ReplayOutcome {
     pub done: Option<bool>,
     pub final_phase: Option<String>,
@@ -59,7 +60,7 @@ pub struct ReplayOutcome {
 }
 
 /// One timing divergence: the same rule, on bars that do not line up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TimingDelta {
     pub rule_id: String,
     pub live_ts: String,
@@ -69,7 +70,7 @@ pub struct TimingDelta {
 }
 
 /// The classified diff between the live fires and the replay fires.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Divergences {
     /// Rule ids that fired on both sides, with matching normalised timing.
     pub matches: Vec<FireFact>,

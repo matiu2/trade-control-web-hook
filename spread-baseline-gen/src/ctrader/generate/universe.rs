@@ -4,6 +4,7 @@ use color_eyre::{Result, eyre::ensure};
 pub(super) async fn select(
     data: &ChartData,
     only: &[String],
+    all_instruments: bool,
 ) -> Result<(Vec<String>, Vec<crate::mt5::Failure>)> {
     let catalogue = data.catalogue().await?;
     ensure!(
@@ -18,10 +19,19 @@ pub(super) async fn select(
         .iter()
         .filter(|s| s.enabled != Some(false) && (only.is_empty() || only.contains(&s.name)))
     {
-        match super::super::calibration::asset(&symbol.name, !only.is_empty()) {
+        let selected = if only.is_empty() {
+            super::super::calibration::discovery_asset(&symbol.name, all_instruments)
+        } else {
+            super::super::calibration::asset(&symbol.name, true)
+        };
+        match selected {
             Ok(_) => {
-                match super::super::calibration::metadata(data, &symbol.name, !only.is_empty())
-                    .await
+                match super::super::calibration::metadata(
+                    data,
+                    &symbol.name,
+                    !only.is_empty() || all_instruments,
+                )
+                .await
                 {
                     Ok(_) => requested.push(symbol.name.clone()),
                     Err(error)
@@ -35,12 +45,12 @@ pub(super) async fn select(
                         });
                     }
                     Err(error) => {
-                        return Err(error.wrap_err("verify supported broker FX catalogue"));
+                        return Err(error.wrap_err("verify supported broker instrument catalogue"));
                     }
                 }
             }
             Err(error) if only.is_empty() => {
-                tracing::info!(symbol=symbol.name, %error, "excluded from supported FX calibration universe");
+                tracing::info!(symbol=symbol.name, %error, "excluded from supported calibration universe");
                 excluded.push(crate::mt5::Failure {
                     symbol: symbol.name.clone(),
                     error: format!("{error:#}"),
@@ -53,7 +63,7 @@ pub(super) async fn select(
     requested.dedup();
     ensure!(
         !requested.is_empty(),
-        "account has no supported FX instruments"
+        "account has no supported instruments for this calibration selection"
     );
     Ok((requested, excluded))
 }
