@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn alignment_filter_reaches_both_strategies_without_adding_a_veto() {
         for trend in [false, true] {
-            let json = plan_json_with(trend, "alignment-wire", true, &["--require-ma-alignment"]);
+            let json = plan_json_with(trend, "alignment-wire", true, &["--ma-cross-pause"]);
             assert_eq!(json["entry_conditions"]["require_ma_alignment"], true);
             let plan: trade_control_core::trade_plan::TradePlan =
                 serde_json::from_value(json).unwrap();

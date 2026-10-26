@@ -4,17 +4,13 @@ use clap::Parser;
 #[test]
 fn alignment_is_independent_of_veto_and_rejects_direct_entry() {
     for flags in [vec![], vec!["--trend"], vec!["--ma-cross-veto"]] {
-        let args = Args::try_parse_from(
-            ["tv-arm", "--require-ma-alignment"]
-                .into_iter()
-                .chain(flags),
-        )
-        .unwrap()
-        .apply_aliases();
-        assert!(args.require_ma_alignment);
+        let args = Args::try_parse_from(["tv-arm", "--ma-cross-pause"].into_iter().chain(flags))
+            .unwrap()
+            .apply_aliases();
+        assert!(args.ma_cross_pause);
         assert!(args.validate().is_ok());
     }
-    let direct = Args::try_parse_from(["tv-arm", "--market-entry", "--require-ma-alignment"])
+    let direct = Args::try_parse_from(["tv-arm", "--market-entry", "--ma-cross-pause"])
         .unwrap()
         .apply_aliases();
     assert!(direct.validate().is_err());
@@ -85,4 +81,16 @@ fn enabling_ma_is_independent_of_the_signal_touch_filter() {
     .unwrap()
     .apply_aliases();
     assert!(direct.validate().is_err());
+}
+
+#[test]
+fn replaced_alignment_option_is_not_an_alias() {
+    use tracing_subscriber::prelude::*;
+    tracing_subscriber::registry()
+        .with(tracing_error::ErrorLayer::default())
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer().with_test_writer())
+        .try_init()
+        .ok();
+    assert!(Args::try_parse_from(["tv-arm", "--require-ma-alignment"]).is_err());
 }
