@@ -890,13 +890,13 @@ pub async fn run_with_upkeep(
                 None
             };
             fires.push(Fire {
-                ma_warmup: if fired
-                    .intent
-                    .breakeven
-                    .is_some_and(|be| be.trigger.includes_ma_cross())
-                {
-                    candles[fire_index.saturating_sub(trade_control_core::ma_cross::HISTORY_BARS)
-                        ..fire_index]
+                ma_warmup: if fired.intent.breakeven.is_some_and(|be| be.has_ma_veto()) {
+                    candles[fire_index.saturating_sub(
+                        fired
+                            .intent
+                            .breakeven
+                            .map_or(0, |be| be.ma_veto_history_bars()),
+                    )..fire_index]
                         .to_vec()
                 } else {
                     Vec::new()

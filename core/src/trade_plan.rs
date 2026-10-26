@@ -333,6 +333,11 @@ pub struct ConditionRule {
 pub enum Trigger {
     /// A fresh adverse close-confirmed swap of 9 EMA and 20 SMA.
     AdverseMaCross { dir: Direction },
+    /// A close crossing an average against the trade, using each bar's own MA.
+    AdverseMaBreak {
+        average: crate::moving_average::MovingAverage,
+        dir: Direction,
+    },
     /// Price crosses a fixed horizontal level (`01-veto-too-high/low` on a
     /// horizontal invalidation line). The `level` is an absolute MID price.
     HorizontalCross {

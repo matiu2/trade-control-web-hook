@@ -3681,6 +3681,33 @@ options. In local-chart, the same option is the **ma cross veto** checkbox under
 **Exit rules** in both Register and Replay; the UI and CLI share the plan builder,
 core MA calculations, engine and replay policy.
 
+### Veto a 200 SMA break and close — `--sma-200-break-veto`
+
+```sh
+tv-arm-staging --spec-url='http://localhost:8790/arm-setup?...' \
+  --trend --sma-200-break-veto --ma-cross-veto register
+```
+
+An adverse **price** break of the 200 SMA is independent of the 9 EMA/20 SMA
+cross. A long is vetoed when a closed candle moves from at/above its 200 SMA to
+below it; a short mirrors this, closing above from at/below. Each candle uses
+its own contemporaneous SMA. Wicks and an already-adverse ordering when armed
+do not count as a fresh break. No retest is required.
+
+The veto blocks later entries for this arm and cancels unfilled orders. Open
+positions retain exit monitoring; a post-fill break can tighten SL to the actual
+fill price only while both the event's executable close and the current exit
+quote are profitable. A better stop is never loosened. The existing spread-widen
+exclusions still apply to break-even arming. `--no-breakeven` disables the
+percentage trigger, leaving either selected MA protection active.
+
+The shared policy retains at least 201 bars to establish both sides of the break;
+insufficient history blocks entry. This combines with either MA-touch filter,
+the retracement gate and `--ma-cross-veto`. In local-chart it appears beside
+**ma cross veto** in **Trend → Exit**, using the same signed plan and live/replay
+logic. Direct position and M/W geometry entry restrictions match the other MA
+protection options.
+
 ### Server-side engine registration (`register`)
 
 Trades are armed **server-side**: the worker evaluates every trigger itself on
