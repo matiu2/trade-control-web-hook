@@ -1,9 +1,11 @@
-//! Signed, read-only worker access with complete audit evidence preserved.
+//! Signed worker journal access with complete audit evidence preserved.
 //!
 //! Construct and call this blocking client outside an async runtime worker
 //! (for example, inside `tokio::task::spawn_blocking`). Destination and key
 //! path must come from trusted server configuration, never browser input.
 
+#[cfg(test)]
+mod deletion_tests;
 mod evidence;
 #[cfg(test)]
 mod tests;
@@ -16,7 +18,8 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 use reqwest::Url;
 use reqwest::blocking::Client;
 use trade_control_cli::{
-    build_plan_list_intent, build_plan_show_intent, build_plan_timeline_intent, wrap_signed,
+    build_plan_delete_intent, build_plan_list_intent, build_plan_show_intent,
+    build_plan_timeline_intent, wrap_signed,
 };
 use trade_control_core::intent::Intent;
 use trade_control_core::sig::{KEY_LEN, parse_key_hex};
@@ -24,7 +27,7 @@ use trade_control_core::sig::{KEY_LEN, parse_key_hex};
 use crate::plan::{PlanRow, parse_plan_list};
 pub use evidence::{RecordedTimeline, ReplayComparison, StoredPlan, compare_timeline_with_replay};
 
-/// A native worker reader. Private signing material is never serialized or
+/// A native worker journal client. Private signing material is never serialized or
 /// included in `Debug` output; clones reuse the bounded HTTP connection pool.
 #[derive(Clone)]
 pub struct JournalClient {
@@ -75,17 +78,25 @@ impl JournalClient {
         RecordedTimeline::from_value(raw)
     }
 
+    /// Delete matching live and archived plans and state across account scopes.
+    /// The worker does not cancel broker orders or close positions.
+    pub fn delete(&self, trade_id: &str) -> Result<String> {
+        validate_trade_id(trade_id)?;
+        let intent = build_plan_delete_intent(trade_id, Utc::now(), &request_suffix()?);
+        parse_delete_response(trade_id, self.post(&intent)?)
+    }
+
     fn post(&self, intent: &Intent) -> Result<String> {
-        let body = wrap_signed(intent, &self.key, Utc::now())
-            .wrap_err("sign journal worker read request")?;
-        tracing::debug!(action = ?intent.action, "reading journal worker evidence");
+        let body =
+            wrap_signed(intent, &self.key, Utc::now()).wrap_err("sign journal worker request")?;
+        tracing::debug!(action = ?intent.action, "sending journal worker request");
         let response = self
             .client
             .post(self.endpoint.clone())
             .header(reqwest::header::CONTENT_TYPE, "text/plain")
             .body(body)
             .send()
-            .wrap_err("send journal worker read request")?;
+            .wrap_err("send journal worker request")?;
         let status = response.status();
         let text = response.text().wrap_err("read journal worker response")?;
         if !status.is_success() {
@@ -93,6 +104,24 @@ impl JournalClient {
         }
         Ok(text)
     }
+}
+
+fn parse_delete_response(trade_id: &str, body: String) -> Result<String> {
+    let prefix = format!("plan-deleted: {trade_id} (");
+    let count = body
+        .strip_prefix(&prefix)
+        .and_then(|text| text.strip_suffix(')'));
+    if count.is_some_and(|count| {
+        count == "noop"
+            || (count.bytes().all(|byte| byte.is_ascii_digit())
+                && !count.starts_with('0')
+                && count.parse::<usize>().is_ok_and(|count| count > 0))
+    }) {
+        return Ok(body);
+    }
+    Err(eyre!(
+        "journal worker returned an invalid plan-delete response: {body}"
+    ))
 }
 
 fn parse_list_response(body: &str) -> Result<Vec<PlanRow>> {
