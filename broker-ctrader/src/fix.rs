@@ -16,6 +16,7 @@ use trade_control_core::{broker::*, settlement::Settlement};
 mod evidence;
 mod management;
 mod mapping;
+pub(crate) mod reconciliation;
 #[cfg(test)]
 mod tests;
 

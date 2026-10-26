@@ -43,6 +43,7 @@
 
 use std::sync::Arc;
 
+mod reconciliation;
 mod registration;
 
 use axum::{
@@ -518,6 +519,7 @@ async fn dispatch_broker(
     // Branch on the broker kind exactly like the wasm worker: build the concrete
     // broker, then monomorphize the shared `run_action` per arm. On acquire
     // failure, mirror the worker's statuses (OANDA → 500, TradeNation → 503).
+    let mut ctrader_broker = None;
     let result = match verified.intent.broker {
         BrokerKind::Oanda => match acquire_oanda(&meta, &state.secrets) {
             Ok(broker) => run_action(&broker, &state.store, verified, &cfg, now, body).await,
@@ -565,7 +567,11 @@ async fn dispatch_broker(
             }
         },
         BrokerKind::Ctrader => match acquire_ctrader(&meta).await {
-            Ok(broker) => run_action(&broker, &state.store, verified, &cfg, now, body).await,
+            Ok(broker) => {
+                let result = run_action(&broker, &state.store, verified, &cfg, now, body).await;
+                ctrader_broker = Some(broker);
+                result
+            }
             Err(err) => {
                 tracing::error!("ctrader acquire failed: {err}");
                 return DispatchOutcome::plain(
@@ -576,12 +582,20 @@ async fn dispatch_broker(
         },
     };
 
-    // Shared seen-index write (only `Ok` marks; `Failed`/`Rejected` log only).
+    // Preserve replay poison before any optional read-only evidence lookup.
     record_dispatcher_outcome(&state.store, verified, now, &result).await;
     // The HTTP body is caller-facing; the *record* keeps the rich outcome
     // (`ActionResult::record_outcome`) so `plan timeline` / `status` shows the
     // same concise verdict the offline replay does — see `DispatchOutcome`.
-    DispatchOutcome::from_action(&result)
+    let mut outcome = DispatchOutcome::from_action(&result);
+    if let Some(broker) = ctrader_broker
+        && let Some((status, body)) =
+            reconciliation::response(&broker, verified, &cfg, &result).await
+    {
+        outcome.status = status;
+        outcome.body = body;
+    }
+    outcome
 }
 
 /// Account-resolution failure modes at the native edge.
@@ -637,8 +651,8 @@ fn action_to_parts(result: &ActionResult) -> (StatusCode, String) {
         ),
         ActionResult::AmbiguousSuccess(_) => (
             StatusCode::BAD_GATEWAY,
-            "ambiguous: broker call may have succeeded, response unreadable — \
-             check the broker before retrying"
+            "ambiguous: unconfirmed execution/protection state — \
+             do not retry; check the broker and reconcile the original request"
                 .to_string(),
         ),
     }

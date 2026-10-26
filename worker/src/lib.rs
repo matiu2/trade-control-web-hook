@@ -8,6 +8,7 @@ mod config;
 mod dispatch_config_native;
 mod engine_health;
 mod entry_notifications;
+pub mod entry_reconciliation;
 pub mod http;
 mod manual_close_audit;
 mod native_cron;

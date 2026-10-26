@@ -2,7 +2,7 @@ use super::*;
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 use wire::{array, integer, is_enum};
 mod geometry;
-mod market;
+pub(crate) mod market;
 mod sizing;
 mod validate;
 pub(crate) use geometry::payload;

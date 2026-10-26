@@ -2,7 +2,7 @@
 use super::*;
 use proof::{account, trade_data};
 
-pub(super) fn position<'a>(
+pub(crate) fn position<'a>(
     snapshot: &'a Value,
     terms: &Terms,
     order: i64,
@@ -70,7 +70,7 @@ pub(super) fn fill_geometry(position: &Value, terms: &Terms) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn protected(position: &Value, terms: &Terms, id: i64, filled: i64) -> Result<()> {
+pub(crate) fn protected(position: &Value, terms: &Terms, id: i64, filled: i64) -> Result<()> {
     identity(position, terms, id, filled)?;
     fill_geometry(position, terms)?;
     ensure!(

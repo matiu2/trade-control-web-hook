@@ -12,6 +12,15 @@ enum Backend {
 }
 
 impl CtraderBroker {
+    pub(crate) fn hybrid_backend(&self) -> Result<&hybrid::Hybrid> {
+        match &self.backend {
+            Backend::Hybrid(broker) => Ok(broker),
+            _ => color_eyre::eyre::bail!(
+                "this operation requires an identity-verified cTrader hybrid demo account"
+            ),
+        }
+    }
+
     pub async fn connect(name: &str) -> Result<Self> {
         Self::connect_profile(name, access::Profile::load(name)?).await
     }

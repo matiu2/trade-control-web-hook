@@ -50,6 +50,13 @@ fn state_root() -> Result<PathBuf> {
         .ok_or_else(|| eyre!("cTrader FIX audit directory unavailable; no mutation sent"))?;
     Ok(root.join("trade-control/ctrader-fix"))
 }
+pub(super) fn reconciliation_directory(broker: &FixBroker) -> Result<PathBuf> {
+    let root = state_root()?;
+    private_directory(&root)?;
+    let directory = root.join(account_key(broker));
+    private_directory(&directory)?;
+    Ok(directory)
+}
 fn private_directory(path: &Path) -> Result<()> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -103,6 +110,20 @@ impl AccountLock {
         Self::acquire_at(broker, &state_root()?)
     }
     pub(super) fn acquire_at(broker: &FixBroker, root: &Path) -> Result<Self> {
+        Self::acquire_inner(broker, root, None)
+    }
+    pub(super) fn reconciliation(broker: &FixBroker, audit_id: &str) -> Result<Self> {
+        ensure!(
+            !audit_id.is_empty()
+                && audit_id.len() <= 50
+                && audit_id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"-_.:".contains(&c)),
+            "invalid reconciliation audit ID"
+        );
+        Self::acquire_inner(broker, &state_root()?, Some(audit_id))
+    }
+    fn acquire_inner(broker: &FixBroker, root: &Path, allowed: Option<&str>) -> Result<Self> {
         private_directory(root)?;
         let directory = root.join(account_key(broker));
         private_directory(&directory)?;
@@ -128,7 +149,7 @@ impl AccountLock {
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
             "another cTrader FIX management operation is active; no mutation sent"
         );
-        check_resolved(&directory)?;
+        check_resolved_except(&directory, allowed)?;
         Ok(Self {
             _file: file,
             directory,
@@ -136,6 +157,9 @@ impl AccountLock {
     }
 }
 fn check_resolved(directory: &Path) -> Result<()> {
+    check_resolved_except(directory, None)
+}
+fn check_resolved_except(directory: &Path, allowed: Option<&str>) -> Result<()> {
     let entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
     ensure!(
         entries.len() <= MAX_FILES,
@@ -177,7 +201,8 @@ fn check_resolved(directory: &Path) -> Result<()> {
             }
         }
         ensure!(
-            resolved,
+            resolved
+                || allowed.is_some_and(|id| entry.file_name() == format!("{id}.jsonl").as_str()),
             "unresolved cTrader FIX mutation intent exists; reconcile its recorded client order ID before further mutations"
         );
     }
@@ -280,7 +305,7 @@ pub(super) async fn finish<T>(
     result
 }
 
-fn account_identity(broker: &FixBroker) -> Value {
+pub(super) fn account_identity(broker: &FixBroker) -> Value {
     json!({"sender_comp_id":broker.trade.sender_comp_id,"target_comp_id":broker.trade.target_comp_id,
         "quote_host":broker.quote.host,"quote_port":broker.quote.port,"trade_host":broker.trade.host,"trade_port":broker.trade.port})
 }

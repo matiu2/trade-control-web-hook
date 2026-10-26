@@ -9,6 +9,7 @@ mod history;
 mod management;
 pub mod market_data;
 mod metadata;
+pub mod reconciliation;
 mod session;
 #[cfg(test)]
 mod tests;

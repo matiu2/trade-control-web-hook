@@ -3,12 +3,12 @@ use super::*;
 use std::{collections::BTreeSet, future::Future, time::Duration};
 use tokio::time::{sleep, timeout};
 
-mod position;
-mod proof;
+pub(crate) mod position;
+pub(crate) mod proof;
 #[cfg(test)]
 mod tests;
 
-pub(super) struct Terms {
+pub(crate) struct Terms {
     pub account: i64,
     pub symbol: i64,
     pub volume: i64,

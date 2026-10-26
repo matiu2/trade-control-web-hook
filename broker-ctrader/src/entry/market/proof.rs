@@ -2,7 +2,7 @@
 use super::*;
 use std::collections::BTreeSet;
 
-pub(super) fn account(payload: &Value, terms: &Terms) -> Result<()> {
+pub(crate) fn account(payload: &Value, terms: &Terms) -> Result<()> {
     ensure!(
         integer(payload, "ctidTraderAccountId")? == terms.account,
         "market evidence belongs to another account"
@@ -106,7 +106,7 @@ pub(super) fn trade_data(data: &Value, terms: &Terms, volume: i64) -> Result<()>
     Ok(())
 }
 
-pub(super) fn terminal(detail: &Value, terms: &Terms, id: i64) -> Result<Option<i64>> {
+pub(crate) fn terminal(detail: &Value, terms: &Terms, id: i64) -> Result<Option<i64>> {
     let order = &detail["order"];
     ensure!(
         integer(order, "orderId")? == id

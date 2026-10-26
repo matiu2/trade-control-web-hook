@@ -19,6 +19,10 @@ path = "src/bin/accounts.rs"
 name = "trade-control-broker-check"
 path = "src/bin/broker_check.rs"
 
+[[bin]]
+name = "trade-control-reconcile-entry"
+path = "src/bin/reconcile_entry.rs"
+
 [dependencies]
 mt5-data-source = { path = "../../mt5-data-source" }
 broker-mt5 = { path = "../broker-mt5" }

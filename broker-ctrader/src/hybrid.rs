@@ -1,5 +1,6 @@
 //! Bind FIX management to Open API risk, protection and history for the same account.
 use super::*;
+mod exact_close;
 mod writes;
 
 pub(crate) struct Hybrid {
