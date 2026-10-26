@@ -224,6 +224,17 @@ mod tests {
         init();
         let schema = options();
         assert!(schema.arm.iter().any(|d| d.long == "enable-on-ma-touch"));
+        let alignment = schema
+            .arm
+            .iter()
+            .find(|d| d.long == "ma-cross-pause")
+            .unwrap();
+        assert_eq!(alignment.id, "ma_cross_pause");
+        assert_eq!(alignment.label, "ma cross pause");
+        assert!(!schema.arm.iter().any(|d| d.long == "require-ma-alignment"));
+        assert_eq!(alignment.kind, "boolean");
+        assert_eq!(alignment.group, "Entry conditions");
+        assert!(alignment.help.contains("Unfilled orders are held"));
         let cross = schema
             .arm
             .iter()

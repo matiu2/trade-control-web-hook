@@ -120,6 +120,8 @@
 
 use chrono::{DateTime, Duration, Utc};
 
+mod ma_alignment;
+
 use crate::blackout_recreate::{RestorePlan, restore_plan};
 use crate::broker::{AttemptState, Broker, PendingOrder};
 use crate::dispatch::run_enter;
@@ -556,7 +558,7 @@ async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
             return;
         }
     };
-    let record = merge_cancelled_order(
+    let mut record = merge_cancelled_order(
         existing,
         &trade_id,
         &order.instrument,
@@ -571,7 +573,12 @@ async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
     );
     // TTL = block length + grace (concern 1), keyed off the record's own
     // `opened_at` so it matches the `expires_at` the merge stamped.
-    let ttl = spread_block_ttl_seconds(&order.instrument, record.opened_at);
+    if let Err(err) = ma_alignment::protect(store, &mut record).await {
+        tracing::error!(%trade_id, %err, "cannot preserve MA hold; leaving order untouched");
+        return;
+    }
+    let ttl = spread_block_ttl_seconds(&order.instrument, record.opened_at)
+        .max((record.expires_at - now).num_seconds().max(1) as u64);
     if let Err(err) = store.upsert_held_trade_record(&record, ttl).await {
         tracing::error!(
             "pending-lifecycle[{scope}]: upsert_record({trade_id}) FAILED ({err}); NOT cancelling \
@@ -829,6 +836,27 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verifi
         return;
     }
 
+    // MA alignment can legitimately remain adverse for days. Retain the
+    // recoverable order until its named pause lifts; the spread-hour backstop
+    // must not discard it after a rejected re-drive into an active MA pause.
+    let mut protected = record.clone();
+    match ma_alignment::protect(store, &mut protected).await {
+        Ok(true) => {
+            if protected.expires_at != record.expires_at || protected.holders != record.holders {
+                let ttl = (protected.expires_at - now).num_seconds().max(1) as u64;
+                if let Err(err) = store.upsert_held_trade_record(&protected, ttl).await {
+                    tracing::error!(trade_id = %record.trade_id, %err, "cannot extend MA hold");
+                }
+            }
+            return;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::error!(trade_id = %record.trade_id, %err, "cannot check MA pause; retaining held order");
+            return;
+        }
+    }
+
     // NORMAL OFF trigger FIRST — release every satisfied reason. The restore fires
     // only on the release that EMPTIES the holder set, so overlapping reasons each
     // have to lift first. This is the path that should restore AUD/CHF at the
@@ -1010,7 +1038,9 @@ async fn release_satisfied<B: Broker, S: StateStore>(
     for reason in holders.clone().iter() {
         let released = match reason {
             HoldReason::SpreadHour => spread_hour_released(broker, record, now).await,
-            HoldReason::NewsPause => !pause_active(store, &record.trade_id).await,
+            HoldReason::NewsPause | HoldReason::MaAlignment => {
+                !pause_active(store, &record.trade_id).await
+            }
             // Purely the baked mask, mirroring the ON side. No live-quote
             // early-release analogue to `spread_hour_released`: a closed market
             // has no quote to recover, and a broker that returns a stale
@@ -1286,6 +1316,7 @@ pub fn backstop_due(opened_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod ma_alignment;
     use super::*;
     use crate::account::AccountCaps;
     use crate::broker::{

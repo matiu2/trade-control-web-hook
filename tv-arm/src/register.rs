@@ -239,8 +239,10 @@ pub(crate) fn register_trade_plan(
         crate::ma_cross_veto::configure(&mut plan, ma_requirements)?;
     }
     plan.entry_conditions.must_touch = ma_requirements.signal_touch.to_vec();
+    plan.entry_conditions.require_ma_alignment = ma_requirements.alignment;
     plan.entry_conditions.enable_on_ma_touch = ma_requirements.enabling_touch.to_vec();
     info!(retrace_line = ?plan.entry_conditions.retrace,
+        require_ma_alignment = plan.entry_conditions.require_ma_alignment,
         must_touch = ?plan.entry_conditions.must_touch,
         enable_on_ma_touch = ?plan.entry_conditions.enable_on_ma_touch,
         "resolved entry conditions (retracement requires a close; MA touch accepts wicks)");
@@ -595,6 +597,18 @@ mod tests {
             assert_eq!(averages[0], serde_json::json!({"kind":"ema","period":9}));
             assert_eq!(averages[2], serde_json::json!({"kind":"sma","period":200}));
             assert_eq!(json["entry_conditions"].get("retrace").is_some(), trend);
+        }
+    }
+
+    #[test]
+    fn alignment_filter_reaches_both_strategies_without_adding_a_veto() {
+        for trend in [false, true] {
+            let json = plan_json_with(trend, "alignment-wire", true, &["--ma-cross-pause"]);
+            assert_eq!(json["entry_conditions"]["require_ma_alignment"], true);
+            let plan: trade_control_core::trade_plan::TradePlan =
+                serde_json::from_value(json).unwrap();
+            assert!(!plan.has_ma_veto());
+            assert!(plan.detector_history_bars() >= 90);
         }
     }
 

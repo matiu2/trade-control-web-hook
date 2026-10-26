@@ -1495,6 +1495,7 @@ async fn inject_control_ticks(
 
 #[cfg(test)]
 mod tests {
+    mod ma_alignment;
     use super::*;
     use crate::replay_args::{DirectionFilter, GoldenFilter};
     use chrono::TimeZone;
