@@ -514,7 +514,7 @@ pub struct Args {
     /// vetoes. Does not veto the setup or alter open positions. Works with both
     /// reversal and --trend entries; independent of --ma-cross-veto.
     #[arg(long)]
-    pub require_ma_alignment: bool,
+    pub ma_cross_pause: bool,
 
     /// Require the entry signal pattern to touch ANY listed close-based MA on
     /// the setup timeframe, e.g. '9 ema|20 sma|200 sma'. A wick counts. For a
@@ -1037,7 +1037,7 @@ impl Args {
             cross_veto: self.ma_cross_veto,
             sma_200_break_veto: self.sma_200_break_veto,
 
-            alignment: self.require_ma_alignment,
+            alignment: self.ma_cross_pause,
         }
     }
     /// Expand convenience aliases into the concrete flags the pipeline
