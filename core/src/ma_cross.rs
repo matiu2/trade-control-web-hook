@@ -1,4 +1,4 @@
-//! Close-confirmed 9 EMA / 20 SMA reversal policy shared by live and replay.
+//! Close-confirmed moving-average protection shared by live and replay.
 use std::cmp::Ordering;
 
 use crate::broker::Candle;
@@ -81,7 +81,7 @@ pub fn cross_stop_at(
     index: usize,
     inputs: StopInputs,
 ) -> Option<f64> {
-    if !rule.trigger.includes_ma_cross() || !adverse_cross_at(candles, index, inputs.direction) {
+    if !rule.ma_veto_at(candles, index, inputs.direction) {
         return None;
     }
     tighten_to_fill(
@@ -96,4 +96,43 @@ pub fn cross_stop_at(
         inputs.current_stop,
         inputs.exit_price,
     )
+}
+
+#[cfg(test)]
+mod sma_break_tests;
+
+/// Both closes need their own contemporaneous average; one earlier bar seeds
+/// the side of the break. Unknown values fail closed rather than guessing.
+pub fn average_ready_at(candles: &[Candle], index: usize, average: MovingAverage) -> bool {
+    index
+        .checked_sub(1)
+        .and_then(|i| average.value_at(candles, i))
+        .is_some()
+        && average.value_at(candles, index).is_some()
+}
+
+/// A fresh price break and CLOSE against the trade, not a wick touch. An
+/// already-adverse close at arming is not itself a new break. Like MA cross,
+/// departure from equality counts; equality on the new close does not.
+pub fn average_break_at(
+    candles: &[Candle],
+    index: usize,
+    average: MovingAverage,
+    direction: Direction,
+) -> bool {
+    let relation = |i: usize| {
+        candles
+            .get(i)?
+            .c
+            .partial_cmp(&average.value_at(candles, i)?)
+    };
+    let adverse = match direction {
+        Direction::Long => Ordering::Less,
+        Direction::Short => Ordering::Greater,
+    };
+    relation(index) == Some(adverse)
+        && index
+            .checked_sub(1)
+            .and_then(relation)
+            .is_some_and(|previous| previous != adverse)
 }

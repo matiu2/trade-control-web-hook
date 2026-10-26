@@ -797,10 +797,7 @@ fn find_fill<'a>(
     dir: Direction,
     candles: &'a [BidAskCandle],
 ) -> Option<Fill<'a>> {
-    let candles = if intent
-        .breakeven
-        .is_some_and(|be| be.trigger.includes_ma_cross())
-    {
+    let candles = if intent.breakeven.is_some_and(|be| be.has_ma_veto()) {
         &candles[candles.partition_point(|c| c.time < shell.time)..]
     } else {
         candles
@@ -1734,6 +1731,7 @@ fn book_reaches(c: &BidAskCandle, book: Book, level: f64, approach: Approach) ->
 #[cfg(test)]
 mod tests {
     mod ma_cross_tests;
+    mod sma_break_tests;
     use super::*;
     use chrono::{DateTime, Utc};
     use trade_control_core::intent::{
