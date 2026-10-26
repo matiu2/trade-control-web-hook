@@ -131,3 +131,37 @@ async fn hybrid_symbol_validation_succeeds_with_fix_offline() {
             .is_err()
     );
 }
+
+/// Exercises real account sizing and quote reads; the request cannot submit an order.
+#[tokio::test]
+#[ignore = "requires CTRADER_METADATA_TEST_ACCOUNT and Open API demo access"]
+async fn hybrid_market_dry_run_validates_native_eurgbp_without_submission() {
+    init_tracing();
+    let account = std::env::var("CTRADER_METADATA_TEST_ACCOUNT").unwrap();
+    let broker = CtraderBroker::connect(&account).await.unwrap();
+    let Backend::Hybrid(hybrid) = &broker.backend else {
+        panic!("integration check requires a hybrid demo profile");
+    };
+    let symbol = broker.instrument_metadata("EURGBP").await.unwrap();
+    let quote = crate::metadata::quote(&hybrid.data, &symbol.name)
+        .await
+        .unwrap();
+    let scale = 10_f64.powi(symbol.digits as i32);
+    let snap = |price: f64| (price * scale).round() / scale;
+    let request = EntryRequest {
+        instrument: &symbol.name,
+        direction: Direction::Short,
+        entry: ResolvedEntry::Market {
+            reference_price: quote.bid,
+        },
+        stop_loss: snap(quote.ask + 10.0 * symbol.pip_size),
+        take_profit: snap(quote.bid - 20.0 * symbol.pip_size),
+        risk: RiskBudget::Units(symbol.min_units),
+        dry_run: true,
+        contract_multiplier: None,
+    };
+    let placement = broker.place_entry(1.0, u32::MAX, &request).await.unwrap();
+    assert_eq!(placement.order_id, "dry-run");
+    assert_eq!(placement.size, Some(symbol.min_units));
+    assert!(placement.price.is_some_and(|price| price > 0.0));
+}

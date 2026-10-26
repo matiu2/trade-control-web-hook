@@ -2,6 +2,7 @@ use super::*;
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 use wire::{array, integer, is_enum};
 mod geometry;
+mod market;
 mod sizing;
 mod validate;
 pub(crate) use geometry::payload;
@@ -11,12 +12,14 @@ pub(crate) use sizing::volume;
 fn reject(detail: impl Into<String>) -> EntryError {
     EntryError::OrderRejectedWithDetail(detail.into())
 }
-/// The core tracks absolute strategy protection. Relative market protection shifts
-/// with slippage; refuse until actual fills can be normalized and durably tracked.
-pub(crate) fn validate_entry_kind(req: &EntryRequest<'_>) -> std::result::Result<(), EntryError> {
-    if matches!(req.entry, ResolvedEntry::Market { .. }) {
+/// Real market entries require the durable hybrid audit across fill normalization.
+pub(crate) fn validate_entry_kind(
+    req: &EntryRequest<'_>,
+    audited: bool,
+) -> std::result::Result<(), EntryError> {
+    if matches!(req.entry, ResolvedEntry::Market { .. }) && !req.dry_run && !audited {
         return Err(reject(
-            "cTrader market entries are unavailable until post-fill absolute SL/TP normalization is verified; use stop or limit entries",
+            "cTrader market entries require the audited hybrid backend for post-fill absolute SL/TP normalization",
         ));
     }
     Ok(())
@@ -27,17 +30,21 @@ pub(crate) async fn place(
     max_positions: u32,
     req: &EntryRequest<'_>,
 ) -> std::result::Result<Placement, EntryError> {
-    place_with_client_id(broker, cap, max_positions, req, None).await
+    place_with_client_id(broker, cap, max_positions, req, None, |_, _| Ok(())).await
 }
 
-pub(crate) async fn place_with_client_id(
+pub(crate) async fn place_with_client_id<F>(
     broker: &OpenApiBroker,
     cap: f64,
     max_positions: u32,
     req: &EntryRequest<'_>,
     client_id: Option<&str>,
-) -> std::result::Result<Placement, EntryError> {
-    validate_entry_kind(req)?;
+    mut audit: F,
+) -> std::result::Result<Placement, EntryError>
+where
+    F: FnMut(&str, &Value) -> Result<()> + Send,
+{
+    validate_entry_kind(req, client_id.is_some())?;
     if !cap.is_finite() || cap <= 0.0 {
         return Err(reject("risk cap must be finite and positive"));
     }
@@ -50,6 +57,9 @@ pub(crate) async fn place_with_client_id(
         .instrument_metadata(req.instrument)
         .await
         .map_err(|e| reject(e.to_string()))?;
+    if matches!(req.entry, ResolvedEntry::Market { .. }) {
+        market::grid(req, symbol.digits).map_err(|error| reject(error.to_string()))?;
+    }
     let trader = validate::account(broker, req, &symbol).await?;
     let snapshot = broker
         .snapshot()
@@ -64,13 +74,42 @@ pub(crate) async fn place_with_client_id(
         .await
         .map_err(|_| EntryError::AccountFetch)?;
     let price = geometry::price(req, quote)?;
-    let (cents, implied) = sizing::size(broker, req, &symbol, &trader, price, cap).await?;
+    let sizing::SizedEntry {
+        cents,
+        implied_pct: implied,
+        max_stop_distance,
+    } = sizing::size(broker, req, &symbol, &trader, price, cap).await?;
     let payload = with_client_id(
         payload(broker.account_id(), symbol.id, cents, req, price)?,
         client_id,
     )?;
     if req.dry_run {
         tracing::info!(account=%broker.account_name,instrument=%symbol.name,units=cents as f64/100.0,price,implied_risk_pct=implied,"cTrader dry run; no order submitted");
+    }
+    if matches!(req.entry, ResolvedEntry::Market { .. }) && !req.dry_run {
+        let terms = market::Terms {
+            account: broker.account_id(),
+            symbol: symbol.id,
+            volume: cents,
+            client_id: client_id
+                .ok_or_else(|| reject("market audit ID missing; no order submitted"))?
+                .into(),
+            direction: req.direction,
+            stop: req.stop_loss,
+            target: req.take_profit,
+            requested_price: price,
+            max_stop_distance,
+            before: market::before(&snapshot).map_err(|error| reject(error.to_string()))?,
+        };
+        return market::execute(
+            &mut market::Api {
+                broker,
+                audit: &mut audit,
+            },
+            terms,
+            payload,
+        )
+        .await;
     }
     submit(req.dry_run, cents, price, || broker.mutate(2106, payload)).await
 }

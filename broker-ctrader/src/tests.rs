@@ -285,7 +285,7 @@ fn originating_order_resolves_to_exact_linked_position() {
     assert_eq!(row["positionId"], 12);
 }
 #[test]
-fn market_entry_refused_before_network_for_real_and_dry_run() {
+fn real_market_entry_requires_durable_audit_and_dry_run_cannot_submit() {
     init();
     use trade_control_core::intent::{Direction, ResolvedEntry};
     for dry_run in [true, false] {
@@ -296,14 +296,19 @@ fn market_entry_refused_before_network_for_real_and_dry_run() {
             },
         );
         req.dry_run = dry_run;
-        let error = entry::validate_entry_kind(&req).unwrap_err();
-        assert!(error.to_string().contains("post-fill absolute SL/TP"));
+        if dry_run {
+            entry::validate_entry_kind(&req, false).unwrap();
+        } else {
+            let error = entry::validate_entry_kind(&req, false).unwrap_err();
+            assert!(error.to_string().contains("audited hybrid backend"));
+            entry::validate_entry_kind(&req, true).unwrap();
+        }
     }
     for entry in [
         ResolvedEntry::Stop { trigger_price: 1.1 },
         ResolvedEntry::Limit { trigger_price: 1.1 },
     ] {
-        assert!(entry::validate_entry_kind(&request(Direction::Long, entry)).is_ok());
+        assert!(entry::validate_entry_kind(&request(Direction::Long, entry), false).is_ok());
     }
 }
 #[test]
