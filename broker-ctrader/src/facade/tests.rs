@@ -90,3 +90,44 @@ async fn quote_only_profile_cannot_become_a_management_connection() {
     let result = CtraderBroker::connect_profile("demo", access::Profile::Fix(quote)).await;
     assert!(result.is_err());
 }
+
+/// Explicitly opted-in, read-only integration check against a configured demo.
+#[tokio::test]
+#[ignore = "requires CTRADER_METADATA_TEST_ACCOUNT and Open API demo access"]
+async fn hybrid_symbol_validation_succeeds_with_fix_offline() {
+    init_tracing();
+    let account = std::env::var("CTRADER_METADATA_TEST_ACCOUNT").unwrap();
+    let access::Profile::Hybrid {
+        open_api,
+        mut quote,
+        trade,
+        binding,
+    } = access::Profile::load(&account).unwrap()
+    else {
+        panic!("integration check requires a hybrid demo profile");
+    };
+    assert_eq!(open_api.environment, ctrader_api::Environment::Demo);
+    let offline = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    quote.host = "127.0.0.1".into();
+    quote.port = offline.local_addr().unwrap().port();
+    drop(offline);
+    let profile = access::Profile::Hybrid {
+        open_api,
+        quote,
+        trade,
+        binding,
+    };
+    let broker = CtraderBroker::connect_profile(&account, profile)
+        .await
+        .unwrap();
+    assert_eq!(
+        broker.canonical_instrument("USD_JPY").await.unwrap(),
+        "USDJPY"
+    );
+    assert!(
+        broker
+            .canonical_instrument("NO_SUCH_INSTRUMENT")
+            .await
+            .is_err()
+    );
+}

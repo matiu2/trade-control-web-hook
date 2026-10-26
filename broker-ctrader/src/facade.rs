@@ -53,12 +53,12 @@ impl CtraderBroker {
         }
     }
 
-    /// Validate a symbol for management without requiring risk/sizing metadata.
+    /// Prefer the bound Open API catalogue; FIX-only profiles use FIX discovery.
     pub async fn canonical_instrument(&self, instrument: &str) -> Result<String> {
         match &self.backend {
             Backend::OpenApi(broker) => Ok(broker.instrument_metadata(instrument).await?.name),
             Backend::Fix(broker) => broker.canonical_instrument(instrument).await,
-            Backend::Hybrid(broker) => broker.management.canonical_instrument(instrument).await,
+            Backend::Hybrid(broker) => Ok(broker.data.instrument_metadata(instrument).await?.name),
         }
     }
 
