@@ -500,6 +500,13 @@ pub struct Args {
     #[arg(long, visible_alias = "trend-reverse-veto")]
     pub ma_cross_veto: bool,
 
+    /// Veto further entries after a close breaks the 200 SMA against the trade:
+    /// below for longs, above for shorts. Wicks do not count. Cancel unfilled
+    /// orders; for open positions tighten SL to actual fill only while profitable,
+    /// without loosening a better stop. Combine with --ma-cross-veto independently.
+    #[arg(long)]
+    pub sma_200_break_veto: bool,
+
     /// Require the entry signal pattern to touch ANY listed close-based MA on
     /// the setup timeframe, e.g. '9 ema|20 sma|200 sma'. A wick counts. For a
     /// multi-candle pattern, any constituent candle can touch at its own MA
@@ -1019,6 +1026,7 @@ impl Args {
             signal_touch: &self.must_touch,
             enabling_touch: &self.enable_on_ma_touch,
             cross_veto: self.ma_cross_veto,
+            sma_200_break_veto: self.sma_200_break_veto,
         }
     }
     /// Expand convenience aliases into the concrete flags the pipeline
