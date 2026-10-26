@@ -138,6 +138,7 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
                     reconcile_loop(state.clone(), cron.clone(), reconcile_period),
                     operator_alert_loop(state.clone()),
                     entry_notification_loop(state.clone(), cron.clone()),
+                    position_observation_loop(state.clone(), cron.clone()),
                     expiry_gc_loop(state, expiry_gc_period),
                 );
             });
@@ -442,6 +443,19 @@ async fn entry_notification_loop(state: Arc<AppState>, cron: NativeCronEnv) {
         let (state, cron) = (state.clone(), cron.clone());
         run_isolated("entry-notifications", async move {
             crate::entry_notifications::poll(&state.store, &cron).await;
+        })
+        .await;
+    }
+}
+
+/// Read-only reporting runs independently of candle fetching and entry signals.
+async fn position_observation_loop(state: Arc<AppState>, cron: NativeCronEnv) {
+    let mut interval = skip_interval(Duration::from_secs(15));
+    loop {
+        interval.tick().await;
+        let (state, cron) = (state.clone(), cron.clone());
+        run_isolated("position-observations", async move {
+            crate::position_tracking::poll(&state.store, &cron).await;
         })
         .await;
     }

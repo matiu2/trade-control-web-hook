@@ -53,13 +53,21 @@ pub struct PlanTimeline {
     /// recorded", not a parse error.
     #[serde(default)]
     pub notes: Vec<CronNote>,
+    /// Broker position observations, distinct from setup rule-engine phase.
+    #[serde(default)]
+    pub positions: Vec<crate::position_tracking::PositionObservation>,
+    #[serde(default)]
+    pub position_sync: Vec<crate::position_tracking::PositionSync>,
 }
 
 impl PlanTimeline {
     /// True when no event stream has anything — the worker maps this to a
     /// 404 (no recorded events for the trade).
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty() && self.ticks.is_empty() && self.notes.is_empty()
+        self.records.is_empty()
+            && self.ticks.is_empty()
+            && self.notes.is_empty()
+            && self.positions.is_empty()
     }
 }
 

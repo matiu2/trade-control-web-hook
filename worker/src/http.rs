@@ -374,7 +374,20 @@ async fn dispatch_control(
                 }
             }
         }
-        Action::PlanList => handle_plan_list(store, verified, now).await,
+        Action::PlanList => {
+            let result = handle_plan_list(store, verified, now).await;
+            if result.is_success() {
+                match crate::position_tracking::enrich_list(store.pool(), &result.body).await {
+                    Ok(body) => ControlResult::ok(body),
+                    Err(error) => {
+                        tracing::error!(%error, "plan-list position reporting unavailable");
+                        ControlResult::error("position reporting unavailable", 500)
+                    }
+                }
+            } else {
+                result
+            }
+        }
         Action::PlanShow => handle_plan_show(store, verified, now).await,
         // Recording-backed (reads `request_records`), so it can't be a generic
         // `core` handler like the others — it's dispatched here against the
@@ -445,10 +458,26 @@ async fn handle_plan_timeline(
         }
     };
 
+    let (positions, position_sync) = match async {
+        Ok::<_, color_eyre::Report>((
+            crate::position_tracking::for_trade(store.pool(), target).await?,
+            crate::position_tracking::sync_for_trade(store.pool(), target).await?,
+        ))
+    }
+    .await
+    {
+        Ok(data) => data,
+        Err(error) => {
+            tracing::error!(%error, "plan-timeline position reporting unavailable");
+            return ControlResult::error("position reporting unavailable", 500);
+        }
+    };
     let timeline = trade_control_core::recording::PlanTimeline {
         records,
         ticks,
         notes,
+        positions,
+        position_sync,
     };
 
     if timeline.is_empty() {
