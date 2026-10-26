@@ -893,9 +893,7 @@ impl ReplayBroker {
         let prefix = self.prefix_from_fire(
             shell,
             up_to,
-            intent
-                .breakeven
-                .is_some_and(|be| be.trigger.includes_ma_cross()),
+            intent.breakeven.is_some_and(|be| be.has_ma_veto()),
         );
         // Build a throwaway attempt so `resolved_for_sim` (which reads
         // `attempt.placed` / `attempt.intent` / `attempt.shell`) applies the SAME

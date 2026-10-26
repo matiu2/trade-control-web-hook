@@ -182,7 +182,8 @@ fn group(long: &str) -> &'static str {
         | "tp-resistance-fib-level"
         | "skip-tp-resistance"
         | "veto-on-reversal"
-        | "ma-cross-veto" => "Exit rules",
+        | "ma-cross-veto"
+        | "sma-200-break-veto" => "Exit rules",
         "replace" | "shadow" => "Registration",
         "simulate"
         | "verbose"
@@ -231,6 +232,13 @@ mod tests {
         assert_eq!(cross.kind, "boolean");
         assert_eq!(cross.group, "Exit rules");
         assert!(cross.help.contains("actual fill"));
+        let sma = schema
+            .arm
+            .iter()
+            .find(|d| d.long == "sma-200-break-veto")
+            .unwrap();
+        assert_eq!(sma.kind, "boolean");
+        assert_eq!(sma.group, "Exit rules");
         assert!(schema.replay.iter().any(|d| d.long == "bless-baseline"));
         assert!(
             schema

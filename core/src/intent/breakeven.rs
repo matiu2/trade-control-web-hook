@@ -27,6 +27,8 @@
 //!   On the arming bar the original SL still applies (the broker's resting stop
 //!   handles intrabar) — the moved stop is live from the *next* bar.
 
+mod ma_veto;
+
 use serde::{Deserialize, Serialize};
 
 use super::Direction;
@@ -41,6 +43,10 @@ pub const DEFAULT_BREAKEVEN_THRESHOLD: f64 = 0.5;
 /// candle closes past [`Breakeven::arms_at`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Breakeven {
+    /// An adverse closed price break of the 200 SMA can also arm break-even.
+    /// Independent of the EMA9/SMA20 cross and percentage triggers.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sma_200_break: bool,
     /// The default retains historical percentage management. MA-only allows
     /// --no-breakeven to disable the percentage trigger while keeping the cross.
     #[serde(default, skip_serializing_if = "BreakevenTrigger::is_default")]
@@ -55,6 +61,7 @@ pub struct Breakeven {
 impl Default for Breakeven {
     fn default() -> Self {
         Self {
+            sma_200_break: false,
             threshold: DEFAULT_BREAKEVEN_THRESHOLD,
             trigger: BreakevenTrigger::default(),
         }
@@ -93,7 +100,10 @@ impl Breakeven {
     /// - Long: arms when `close_price >= level` (price ran up toward TP).
     /// - Short: arms when `close_price <= level` (price ran down toward TP).
     pub fn close_arms(&self, direction: Direction, level: f64, close_price: f64) -> bool {
-        if self.trigger == BreakevenTrigger::MaCrossOnly {
+        if matches!(
+            self.trigger,
+            BreakevenTrigger::MaCrossOnly | BreakevenTrigger::MaProtectionOnly
+        ) {
             return false;
         }
         match direction {
@@ -327,12 +337,18 @@ pub enum BreakevenTrigger {
     PriceProgress,
     PriceProgressOrMaCross,
     MaCrossOnly,
+    /// Non-percentage MA protection without implicitly enabling EMA9/SMA20.
+    MaProtectionOnly,
 }
 impl BreakevenTrigger {
     pub fn is_default(&self) -> bool {
         *self == Self::PriceProgress
     }
     pub fn includes_ma_cross(self) -> bool {
-        self != Self::PriceProgress
+        matches!(self, Self::PriceProgressOrMaCross | Self::MaCrossOnly)
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }

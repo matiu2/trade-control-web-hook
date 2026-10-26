@@ -673,7 +673,7 @@ fn evaluate_guards(
         // candle detector over the back-window, not a level cross. Every other
         // guard trigger is the plain per-candle predicate.
         let signal = match &rule.trigger {
-            Trigger::AdverseMaCross { .. }
+            Trigger::AdverseMaCross { .. } | Trigger::AdverseMaBreak { .. }
                 if plan.armed_at.is_some_and(|arm| {
                     candle.time + chrono::Duration::seconds(plan.granularity.seconds()) <= arm
                 }) || plan.replay_start.is_some_and(|start| {
@@ -883,13 +883,13 @@ fn evaluate_one_entry(
     fired: &mut Vec<FiredIntent>,
     declines: &mut Vec<EntryDecline>,
 ) {
-    if plan.has_ma_cross_veto()
+    if plan.has_ma_veto()
         && !detector_window
             .iter()
             .position(|c| c.time == candle.time)
-            .is_some_and(|i| trade_control_core::ma_cross::ready_at(detector_window, i))
+            .is_some_and(|i| plan.ma_veto_ready_at(detector_window, i))
     {
-        tracing::warn!("MA-cross veto has insufficient history; entry blocked");
+        tracing::warn!("MA veto has insufficient history; entry blocked");
         return;
     }
     if plan.entry_conditions.retrace.is_some() && state.retrace_seen_at.is_none() {
@@ -1094,7 +1094,7 @@ fn evaluate_one_entry(
         state.fired.insert(rule.rule_id.clone());
         // Consume the entry once while retaining guards for its resting order
         // and open position. Cross policy must survive --max-retries 0 too.
-        if !plan.has_ma_cross_veto() {
+        if !plan.has_ma_veto() {
             state.phase = Phase::Done;
         }
     }
@@ -2561,6 +2561,7 @@ fn trigger_uses_close(trigger: &Trigger) -> bool {
     matches!(
         trigger,
         Trigger::AdverseMaCross { .. }
+            | Trigger::AdverseMaBreak { .. }
             | Trigger::HorizontalCross {
                 bar: BarEvent::OnClose,
                 ..
@@ -2609,6 +2610,12 @@ fn eval_trigger(
             };
             level_crossed(level, *dir, *bar, candle, refs, buffer)
         }
+        Trigger::AdverseMaBreak { average, dir } => window
+            .iter()
+            .position(|bar| bar.time == candle.time)
+            .is_some_and(|i| {
+                trade_control_core::ma_cross::average_break_at(window, i, *average, *dir)
+            }),
         Trigger::AdverseMaCross { dir } => window
             .iter()
             .position(|bar| bar.time == candle.time)
@@ -3045,7 +3052,10 @@ fn guard_is_terminal(rule: &ConditionRule) -> bool {
 fn veto_retires_plan(rule: &ConditionRule) -> bool {
     use trade_control_core::intent::VetoLevel;
     // Cancel resting orders without retiring monitoring for a filled position.
-    if matches!(rule.trigger, Trigger::AdverseMaCross { .. }) {
+    if matches!(
+        rule.trigger,
+        Trigger::AdverseMaCross { .. } | Trigger::AdverseMaBreak { .. }
+    ) {
         return false;
     }
     !matches!(
@@ -3117,6 +3127,7 @@ mod tests {
     mod entry_conditions;
     mod ma_cross;
     mod ma_enablement;
+    mod sma_break;
     use super::*;
     use std::collections::BTreeMap;
 
