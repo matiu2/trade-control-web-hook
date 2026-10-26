@@ -11,6 +11,25 @@ fn init() {
         .ok();
 }
 
+#[test]
+fn favorable_alignment_requires_warm_strict_values_at_the_entry_bar() {
+    let mut candles = path();
+    assert!(favorable_at(&candles, 100, Direction::Short));
+    assert!(!favorable_at(&candles, 100, Direction::Long));
+    assert!(favorable_at(&candles, 139, Direction::Long));
+    assert!(!favorable_at(&candles, 139, Direction::Short));
+    assert!(!favorable_at(&candles, 88, Direction::Short));
+    assert_eq!(
+        favorable_at(&candles, 100, Direction::Short),
+        favorable_at(&candles[..101], 100, Direction::Short)
+    );
+    candles.iter_mut().for_each(|bar| bar.c = 100.0);
+    assert!(!favorable_at(&candles, 100, Direction::Long));
+    assert!(!favorable_at(&candles, 100, Direction::Short));
+    candles[100].c = f64::NAN;
+    assert!(!favorable_at(&candles, 100, Direction::Short));
+}
+
 fn path() -> Vec<Candle> {
     init();
     let start = Utc.with_ymd_and_hms(2026, 6, 16, 0, 0, 0).unwrap();

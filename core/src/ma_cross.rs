@@ -8,6 +8,19 @@ use crate::moving_average::MovingAverage;
 /// Ninety bars seed the EMA; the preceding bar establishes the crossing side.
 pub const HISTORY_BARS: usize = 91;
 
+/// Named pause shared by entry evaluation and the resting-order lifecycle.
+pub const ALIGNMENT_PAUSE_ID: &str = "ma-alignment";
+
+/// Current alignment, not a crossover event. Equality and missing/invalid
+/// history cannot authorize an entry. Values use only closes through `index`.
+pub fn favorable_at(candles: &[Candle], index: usize, direction: Direction) -> bool {
+    let favorable = match direction {
+        Direction::Long => Ordering::Greater,
+        Direction::Short => Ordering::Less,
+    };
+    relation_at(candles, index) == Some(favorable)
+}
+
 fn relation_at(candles: &[Candle], index: usize) -> Option<Ordering> {
     let mut averages = MovingAverage::standard_set().into_iter();
     let fast = averages.next()?.value_at(candles, index)?;

@@ -3650,6 +3650,24 @@ and invalidation rules still apply. Re-arming starts with a fresh touch mileston
 Like the per-pattern MA filter, this option requires a candle-pattern entry;
 direct position and M/W geometry entries reject it.
 
+### Pause entries while MAs are unfavorable — `--require-ma-alignment`
+
+For a reversible entry filter instead, use `--require-ma-alignment` with either
+reversal or `--trend` setups. On each closed setup-timeframe candle, longs
+require the 9 EMA above the 20 SMA; shorts require it below. Equal averages or
+insufficient MA history pause entries. Favorable alignment allows entry again,
+subject to the normal signals, preparation, pauses and vetoes.
+
+Unfilled stop/limit orders use the existing hold-and-restore mechanism while
+alignment is unfavorable. They remain recoverable through long MA pauses and
+resume only after overlapping pauses lift, subject to the existing expiry,
+price-validity and veto checks. This filter does not close positions, change
+their stops, or clear vetoes. It is independent of `--ma-cross-veto`; selecting
+both retains that option's permanent adverse-cross veto.
+
+In local-chart, select **require ma alignment** in the shared Entry settings
+for Reversal or Trend. In the CLI, add `--require-ma-alignment` to the arm.
+
 ### Veto an adverse MA cross — `--ma-cross-veto`
 
 ```sh

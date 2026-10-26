@@ -195,6 +195,7 @@ pub fn build_trade_plan(
 
     TradePlan {
         entry_conditions: trade_control_core::trade_plan::EntryConditions {
+            require_ma_alignment: false,
             enable_on_ma_touch: Vec::new(),
             must_touch: Vec::new(),
             retrace: if trend.0 && !is_mw {

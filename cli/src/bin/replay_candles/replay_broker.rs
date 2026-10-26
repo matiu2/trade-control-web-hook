@@ -649,6 +649,10 @@ impl ReplayBroker {
         {
             o.cancelled = false;
             o.placed = Some(restored_levels);
+            // Restoration is a new placement instant. Keep the original
+            // signal geometry, but never walk fills through the held interval.
+            // A news/MA pause has no spread-hour fill mask to hide those bars.
+            o.shell.time = *self.as_of.borrow();
         }
         Some(restored_id)
     }
