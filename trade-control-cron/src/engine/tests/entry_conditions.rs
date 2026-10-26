@@ -16,6 +16,16 @@ fn plan() -> TradePlan {
 }
 
 #[test]
+fn alignment_requests_warm_history_even_for_a_non_pine_entry() {
+    let mut p = plan();
+    p.rules[0].trigger = Trigger::MwEveryBar;
+    let now = ts("2026-06-17T20:00:00Z");
+    assert_eq!(pine_lookback_since(&p, now), None);
+    p.entry_conditions.require_ma_alignment = true;
+    assert!(pine_lookback_since(&p, now).unwrap() <= now - chrono::Duration::hours(90));
+}
+
+#[test]
 fn live_history_request_covers_ma_warmup_and_pattern_confirmation() {
     let mut p = plan();
     let now = ts("2026-06-17T20:00:00Z");

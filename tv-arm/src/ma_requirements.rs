@@ -7,6 +7,8 @@ pub(crate) struct MaRequirements<'a> {
     pub signal_touch: &'a [MovingAverage],
     pub cross_veto: bool,
     pub sma_200_break_veto: bool,
+
+    pub alignment: bool,
     pub enabling_touch: &'a [MovingAverage],
 }
 
@@ -16,5 +18,6 @@ impl MaRequirements<'_> {
             && self.enabling_touch.is_empty()
             && !self.cross_veto
             && !self.sma_200_break_veto
+            && !self.alignment
     }
 }

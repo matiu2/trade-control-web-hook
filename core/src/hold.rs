@@ -68,6 +68,10 @@ pub enum HoldReason {
     ///
     /// Releases when the baked mask says the market has reopened.
     MarketHours,
+    /// A pause episode involving MA alignment can last days. Preserve the
+    /// unfilled order until all overlapping pauses clear, without the short
+    /// spread-recovery backstop discarding it during a valid pause.
+    MaAlignment,
 }
 
 impl HoldReason {
@@ -78,6 +82,7 @@ impl HoldReason {
             Self::SpreadHour => "spread-hour",
             Self::NewsPause => "news-pause",
             Self::MarketHours => "market-hours",
+            Self::MaAlignment => "ma-alignment",
         }
     }
 }

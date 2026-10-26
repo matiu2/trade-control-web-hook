@@ -325,6 +325,10 @@ pub fn evaluate_plan(
             break;
         }
 
+        if let Some(control) = crate::ma_alignment::control(plan, &state, candle, detector_window) {
+            fired.push(control);
+        }
+
         // Sequential spine. Frozen once a `StopNextEntry` invalidation has
         // latched `entries_blocked`: no new entries, and the break/retest prep
         // spine stops advancing (an entry-blocked setup won't place anything, so
@@ -883,6 +887,9 @@ fn evaluate_one_entry(
     fired: &mut Vec<FiredIntent>,
     declines: &mut Vec<EntryDecline>,
 ) {
+    if !crate::ma_alignment::satisfied(plan, candle.time, detector_window) {
+        return;
+    }
     if plan.has_ma_veto()
         && !detector_window
             .iter()
@@ -1094,7 +1101,7 @@ fn evaluate_one_entry(
         state.fired.insert(rule.rule_id.clone());
         // Consume the entry once while retaining guards for its resting order
         // and open position. Cross policy must survive --max-retries 0 too.
-        if !plan.has_ma_veto() {
+        if !plan.has_ma_veto() && !plan.entry_conditions.require_ma_alignment {
             state.phase = Phase::Done;
         }
     }
@@ -2182,6 +2189,8 @@ fn leg_has_confirmed_signal(
 /// phase (break-and-close) → confirmation → retest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnterBlock {
+    /// Alignment is adverse, equal, or unavailable on this closed bar.
+    NeedsMaAlignment,
     /// The optional one-time MA touch has not occurred since arming.
     NeedsEnablingMaTouch,
     /// An optional trend retracement line has not seen a qualifying close.
@@ -2203,6 +2212,7 @@ impl EnterBlock {
     /// A short operator-facing reason, worded for the replay's `not-taken:` line.
     pub fn reason(self) -> &'static str {
         match self {
+            Self::NeedsMaAlignment => "requires favorable 9 EMA / 20 SMA alignment",
             Self::NeedsEnablingMaTouch => "requires MA touch (entry not enabled yet)",
             Self::NeedsRetracement => "requires retracement (no close beyond the line yet)",
             Self::NeedsBreakAndClose => "requires break-and-close (prep not satisfied yet)",
@@ -2271,6 +2281,11 @@ pub fn enter_preconditions_by_leg(
         .filter(|r| !state.fired.contains(&r.rule_id))
     {
         let mut leg = Vec::new();
+        if plan.entry_conditions.require_ma_alignment
+            && !detector_window.is_some_and(|w| crate::ma_alignment::satisfied(plan, bar, w))
+        {
+            leg.push(EnterBlock::NeedsMaAlignment);
+        }
         if !crate::ma_enablement::satisfied(plan, state) {
             leg.push(EnterBlock::NeedsEnablingMaTouch);
         }
@@ -3125,6 +3140,7 @@ fn armed_in_rule(rule: &ConditionRule, phase: Phase, entries_blocked: bool) -> b
 #[cfg(test)]
 mod tests {
     mod entry_conditions;
+    mod ma_alignment;
     mod ma_cross;
     mod ma_enablement;
     mod sma_break;

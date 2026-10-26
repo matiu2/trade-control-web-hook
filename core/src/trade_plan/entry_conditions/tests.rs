@@ -3,6 +3,19 @@ use crate::broker::Candle;
 use crate::moving_average::{AverageKind, MovingAverage};
 use chrono::{DateTime, Utc};
 
+#[test]
+fn alignment_is_opt_in_and_survives_a_plan_round_trip() {
+    candles(&[]);
+    let legacy: EntryConditions = serde_json::from_str("{}").unwrap();
+    assert!(!legacy.require_ma_alignment);
+    assert!(legacy.is_empty());
+    let active: EntryConditions = serde_json::from_str(r#"{"require_ma_alignment":true}"#).unwrap();
+    assert!(!active.is_empty());
+    assert!(active.history_bars() >= 90);
+    let wire = serde_json::to_value(&active).unwrap();
+    assert_eq!(wire, serde_json::json!({"require_ma_alignment":true}));
+}
+
 fn candles(closes: &[f64]) -> Vec<Candle> {
     use tracing_subscriber::prelude::*;
     tracing_subscriber::registry()
@@ -107,6 +120,7 @@ fn legacy_conditions_are_empty_and_the_ma_history_floor_covers_200_sma() {
             .is_none()
     );
     plan.entry_conditions = EntryConditions {
+        require_ma_alignment: false,
         enable_on_ma_touch: Vec::new(),
         must_touch: MovingAverage::standard_set(),
         retrace: None,

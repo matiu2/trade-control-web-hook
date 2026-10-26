@@ -57,6 +57,7 @@ pub use trade_control_core::trade_plan::{
 };
 
 mod entry_conditions;
+mod ma_alignment;
 mod ma_enablement;
 pub mod pullback;
 

@@ -1501,6 +1501,7 @@ async fn inject_control_ticks(
 
 #[cfg(test)]
 mod tests {
+    mod ma_alignment;
     use super::*;
     use chrono::TimeZone;
     use trade_control_cli::replay_args::{DirectionFilter, GoldenFilter};

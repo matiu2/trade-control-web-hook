@@ -507,6 +507,15 @@ pub struct Args {
     #[arg(long)]
     pub sma_200_break_veto: bool,
 
+    /// Require favorable closed 9 EMA / 20 SMA alignment on the setup timeframe:
+    /// EMA above SMA for longs, below for shorts. Equality or insufficient history
+    /// pauses entries. Unfilled orders are held by the existing pause mechanism
+    /// and may resume when alignment recovers, subject to all other gates and
+    /// vetoes. Does not veto the setup or alter open positions. Works with both
+    /// reversal and --trend entries; independent of --ma-cross-veto.
+    #[arg(long)]
+    pub require_ma_alignment: bool,
+
     /// Require the entry signal pattern to touch ANY listed close-based MA on
     /// the setup timeframe, e.g. '9 ema|20 sma|200 sma'. A wick counts. For a
     /// multi-candle pattern, any constituent candle can touch at its own MA
@@ -1027,6 +1036,8 @@ impl Args {
             enabling_touch: &self.enable_on_ma_touch,
             cross_veto: self.ma_cross_veto,
             sma_200_break_veto: self.sma_200_break_veto,
+
+            alignment: self.require_ma_alignment,
         }
     }
     /// Expand convenience aliases into the concrete flags the pipeline
