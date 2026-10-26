@@ -1,4 +1,4 @@
-//! Resolve account-native cTrader precision without broadening live execution.
+//! Resolve account-native cTrader precision while keeping live execution FX-only.
 use color_eyre::eyre::{Result, ensure, eyre};
 use instrument_lookup::AssetClass;
 
@@ -15,8 +15,15 @@ enum Mode {
 impl Mode {
     fn asset(self, symbol: &str) -> Result<&'static instrument_lookup::Asset> {
         let asset = match self {
-            Self::Trading => instrument_lookup::resolve(symbol)?
-                .ok_or_else(|| eyre!("no catalogued underlying for cTrader symbol {symbol:?}"))?,
+            Self::Trading => match instrument_lookup::resolve(symbol)? {
+                Some(asset) => asset,
+                None => broker_ctrader::catalogue::replay_asset(symbol).map_err(|error| {
+                    eyre!(
+                        "no catalogued underlying for cTrader symbol {symbol:?} in instrument-lookup \
+                         or the audited cTrader catalogue: {error:#}"
+                    )
+                })?,
+            },
             Self::Replay => broker_ctrader::catalogue::replay_asset(symbol).map_err(|error| {
                 eyre!(
                     "cTrader native symbol {symbol:?} is not ready for replay metadata; only audited native non-stock underlyings are onboarded: {error:#}"
