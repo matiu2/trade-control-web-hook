@@ -843,7 +843,7 @@ fn pine_lookback_since(
     let has_pine = plan.rules.iter().any(|r| {
         r.intent.action == Action::Enter && matches!(r.trigger, Trigger::PinePattern { .. })
     });
-    if !has_pine && !plan.has_ma_cross_veto() {
+    if !has_pine && !plan.has_ma_veto() {
         return None;
     }
     let lookback = plan

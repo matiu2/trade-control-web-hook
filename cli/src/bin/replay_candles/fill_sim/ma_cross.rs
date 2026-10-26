@@ -15,7 +15,7 @@ impl CrossHistory {
         Self(
             resolved
                 .breakeven
-                .filter(|be| be.trigger.includes_ma_cross())
+                .filter(|be| be.has_ma_veto())
                 .map(|_| candles.iter().map(BidAskCandle::mid).collect()),
             fire_at,
         )

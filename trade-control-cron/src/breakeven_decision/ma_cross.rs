@@ -13,14 +13,14 @@ pub fn decide_ma_cross(
     exit_price: f64,
 ) -> BreakevenDecision {
     use trade_control_core::ma_cross::{StopInputs, cross_stop_at};
-    if !inputs.snapshot.rule.trigger.includes_ma_cross() {
+    if !inputs.snapshot.rule.has_ma_veto() {
         return BreakevenDecision::Hold;
     }
     let Some(fill_at) = inputs.position.opened_at else {
         return BreakevenDecision::Blocked(BreakevenBlock::NoFillTime);
     };
     let Some(fill) = inputs.position.entry_price else {
-        tracing::error!(position_id = %inputs.position.position_id, "MA-cross break-even needs actual fill price; leaving stop unchanged");
+        tracing::error!(position_id = %inputs.position.position_id, "MA protection needs actual fill price; leaving stop unchanged");
         return BreakevenDecision::Hold;
     };
     let key = trade_control_core::spread_blackout::spread_lookup_key(
@@ -35,9 +35,9 @@ pub fn decide_ma_cross(
     if !mid
         .len()
         .checked_sub(1)
-        .is_some_and(|i| trade_control_core::ma_cross::ready_at(&mid, i))
+        .is_some_and(|i| inputs.snapshot.rule.ma_veto_ready_at(&mid, i))
     {
-        tracing::warn!("MA-cross stop has insufficient history; leaving stop unchanged");
+        tracing::warn!("MA protection has insufficient history; leaving stop unchanged");
         return BreakevenDecision::Hold;
     }
     candles

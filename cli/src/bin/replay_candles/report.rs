@@ -839,10 +839,7 @@ fn render_fire(
     {
         events.push(EntryEvent {
             at: armed_at,
-            note: if intent
-                .breakeven
-                .is_some_and(|be| be.trigger.includes_ma_cross())
-            {
+            note: if intent.breakeven.is_some_and(|be| be.has_ma_veto()) {
                 format!("{ev} SL→break-even (configured MA-cross/profit rule)")
             } else {
                 format!("{ev} SL→break-even (a candle closed past 50%-to-TP)")

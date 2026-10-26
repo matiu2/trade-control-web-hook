@@ -207,7 +207,7 @@ impl PositionBroker for BrokerHandle {
         match result {
             Ok(candles) => Some(candles),
             Err(error) => {
-                tracing::error!(%error, "MA-cross stop needs bid/ask history; leaving cross stop unchanged");
+                tracing::error!(%error, "MA protection needs bid/ask history; leaving cross stop unchanged");
                 None
             }
         }
@@ -226,7 +226,7 @@ impl PositionBroker for BrokerHandle {
                 trade_control_core::intent::Direction::Short => q.ask,
             }),
             Err(error) => {
-                tracing::error!(%error, "MA-cross break-even quote failed; leaving cross stop unchanged");
+                tracing::error!(%error, "MA protection quote failed; leaving cross stop unchanged");
                 None
             }
         }
@@ -281,14 +281,12 @@ async fn watch_one<B: PositionBroker>(
     let since = now - Duration::seconds(snap.granularity.seconds() * BREAKEVEN_LOOKBACK_BARS);
     // Include the position's full lifetime plus MA warmup. A fixed recent
     // window could otherwise lose a cross after a prolonged worker outage.
-    let since = if snap.rule.trigger.includes_ma_cross() {
+    let since = if snap.rule.has_ma_veto() {
         position
             .opened_at
             .map(|fill| {
                 fill - Duration::seconds(
-                    snap.granularity.seconds()
-                        * trade_control_core::ma_cross::HISTORY_BARS as i64
-                        * 3,
+                    snap.granularity.seconds() * snap.rule.ma_veto_history_bars() as i64 * 3,
                 )
             })
             .map_or(since, |warmup| warmup.min(since))
@@ -308,7 +306,7 @@ async fn watch_one<B: PositionBroker>(
         position,
         current_stop,
     };
-    let cross = if snap.rule.trigger.includes_ma_cross() {
+    let cross = if snap.rule.has_ma_veto() {
         match (
             broker.exit_price(position).await,
             broker
@@ -320,7 +318,7 @@ async fn watch_one<B: PositionBroker>(
             }
             _ => {
                 tracing::warn!(
-                    "MA-cross stop needs an executable quote and bid/ask history; retrying on next tick"
+                    "MA protection needs an executable quote and bid/ask history; retrying on next tick"
                 );
                 BreakevenDecision::Hold
             }
@@ -473,6 +471,7 @@ async fn amend(
 #[cfg(test)]
 mod tests {
     mod ma_cross_tests;
+    mod sma_break_tests;
 
     use super::*;
     use std::cell::RefCell;

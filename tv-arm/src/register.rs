@@ -235,8 +235,8 @@ pub(crate) fn register_trade_plan(
         screenshot_url,
         trend,
     );
-    if ma_requirements.cross_veto {
-        crate::ma_cross_veto::configure(&mut plan)?;
+    if ma_requirements.cross_veto || ma_requirements.sma_200_break_veto {
+        crate::ma_cross_veto::configure(&mut plan, ma_requirements)?;
     }
     plan.entry_conditions.must_touch = ma_requirements.signal_touch.to_vec();
     plan.entry_conditions.enable_on_ma_touch = ma_requirements.enabling_touch.to_vec();
@@ -495,6 +495,55 @@ mod tests {
     }
 
     #[test]
+    fn sma_200_break_veto_is_signed_independently_and_combines_with_ma_cross() {
+        for percentage in [false, true] {
+            for cross in [false, true] {
+                let mut flags = vec!["--sma-200-break-veto"];
+                if !percentage {
+                    flags.push("--no-breakeven");
+                }
+                if cross {
+                    flags.push("--ma-cross-veto");
+                }
+                let wire = plan_json_with(true, "sma-break-wire", true, &flags);
+                let plan: trade_control_core::trade_plan::TradePlan =
+                    serde_json::from_value(wire).unwrap();
+                let entry = plan
+                    .rules
+                    .iter()
+                    .find(|r| r.intent.action == trade_control_core::intent::Action::Enter)
+                    .unwrap();
+                let be = entry.intent.breakeven.unwrap();
+                assert!(be.sma_200_break);
+                assert_eq!(be.trigger.includes_ma_cross(), cross);
+                assert_eq!(
+                    be.close_arms(trade_control_core::intent::Direction::Short, 100.0, 99.0),
+                    percentage
+                );
+                assert!(entry.intent.vetos.iter().any(|v| v == "sma-200-break"));
+                let guard = plan
+                    .rules
+                    .iter()
+                    .find(|r| r.rule_id == "01-veto-sma-200-break")
+                    .unwrap();
+                assert!(matches!(
+                    guard.trigger,
+                    trade_control_core::trade_plan::Trigger::AdverseMaBreak { .. }
+                ));
+                assert_eq!(
+                    guard.intent.level,
+                    Some(trade_control_core::intent::VetoLevel::CancelPending)
+                );
+                assert!(plan.detector_history_bars() >= 201);
+                assert_eq!(
+                    plan.rules.iter().any(|r| r.rule_id == "01-veto-ma-cross"),
+                    cross
+                );
+            }
+        }
+    }
+
+    #[test]
     fn ma_cross_policy_reaches_cli_and_gui_signed_plans() {
         for flag in ["--ma-cross-veto", "--trend-reverse-veto"] {
             for no_percentage in [false, true] {
@@ -531,7 +580,7 @@ mod tests {
                 );
                 let plan: trade_control_core::trade_plan::TradePlan =
                     serde_json::from_value(json).unwrap();
-                assert!(plan.has_ma_cross_veto());
+                assert!(plan.has_ma_veto());
                 assert!(plan.detector_history_bars() >= 91);
             }
         }
