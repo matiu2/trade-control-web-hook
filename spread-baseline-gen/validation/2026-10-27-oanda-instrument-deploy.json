@@ -1,0 +1,35 @@
+{
+  "instrument_definitions": 127,
+  "separate_oanda_chart_feeds": true,
+  "live_execution_configured": true,
+  "account": "oanda-live",
+  "account_identity_sha256": "de06c15bdafb933a8467fe97c1f55846531cea83d72af12dd51735c3a1e90e2d",
+  "instruments": 127,
+  "measured_minutes": 10249815,
+  "from_utc": "2026-07-29T00:00:00Z",
+  "to_utc": "2026-10-27T00:00:00Z",
+  "cache_namespace": "oanda_acct_de06c15bdafb933a8467fe97",
+  "table_sha256": "178980593a88c95c216592d55f246f96eeab873ee8bf762de3af41977550633e",
+  "worker_sha256": "1df88a6d147edeb1f8f0c67697d31b48269abc3248abab1559b6885176418fd4",
+  "chart_sha256": "e11ba725b278367306e6f2b174d9497e0032c8e2bb6fd56d6b4ff44c362da4ed",
+  "chart_pid": 546703,
+  "services": [
+    "trade-control-worker-dev.service",
+    "trade-control-worker-staging.service"
+  ],
+  "authenticated_live_quote_verified": true,
+  "chart_account_discovery_verified": true,
+  "orders_submitted_by_validation": 0,
+  "instrument_definitions_sha256": "ef62d01b6d6b4f829f1c6b79109533883f54ca10315851155eb7551db8b7965d",
+  "live_candle_precision_probes": {
+    "EUR_USD": 5,
+    "XAG_CAD": 5,
+    "BTC_USD": 1
+  },
+  "header_feed_labels": {
+    "oanda": "oanda demo",
+    "oanda-live": "oanda live"
+  },
+  "deployed_browser_live_account_verified": true,
+  "browser_validation_writes_blocked": true
+}
