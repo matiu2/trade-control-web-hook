@@ -1,4 +1,6 @@
 //! Read-only calibration; writes an account-pinned JSON report, never a live table.
+#[path = "generate-mt5/catalogue.rs"]
+mod catalogue;
 #[path = "generate-mt5/checkpoint.rs"]
 mod checkpoint;
 #[path = "generate-mt5/run.rs"]

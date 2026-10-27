@@ -56,13 +56,8 @@ pub async fn attempt(args: &Args, resume: &mut Option<PathBuf>) -> Result<()> {
         "--out must be a JSON report path"
     );
     let config = AccountConfig::load(&args.account)?;
-    let trader = config.trader().await?;
-    let symbols: Vec<String> = trader
-        .symbols()
-        .await?
-        .into_iter()
-        .map(|s| s.name)
-        .collect();
+    let desktop = config.desktop()?;
+    let symbols = super::catalogue::read(&desktop).await?;
     ensure!(
         args.only.iter().all(|s| symbols.contains(s)),
         "--only contains a symbol absent from this MT5 account"
@@ -101,7 +96,6 @@ pub async fn attempt(args: &Args, resume: &mut Option<PathBuf>) -> Result<()> {
     // Only reuse a checkpoint written by this attempt or explicitly supplied.
     // Never adopt an unrelated pre-existing --out file after login fails.
     *resume = Some(args.out.clone());
-    let desktop = config.desktop()?;
     desktop
         .identity()
         .await
