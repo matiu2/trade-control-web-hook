@@ -1,0 +1,40 @@
+{
+  "created_at": "2026-10-27T00:11:46.338120+00:00",
+  "source_report": "/home/matiu/projects/trading-libraries/trade-control-ctrader-calibration-finish/spread-baseline-gen/validation/ctrader-demo-retry4-v2-90d-report.json",
+  "source_report_sha256": "a441e2f5a14f3090075f14dd6280c4b44a274230409387fa5dd2493fa06e580f",
+  "source_report_retained": true,
+  "source_job_exit_status": 1,
+  "source_job_result": "3 fully measured instruments; ETHEUR retained as a strict data-quality failure",
+  "selected_successful_symbols": [
+    "BTCUSD",
+    "UK 100",
+    "US 30"
+  ],
+  "excluded_failed_instruments": [
+    {
+      "symbol": "ETHEUR",
+      "error": "paired cTrader ETHEUR [2026-07-27 16:26:00 UTC,2026-07-28 16:26:00 UTC): invalid crossed historical cTrader quote at time_ms=1785192054252: bid=1689.595 ask=1683.94"
+    }
+  ],
+  "measurement_basis": "paired-ticks-m1, corrected exclusive tick endpoints and paired-cache-v2",
+  "sampling_window": [
+    "2026-07-24T16:26:00Z",
+    "2026-10-22T16:26:00Z"
+  ],
+  "current_source_heads_before_completion": {
+    "root": "c1e745d993f7dbe174acdc09d6da01d45f5d699a",
+    "workspace": "f36f9a26f03b4e2f4966cb9a538538451e8bbc40",
+    "candle_cache": "94a45d1781f4ffde6dc478786bd6c0334e092fb0"
+  },
+  "pinned_binary_manifest": {
+    "generate-ctrader": "fee0e1398aee136c058f69361e243295e59dfabd38dcc1b5fdfc90709edc3b13",
+    "bake-ctrader": "ba9e3bfef4711a0a3a4695d3a2fc0f08dd024d707727bb2e65df726b34f24645",
+    "finish-ctrader-nonstocks": "d9e17811a7c092637737611a00c02a61c49f2c5911da3e5b0073fc0fa359ed2e"
+  },
+  "existing_89_literal_rows_preserved_before_bake": true,
+  "baseline_input_provenance": "ctrader-demo-retry4-v2-completion-inputs.json",
+  "measurements_reused_without_recollection": true,
+  "serialization_note": "Typed f64 JSON round trips may normalize decimal representations by approximately one ULP; original report is retained and literal numeric byte identity is not claimed.",
+  "strict_quality_checks_unchanged": true,
+  "no_broker_mutations": true
+}
