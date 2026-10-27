@@ -970,8 +970,10 @@ where
             source: "entry-dispatch".into(),
             severity: trade_control_core::recording::CronNoteSeverity::Warn,
             message: format!(
-                "{} {:?}: entry was not confirmed: {outcome}",
-                verified.intent.instrument, granularity
+                "{} {:?}: {}",
+                verified.intent.instrument,
+                granularity,
+                result.entry_warning()
             ),
             broker_exit: None,
             attempt_resolution: None,

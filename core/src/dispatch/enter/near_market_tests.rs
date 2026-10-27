@@ -11,6 +11,7 @@ enum Reply {
     TooClose,
     GenericTooClose,
     Rejected,
+    RejectedWithDetail,
     AccountFailed,
     RiskCap,
     Ambiguous,
@@ -62,6 +63,10 @@ impl Scenario {
             )),
             Reply::GenericTooClose => Err(EntryError::EntryTooCloseToMarket),
             Reply::Rejected => Err(EntryError::OrderRejected),
+            Reply::RejectedWithDetail => Err(EntryError::OrderRejectedWithDetail(
+                "MT5 request_id=1857616817 result_code=10040; account position limit reached"
+                    .into(),
+            )),
             Reply::AccountFailed => Err(EntryError::AccountFetch),
             Reply::RiskCap => Err(EntryError::RiskCapExceeded {
                 requested: 2.0,
@@ -578,4 +583,39 @@ fn changed_market_price_must_respect_continuous_entry_veto_levels() {
                 assert_eq!(*broker.sent.borrow(), 0);
             });
     });
+}
+
+#[test]
+fn real_dispatch_warning_distinguishes_validation_from_the_terminal_broker_rejection() {
+    let mut broker = Scenario::audjpy();
+    broker.replies[2] = Reply::RejectedWithDetail;
+    let (result, store) = run(&broker, verified(Direction::Long));
+    assert!(matches!(result, ActionResult::Failed(_)));
+    let warning = result.entry_warning();
+    [
+        "Final result: BROKER REJECTION",
+        "1. LOCAL BLOCK — Stop entry was not submitted",
+        "2. LOCAL BLOCK — Limit entry was not submitted",
+        "3. MARKET FALLBACK — Local proximity check passed",
+        "BROKER REJECTION — broker rejected the order",
+        "account position limit reached",
+    ]
+    .into_iter()
+    .for_each(|part| assert!(warning.contains(part), "missing {part}: {warning}"));
+    assert_eq!(
+        warning.matches("request_id=1857616817").count(),
+        1,
+        "{warning}"
+    );
+    assert_eq!(broker.requests.borrow().len(), 3);
+    assert_eq!(*broker.sent.borrow(), 0);
+    assert!(
+        pollster::block_on(store.list_entry_attempts(Some("the5ers-competition"), "audjpy"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        crate::dispatch::seen_decision(&result),
+        crate::dispatch::SeenDecision::Skip { .. }
+    ));
 }
