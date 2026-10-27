@@ -202,18 +202,7 @@ fn plan_action_args<'a>(
 }
 
 pub fn accounts() -> Result<Vec<crate::plan_admin::AccountChoice>> {
-    let program = "trade-control-accounts";
-    let output = Command::new(program)
-        .args(["list", "--json"])
-        .output()
-        .map_err(|e| launch_error(program, e))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(eyre!("account list failed: {}", stderr.trim()));
-    }
-    let json =
-        String::from_utf8(output.stdout).map_err(|e| eyre!("account list was not UTF-8: {e}"))?;
-    crate::plan_admin::parse_accounts(&json)
+    crate::plan_admin::load_accounts()
 }
 
 /// Build the argv for re-blessing ONE saved fixture cell:
