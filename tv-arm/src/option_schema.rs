@@ -223,6 +223,10 @@ mod tests {
     fn schema_covers_semantics_and_hides_transport() {
         init();
         let schema = options();
+        let offside = schema.arm.iter().find(|d| d.long == "be-offside").unwrap();
+        assert_eq!(offside.label, "be offside");
+        assert!(offside.repeatable);
+        assert!(offside.help.contains("above ANY selected MA for shorts"));
         assert!(schema.arm.iter().any(|d| d.long == "enable-on-ma-touch"));
         let alignment = schema
             .arm

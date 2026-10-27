@@ -241,11 +241,13 @@ pub(crate) fn register_trade_plan(
         crate::ma_cross_veto::configure(&mut plan, ma_requirements)?;
     }
     plan.entry_conditions.must_touch = ma_requirements.signal_touch.to_vec();
+    plan.entry_conditions.be_offside = ma_requirements.signal_offside.to_vec();
     plan.entry_conditions.require_ma_alignment = ma_requirements.alignment;
     plan.entry_conditions.enable_on_ma_touch = ma_requirements.enabling_touch.to_vec();
     info!(retrace_line = ?plan.entry_conditions.retrace,
         require_ma_alignment = plan.entry_conditions.require_ma_alignment,
         must_touch = ?plan.entry_conditions.must_touch,
+        be_offside = ?plan.entry_conditions.be_offside,
         enable_on_ma_touch = ?plan.entry_conditions.enable_on_ma_touch,
         "resolved entry conditions (retracement requires a close; MA touch accepts wicks)");
     // Unwrap the tv-arm bundle wrappers to the cli `BuiltPause`/`BuiltNews` the
@@ -587,6 +589,25 @@ mod tests {
                 assert!(plan.has_ma_veto());
                 assert!(plan.detector_history_bars() >= 91);
             }
+        }
+    }
+
+    #[test]
+    fn offside_reaches_the_signed_plan_for_both_strategies() {
+        for trend in [false, true] {
+            let json = plan_json_with(
+                trend,
+                "offside-wire",
+                true,
+                &["--be-offside", "9 ema|20 sma|200 sma"],
+            );
+            let averages = json["entry_conditions"]["be_offside"].as_array().unwrap();
+            assert_eq!(averages.len(), 3);
+            assert_eq!(averages[0], serde_json::json!({"kind":"ema","period":9}));
+            assert!(json["entry_conditions"].get("must_touch").is_none());
+            let plan: trade_control_core::trade_plan::TradePlan =
+                serde_json::from_value(json).unwrap();
+            assert!(plan.detector_history_bars() >= 205);
         }
     }
 

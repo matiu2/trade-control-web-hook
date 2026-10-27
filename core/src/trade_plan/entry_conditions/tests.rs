@@ -16,7 +16,7 @@ fn alignment_is_opt_in_and_survives_a_plan_round_trip() {
     assert_eq!(wire, serde_json::json!({"require_ma_alignment":true}));
 }
 
-fn candles(closes: &[f64]) -> Vec<Candle> {
+pub(super) fn candles(closes: &[f64]) -> Vec<Candle> {
     use tracing_subscriber::prelude::*;
     tracing_subscriber::registry()
         .with(tracing_error::ErrorLayer::default())
@@ -123,6 +123,7 @@ fn legacy_conditions_are_empty_and_the_ma_history_floor_covers_200_sma() {
         require_ma_alignment: false,
         enable_on_ma_touch: Vec::new(),
         must_touch: MovingAverage::standard_set(),
+        be_offside: Vec::new(),
         retrace: None,
     };
     assert!(plan.detector_history_bars() >= 205);

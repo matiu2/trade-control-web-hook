@@ -906,10 +906,11 @@ fn evaluate_one_entry(
         return;
     }
     if (!plan.entry_conditions.must_touch.is_empty()
+        || !plan.entry_conditions.be_offside.is_empty()
         || !plan.entry_conditions.enable_on_ma_touch.is_empty())
         && !matches!(rule.trigger, Trigger::PinePattern { .. })
     {
-        tracing::warn!(rule_id = %rule.rule_id, "MA touch requires a candle-pattern entry; declining non-pattern entry");
+        tracing::warn!(rule_id = %rule.rule_id, "MA requirements require a candle-pattern entry; declining non-pattern entry");
         return;
     }
     // Replay-start entry floor (journaling only). When a plan carries a
@@ -1176,7 +1177,7 @@ fn eval_pine_entry(
             &crit,
             |start, print| {
                 entry_conditions.is_none_or(|conditions| {
-                    conditions.pattern_touches(detector_window, start, print)
+                    conditions.pattern_qualifies(detector_window, start, print, dir)
                 })
             },
         )
@@ -1253,9 +1254,14 @@ fn eval_pine_entry(
         return None;
     }
     if entry_conditions.is_some_and(|conditions| {
-        !conditions.pattern_touches(detector_window, sig.signal_start_time, sig.signal_bar_time)
+        !conditions.pattern_qualifies(
+            detector_window,
+            sig.signal_start_time,
+            sig.signal_bar_time,
+            dir,
+        )
     }) {
-        tracing::debug!(bar = %candle.time, "pine-enter: signal pattern did not touch a required moving average");
+        tracing::debug!(bar = %candle.time, "pine-enter: signal pattern did not satisfy moving-average requirements");
         return None;
     }
     Some(sig)
@@ -2160,7 +2166,7 @@ fn leg_has_confirmed_signal(
         &crit,
         |start, print| {
             plan.entry_conditions
-                .pattern_touches(detector_window, start, print)
+                .pattern_qualifies(detector_window, start, print, *dir)
         },
     )
     .is_some()

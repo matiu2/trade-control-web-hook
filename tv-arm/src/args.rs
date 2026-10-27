@@ -530,6 +530,13 @@ pub struct Args {
     #[arg(long, value_delimiter = '|', conflicts_with = "ma_touch_required")]
     pub must_touch: Vec<trade_control_core::moving_average::MovingAverage>,
 
+    /// Require the signal to touch or be above ANY selected MA for shorts,
+    /// below for longs, e.g. '9 ema|20 sma|200 sma'. Wicks count. Each pattern
+    /// constituent uses its own close-based average; later confirmation candles
+    /// cannot qualify the signal. Insufficient MA history does not qualify.
+    #[arg(long, value_delimiter = '|')]
+    pub be_offside: Vec<trade_control_core::moving_average::MovingAverage>,
+
     /// Enable entry once a post-arm closed candle touches ANY listed MA,
     /// e.g. '200 sma'. Wicks count. The touch is remembered across candles
     /// and restarts; a signal on that candle or later may enter away from the
@@ -1040,6 +1047,7 @@ impl Args {
     pub(crate) fn ma_requirements(&self) -> crate::ma_requirements::MaRequirements<'_> {
         crate::ma_requirements::MaRequirements {
             signal_touch: &self.must_touch,
+            signal_offside: &self.be_offside,
             enabling_touch: &self.enable_on_ma_touch,
             cross_veto: self.ma_cross_veto,
             sma_200_break_veto: self.sma_200_break_veto,

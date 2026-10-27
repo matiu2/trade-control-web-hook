@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::broker::Candle;
 
+mod offside;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AverageKind {
@@ -74,6 +76,18 @@ impl MovingAverage {
         start: DateTime<Utc>,
         print: DateTime<Utc>,
     ) -> bool {
+        self.pattern_matches(candles, start, print, |index| {
+            self.touches_at(candles, index)
+        })
+    }
+
+    fn pattern_matches(
+        self,
+        candles: &[Candle],
+        start: DateTime<Utc>,
+        print: DateTime<Utc>,
+        matches: impl Fn(usize) -> bool,
+    ) -> bool {
         // Require both endpoints: a truncated window cannot prove the pattern
         // touched. Never substitute the confirmation candle or aggregate range.
         if !candles.iter().any(|bar| bar.time == start)
@@ -85,7 +99,7 @@ impl MovingAverage {
             .iter()
             .enumerate()
             .filter(|(_, bar)| bar.time >= start && bar.time <= print)
-            .any(|(index, _)| self.touches_at(candles, index))
+            .any(|(index, _)| matches(index))
     }
 }
 

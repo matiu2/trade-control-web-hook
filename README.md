@@ -3593,6 +3593,26 @@ The exhaustion change is encoded in the signed trigger; the optional retracement
 line is stored in signed `entry_conditions`. Live and replay evaluate both in the
 same engine. `--trend` still conflicts with `--strategy-v2` and `--save-matrix`.
 
+### Require the signal to be offside — `--be-offside`
+
+```sh
+tv-arm-staging --spec-url='http://localhost:8790/arm-setup?...' \
+  --be-offside '9 ema|20 sma|200 sma' register
+```
+
+For shorts, a signal candle must touch or be above **any one** selected average;
+for longs, it must touch or be below it. Wicks count, so the high must reach the
+MA for shorts and the low must reach it for longs. Each constituent of a
+multi-candle pattern uses its own contemporary close-based average. Earlier
+unrelated candles and later confirmation candles cannot qualify the signal.
+Insufficient history fails that average; another selected average may qualify.
+
+This works with both reversal and trend entries in live evaluation and replay.
+It requires a candle-pattern entry and requests enough history for all selected
+averages. The GUI's **be offside** control uses this option. Existing plans and
+CLI users of `--must-touch` keep the stricter touch behavior below. When combined
+with an enabling touch or a retracement condition, every condition must pass.
+
 ### Require an MA touch — `--must-touch` / `--ma-touch-required`
 
 ```sh

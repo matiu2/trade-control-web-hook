@@ -198,6 +198,7 @@ pub fn build_trade_plan(
             require_ma_alignment: false,
             enable_on_ma_touch: Vec::new(),
             must_touch: Vec::new(),
+            be_offside: Vec::new(),
             retrace: if trend.0 && !is_mw {
                 geom.neckline
                     .map(|line| trade_control_core::trade_plan::RetraceLine {
