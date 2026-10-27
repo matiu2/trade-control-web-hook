@@ -242,3 +242,34 @@ not an inferred exchange timezone or historical holiday calendar. Current weekly
 sessions do not filter historical candles. Sparse daily sessions retain the
 existing minimum observation and hour-bucket thresholds; a measured baseline
 with `MaskNotComputable` remains eligible, while insufficient history fails.
+
+## Audited crossed-minute exclusions
+
+Normal historical feeds remain strict. A calibration can explicitly exclude
+whole M1 candles containing a finite, positive crossed book (`bid > ask`):
+
+```sh
+target/release/generate-ctrader --account ctrader-demo --only ETHEUR \
+  --from 2026-07-24T16:26:00Z --to 2026-10-22T16:26:00Z \
+  --quarantine-crossed-minutes --max-quarantined-minutes 5 \
+  --out spread-baseline-gen/validation/ctrader-demo-etheur-quarantine-90d-report.json
+```
+
+The absolute limit defaults to five and accepts one through 100 distinct minutes
+per instrument over the entire sampling window. Every completed profile must also
+keep `excluded_minutes / (retained_M1_observations + excluded_minutes) <= 0.001`
+(0.1%); collection, resume validation and strict baking enforce the same quota.
+A larger explicit allowance cannot bypass this fraction for sparse stock sessions.
+Existing reports retain their original policy; changing the allowance requires a
+fresh report and leaves the original report and audit intact. Every exclusion
+is durably recorded before collection continues, including native identity, minute bounds, observation timestamp and
+bid/ask. Other data errors remain fatal. Valid segments use candle-cache;
+excluded minutes remain uncovered gaps rather than cached empty results.
+
+Keep the report's `.quarantine.json` sidecar: resume and baking validate its
+identity, exclusions and digest. Resume requires the same explicit policy and
+retains the original cumulative budget, including exclusions for unfinished
+symbols. Start a fresh report when opting in for an earlier strict failure;
+existing strict reports cannot silently acquire a different policy. The
+missing-only finisher accepts and forwards both flags, and baked rows retain
+an exclusion-count and audit-digest comment.

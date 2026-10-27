@@ -30,11 +30,12 @@ pub struct Args {
     /// With --only, sample an explicit stock subset; this never enables stock orders.
     #[arg(long, conflicts_with_all = ["all_instruments", "resume"])]
     pub stocks: bool,
-    /// Exclude and durably audit at most five crossed whole M1 minutes per instrument.
+    /// Exclude and durably audit crossed M1 minutes (default five, maximum 100).
+    /// Each instrument must also keep exclusions at or below 0.1% of its observations.
     /// Runtime feeds remain strict; every other historical-data failure stays fatal.
     #[arg(long)]
     pub quarantine_crossed_minutes: bool,
-    #[arg(long, default_value_t=5, value_parser=clap::value_parser!(u32).range(1..=5), requires="quarantine_crossed_minutes")]
+    #[arg(long, default_value_t=5, value_parser=clap::value_parser!(u32).range(1..=100), requires="quarantine_crossed_minutes")]
     pub max_quarantined_minutes: u32,
     #[arg(long)]
     pub out: PathBuf,
@@ -134,6 +135,20 @@ mod tests {
                 .max_minutes_per_instrument,
             5
         );
+        let twenty = Args::try_parse_from(base.into_iter().chain([
+            "--quarantine-crossed-minutes",
+            "--max-quarantined-minutes",
+            "20",
+        ]))
+        .unwrap();
+        assert_eq!(
+            twenty
+                .quarantine_policy()
+                .unwrap()
+                .unwrap()
+                .max_minutes_per_instrument,
+            20
+        );
         for tail in [
             vec!["--max-quarantined-minutes", "1"],
             vec![
@@ -144,7 +159,7 @@ mod tests {
             vec![
                 "--quarantine-crossed-minutes",
                 "--max-quarantined-minutes",
-                "6",
+                "101",
             ],
         ] {
             assert!(Args::try_parse_from(base.into_iter().chain(tail)).is_err());

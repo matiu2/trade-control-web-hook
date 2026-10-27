@@ -433,3 +433,75 @@ fn qualified_complete_profile_requires_durable_matching_bounded_exclusions() {
     let old: Report = serde_json::from_slice(&bytes).unwrap();
     assert!(old.quarantine_policy.is_none());
 }
+
+fn audit_exclusions(r: &mut Report, path: &std::path::Path, count: usize) {
+    use crate::ctrader::quarantine::{Binding, Minute, Policy, audit::Audit};
+    r.quarantine_policy = Some(Policy::new(20).unwrap());
+    let mut audit = Audit::open(path, None, Binding::from_report(r).unwrap()).unwrap();
+    let row = &mut r.instruments[0];
+    for number in 0..count {
+        let crossed = ctrader_data_source::CrossedHistoricalQuote {
+            time_ms: (r.from_utc + chrono::Duration::minutes(number as i64 + 1)).timestamp_millis(),
+            bid: 2.0,
+            ask: 1.0,
+        };
+        let minute = Minute::from_error(&row.measurement.symbol, row.symbol_id, &crossed).unwrap();
+        audit.record(minute.clone()).unwrap();
+        row.quarantined_minutes.push(minute);
+    }
+    r.quarantine_audit = Some(audit.evidence().unwrap());
+}
+
+#[test]
+fn fractional_quarantine_limit_is_checked_for_report_resume_and_strict_bake() {
+    crate::ctrader::test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = report();
+    audit_exclusions(&mut r, &dir.path().join("audit.json"), 1);
+    r.instruments[0].measurement.profile.n_bars = 999;
+    assert!(render(&r, &r.identity).is_ok());
+    r.instruments[0].measurement.profile.n_bars = 998;
+    assert!(
+        render(&r, &r.identity)
+            .unwrap_err()
+            .to_string()
+            .contains("0.1%")
+    );
+    assert!(crate::ctrader::checkpoint::validate(&r, &r.identity, &r.requested_symbols).is_err());
+    // A valid audit and a large explicit absolute allowance do not override the fraction.
+    let mut r = report();
+    audit_exclusions(&mut r, &dir.path().join("two.json"), 2);
+    assert!(render(&r, &r.identity).is_err());
+    r.instruments[0].measurement.profile.n_bars = 1998;
+    assert!(render(&r, &r.identity).is_ok());
+}
+
+#[test]
+fn sparse_stock_session_cannot_use_the_absolute_budget_to_exclude_a_large_fraction() {
+    crate::ctrader::test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = report();
+    r.identity.profile = "ctrader-demo".into();
+    r.identity.account_id = 49247794;
+    r.identity.broker = "Spotware".into();
+    r.identity.login = 5944473;
+    let native = broker_ctrader::catalogue::stock_metadata("AMP").unwrap();
+    let row = &mut r.instruments[0];
+    row.symbol_id = native.id;
+    row.measurement.symbol = "AMP".into();
+    row.measurement.pip_size = 10_f64.powi(-native.pip_position);
+    row.measurement.schedule = "utc".into();
+    row.measurement.timezone = "UTC".into();
+    row.measurement.profile.review = ReviewStatus::MaskNotComputable;
+    row.measurement.profile.n_bars = 500;
+    r.requested_symbols = vec!["AMP".into()];
+    audit_exclusions(&mut r, &dir.path().join("stock.json"), 1);
+    assert!(
+        render(&r, &r.identity)
+            .unwrap_err()
+            .to_string()
+            .contains("0.1%")
+    );
+    r.instruments[0].measurement.profile.n_bars = 999;
+    assert!(render(&r, &r.identity).is_ok());
+}

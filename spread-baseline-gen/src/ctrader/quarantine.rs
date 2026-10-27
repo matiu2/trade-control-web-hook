@@ -8,6 +8,8 @@ use std::path::PathBuf;
 pub(crate) mod audit;
 pub(crate) mod collect;
 mod persistence;
+mod quota;
+pub use quota::validate_fraction;
 mod validation;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,8 +20,8 @@ pub struct Policy {
 impl Policy {
     pub fn new(max_minutes_per_instrument: u32) -> Result<Self> {
         ensure!(
-            (1..=5).contains(&max_minutes_per_instrument),
-            "crossed-minute quarantine limit must be between one and five"
+            (1..=100).contains(&max_minutes_per_instrument),
+            "crossed-minute quarantine limit must be between one and one hundred"
         );
         Ok(Self {
             max_minutes_per_instrument,

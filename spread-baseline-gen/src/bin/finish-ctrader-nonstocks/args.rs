@@ -31,7 +31,7 @@ pub struct Args {
     /// Explicit bounded whole-minute quality exclusions, forwarded to the generator.
     #[arg(long)]
     pub quarantine_crossed_minutes: bool,
-    #[arg(long, default_value_t=5, value_parser=clap::value_parser!(u32).range(1..=5), requires="quarantine_crossed_minutes")]
+    #[arg(long, default_value_t=5, value_parser=clap::value_parser!(u32).range(1..=100), requires="quarantine_crossed_minutes")]
     pub max_quarantined_minutes: u32,
     #[arg(long)]
     pub deploy_staging: bool,
@@ -97,6 +97,32 @@ pub(super) mod tests {
             "2026-10-22T16:26:00Z",
         ])
         .unwrap()
+    }
+    #[test]
+    fn explicit_quarantine_budget_twenty_is_forwardable_but_one_hundred_one_is_refused() {
+        crate::test_logging();
+        let parse = |budget| {
+            Args::try_parse_from([
+                "finish-ctrader-nonstocks",
+                "--account",
+                "ctrader-demo",
+                "--report",
+                "r.json",
+                "--status",
+                "s.json",
+                "--only",
+                "ETHEUR",
+                "--from",
+                "2026-07-24T16:26:00Z",
+                "--to",
+                "2026-10-22T16:26:00Z",
+                "--quarantine-crossed-minutes",
+                "--max-quarantined-minutes",
+                budget,
+            ])
+        };
+        assert_eq!(parse("20").unwrap().max_quarantined_minutes, 20);
+        assert!(parse("101").is_err());
     }
     #[test]
     fn stock_scope_is_explicit_native_only_and_rejects_mixed_batches() {

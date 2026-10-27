@@ -78,12 +78,18 @@ pub(super) async fn measure(
         &candles,
     )
     .wrap_err("cTrader paired spread calculation")?;
+    let quarantined_minutes = audit
+        .map(|a| a.minutes(symbol, metadata.id))
+        .transpose()?
+        .unwrap_or_default();
+    crate::ctrader::quarantine::validate_fraction(
+        measurement.profile.n_bars,
+        quarantined_minutes.len(),
+    )
+    .wrap_err_with(|| format!("cTrader calibration quality for {symbol}"))?;
     Ok(InstrumentReport {
         symbol_id: metadata.id,
-        quarantined_minutes: audit
-            .map(|a| a.minutes(symbol, metadata.id))
-            .transpose()?
-            .unwrap_or_default(),
+        quarantined_minutes,
         measurement,
     })
 }

@@ -16,6 +16,10 @@ pub(super) fn validate_report(report: &Report, verify_audit: bool) -> Result<()>
     let binding = Binding::from_report(report)?;
     for row in &report.instruments {
         audit::validate_records(&binding, &row.quarantined_minutes)?;
+        super::validate_fraction(
+            row.measurement.profile.n_bars,
+            row.quarantined_minutes.len(),
+        )?;
         ensure!(
             row.quarantined_minutes
                 .iter()
