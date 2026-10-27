@@ -132,6 +132,7 @@ mod tests {
 
     fn resolved_long_market() -> Resolved {
         Resolved {
+            setup_id: "test-setup".into(),
             id: "t1".into(),
             not_after: ts("2026-05-13T20:00:00Z"),
             instrument: "EUR_USD".into(),
@@ -210,6 +211,7 @@ mod tests {
             blackout_close: crate::intent::BlackoutCloseAction::default(),
             breakeven: None,
             include_archived: false,
+            plan_admin: None,
         }
     }
 

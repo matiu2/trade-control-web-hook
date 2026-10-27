@@ -7,11 +7,8 @@
 //! text, and validation; no arg drift between `replay-candles` and the
 //! `tv-arm` pre-flight parse.
 //!
-//! The heavier replay machinery (candle pulling, the engine loop, the
-//! report) stays bin-local under `cli/src/bin/replay_candles/`. Only the
-//! CLI surface — [`ReplayArgs`] plus the value-enums its fields reference
-//! ([`CandleSource`], [`DirectionFilter`], [`GoldenFilter`]) and the
-//! resolved [`DetectorMarkConfig`] — is shared here.
+//! Replay execution is shared through [`crate::replay_driver`], including
+//! structured reports and positions for in-process chart integrations.
 
 use std::path::PathBuf;
 
@@ -221,6 +218,13 @@ pub struct ReplayArgs {
     /// Named cTrader profile; inferred only from one unique cTrader plan account.
     #[arg(long)]
     pub ctrader_account: Option<String>,
+    /// Named OANDA live account; otherwise inferred from live plan rules.
+    #[arg(long)]
+    pub oanda_account: Option<String>,
+    #[arg(long, hide = true)]
+    pub oanda_worker_url: Option<String>,
+    #[arg(long, hide = true)]
+    pub oanda_key_file: Option<PathBuf>,
 
     /// MT5 replay history: auto falls back to explicitly labelled estimated
     /// ask/mid using this account's baked spread. Paired requires genuine history;

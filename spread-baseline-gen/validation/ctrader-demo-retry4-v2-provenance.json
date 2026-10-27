@@ -1,0 +1,22 @@
+{
+  "root_commit": "c1e745d",
+  "candle_cache_commit": "d56e480",
+  "workspace_commit": "51c580d7",
+  "paired_cache_basis": "ctrader-paired-v2",
+  "tick_request_bounds": "[from,to)",
+  "native_trendbar_upper_bound": "inclusive; existing conversion retained",
+  "binary_sha256": {
+    "generate-ctrader": "fee0e1398aee136c058f69361e243295e59dfabd38dcc1b5fdfc90709edc3b13",
+    "bake-ctrader": "ba9e3bfef4711a0a3a4695d3a2fc0f08dd024d707727bb2e65df726b34f24645",
+    "finish-ctrader-nonstocks": "d9e17811a7c092637737611a00c02a61c49f2c5911da3e5b0073fc0fa359ed2e"
+  },
+  "requested_symbols": [
+    "BTCUSD",
+    "ETHEUR",
+    "UK 100",
+    "US 30"
+  ],
+  "broker_mutations": false,
+  "v1_caches_preserved": true,
+  "strict_checks_unchanged": true
+}

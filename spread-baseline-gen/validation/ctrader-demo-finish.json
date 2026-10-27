@@ -1,0 +1,18 @@
+{
+  "pid": 3207080,
+  "state": "complete",
+  "detail": "strict demo bake and release checks passed; workspace HEAD=034066112e07fb1468d1a54c443ef78fbd3efc32, source SHA256=d3adfbdd2983a5db58d7af8033af28ca8dff74d8b1662271bf34b865e4b1d744, candle-cache HEAD=fceeeca63dbe424ac979202bd272854b7f8011b5, cache SHA256=3fde868ef0ddaf35db2db21d7c3cbbfb91d22832b15f067bf37dbe28530006cb, staging_deployed=true; generated table/evidence await scoped commits",
+  "updated_at": "2026-10-23T08:36:19.424831490Z",
+  "sources": [
+    {
+      "name": "workspace",
+      "head": "034066112e07fb1468d1a54c443ef78fbd3efc32",
+      "sha256": "d3adfbdd2983a5db58d7af8033af28ca8dff74d8b1662271bf34b865e4b1d744"
+    },
+    {
+      "name": "candle-cache",
+      "head": "fceeeca63dbe424ac979202bd272854b7f8011b5",
+      "sha256": "3fde868ef0ddaf35db2db21d7c3cbbfb91d22832b15f067bf37dbe28530006cb"
+    }
+  ]
+}

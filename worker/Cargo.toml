@@ -19,6 +19,10 @@ path = "src/bin/accounts.rs"
 name = "trade-control-broker-check"
 path = "src/bin/broker_check.rs"
 
+[[bin]]
+name = "trade-control-reconcile-entry"
+path = "src/bin/reconcile_entry.rs"
+
 [dependencies]
 mt5-data-source = { path = "../../mt5-data-source" }
 broker-mt5 = { path = "../broker-mt5" }
@@ -43,10 +47,18 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 trade-control-core = { version = "0.1.0", path = "../core" }
 trade-control-cron = { version = "0.1.0", path = "../trade-control-cron" }
 tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.20.0", version = "0.7.0" }
+reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
+instrument-lookup = { version = "0.7.0", path = "../../instrument-lookup" }
 ctrader-api = { version = "0.1.0", path = "../../ctrader-api" }
 broker-ctrader = { version = "0.1.0", path = "../broker-ctrader" }
 ctrader-fix = { version = "0.1.0", path = "../../ctrader-fix" }
+rpassword = "7.5.4"
+tempfile = "3.27.0"
+toml_edit = "0.25.15"
+subtle = "2.6.1"
+adaptive-risk = { version = "0.1.0", path = "../adaptive-risk" }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+tower = { version = "0.5.3", features = ["util"] }
 trade-control-core = { path = "../core", features = ["test-support"] }

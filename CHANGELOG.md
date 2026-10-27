@@ -1,5 +1,50 @@
 # Changelog
 
+## 2026-10-19 — bounded market fallback after two proximity rejections
+
+MT5 stop entries configured to recover as limits now have one third attempt:
+market, only after BOTH stop and limit fail local validation inside the broker
+minimum-distance band at the original trigger. Generic wrong-side errors and
+other failures cannot authorize it. A fresh executable price must remain inside
+the narrower band (and any explicit slippage allowance); MT5 rechecks after
+account/FX reads, preserves SL/TP, revalidates minimum R and entry veto levels,
+and sizes again.
+
+Entry outcomes now preserve the recovery stage, original trigger, bid/ask,
+distance and minimum, and explain why market was not attempted or confirmed.
+Recovered markets are labelled `entered` and use the placed reference in their
+break-even snapshot. The chain consumes one entry attempt. Uncertain responses
+from any recovery preserve duplicate suppression rather than becoming ordinary
+retryable price failures. Dry runs show their stages without submitting trades.
+
+Tests cover the recorded AUDJPY 110.138 trigger with bid/ask 110.123/110.133,
+the short mirror, accepted limits, unrelated failures at either pending stage,
+uncertainty, moved/invalid quotes, exact minimum-distance rounding, price/R
+bounds, explicit caps, dry runs and one-attempt bookkeeping. This fixes the
+placement lifecycle for near-price failures; it does not enable continuous
+trigger watching or change the separately tracked replay rejection model.
+
+## 2026-10-19 — use executable quotes for entry recovery
+
+Stop-entry recovery now checks the ask for longs and bid for shorts, matching
+broker placement. Using mid could skip a valid recovery limit when the trigger
+was inside the spread, or allow a market recovery beyond its slippage bound.
+MT5's local pending-entry rejection now logs the bid, ask, trigger, distance
+and broker minimum, explicitly stating that the order was never transmitted.
+
+Investigation of `ihs-audjpy-4c834155` found a long stop at 110.138, SL 109.720
+and TP 110.999. AUDJPY requires 0.010 minimum entry distance. Historical ticks
+at 02:00:17.779 UTC were bid 110.123 / ask 110.133, matching the logged recovery
+mid 110.128: the configured limit fallback correctly declined this particular
+attempt. MT5 history contained no AUDJPY orders or deals around the attempt.
+The quote-selection fix does not change that historical verdict.
+
+Regression tests cover both directions inside the spread, executable-price
+market slippage and sizing references, read failures, wrong-side controls and
+the actual AUDJPY recovery quote. The separate replay rejection gap remains
+tracked in `BUG-replay-blind-to-broker-entry-recovery.md`; a replay position
+does not establish that a live order was accepted.
+
 ## v154 — 2026-10-11 — refresh forming range candles
 
 Shared candle-cache excludes forming bars from range persistence and coverage,

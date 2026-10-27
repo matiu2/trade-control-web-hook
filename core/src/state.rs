@@ -755,6 +755,26 @@ pub struct Snapshot {
 /// Async storage interface. Implementations are `?Send` because the CF Worker
 /// runtime is single-threaded WASM and its KV handle is `!Send`.
 pub trait StateStore {
+    /// Durable placement identity for reporting, independent of retry policy.
+    fn record_position_link(
+        &self,
+        _link: crate::position_tracking::PositionLink,
+    ) -> impl Future<Output = Result<(), StateError>> {
+        async {
+            Err(StateError::Backend(
+                "position link persistence unavailable".into(),
+            ))
+        }
+    }
+    fn list_position_links(
+        &self,
+    ) -> impl Future<Output = Result<Vec<crate::position_tracking::PositionLink>, StateError>> {
+        async {
+            Err(StateError::Backend(
+                "position link listing unavailable".into(),
+            ))
+        }
+    }
     /// Returns true if `id` has already been recorded as seen.
     fn is_seen(&self, id: &str) -> impl Future<Output = Result<bool, StateError>>;
 
@@ -1733,6 +1753,7 @@ mod memstore {
     pub struct MemStateStore {
         inner: RefCell<Entries>,
         attempts: RefCell<AttemptMap>,
+        position_links: RefCell<Vec<crate::position_tracking::PositionLink>>,
         /// Optional injected "current time". `None` (the default) ⇒ TTL
         /// expiry is judged against real wall-clock `Utc::now()`, matching
         /// the live KV store. An **offline replay** sets this to each tick's
@@ -1787,6 +1808,31 @@ mod memstore {
     }
 
     impl StateStore for MemStateStore {
+        async fn record_position_link(
+            &self,
+            link: crate::position_tracking::PositionLink,
+        ) -> Result<(), StateError> {
+            let mut links = self.position_links.borrow_mut();
+            if let Some(existing) = links
+                .iter()
+                .find(|p| p.account == link.account && p.broker_order_id == link.broker_order_id)
+            {
+                return if *existing == link {
+                    Ok(())
+                } else {
+                    Err(StateError::Backend(
+                        "position link ownership conflict".into(),
+                    ))
+                };
+            }
+            links.push(link);
+            Ok(())
+        }
+        async fn list_position_links(
+            &self,
+        ) -> Result<Vec<crate::position_tracking::PositionLink>, StateError> {
+            Ok(self.position_links.borrow().clone())
+        }
         async fn is_seen(&self, id: &str) -> Result<bool, StateError> {
             Ok(self.get_live(&format!("seen:{id}"), self.now()).is_some())
         }

@@ -87,6 +87,9 @@ pub struct FrozenSetup {
     /// OANDA feed, so an unqualified capture would re-arm against a different
     /// price feed and look entirely plausible.
     pub chart_symbol: String,
+    /// Explicit account selected with a chart feed; older captures leave it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trading_account: Option<String>,
     /// The journaling cursor (`--start`) this setup was read at, as an epoch.
     ///
     /// `None` means the setup was captured live with no cursor.
@@ -134,6 +137,7 @@ impl FrozenSetup {
             geom,
             resolution,
             chart_symbol,
+            trading_account: None,
             start,
             note,
             tv_arm_version: Some(env!("GIT_VERSION").to_string()),
@@ -190,16 +194,21 @@ impl FrozenSetup {
     pub fn parse(text: &str, source: &str) -> Result<Self> {
         let setup: Self =
             serde_json::from_str(text).wrap_err_with(|| format!("parse frozen setup {source}"))?;
-        if setup.version > SPEC_VERSION {
+        setup.validate_version(source)?;
+        Ok(setup)
+    }
+
+    pub(crate) fn validate_version(&self, source: &str) -> Result<()> {
+        if self.version > SPEC_VERSION {
             return Err(eyre!(
                 "frozen setup {} is version {} but this tv-arm understands up to {}; \
                  upgrade tv-arm rather than arming from a spec it can't read",
                 source,
-                setup.version,
+                self.version,
                 SPEC_VERSION,
             ));
         }
-        Ok(setup)
+        Ok(())
     }
 }
 
@@ -265,6 +274,7 @@ mod tests {
         // fixture whose `position` was None, so the new field slipped past
         // the one check meant to catch new fields.
         let full = FrozenSetup {
+            trading_account: Some("oanda-live".into()),
             position: Some(crate::frozen_position::FrozenPosition {
                 direction: crate::frozen_position::FrozenDirection::Long,
                 entry: 1.1000,
@@ -290,6 +300,7 @@ mod tests {
                 "position",
                 "resolution",
                 "start",
+                "trading_account",
                 "tv_arm_version",
                 "version",
             ],

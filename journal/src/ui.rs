@@ -4,6 +4,7 @@
 mod compare;
 mod infobar;
 mod list;
+mod plan_actions;
 mod popup;
 mod replay;
 mod timeline;
@@ -26,6 +27,7 @@ pub fn render(f: &mut Frame, app: &App) {
             // carries a screenshot URL — so a plan without one keeps the bar's
             // old height rather than showing a blank line.
             Constraint::Length(infobar::height(app)),
+            Constraint::Length(1), // plan management buttons
             Constraint::Min(1),    // body
             Constraint::Length(1), // footer
         ]
@@ -39,7 +41,8 @@ pub fn render(f: &mut Frame, app: &App) {
 
     let (body, footer) = if show_infobar {
         infobar::render(f, app, chunks[0]);
-        (chunks[1], chunks[2])
+        plan_actions::render_controls(f, app, chunks[1]);
+        (chunks[2], chunks[3])
     } else {
         (chunks[0], chunks[1])
     };
@@ -53,12 +56,21 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.confirm.is_some() {
         popup::render_confirm(f, app);
     }
+    plan_actions::render_modal(f, app);
     // Drawn last so it sits above the others — while a prompt is open every
     // key goes to it (see `keys::map_key`), so it must be what the operator
     // sees on top.
     if app.prompt.is_some() {
         popup::render_prompt(f, app);
     }
+}
+
+pub fn map_mouse(
+    app: &App,
+    event: crossterm::event::MouseEvent,
+    area: Rect,
+) -> crate::keys::Action {
+    plan_actions::map_mouse(app, event, area)
 }
 
 /// Dispatch the body area to the active screen's renderer.

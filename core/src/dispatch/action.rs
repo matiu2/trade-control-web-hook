@@ -45,6 +45,9 @@ pub async fn run_action<B: Broker, S: StateStore>(
         | Action::PlanShow
         | Action::PlanTimeline
         | Action::PlanDelete
+        | Action::PlanPaper
+        | Action::PlanSwapAccount
+        | Action::PlanClosedManually
         | Action::PlanPurge
         | Action::PurgeOlderThan
         // MarketInfo needs the concrete TradeNation broker (its `market_info`

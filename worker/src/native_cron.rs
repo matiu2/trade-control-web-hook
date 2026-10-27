@@ -73,46 +73,39 @@ impl NativeCronEnv {
 
 impl CronEnv for NativeCronEnv {
     async fn acquire_broker(&self, account: Option<&str>) -> Option<BrokerHandle> {
-        let meta = self.resolve_meta(account).await?;
-        match meta.broker {
-            BrokerKind::Oanda => match acquire_oanda(&meta, &self.state.secrets) {
-                Ok(b) => Some(BrokerHandle::Oanda(b)),
-                Err(err) => {
-                    tracing::error!("cron: oanda acquire failed for '{}': {err}", meta.name);
-                    None
-                }
-            },
-            BrokerKind::TradeNation => match acquire_tn(&meta).await {
-                Ok(b) => Some(BrokerHandle::TradeNation(b)),
-                Err(err) => {
-                    tracing::error!(
-                        "cron: tradenation acquire failed for '{}': {err}",
-                        meta.name
-                    );
-                    None
-                }
-            },
-            BrokerKind::Ibkr => match acquire_ibkr(&meta).await {
-                Ok(b) => Some(BrokerHandle::Ibkr(b)),
-                Err(err) => {
-                    tracing::error!("cron: ibkr acquire failed for '{}': {err}", meta.name);
-                    None
-                }
-            },
-            BrokerKind::Mt5 => match acquire_mt5(&meta).await {
-                Ok(b) => Some(BrokerHandle::Mt5(b)),
-                Err(err) => {
-                    tracing::error!("cron: mt5 acquire failed for '{}': {err}", meta.name);
-                    None
-                }
-            },
-            BrokerKind::Ctrader => match acquire_ctrader(&meta).await {
-                Ok(b) => Some(BrokerHandle::Ctrader(b)),
-                Err(err) => {
-                    tracing::error!("cron: ctrader acquire failed for '{}': {err}", meta.name);
-                    None
-                }
-            },
+        match self.acquire_engine_broker(account).await {
+            Ok(broker) => Some(broker),
+            Err(error) => {
+                tracing::error!(?account, %error, "cron: broker acquisition failed");
+                None
+            }
+        }
+    }
+
+    async fn acquire_engine_broker(&self, account: Option<&str>) -> Result<BrokerHandle, String> {
+        let name = account.ok_or("plan has no named account; no default-account routing")?;
+        let meta = self
+            .state
+            .accounts
+            .get(name)
+            .await
+            .map_err(|error| format!("account {name}: {error}"))?;
+        let result = match meta.broker {
+            BrokerKind::Oanda => acquire_oanda(&meta, &self.state.secrets).map(BrokerHandle::Oanda),
+            BrokerKind::TradeNation => acquire_tn(&meta).await.map(BrokerHandle::TradeNation),
+            BrokerKind::Ibkr => acquire_ibkr(&meta).await.map(BrokerHandle::Ibkr),
+            BrokerKind::Mt5 => acquire_mt5(&meta).await.map(BrokerHandle::Mt5),
+            BrokerKind::Ctrader => acquire_ctrader(&meta).await.map(BrokerHandle::Ctrader),
+        };
+        result.map_err(|error| format!("account {name}: {error}"))
+    }
+
+    async fn record_engine_health(&self, note: trade_control_core::recording::CronNote) {
+        match crate::engine_health::record(self.state.store.pool(), &note).await {
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(trade_id=note.trade_id, %error, "engine-health journal write failed; will retry next tick")
+            }
         }
     }
 
@@ -163,6 +156,17 @@ impl CronEnv for NativeCronEnv {
                 );
             }
         });
+    }
+
+    async fn record_paper_entry(
+        &self,
+        identity: &str,
+        note: trade_control_core::recording::CronNote,
+    ) -> Result<(), String> {
+        crate::paper_entries::record(self.state.store.pool(), identity, &note)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     fn signing_key(&self) -> Option<Vec<u8>> {

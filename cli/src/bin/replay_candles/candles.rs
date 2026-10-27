@@ -23,7 +23,7 @@ use trade_control_core::broker::BidAskCandle as EngineCandle;
 use tradenation_api::TradeNationClient;
 
 use super::granularity::ReplayGranularity;
-use trade_control_cli::replay_args::CandleSource;
+use crate::replay_args::CandleSource;
 
 /// Pull `[from, to]` bid/ask candles for `symbol` at `granularity` from
 /// `source`, in ascending time order, already converted to engine bid/ask
@@ -37,7 +37,8 @@ pub async fn pull(
     cache_dir: Option<PathBuf>,
     mt5_history: &super::history::SourceHistory<'_>,
 ) -> Result<Vec<EngineCandle>> {
-    if matches!(source, CandleSource::Mt5 | CandleSource::Ctrader) {
+    if matches!(source, CandleSource::Mt5 | CandleSource::Ctrader) || mt5_history.uses_live_oanda()
+    {
         color_eyre::eyre::ensure!(
             cache_dir.is_none(),
             "{source:?} uses its pinned account cache namespace; --cache-dir is unsupported"

@@ -1,50 +1,78 @@
-//! Resolve cTrader FX symbols using the selected account's contract metadata.
+//! Resolve account-native cTrader precision while keeping live execution FX-only.
 use color_eyre::eyre::{Result, ensure, eyre};
 use instrument_lookup::AssetClass;
 
-use crate::{instrument_resolution::ResolvedInstrument, precision::CatalogPrecision};
+use crate::instrument_resolution::ResolvedInstrument;
+
+mod metadata;
+
+#[derive(Clone, Copy)]
+enum Mode {
+    Trading,
+    Replay,
+}
+
+impl Mode {
+    fn asset(self, symbol: &str) -> Result<&'static instrument_lookup::Asset> {
+        let asset = match self {
+            Self::Trading => match instrument_lookup::resolve(symbol)? {
+                Some(asset) => asset,
+                None => broker_ctrader::catalogue::replay_asset(symbol).map_err(|error| {
+                    eyre!(
+                        "no catalogued underlying for cTrader symbol {symbol:?} in instrument-lookup \
+                         or the audited cTrader catalogue: {error:#}"
+                    )
+                })?,
+            },
+            Self::Replay => broker_ctrader::catalogue::replay_asset(symbol).map_err(|error| {
+                eyre!(
+                    "cTrader native symbol {symbol:?} is not ready for replay metadata; only audited native non-stock underlyings are onboarded: {error:#}"
+                )
+            })?,
+        };
+        self.validate_class(asset.class)?;
+        Ok(asset)
+    }
+
+    fn validate_class(self, class: AssetClass) -> Result<()> {
+        match self {
+            Self::Trading => ensure!(
+                class == AssetClass::Forex,
+                "cTrader initially supports catalogued FX only"
+            ),
+            // Class alone never establishes readiness: the replay catalogue
+            // audits native non-stock metadata before this policy is checked.
+            Self::Replay => {}
+        }
+        Ok(())
+    }
+}
 
 pub(super) fn resolve(raw: &str, account: Option<&str>) -> Result<ResolvedInstrument> {
+    resolve_with_mode(raw, account, Mode::Trading)
+}
+
+/// Resolve audited native non-stock precision for a price/R replay.
+///
+/// Asset-class permission does not onboard every broker symbol. Stocks and
+/// unverified aliases remain blocked; no executable contract or volume is inferred.
+pub(super) fn resolve_replay(raw: &str, account: Option<&str>) -> Result<ResolvedInstrument> {
+    resolve_with_mode(raw, account, Mode::Replay)
+}
+
+fn resolve_with_mode(raw: &str, account: Option<&str>, mode: Mode) -> Result<ResolvedInstrument> {
     let account = account
-        .filter(|name| !name.is_empty())
+        .filter(|name| !name.trim().is_empty())
         .ok_or_else(|| eyre!("cTrader requires an explicit named account"))?;
     let symbol =
         trade_control_conventions::instrument_for(trade_control_conventions::Broker::Ctrader, raw);
-    let asset = instrument_lookup::resolve(&symbol)?
-        .ok_or_else(|| eyre!("no catalogued underlying for cTrader symbol {raw:?}"))?;
-    ensure!(
-        asset.class == AssetClass::Forex,
-        "cTrader initially supports catalogued FX only"
-    );
+    let asset = mode.asset(&symbol)?;
     trade_control_cli::blocking::run_blocking(async {
         let broker = broker_ctrader::CtraderBroker::connect(account).await?;
-        let metadata = broker.instrument_metadata(&symbol).await?;
-        let decimal_places = u8::try_from(metadata.digits)?;
-        ensure!(decimal_places <= 12, "unsupported cTrader precision");
-        let tick_size = 10_f64.powi(-i32::from(decimal_places));
-        ensure!(
-            metadata.pip_size.is_finite() && metadata.pip_size > 0.0,
-            "invalid cTrader pip size"
-        );
-        Ok(ResolvedInstrument {
-            asset,
-            broker_symbol: metadata.name,
-            precision: CatalogPrecision {
-                tick_size,
-                pip_size: metadata.pip_size,
-                decimal_places,
-                class: asset.class,
-                contract_multiplier: None,
-            },
-        })
+        let native = broker.instrument_metadata(&symbol).await?;
+        metadata::resolve(asset, &symbol, &metadata::NativeMetadata::from(&native))
     })
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn named_account_required_before_network() {
-        let error = super::resolve("EURUSD", None).unwrap_err();
-        assert!(error.to_string().contains("explicit named account"));
-    }
-}
+mod tests;

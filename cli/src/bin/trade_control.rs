@@ -14,6 +14,8 @@
 
 #[path = "trade_control/control_validation.rs"]
 mod control_validation;
+#[path = "trade_control/ctrader_instruments.rs"]
+mod ctrader_instruments;
 use control_validation::{
     canonicalize_instrument, canonicalize_instrument_or_force, scope_ctrader_control,
 };
@@ -29,14 +31,15 @@ use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
     AdoptBody, BuildStrictness, KEY_LEN, TradePattern, adopt_trade, build_clear_prep_intent,
-    build_clear_veto_intent, build_market_info_intent, build_plan_delete_intent,
-    build_plan_list_intent, build_plan_purge_intent, build_plan_show_intent,
-    build_plan_timeline_intent, build_prep_intent, build_purge_older_than_intent,
-    build_register_intent, build_status_intent, build_trade_from_spec, build_trade_interactive,
-    build_unlock_intent, build_veto_intent, fill_missing_fields, generate_key_hex, load_cache,
-    load_spec_from_file, pick_pattern_interactive, pick_template_interactive,
-    prompt_save_as_template, record_account_use, record_prep_use, record_veto_use,
-    validate_instrument, wrap_signed, wrap_signed_template, write_trade,
+    build_clear_veto_intent, build_market_info_intent, build_plan_admin_intent,
+    build_plan_delete_intent, build_plan_list_intent, build_plan_purge_intent,
+    build_plan_show_intent, build_plan_timeline_intent, build_prep_intent,
+    build_purge_older_than_intent, build_register_intent, build_status_intent,
+    build_trade_from_spec, build_trade_interactive, build_unlock_intent, build_veto_intent,
+    fill_missing_fields, generate_key_hex, load_cache, load_spec_from_file,
+    pick_pattern_interactive, pick_template_interactive, prompt_save_as_template,
+    record_account_use, record_prep_use, record_veto_use, validate_instrument, wrap_signed,
+    wrap_signed_template, write_trade,
 };
 use trade_control_core::account::{AccountKind, TradeNationKind};
 use trade_control_core::incoming::signed_pairs_from_text;
@@ -176,11 +179,49 @@ enum PlanCmd {
     /// no-op). Use to re-arm a setup after editing its chart: `plan delete
     /// <id>` then re-run `tv-arm`.
     Delete(PlanDeleteArgs),
+    /// Log paper entries using another account for data; detach existing broker management.
+    Paper(PlanPaperArgs),
+    /// Route future execution to a different account (existing exposure is detached).
+    SwapAccount(PlanSwapAccountArgs),
+    /// Record a manually closed trade and retire local management without a broker call.
+    ClosedManually(PlanManualCloseArgs),
     /// Purge **every** trace of a journaled trade — a superset of `delete`.
     /// Also clears the no-TTL per-trade rows (entry-attempt / order-body /
     /// control-event), enumerable trade-scoped controls (pause / news), and the
     /// trade's R2 `ticks/` bundles. Use after the trade is journaled/logged.
     Purge(PlanPurgeArgs),
+}
+
+#[derive(Parser)]
+struct PlanPaperArgs {
+    trade_id: String,
+    /// Explicitly stop managing old broker orders/positions; does not close them.
+    #[arg(long, required = true)]
+    detach_existing: bool,
+    /// Independent account supplying quotes/candles for paper entry logging.
+    #[arg(long)]
+    account: String,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct PlanSwapAccountArgs {
+    trade_id: String,
+    #[arg(long)]
+    account: String,
+    /// Explicitly stop managing old broker exposure; it is not migrated or closed.
+    #[arg(long, required = true)]
+    detach_existing: bool,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct PlanManualCloseArgs {
+    trade_id: String,
+    #[command(flatten)]
+    common: EndpointArgs,
 }
 
 #[derive(Parser)]
@@ -287,20 +328,25 @@ struct PurgeArgs {
 
 #[derive(Subcommand)]
 enum InstrumentsCmd {
-    /// Force-refresh the on-disk catalog (re-walks the broker's market
-    /// tree, ~1200 entries for TradeNation, takes a few seconds).
+    /// Refresh the broker catalogue. TradeNation updates its on-disk cache;
+    /// cTrader reads the selected account's current Open API catalogue.
     Refresh {
-        #[arg(long, value_enum, default_value_t = BrokerKindArg::TradeNation)]
-        broker: BrokerKindArg,
+        #[arg(long, value_enum, default_value_t = ctrader_instruments::BrokerArg::TradeNation)]
+        broker: ctrader_instruments::BrokerArg,
+        /// Named local account profile. Required for cTrader Open API.
+        #[arg(long)]
+        account: Option<String>,
     },
-    /// Resolve a user-supplied name. Exit 0 on hit (prints canonical
-    /// name + market_id), exit 2 on miss (prints candidate list to
-    /// stderr).
+    /// Resolve a name on the selected broker. Exit 0 on a match (prints
+    /// the canonical name and broker instrument ID), or 2 on a miss.
     Resolve {
         /// Name to resolve, e.g. "XAG/USD", "Spot Gold", "EURUSD".
         name: String,
-        #[arg(long, value_enum, default_value_t = BrokerKindArg::TradeNation)]
-        broker: BrokerKindArg,
+        #[arg(long, value_enum, default_value_t = ctrader_instruments::BrokerArg::TradeNation)]
+        broker: ctrader_instruments::BrokerArg,
+        /// Named local account profile. Required for cTrader Open API.
+        #[arg(long)]
+        account: Option<String>,
         /// Emit machine-readable JSON instead of plain text. Used by
         /// `tv_arm_hs.py` and other tooling.
         #[arg(long)]
@@ -309,8 +355,14 @@ enum InstrumentsCmd {
     /// Print every known instrument name (one per line). Drives the zsh
     /// completion hook on the control subcommands' `instrument` positional.
     List {
-        #[arg(long, value_enum, default_value_t = BrokerKindArg::TradeNation)]
-        broker: BrokerKindArg,
+        /// Emit the selected account identity and full catalogue as JSON.
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_enum, default_value_t = ctrader_instruments::BrokerArg::TradeNation)]
+        broker: ctrader_instruments::BrokerArg,
+        /// Named local account profile. Required for cTrader Open API.
+        #[arg(long)]
+        account: Option<String>,
     },
 }
 
@@ -953,45 +1005,56 @@ _trade_control_tn_instruments() {
 "#;
 
 fn run_instruments(sub: InstrumentsCmd) -> Result<()> {
-    match sub {
-        InstrumentsCmd::Refresh { broker } => match broker.into() {
-            BrokerKind::TradeNation => {
-                // No --account-id on this admin command; fall back to
-                // the default-demo login. The catalog is account-
-                // agnostic, so any working demo produces the same data.
-                let cache = load_cache(true, None, None)?;
+    use ctrader_instruments::Operation;
+    let (broker, account, operation) = match sub {
+        InstrumentsCmd::Refresh { broker, account } => (broker, account, Operation::Refresh),
+        InstrumentsCmd::Resolve {
+            name,
+            broker,
+            account,
+            json,
+        } => (broker, account, Operation::Resolve { name, json }),
+        InstrumentsCmd::List {
+            broker,
+            account,
+            json,
+        } => (broker, account, Operation::List { json }),
+    };
+    let (broker, account) = broker.select(account)?;
+    match (broker, operation) {
+        (BrokerKind::Ctrader, operation) => ctrader_instruments::run(operation, account.as_deref()),
+        (BrokerKind::TradeNation, Operation::Refresh) => {
+            let cache = load_cache(true, account.as_deref(), None)?;
+            println!(
+                "refreshed: {} markets at {}",
+                cache.catalog().markets.len(),
+                cache.path().display()
+            );
+            Ok(())
+        }
+        (BrokerKind::TradeNation, Operation::Resolve { name, json }) => {
+            run_resolve_tradenation(&name, json, account.as_deref())
+        }
+        (BrokerKind::TradeNation, Operation::List { json }) => {
+            let cache = load_cache(false, account.as_deref(), None)?;
+            if json {
                 println!(
-                    "refreshed: {} markets at {}",
-                    cache.catalog().markets.len(),
-                    cache.path().display(),
+                    "{}",
+                    serde_json::json!({"broker":"tradenation", "account":account, "instruments": cache.names().collect::<Vec<_>>()})
                 );
-                Ok(())
+            } else {
+                cache.names().for_each(|name| println!("{name}"));
             }
-            other => Err(no_catalog(other)),
-        },
-        InstrumentsCmd::Resolve { name, broker, json } => match broker.into() {
-            BrokerKind::TradeNation => run_resolve_tradenation(&name, json),
-            other => Err(no_catalog(other)),
-        },
-        InstrumentsCmd::List { broker } => match broker.into() {
-            BrokerKind::TradeNation => {
-                let cache = load_cache(false, None, None)?;
-                for name in cache.names() {
-                    println!("{name}");
-                }
-                Ok(())
-            }
-            other => Err(no_catalog(other)),
-        },
+            Ok(())
+        }
+        (other, _) => Err(no_catalog(other)),
     }
 }
 
-/// The `instruments` subcommands all read the TradeNation market catalog;
-/// no other broker has one wired up. One message rather than a copy per
-/// subcommand, which is how the OANDA arm came to be repeated three times.
+/// Broker catalogues are only wired through their verified native integrations.
 fn no_catalog(broker: BrokerKind) -> color_eyre::eyre::Report {
     eyre!(
-        "no instrument catalog for {}; only --broker tradenation is supported",
+        "no instrument catalog for {}; supported brokers: tradenation, ctrader (--account required)",
         broker.as_str()
     )
 }
@@ -1000,10 +1063,10 @@ fn no_catalog(broker: BrokerKind) -> color_eyre::eyre::Report {
 /// uses a machine-readable shape consumed by `tv_arm_hs.py`. Exit code 2 on
 /// miss (distinct from "broker / cache failed" → exit 1) so callers can
 /// distinguish a clean "not found" from an infra problem.
-fn run_resolve_tradenation(name: &str, json: bool) -> Result<()> {
+fn run_resolve_tradenation(name: &str, json: bool, account: Option<&str>) -> Result<()> {
     use tradenation_instrument_cache::ResolveError;
 
-    let cache = load_cache(false, None, None)?;
+    let cache = load_cache(false, account, None)?;
     match cache.resolve(name) {
         Ok(market) => {
             if json {
@@ -1162,6 +1225,27 @@ fn run_plan(sub: PlanCmd) -> Result<()> {
         PlanCmd::Export(args) => run_plan_export(args),
         PlanCmd::Register(args) => run_plan_register(args),
         PlanCmd::Delete(args) => run_plan_delete(args),
+        PlanCmd::Paper(args) => run_plan_admin(
+            trade_control_core::intent::Action::PlanPaper,
+            &args.trade_id,
+            Some(args.account),
+            args.detach_existing,
+            args.common,
+        ),
+        PlanCmd::SwapAccount(args) => run_plan_admin(
+            trade_control_core::intent::Action::PlanSwapAccount,
+            &args.trade_id,
+            Some(args.account),
+            args.detach_existing,
+            args.common,
+        ),
+        PlanCmd::ClosedManually(args) => run_plan_admin(
+            trade_control_core::intent::Action::PlanClosedManually,
+            &args.trade_id,
+            None,
+            true,
+            args.common,
+        ),
         PlanCmd::Purge(args) => run_plan_purge(args),
     }
 }
@@ -1535,6 +1619,30 @@ fn run_plan_register(args: PlanRegisterArgs) -> Result<()> {
     let intent = build_register_intent(plan, args.account_id.as_deref(), now, &suffix);
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
+    print_raw(&response);
+    Ok(())
+}
+
+fn run_plan_admin(
+    action: trade_control_core::intent::Action,
+    trade_id: &str,
+    target_account: Option<String>,
+    detach_existing: bool,
+    common: EndpointArgs,
+) -> Result<()> {
+    let key = load_key(&common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let intent = build_plan_admin_intent(
+        action,
+        trade_id,
+        target_account,
+        detach_existing,
+        now,
+        &suffix,
+    );
+    let body = wrap_control(&intent, &key, now)?;
+    let response = post_control(&common.endpoint, &body)?;
     print_raw(&response);
     Ok(())
 }

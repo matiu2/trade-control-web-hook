@@ -254,8 +254,8 @@ mod tests {
     /// version asserted a marker list against itself and could not fail.
     #[test]
     fn real_bad_input_constructors_classify_as_bad_input() {
+        use crate::replay_args::CandleSource;
         use crate::replay_candles::{granularity, instrument};
-        use trade_control_cli::replay_args::CandleSource;
 
         let cases: Vec<(&str, color_eyre::Report)> = vec![
             (
@@ -269,7 +269,7 @@ mod tests {
             ),
             (
                 "unparseable datetime",
-                crate::parse_start_end("not-a-date").expect_err("not a datetime"),
+                crate::replay_driver::parse_start_end("not-a-date").expect_err("not a datetime"),
             ),
         ];
 

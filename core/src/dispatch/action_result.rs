@@ -62,7 +62,7 @@ impl ActionResult {
     /// This deliberately differs from the HTTP response body for
     /// [`Self::Rejected`] and [`Self::Failed`]: the body is the caller-facing
     /// message (e.g. the long "entry blocked: SL too close to spread …"
-    /// prose, or a flat `"action failed"`), whereas the recorded outcome is
+    /// prose, or `"action failed: …"`), whereas the recorded outcome is
     /// the concise gate verdict a later `plan timeline` / `status` read wants
     /// (e.g. `rejected: sl-widen-below-min-r (spread=1 widened_sl_lvl=… …)`).
     /// Persisting this instead of the body is what makes the live worker's

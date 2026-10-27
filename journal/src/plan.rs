@@ -10,14 +10,18 @@
 //! (the plan format evolves often) doesn't break the journal.
 
 use color_eyre::eyre::{Result, eyre};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use trade_control_core::screenshot::ScreenshotUrl;
 
 /// One plan as summarised by `plan list --yaml`. Terminated (archived) plans
 /// carry `archived_at`; live plans leave it `None`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct PlanRow {
     pub trade_id: String,
+    #[serde(default)]
+    pub positions: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub position_sync: Vec<serde_json::Value>,
     #[serde(default)]
     pub account: String,
     #[serde(default)]
@@ -30,6 +34,9 @@ pub struct PlanRow {
     pub granularity: String,
     #[serde(default)]
     pub phase: Option<String>,
+    /// Entry invalidation leaves exit guards active, so phase alone is ambiguous.
+    #[serde(default)]
+    pub entries_blocked: bool,
     #[serde(default)]
     pub shadow: bool,
     #[serde(default)]
@@ -42,6 +49,14 @@ pub struct PlanRow {
 }
 
 impl PlanRow {
+    pub fn phase_label(&self) -> &str {
+        if self.entries_blocked && !self.is_archived() && self.phase.as_deref() != Some("done") {
+            "entries blocked"
+        } else {
+            self.phase.as_deref().unwrap_or("-")
+        }
+    }
+
     /// True for a terminated / archived plan (only surfaced under
     /// `--include-all`).
     pub fn is_archived(&self) -> bool {
@@ -84,7 +99,8 @@ fn sort_oldest_event_first(rows: &mut [PlanRow]) {
 }
 
 /// How the trade enters — classified from which enter rules the plan carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EntryMode {
     /// `05-enter` only — the H&S break-and-close-then-retest stop entry.
     Normal,
@@ -113,7 +129,7 @@ impl EntryMode {
 /// `--skip-retest` halves) omit them so the enter fires directly on the pine
 /// pattern. This is derived from the presence of the `03-prep-break-and-close`
 /// and `04-prep-retest` rules — the plan's `preps` list isn't reliably present.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct BcrPreps {
     /// `03-prep-break-and-close` is present.
     pub break_and_close: bool,
@@ -153,7 +169,8 @@ impl BcrPreps {
 }
 
 /// The order type of one enter leg, from the intent's `entry.type`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OrderType {
     Market,
     Stop,
@@ -182,7 +199,7 @@ impl OrderType {
 }
 
 /// The info-bar facts distilled from `plan export`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PlanDetail {
     pub trade_id: String,
     pub instrument: String,
@@ -319,6 +336,26 @@ pub fn parse_plan_export(json: &str) -> Result<PlanDetail> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entries_blocked_label_distinguishes_monitoring_from_awaiting_entry() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        let rows = parse_plan_list(
+            "- trade_id: blocked\n  phase: await_entry\n  entries_blocked: true\n\
+             - trade_id: done\n  phase: done\n  entries_blocked: true\n\
+             - trade_id: legacy\n  phase: await_entry\n",
+        )
+        .expect("plan rows");
+        assert_eq!(rows[0].phase_label(), "entries blocked");
+        assert_eq!(rows[1].phase_label(), "done");
+        assert_eq!(rows[2].phase_label(), "await_entry");
+    }
 
     const LIST: &str = include_str!("../tests/fixtures/plan_list.yaml");
     const EXPORT: &str = include_str!("../tests/fixtures/plan_export.json");

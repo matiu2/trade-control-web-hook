@@ -1,4 +1,11 @@
 use super::*;
+mod risk;
+
+pub(super) struct SizedEntry {
+    pub cents: i64,
+    pub implied_pct: f64,
+    pub max_stop_distance: f64,
+}
 pub(crate) fn volume(
     units: f64,
     min: i64,
@@ -67,7 +74,7 @@ pub(super) async fn size(
     trader: &Value,
     price: f64,
     cap: f64,
-) -> std::result::Result<(i64, f64), EntryError> {
+) -> std::result::Result<SizedEntry, EntryError> {
     let (distance, _) = geometry::geometry(req, price)?;
     let effective_distance = if matches!(req.entry, ResolvedEntry::Market { .. }) {
         (distance * 100000.0 - 1e-7).ceil() / 100000.0
@@ -108,5 +115,9 @@ pub(super) async fn size(
             cap,
         });
     }
-    Ok((cents, implied))
+    Ok(SizedEntry {
+        cents,
+        implied_pct: implied,
+        max_stop_distance: risk::max_stop_distance(&req.risk, equity, rate, cents, cap)?,
+    })
 }

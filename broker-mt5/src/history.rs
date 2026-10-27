@@ -6,6 +6,9 @@ use trade_control_core::{
     settlement::{LedgerEntry, LedgerSource, SettledTrade, Settlement},
 };
 
+mod exit;
+pub(crate) use exit::exit;
+
 pub(crate) fn attempt(
     symbol: &str,
     order: &str,

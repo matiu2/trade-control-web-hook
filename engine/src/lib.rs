@@ -60,6 +60,7 @@ mod entry_conditions;
 mod ma_alignment;
 mod ma_enablement;
 pub mod pullback;
+pub mod spread_identity;
 
 mod evaluate;
 pub use evaluate::{

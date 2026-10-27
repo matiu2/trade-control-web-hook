@@ -4,7 +4,7 @@
 //! Where the order sweep walks pending broker orders, this walks every
 //! registered [`TradePlan`](trade_control_core::trade_plan::TradePlan). For
 //! each plan it loads the persisted [`PlanState`], fetches the candles that have
-//! closed since the watermark, runs the pure [`evaluate_plan`] FSM, persists the
+//! closed since the watermark, runs the pure [`trade_control_engine::evaluate_plan`] FSM, persists the
 //! advanced state, and dispatches each fired intent through the *same* handlers
 //! the webhook uses (`run_enter` / `run_close` / the veto + prep handlers). The
 //! plan was already HMAC-verified at register time, so the engine synthesises a
@@ -25,7 +25,9 @@
 //! `= true` is evaluated and its [`PlanState`] advanced **identically** to a
 //! live plan — same candles, same FSM, same watermark — but its fired intents
 //! are **never dispatched**: each is logged as a `SHADOW would-fire` line
-//! instead (see [`log_shadow_fire`]). This is the safe way to run the engine
+//! instead (see [`log_shadow_fire`]). Paper entries also receive a durable
+//! journal note with their resolved bracket before the watermark advances.
+//! No fills or P&L are simulated. This is the safe way to run the engine
 //! beside the live TradingView alerts on demo (the Stage F gate): both observe
 //! the same bars, but only the TV alert places real orders, so the engine's
 //! decisions can be diffed against the alert without any double-firing.
@@ -38,7 +40,7 @@
 //! # Where the tests live
 //!
 //! The decision logic is pure and tested where it lives: the FSM
-//! ([`evaluate_plan`]) and the seed-without-firing rule ([`seed_plan_state`])
+//! ([`trade_control_engine::evaluate_plan`]) and the seed-without-firing rule ([`seed_plan_state`])
 //! have native table tests in the `trade-control-engine` crate;
 //! [`Shell::from_candle`] is tested in `core`. This module's own functions are
 //! thin glue over the concrete [`BrokerHandle`] and the [`CronEnv`] seam, so
@@ -48,6 +50,8 @@
 
 mod catchup;
 mod detector_history;
+mod health;
+mod paper;
 
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{Broker, Candle, CandleError, Granularity, filter_new_candles};
@@ -92,13 +96,20 @@ where
     tracing::info!("cron engine: {} registered plans", plans.len());
 
     for stored in plans {
-        if let Err(err) = tick_one(store, cron, &stored, now).await {
+        let result = tick_one(store, cron, &stored, now).await;
+        if let Err(err) = &result {
             tracing::error!(
                 "cron engine[{}/{}]: {err}",
                 stored.account.as_deref().unwrap_or("<global>"),
                 stored.plan.trade_id,
             );
         }
+        cron.record_engine_health(health::observation(
+            &stored,
+            result.as_ref().err().map(String::as_str),
+            now,
+        ))
+        .await;
     }
 }
 
@@ -133,18 +144,12 @@ where
     let prior = match read_plan_state_settled(store, account, &plan.trade_id).await? {
         Some(state) => state,
         None => {
-            let broker = cron
-                .acquire_broker(account)
-                .await
-                .ok_or("broker acquisition failed")?;
+            let broker = cron.acquire_engine_broker(account).await?;
             return seed_first_tick(store, &broker, plan, account, expires_at, now).await;
         }
     };
 
-    let broker = cron
-        .acquire_broker(account)
-        .await
-        .ok_or("broker acquisition failed")?;
+    let broker = cron.acquire_engine_broker(account).await?;
 
     // Fetch candles closed since the watermark. A plan with no watermark (an
     // earlier seed that found an empty window) re-seeds from the back-window.
@@ -181,7 +186,6 @@ where
     // fetch a wider back-window ending at `now` for the detector; otherwise the
     // window is unused and `fresh` stands in.
     let detector_window = detector_window_for(&broker, plan, &fresh, now).await?;
-
     let eval = evaluate_plan(plan, &prior, &fresh, &detector_window, now, expires_at);
 
     // Surface any trendline out-of-window anchor diagnostics the pure evaluator
@@ -193,19 +197,36 @@ where
         tracing::info!("cron engine: plan {} {}", plan.trade_id, w);
     }
 
-    // Persist the advanced state (or clear it + the plan when the spine is
+    // Paper entry notes must commit before consuming their signals. Persist
+    // the advanced state (or clear it + the plan when the spine is
     // done) before dispatching, so a dispatch failure can't replay a fired bar.
     // Capture the transition (before/after/success/error) for the tick-bundle.
-    let kv = persist_plan_state(store, &broker, plan, account, &eval, now, &prior).await;
+    let kv = paper::record_then_advance(cron, stored, &eval.fired, now, || {
+        persist_plan_state(store, &broker, plan, account, &eval, now, &prior)
+    })
+    .await?;
     // A hard put failure is still a skip for this tick — but the bundle records
     // the failed transition first, so a replay can see "wanted to advance,
     // couldn't" rather than a silent gap.
     let put_failed = !kv.success && !eval.done;
 
-    if !put_failed
-        && let Some(note) =
-            catchup::observation(stored, since, &fresh, eval.new_state.watermark, now)
-    {
+    if put_failed {
+        let bundle = build_tick_bundle(
+            stored,
+            &prior,
+            &fresh,
+            &detector_window,
+            eval,
+            now,
+            expires_at,
+            Vec::new(),
+            kv.clone(),
+        );
+        cron.record_tick(bundle);
+        return Err(format!("put_plan_state: {}", kv.error.unwrap_or_default()));
+    }
+
+    if let Some(note) = catchup::observation(stored, since, &fresh, eval.new_state.watermark, now) {
         tracing::warn!(
             trade_id = plan.trade_id,
             message = note.message,
@@ -246,25 +267,6 @@ where
         );
         cron.record_tick(bundle);
         return Ok(());
-    }
-
-    if put_failed {
-        // Record the failed transition before bailing, so a replay sees the
-        // "wanted to advance, couldn't" rather than a silent gap. No dispatch
-        // happened, so `dispatch_outcomes` is empty.
-        let bundle = build_tick_bundle(
-            stored,
-            &prior,
-            &fresh,
-            &detector_window,
-            eval,
-            now,
-            expires_at,
-            Vec::new(),
-            kv.clone(),
-        );
-        cron.record_tick(bundle);
-        return Err(format!("put_plan_state: {}", kv.error.unwrap_or_default()));
     }
 
     let mut dispatch_outcomes = Vec::with_capacity(eval.fired.len());
@@ -357,7 +359,10 @@ where
     // Persist the control state (open_news_windows / blackout) before dispatch,
     // so a dispatch failure can't replay a fired window edge. A control tick
     // never advances the watermark (no bar processed) and is never `done`.
-    let kv = persist_plan_state(store, broker, plan, account, &eval, now, prior).await;
+    let kv = paper::record_then_advance(cron, stored, &eval.fired, now, || {
+        persist_plan_state(store, broker, plan, account, &eval, now, prior)
+    })
+    .await?;
     if !kv.success {
         let bundle = build_tick_bundle(
             stored,
@@ -449,6 +454,9 @@ async fn fetch_plan_settlement<S: StateStore>(
     account: Option<&str>,
     now: DateTime<Utc>,
 ) -> Option<trade_control_core::settlement::Settlement> {
+    if plan.shadow {
+        return None;
+    }
     let attempts = match store.list_entry_attempts(account, &plan.trade_id).await {
         Ok(rows) => rows,
         Err(err) => {
@@ -1210,12 +1218,14 @@ mod tests {
     }
 
     #[test]
-    fn disposition_unavailable_preserves_ctrader_history_evidence() {
-        let error = disposition(Err(CandleError::Unavailable(
-            "cTrader paired quotes unavailable".into(),
-        )))
-        .unwrap_err();
-        assert!(error.contains("cTrader paired quotes unavailable"));
+    fn disposition_preserves_mt5_identity_failure_for_the_journal() {
+        let result = disposition(Err(CandleError::Unavailable(
+            "MT5 GBPAUD: account/server mismatch".into(),
+        )));
+        assert_eq!(
+            result,
+            Err("candle fetch failed: MT5 GBPAUD: account/server mismatch".into())
+        );
     }
 
     #[test]

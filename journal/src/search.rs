@@ -98,7 +98,7 @@ fn haystack(row: &PlanRow) -> String {
         row.instrument,
         row.direction.as_deref().unwrap_or(""),
         row.granularity,
-        row.phase.as_deref().unwrap_or(""),
+        row.phase_label(),
         row.account,
         if row.is_archived() { "archived" } else { "" },
     );
@@ -117,12 +117,15 @@ mod tests {
 
     fn row(trade_id: &str, instrument: &str, granularity: &str, phase: &str) -> PlanRow {
         PlanRow {
+            positions: Vec::new(),
+            position_sync: Vec::new(),
             trade_id: trade_id.to_string(),
             account: "demo".into(),
             instrument: instrument.to_string(),
             direction: None,
             granularity: granularity.to_string(),
             phase: Some(phase.to_string()),
+            entries_blocked: false,
             shadow: false,
             archived_at: None,
             watermark: None,

@@ -166,7 +166,7 @@ mod tests {
         ] {
             let mut args = vec!["trade-control"];
             args.extend(tail);
-            args.extend(["--broker", "ctrader"]);
+            args.extend(["--broker", "ctrader", "--key-file", "test-signing-key.hex"]);
             assert!(super::super::Cli::try_parse_from(&args).is_err());
             args.extend(["--account", "demo-account"]);
             assert!(super::super::Cli::try_parse_from(args).is_ok());
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn legacy_controls_keep_optional_account_and_default_route() {
         init_tracing();
-        for args in [
+        for mut args in [
             vec!["trade-control", "prep", "EUR_USD", "ready"],
             vec!["trade-control", "unlock", "EUR_USD"],
             vec![
@@ -199,6 +199,7 @@ mod tests {
                 "reversals",
             ],
         ] {
+            args.extend(["--key-file", "test-signing-key.hex"]);
             assert!(super::super::Cli::try_parse_from(args).is_ok());
         }
         let mut intent =

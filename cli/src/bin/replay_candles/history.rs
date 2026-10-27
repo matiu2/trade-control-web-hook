@@ -3,6 +3,7 @@ use super::{
     granularity::ReplayGranularity,
     mt5_history::{EstimatedSpread, Mt5Replay},
 };
+use crate::replay_args::{CandleSource, Mt5HistoryMode};
 use candle_cache::ctrader::CachedFeed;
 use chrono::{DateTime, Utc};
 use color_eyre::{
@@ -11,12 +12,13 @@ use color_eyre::{
 };
 use std::{collections::BTreeSet, sync::Arc};
 use tokio::sync::OnceCell;
-use trade_control_cli::replay_args::{CandleSource, Mt5HistoryMode};
 use trade_control_core::intent::BrokerKind;
 use trade_control_engine::{BidAskCandle, TradePlan};
 
 pub struct SourceHistory<'a> {
     source: CandleSource,
+    oanda_account: Option<&'a str>,
+    oanda_live: super::oanda_history::Live,
     mt5: Mt5Replay<'a>,
     ctrader_account: Option<&'a str>,
     ctrader: OnceCell<Arc<CachedFeed>>,
@@ -31,6 +33,8 @@ impl<'a> SourceHistory<'a> {
     ) -> Self {
         Self {
             source,
+            oanda_account: None,
+            oanda_live: super::oanda_history::Live::default(),
             mt5: Mt5Replay::new(mt5_account, mode, pip_size),
             ctrader_account,
             ctrader: OnceCell::new(),
@@ -48,12 +52,29 @@ impl<'a> SourceHistory<'a> {
         );
         Ok(Self {
             source,
+            oanda_account: (source == CandleSource::Oanda).then_some(account).flatten(),
+            oanda_live: super::oanda_history::Live::default(),
             mt5: Mt5Replay::from_saved(account, pip_size, saved),
             ctrader_account: (source == CandleSource::Ctrader)
                 .then_some(account)
                 .flatten(),
             ctrader: OnceCell::new(),
         })
+    }
+    pub fn with_oanda_account(mut self, account: Option<&'a str>) -> Self {
+        self.oanda_account = account;
+        self
+    }
+    pub fn with_oanda_destination(
+        mut self,
+        url: Option<&str>,
+        key: Option<&std::path::Path>,
+    ) -> Self {
+        self.oanda_live = self.oanda_live.with_destination(url, key);
+        self
+    }
+    pub fn uses_live_oanda(&self) -> bool {
+        self.source == CandleSource::Oanda && self.oanda_account == Some("oanda-live")
     }
     pub fn provenance(&self) -> Option<EstimatedSpread> {
         if self.source == CandleSource::Mt5 {
@@ -64,6 +85,7 @@ impl<'a> SourceHistory<'a> {
     }
     pub fn account(&self) -> Option<&str> {
         match self.source {
+            CandleSource::Oanda => self.oanda_account,
             CandleSource::Ctrader => self.ctrader_account,
             CandleSource::Mt5 => self.mt5.account(),
             _ => None,
@@ -76,6 +98,9 @@ impl<'a> SourceHistory<'a> {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> Result<Vec<BidAskCandle>> {
+        if self.uses_live_oanda() {
+            return self.oanda_live.pull(symbol, granularity, from, to).await;
+        }
         if self.source == CandleSource::Mt5 {
             return self.mt5.pull(symbol, granularity, from, to).await;
         }
@@ -115,6 +140,35 @@ pub fn resolve_account(
     saved: Option<&str>,
     plan: &TradePlan,
 ) -> Result<Option<String>> {
+    if source == CandleSource::Oanda {
+        let names: BTreeSet<_> = plan
+            .rules
+            .iter()
+            .filter(|rule| rule.intent.broker == BrokerKind::Oanda)
+            .map(|rule| rule.intent.account.as_deref())
+            .collect();
+        let live = names.contains(&Some("oanda-live"))
+            || explicit == Some("oanda-live")
+            || saved == Some("oanda-live");
+        if live {
+            ensure!(
+                names.iter().all(|name| *name == Some("oanda-live")),
+                "Live OANDA replay cannot mix demo or unnamed plan accounts"
+            );
+            ensure!(
+                explicit.is_none_or(|name| name == "oanda-live")
+                    && saved.is_none_or(|name| name == "oanda-live"),
+                "Live OANDA replay account override conflicts with plan or fixture"
+            );
+            return Ok(Some("oanda-live".into()));
+        }
+        ensure!(
+            explicit.is_none_or(|name| name == "m-and-w")
+                && saved.is_none_or(|name| name == "m-and-w"),
+            "Unknown OANDA replay account; choose m-and-w or oanda-live"
+        );
+        return Ok(None);
+    }
     let kind = match source {
         CandleSource::Mt5 => BrokerKind::Mt5,
         CandleSource::Ctrader => BrokerKind::Ctrader,
@@ -241,6 +295,61 @@ mod tests {
             Some("ctrader-oanda-demo")
         );
     }
+    #[test]
+    fn live_oanda_history_is_inferred_and_cannot_be_mixed_with_demo() {
+        init_tracing();
+        let rule = |id: &str, broker: &str, account: &str| {
+            serde_json::json!({
+                "rule_id":id,"trigger":{"type":"time_reached","at_epoch":1},"fire_mode":"once",
+                "intent":{"v":1,"id":id,"not_after":"2027-01-01T00:00:00Z","action":"veto","instrument":"EUR_USD","broker":broker,"account":account}
+            })
+        };
+        let mut plan: TradePlan = serde_json::from_value(serde_json::json!({
+            "trade_id":"live","instrument":"EUR_USD","direction":"long","granularity":"h1","pip_size":0.0001,
+            "rules":[rule("live","oanda","oanda-live")]
+        })).unwrap();
+        assert_eq!(
+            resolve_account(CandleSource::Oanda, None, None, &plan)
+                .unwrap()
+                .as_deref(),
+            Some("oanda-live")
+        );
+        assert!(resolve_account(CandleSource::Oanda, Some("m-and-w"), None, &plan).is_err());
+        let history =
+            SourceHistory::from_saved(CandleSource::Oanda, Some("oanda-live"), 0.0001, None)
+                .unwrap();
+        assert!(history.uses_live_oanda());
+        assert_eq!(history.account(), Some("oanda-live"));
+        plan.rules
+            .push(serde_json::from_value(rule("demo", "oanda", "m-and-w")).unwrap());
+        assert!(resolve_account(CandleSource::Oanda, None, None, &plan).is_err());
+    }
+
+    #[tokio::test]
+    async fn live_oanda_replay_refuses_a_generic_demo_cache_override_before_connecting() {
+        init_tracing();
+        let history =
+            SourceHistory::from_saved(CandleSource::Oanda, Some("oanda-live"), 0.0001, None)
+                .unwrap();
+        let now = Utc::now();
+        let result = super::super::candles::pull(
+            CandleSource::Oanda,
+            "EUR_USD",
+            super::super::granularity::parse("h1").unwrap(),
+            now,
+            now,
+            Some(std::path::PathBuf::from("candle_cache_oanda")),
+            &history,
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("pinned account cache")
+        );
+    }
+
     #[test]
     fn c_trader_never_accepts_estimated_history() {
         init_tracing();

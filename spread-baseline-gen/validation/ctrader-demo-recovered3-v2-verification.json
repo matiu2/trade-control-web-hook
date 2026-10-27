@@ -1,0 +1,44 @@
+{
+  "verified_at": "2026-10-27T00:17:00.035387+00:00",
+  "completion_state": "complete",
+  "completion_receipt_sha256": "7c04cfbd28d3c7d43e300efd48cb88b80b235331a6cceeb8a10d17de73145891",
+  "successful_subset_report_sha256": "39ff895b1416184daba614c7ff7780067737ec46d9170cfd5f5b0588dff24bad",
+  "original_four_report_sha256": "a441e2f5a14f3090075f14dd6280c4b44a274230409387fa5dd2493fa06e580f",
+  "original_four_report_preserved": true,
+  "original_four_report_complete": false,
+  "failed_symbols_retained": [
+    "ETHEUR"
+  ],
+  "successful_symbols": [
+    "BTCUSD",
+    "UK 100",
+    "US 30"
+  ],
+  "successful_subset_complete": true,
+  "successful_subset_quality": {
+    "BTCUSD": "Reviewed",
+    "UK 100": "Reviewed",
+    "US 30": "Reviewed"
+  },
+  "successful_subset_n_bars": {
+    "BTCUSD": 127103,
+    "UK 100": 81922,
+    "US 30": 88004
+  },
+  "baked_profile_count_before": 89,
+  "baked_profile_count_after": 92,
+  "existing_89_literal_row_strings_unchanged": true,
+  "added_exactly_successful_subset": true,
+  "baked_table_sha256": "a8fa1ba962c5af0430da05d0845e89d5cc1a06d562bf5e1dc67e895e77309769",
+  "release_tests_passed": 3406,
+  "release_tests_failed": 0,
+  "release_tests_ignored": 23,
+  "release_test_suites": 23,
+  "strict_clippy_passed": true,
+  "formatting_passed": true,
+  "source_guards_passed": true,
+  "staging_deployed": false,
+  "git_writes_by_completion": false,
+  "no_broker_mutations": true,
+  "statistical_reuse_note": "Existing89table row strings were compared literally. New report measurements were reused without recollection; JSON floating representations may normalize by approximately one ULP and numeric byte identity is not claimed."
+}

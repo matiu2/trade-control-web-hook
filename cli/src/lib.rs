@@ -14,9 +14,13 @@ mod history;
 mod instruments;
 mod interactive;
 mod news_pattern;
+pub mod oanda_live_profile;
 mod pause_pattern;
 mod prompts;
 pub mod replay_args;
+pub mod replay_candles;
+pub mod replay_driver;
+mod replay_output;
 mod script_validator;
 pub mod start_time;
 mod templates;
@@ -33,8 +37,8 @@ pub use calendar_bars::{
 };
 pub use control::{
     build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
-    build_plan_delete_intent, build_plan_list_intent, build_plan_purge_intent,
-    build_plan_show_intent, build_plan_timeline_intent, build_prep_intent,
+    build_plan_admin_intent, build_plan_delete_intent, build_plan_list_intent,
+    build_plan_purge_intent, build_plan_show_intent, build_plan_timeline_intent, build_prep_intent,
     build_purge_older_than_intent, build_register_intent, build_status_intent, build_unlock_intent,
     build_veto_intent, wrap_signed, wrap_signed_direct_enter, wrap_signed_template,
 };

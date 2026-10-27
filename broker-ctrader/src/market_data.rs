@@ -2,6 +2,10 @@
 use super::*;
 use std::sync::Arc;
 
+mod forex;
+mod identity;
+pub use identity::AccountIdentity;
+
 pub use ctrader_data_source::{InstrumentSummary, NativeBar, NativePeriod};
 
 pub struct ChartData {
@@ -77,6 +81,13 @@ impl ChartData {
     pub fn account_id(&self) -> i64 {
         self.broker.account_id()
     }
+    pub async fn account_identity(&self) -> Result<AccountIdentity> {
+        identity::decode(
+            &metadata::trader(&self.broker).await?,
+            self.account_id(),
+            self.broker.shared.client.environment(),
+        )
+    }
     pub fn is_closed(&self) -> bool {
         self.broker.shared.client.is_closed()
     }
@@ -88,6 +99,13 @@ impl ChartData {
     }
     pub async fn instrument_metadata(&self, instrument: &str) -> Result<InstrumentMetadata> {
         self.broker.instrument_metadata(instrument).await
+    }
+    /// Match the recognized broker currency legs supported by strategy sizing.
+    pub async fn forex_instrument_metadata(&self, instrument: &str) -> Result<InstrumentMetadata> {
+        let symbol = self.instrument_metadata(instrument).await?;
+        let assets = metadata::assets(&self.broker).await?;
+        forex::validate(symbol.base_asset, symbol.quote_asset, &assets)?;
+        Ok(symbol)
     }
     pub async fn quote(&self, instrument: &str) -> Result<Quote> {
         let id = self

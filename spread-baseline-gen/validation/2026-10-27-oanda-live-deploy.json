@@ -1,0 +1,20 @@
+{
+  "account": "oanda-live",
+  "account_identity_sha256": "de06c15bdafb933a8467fe97c1f55846531cea83d72af12dd51735c3a1e90e2d",
+  "instruments": 127,
+  "measured_minutes": 10249815,
+  "from_utc": "2026-07-29T00:00:00Z",
+  "to_utc": "2026-10-27T00:00:00Z",
+  "cache_namespace": "oanda_acct_de06c15bdafb933a8467fe97",
+  "table_sha256": "3d36a19f69d16584a604340e03b9bf8fa9d2a19c7bb4f7b4f830784d3f6499fc",
+  "worker_sha256": "89f2d641446480f0fab18ef40369ca419a49628c4749e971551d2aee2cb44fdb",
+  "chart_sha256": "02d3130c2d7d9fd03c68bed2d5a7cba2eaf76a2dcd6f03fd80b42591554b1430",
+  "chart_pid": 311061,
+  "services": [
+    "trade-control-worker-dev.service",
+    "trade-control-worker-staging.service"
+  ],
+  "authenticated_live_quote_verified": true,
+  "chart_account_discovery_verified": true,
+  "orders_submitted_by_validation": 0
+}

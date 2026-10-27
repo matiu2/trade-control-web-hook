@@ -12,16 +12,12 @@ mod cli;
 mod clipboard;
 mod content;
 mod directions;
-mod divergence;
-mod fixtures;
 mod jobs;
 mod keys;
 mod opener;
-mod plan;
+mod plan_admin;
 mod prompt;
 mod screen;
-mod search;
-mod timeline;
 mod tv;
 mod ui;
 
@@ -30,7 +26,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use color_eyre::eyre::Result;
-use crossterm::event::{self, Event};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -39,6 +35,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::app::App;
+use journal::{divergence, fixtures, plan, search, timeline};
 
 /// The baked git version (see `build.rs`).
 const VERSION: &str = env!("GIT_VERSION");
@@ -106,12 +103,20 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, backend: tv::ChartBack
         terminal.draw(|f| ui::render(f, &app))?;
         // A short poll keeps the spinner animating and lets finished jobs land
         // promptly even when the operator isn't pressing keys.
-        if event::poll(Duration::from_millis(120))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == event::KeyEventKind::Press
-        {
-            let action = keys::map_key(&app, key);
-            keys::apply(&mut app, action);
+        if event::poll(Duration::from_millis(120))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == event::KeyEventKind::Press => {
+                    let action = keys::map_key(&app, key);
+                    keys::apply(&mut app, action);
+                }
+                Event::Mouse(mouse) => {
+                    let size = terminal.size()?;
+                    let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+                    let action = ui::map_mouse(&app, mouse, area);
+                    keys::apply(&mut app, action);
+                }
+                _ => {}
+            }
         }
         // Apply any background results (no-op when nothing finished).
         app.drain_jobs();
@@ -126,14 +131,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, backend: tv::ChartBack
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let terminal = Terminal::new(CrosstermBackend::new(out))?;
     Ok(terminal)
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }

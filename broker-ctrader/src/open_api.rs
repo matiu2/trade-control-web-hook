@@ -7,10 +7,12 @@ pub(crate) struct OpenApiBroker {
 }
 impl OpenApiBroker {
     pub async fn connect_config(name: &str, config: Config) -> Result<Self> {
-        Ok(Self {
+        let broker = Self {
             shared: session::acquire(config).await?,
             account_name: name.into(),
-        })
+        };
+        crate::protection::start_monitor(&broker)?;
+        Ok(broker)
     }
     pub fn account_id(&self) -> i64 {
         self.shared.client.account_id()

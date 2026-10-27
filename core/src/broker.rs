@@ -16,9 +16,11 @@ use crate::settlement::Settlement;
 
 mod candles;
 pub use candles::*;
+mod entry_distance;
+pub use entry_distance::{MarketEntryBand, PendingEntryDistance, PendingEntryKind};
 
 /// A live two-sided quote. `spread()` is the spread-blackout feature's
-/// filter signal; everything else in the codebase only needs `mid()`.
+/// filter signal; entry recovery uses ask for longs and bid for shorts.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Quote {
     pub bid: f64,
@@ -118,7 +120,7 @@ fn trim_float(v: f64) -> String {
 /// `position_id` is the distinct position / trade id. On OANDA the two are
 /// the same trade id (there is no separate originating-order concept once a
 /// trade is open), so both are set to the trade id.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OpenPosition {
     /// TradeNation `market_name` / OANDA `instrument`.
     pub instrument: String,
@@ -198,6 +200,8 @@ impl std::error::Error for AmendError {}
 /// Inputs for placing an entry order. Borrowed because it is built per-request
 /// from the resolved intent and never outlives the dispatch frame.
 pub struct EntryRequest<'a> {
+    /// Stable completed-setup identity. Required by protected prop accounts.
+    pub setup_id: Option<&'a str>,
     pub instrument: &'a str,
     pub direction: Direction,
     pub entry: ResolvedEntry,
@@ -233,7 +237,8 @@ pub struct EntryRequest<'a> {
 #[derive(Debug)]
 pub enum EntryError {
     AccountFetch,
-    /// Account-native sizing could not establish a currency conversion.
+    /// Position risk could not be converted into the account currency before
+    /// submission. Keep the pair and cause visible in operator outcomes.
     CurrencyConversion {
         from: String,
         to: String,
@@ -266,8 +271,13 @@ pub enum EntryError {
     /// or skip) instead of dropping the entry. The stop-loss distance is
     /// **not** the cause.
     EntryTooCloseToMarket,
+    /// Verified local pending-entry rejection with the executable quote and
+    /// broker minimum; only evidence inside that band permits market rescue.
+    EntryWithinMinimumDistance(PendingEntryDistance),
+    /// A guarded market recovery could not enforce its price band or R floor.
+    MarketRecoveryDeclined(String),
     OrderRejected,
-    /// Definitive rejection with safe local or broker evidence for operators.
+    /// Definitive rejection with broker or local validation evidence for operators.
     OrderRejectedWithDetail(String),
     /// The broker confirmed the HTTP call succeeded but the response body
     /// could not be parsed, so whether an order was actually placed is
@@ -290,10 +300,12 @@ impl core::fmt::Display for EntryError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::AccountFetch => f.write_str("failed to fetch account"),
-            Self::CurrencyConversion { from, to, detail } => write!(
-                f,
-                "failed to convert {from} to {to} for position sizing: {detail}"
-            ),
+            Self::CurrencyConversion { from, to, detail } => {
+                write!(
+                    f,
+                    "failed to convert {from} to {to} for position sizing: {detail}"
+                )
+            }
             Self::EquityParse => f.write_str("failed to parse account equity"),
             Self::RiskCapExceeded { requested, cap } => {
                 write!(f, "risk {requested}% > cap {cap}%")
@@ -306,15 +318,16 @@ impl core::fmt::Display for EntryError {
             Self::EntryTooCloseToMarket => {
                 f.write_str("entry trigger too close to (or wrong side of) the market price")
             }
+            Self::EntryWithinMinimumDistance(distance) => distance.fmt(f),
+            Self::MarketRecoveryDeclined(reason) => f.write_str(reason),
             Self::OrderRejected => f.write_str("broker rejected the order"),
             Self::OrderRejectedWithDetail(detail) => {
                 write!(f, "broker rejected the order: {detail}")
             }
             Self::AmbiguousSuccess(detail) => write!(
                 f,
-                "broker confirmed the request but the response could not be \
-                 read — an order may have been placed; check the broker \
-                 directly before retrying ({detail})"
+                "entry submission outcome is unknown; an order may already exist; \
+                 reconcile with the broker before retrying ({detail})"
             ),
         }
     }
@@ -475,6 +488,23 @@ pub trait Broker {
         req: &EntryRequest<'_>,
     ) -> impl Future<Output = Result<Placement, EntryError>>;
 
+    /// Market rescue after verified stop AND limit proximity rejections.
+    /// Implementations must enforce `band` on their own fresh sizing quote.
+    /// Unsupported brokers decline rather than delegate to an unbounded entry.
+    fn place_market_entry_in_band(
+        &self,
+        _max_risk_pct: f64,
+        _max_open_positions: u32,
+        _req: &EntryRequest<'_>,
+        _band: MarketEntryBand,
+    ) -> impl Future<Output = Result<Placement, EntryError>> {
+        async {
+            Err(EntryError::MarketRecoveryDeclined(
+                "broker cannot enforce the market fallback price band".into(),
+            ))
+        }
+    }
+
     /// Close all positions for `instrument`.
     ///
     /// Returns a [`CloseOutcome`] rather than a bool so callers can tell
@@ -550,8 +580,9 @@ pub trait Broker {
     ) -> impl Future<Output = Result<(), CancelError>>;
 
     /// Fetch a live two-sided [`Quote`] for an instrument. The
-    /// spread-blackout systems read [`Quote::spread`]; everything else
-    /// reads [`Quote::mid`] via the [`Broker::get_current_price`] default.
+    /// spread-blackout systems read [`Quote::spread`]; entry recovery uses
+    /// ask for longs and bid for shorts. Price-path watchers use [`Quote::mid`]
+    /// via the [`Broker::get_current_price`] default.
     fn get_quote(&self, instrument: &str) -> impl Future<Output = Result<Quote, LookupError>>;
 
     /// All open positions on the account.
@@ -563,6 +594,27 @@ pub trait Broker {
         &self,
         account_id: &str,
     ) -> impl Future<Output = Result<Vec<OpenPosition>, LookupError>>;
+
+    /// Reporting snapshot. Adapters can include broker P/L; the default never
+    /// invents money values from prices or assumes an account currency.
+    fn position_snapshots(
+        &self,
+        account_id: &str,
+    ) -> impl Future<Output = Result<Vec<crate::position_tracking::PositionSnapshot>, LookupError>>
+    {
+        async move {
+            Ok(self
+                .list_open_positions(account_id)
+                .await?
+                .into_iter()
+                .map(|position| crate::position_tracking::PositionSnapshot {
+                    position,
+                    unrealized_pl: None,
+                    currency: None,
+                })
+                .collect())
+        }
+    }
 
     /// Move the stop-loss on an open position (or a pending order's SL) to
     /// `new_stop`. Take-profit, entry trigger, and stake are left untouched.

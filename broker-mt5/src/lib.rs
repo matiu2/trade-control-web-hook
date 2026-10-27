@@ -1,5 +1,7 @@
 //! Named MT5 demo/competition execution and tick-derived mid history.
 mod candles;
+pub mod contract;
+mod currency_conversion;
 mod entry;
 mod history;
 mod mapping;
@@ -54,7 +56,16 @@ impl Broker for Mt5Broker {
         positions: u32,
         req: &EntryRequest<'_>,
     ) -> std::result::Result<Placement, EntryError> {
-        entry::place(self, cap, positions, req).await
+        entry::place(self, cap, positions, req, None).await
+    }
+    async fn place_market_entry_in_band(
+        &self,
+        cap: f64,
+        positions: u32,
+        req: &EntryRequest<'_>,
+        band: MarketEntryBand,
+    ) -> std::result::Result<Placement, EntryError> {
+        entry::place(self, cap, positions, req, Some(band)).await
     }
     async fn close_positions(&self, instrument: &str) -> CloseOutcome {
         let Ok(trades) = self.trader.trades().await else {
@@ -110,6 +121,25 @@ impl Broker for Mt5Broker {
         }
         Ok(state)
     }
+    async fn lookup_trade_exit(
+        &self,
+        instrument: &str,
+        order: &str,
+        position: Option<&str>,
+    ) -> std::result::Result<Option<trade_control_core::broker_exit::BrokerTradeExit>, LookupError>
+    {
+        let live = self.trader.trades().await.map_err(mapping::lookup_error)?;
+        let history = self.recent_history().await.map_err(mapping::lookup_error)?;
+        let account = self.trader.account().await.map_err(mapping::lookup_error)?;
+        Ok(history::exit(
+            instrument,
+            order,
+            position,
+            &live,
+            &history,
+            &account.currency,
+        ))
+    }
     async fn cancel_order(&self, account: &str, id: &str) -> std::result::Result<(), CancelError> {
         if !self.account_matches(account) {
             return Err(CancelError::Transient);
@@ -156,6 +186,31 @@ impl Broker for Mt5Broker {
             .positions
             .iter()
             .map(|p| mapping::position(p, &history))
+            .collect())
+    }
+    async fn position_snapshots(
+        &self,
+        account: &str,
+    ) -> std::result::Result<
+        Vec<trade_control_core::position_tracking::PositionSnapshot>,
+        LookupError,
+    > {
+        if !self.account_matches(account) {
+            return Err(LookupError::Transient);
+        }
+        let trades = self.trader.trades().await.map_err(mapping::lookup_error)?;
+        let history = self.recent_history().await.map_err(mapping::lookup_error)?;
+        let account = self.trader.account().await.map_err(mapping::lookup_error)?;
+        Ok(trades
+            .positions
+            .iter()
+            .map(
+                |p| trade_control_core::position_tracking::PositionSnapshot {
+                    position: mapping::position(p, &history),
+                    unrealized_pl: Some(p.profit),
+                    currency: Some(account.currency.clone()),
+                },
+            )
             .collect())
     }
     async fn amend_stop(

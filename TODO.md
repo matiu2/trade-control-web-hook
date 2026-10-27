@@ -1,3 +1,17 @@
+# TODO — AUDCHF live H4 detector history (2026-10-14)
+
+- [x] Confirm missed signals: weekend leaves 26 candles in a 38-bar calendar
+      span; H4 ATR needs 36, so golden entries never fire.
+- [x] Add nine regression tests using genuine cached AUDCHF H4 candles.
+      Genuine mid prices decline the 07:00 Brisbane bar but permit the 11:00
+      and 15:00 bars once ATR is warm; estimated replay prices differ at rollover.
+- [x] Widen live detector history until the earliest fresh bar has enough
+      actual preceding candles. If older history genuinely does not exist,
+      report it loudly and process available candles normally so protection
+      rules remain live and incoming candles can eventually warm ATR.
+- [x] Tests (core, engine, cron, native worker), clippy and fmt pass.
+- [x] Independent bug and failure-handling reviews pass.
+
 # TODO — reconcile findings visible in journal, as a proper 3rd event kind (2026-10-03)
 
 ## Why
@@ -363,6 +377,16 @@ should accept either and normalise internally.
       8 alerts, `source=…/arm-setup?instrument=GBP_JPY&tf=h4&broker=tradenation`
 - [ ] committed + pushed, parent pointer bumped
 
+# TODO — AUDNZD completion-state investigation (2026-10-23)
+
+- [x] Read staging state and recordings: too-low fired at 13:15 Brisbane,
+      entries are blocked, and evaluation continues. A broker close was recorded
+      at 14:35 with net P&L +333.72; MT5 exit details are unavailable.
+- [x] Add regressions for blocked-entry summaries and journal labels.
+- [x] Expose the entry-blocking latch in plan summaries and the journal list.
+- [x] All 1,861 core/journal/engine/cron tests pass; clippy with warnings as
+      errors, fmt and both independent reviews pass.
+- [x] Commit and push the journal status fix.
 # TODO — EURGBP candle catch-up investigation (2026-10-27)
 
 - [x] Verify Brisbane timestamps and genuine MT5 H1 closes: the 18:00/19:00
@@ -378,3 +402,5 @@ should accept either and normalise internally.
       formatting and both independent reviews pass.
 - [x] Backport to main: all 1,622 applicable tests, clippy, formatting and
       both integration reviews pass; preserve main's persistence failure paths.
+- [x] Merge onto current staging: all 1,685 applicable tests, clippy, formatting
+      and both integration reviews pass.

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::Parser as _;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, WrapErr, eyre};
 use tracing::{info, warn};
 use trade_control_cli::replay_args::{CandleSource, ReplayArgs};
 use trade_control_conventions::Broker;
@@ -291,6 +291,7 @@ pub fn run_replay(
     // failure in the tv-mcp bridge can no longer abort the replay before the
     // local-chart drawing runs. An explicit `--annotate` still paints both.
     new_tv: Option<&str>,
+    execution: Option<&crate::api::Execution>,
 ) -> Result<()> {
     let bin = replay_binary();
     let plan = plan_path(plan_out, trade_id);
@@ -311,9 +312,10 @@ pub fn run_replay(
     // can read them back. A temp file keyed on the trade id: it is an
     // intermediate between two processes in one run, not an artefact the
     // operator keeps.
-    let positions_path =
-        new_tv.map(|_| std::env::temp_dir().join(format!("tv-arm-positions-{trade_id}.json")));
-    let argv = build_argv(
+    let positions_path = new_tv
+        .filter(|_| execution.is_none())
+        .map(|_| std::env::temp_dir().join(format!("tv-arm-positions-{trade_id}.json")));
+    let mut argv = build_argv(
         &bin,
         &plan,
         source,
@@ -321,13 +323,32 @@ pub fn run_replay(
         arm,
         positions_path.as_deref(),
     );
+    if source == CandleSource::Oanda {
+        argv.extend(oanda_destination_args(execution)?);
+    }
 
     // Validate the full invocation against the shared clap definition before
     // shelling out, so a bad passthrough flag fails with replay-candles' own
-    // error rather than an opaque non-zero exit. (We discard the parsed value —
-    // the actual run is the subprocess, which reparses identically.)
-    ReplayArgs::try_parse_from(&argv)
+    // error rather than an opaque non-zero exit. Keep its selected output path:
+    // an explicit --positions overrides the temporary default above.
+    let mut parsed = ReplayArgs::try_parse_from(&argv)
         .map_err(|e| eyre!("--replay: invalid replay-candles arguments: {e}"))?;
+
+    if let Some(execution) = execution {
+        parsed.annotate = false;
+        parsed.annotate_unfilled = false;
+        parsed.positions = None;
+        if parsed.test_mode {
+            return run_corpus(parsed, execution);
+        }
+        if parsed.start.is_none() {
+            parsed.start = arm.start.map(str::to_string);
+        }
+        let runtime =
+            tokio::runtime::Runtime::new().wrap_err("starting in-process replay runtime")?;
+        let result = runtime.block_on(trade_control_cli::replay_driver::run(parsed))?;
+        return record_completed_replay(execution, result);
+    }
 
     info!(
         binary = %bin,
@@ -357,8 +378,99 @@ pub fn run_replay(
     // The replay succeeded; draw what it recorded. Only under `--new-tv` —
     // without it, nothing above wrote a positions file and this is skipped
     // entirely.
-    if let (Some(url), Some(path)) = (new_tv, positions_path.as_deref()) {
-        draw_positions_on_local_chart(url, path)?;
+    if let Some(url) = new_tv {
+        draw_replay_output(url, &parsed, !sets_flag(passthrough, "--positions"))?;
+    }
+    Ok(())
+}
+
+fn oanda_destination_args(execution: Option<&crate::api::Execution>) -> Result<Vec<String>> {
+    let url = crate::register_post::worker_url(execution);
+    let key = match execution {
+        Some(execution) => execution.context.key_file.clone(),
+        None => crate::pipeline::key_path_resolved()?,
+    };
+    Ok(vec![
+        "--oanda-worker-url".into(),
+        url.into(),
+        "--oanda-key-file".into(),
+        key.display().to_string(),
+    ])
+}
+
+fn record_completed_replay(
+    execution: &crate::api::Execution,
+    result: trade_control_cli::replay_driver::ReplayResult,
+) -> Result<()> {
+    let positions =
+        serde_json::to_value(result.positions).wrap_err("serialize replay positions")?;
+    let open_positions =
+        serde_json::to_value(result.open_positions).wrap_err("serialize replay open positions")?;
+    let position_warnings = result.position_warnings;
+    let replay_outcome =
+        serde_json::to_value(result.outcome).wrap_err("serialize replay outcome")?;
+    execution.update(|outcome| {
+        outcome.report.push_str(&result.report);
+        outcome.positions = Some(positions.clone());
+        outcome.open_positions = Some(open_positions.clone());
+        outcome.position_warnings = position_warnings.clone();
+        if let Some(last) = outcome.executions.last_mut() {
+            last.report = Some(result.report);
+            last.positions = Some(positions);
+            last.replay_outcome = Some(replay_outcome);
+            last.open_positions = Some(open_positions);
+            last.position_warnings = position_warnings;
+        }
+    })?;
+    if !result.success {
+        let error = result
+            .error
+            .as_deref()
+            .unwrap_or("replay artifact write failed");
+        let code = result.exit_code;
+        return Err(eyre!(
+            "replay completed with an error (exit {code}): {error}"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn run_corpus(mut parsed: ReplayArgs, execution: &crate::api::Execution) -> Result<()> {
+    parsed.oanda_worker_url = Some(execution.context.worker_url.clone());
+    parsed.oanda_key_file = Some(execution.context.key_file.clone());
+    let runtime = tokio::runtime::Runtime::new().wrap_err("starting corpus replay runtime")?;
+    let result = runtime.block_on(trade_control_cli::replay_driver::run_corpus(parsed));
+    let success = result.success;
+    let error = result.error.clone();
+    execution.record(crate::api::ArmExecution {
+        pattern: "corpus".into(),
+        ..Default::default()
+    })?;
+    execution.update(|outcome| {
+        outcome.report.push_str(&result.report);
+        if let Some(last) = outcome.executions.last_mut() {
+            last.report = Some(result.report);
+            last.replay_outcome = Some(serde_json::json!({
+                "summary": result.summary,
+                "baseline_diff": result.baseline_diff,
+                "exit_code": result.exit_code,
+                "success": result.success,
+                "error": result.error,
+            }));
+        }
+    })?;
+    if !success {
+        return Err(eyre!(
+            "{}",
+            error.as_deref().unwrap_or("corpus replay failed")
+        ));
+    }
+    Ok(())
+}
+
+fn draw_replay_output(url: &str, parsed: &ReplayArgs, remove_after_draw: bool) -> Result<()> {
+    if let Some(path) = parsed.positions.as_deref() {
+        draw_positions_on_local_chart(url, path, remove_after_draw)?;
     }
     Ok(())
 }
@@ -372,7 +484,7 @@ pub fn run_replay(
 /// `Ok`, rather than turning a successful arm-and-replay into a non-zero exit.
 /// The one thing it must not do is fail *silently*, hence the warning naming
 /// the cause.
-fn draw_positions_on_local_chart(url: &str, path: &Path) -> Result<()> {
+fn draw_positions_on_local_chart(url: &str, path: &Path, remove_after_draw: bool) -> Result<()> {
     let doc = match local_chart_client::read_positions(path) {
         Ok(doc) => doc,
         Err(err) => {
@@ -389,7 +501,9 @@ fn draw_positions_on_local_chart(url: &str, path: &Path) -> Result<()> {
         }
         Err(err) => warn!(%err, url, "could not draw positions on local-chart"),
     }
-    std::fs::remove_file(path).ok();
+    if remove_after_draw {
+        std::fs::remove_file(path).ok();
+    }
     Ok(())
 }
 
@@ -399,6 +513,87 @@ mod drawing_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oanda_replay_pins_the_selected_workers_metadata_and_key_path() {
+        let execution = crate::api::Execution::new(crate::api::ArmContext {
+            worker_url: "http://127.0.0.1:9999".into(),
+            key_file: "/private/selected-key.hex".into(),
+            broker: crate::args::BrokerArg::Oanda,
+            account_id: Some("oanda-live".into()),
+        });
+        let flags = oanda_destination_args(Some(&execution)).unwrap();
+        assert_eq!(
+            flags,
+            vec![
+                "--oanda-worker-url",
+                "http://127.0.0.1:9999",
+                "--oanda-key-file",
+                "/private/selected-key.hex"
+            ]
+        );
+    }
+
+    #[test]
+    fn completed_measurements_survive_an_artifact_write_failure() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .with(tracing_error::ErrorLayer::default())
+            .try_init()
+            .ok();
+        let execution = crate::api::Execution::new(crate::api::ArmContext {
+            worker_url: "http://127.0.0.1:8788".into(),
+            key_file: "/unused-key".into(),
+            broker: crate::args::BrokerArg::Oanda,
+            account_id: None,
+        });
+        execution
+            .record(crate::api::ArmExecution {
+                trade_id: "measured-trade".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let result = trade_control_cli::replay_driver::ReplayResult {
+            report: "Measured trade: -1.00R".into(),
+            open_positions: Vec::new(),
+            position_warnings: vec!["position history unavailable".into()],
+            positions: serde_json::from_value(serde_json::json!({
+                "version": 1, "instrument": "EUR_USD", "granularity": "1h", "broker": "oanda", "positions": [],
+            })).unwrap(),
+            outcome: serde_json::from_value(serde_json::json!({
+                "fires": [], "done": true, "final_phase": "done", "warnings": [],
+            })).unwrap(),
+            success: false, error: Some("could not save fixture: permission denied".into()), exit_code: 4,
+        };
+        let error = record_completed_replay(&execution, result).unwrap_err();
+        assert!(error.to_string().contains("could not save fixture"));
+        execution
+            .update(|outcome| {
+                assert_eq!(outcome.report, "Measured trade: -1.00R");
+                assert!(outcome.positions.is_some());
+                assert_eq!(outcome.open_positions, Some(serde_json::json!([])));
+                assert_eq!(
+                    outcome.position_warnings,
+                    vec!["position history unavailable"]
+                );
+                assert_eq!(
+                    outcome.executions[0].position_warnings,
+                    outcome.position_warnings
+                );
+                assert_eq!(outcome.executions[0].open_positions, outcome.open_positions);
+                assert_eq!(
+                    outcome.executions[0].report.as_deref(),
+                    Some("Measured trade: -1.00R")
+                );
+                assert_eq!(
+                    outcome.executions[0].replay_outcome.as_ref().unwrap()["done"],
+                    true
+                );
+            })
+            .unwrap();
+    }
 
     #[test]
     fn c_trader_replay_accepts_pinned_account_passthrough() {

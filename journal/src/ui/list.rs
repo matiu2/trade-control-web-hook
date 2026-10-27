@@ -36,7 +36,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|p| {
             let marker = if visited(&p.trade_id) { "· " } else { "  " };
-            let phase = p.phase.as_deref().unwrap_or("-");
+            let phase = p.phase_label();
             let archived = if p.is_archived() { "  ARCHIVED" } else { "" };
             let (direction, color) = match p.direction.as_deref() {
                 Some("short") => ("Short", Color::Red),

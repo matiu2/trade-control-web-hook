@@ -12,6 +12,13 @@ pub fn resolve(symbol: &str) -> Result<&'static Asset> {
         "SP500" => "SPX500",
         "XTIUSD" => "WTICOUSD",
         "XBRUSD" => "BCOUSD",
+        "IBXEUR" => "SPAIN35",
+        "ESXEUR" => "EU50EUR",
+        "ASXAUD" => "AU200AUD",
+        "HSIHKD" => "HK33HKD",
+        "F40EUR" => "FR40EUR",
+        "SOLUSD" => "SOLANA",
+        "DOGUSD" => "DOGEUSD",
         name => name.strip_suffix("*t").unwrap_or(name),
     };
     let asset = instrument_lookup::resolve(canonical)?
@@ -29,6 +36,29 @@ pub fn resolve(symbol: &str) -> Result<&'static Asset> {
 mod tests {
     use super::*;
     #[test]
+    fn full_real_catalogue_has_pip_and_timezone_metadata() {
+        use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        let symbols: Vec<String> =
+            serde_json::from_str(include_str!("../../tests/fixtures/mt5-real-symbols.json"))
+                .unwrap();
+        assert_eq!(symbols.len(), 64);
+        for symbol in symbols {
+            let asset = resolve(&symbol).unwrap();
+            assert!(
+                asset.pip_size.is_finite() && asset.pip_size > 0.0,
+                "{symbol}"
+            );
+            assert!(asset.spread_schedule_tz().is_some(), "{symbol}");
+        }
+    }
+
+    #[test]
     fn native_aliases_retain_the_underlying_schedule_and_units() {
         use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
         tracing_subscriber::registry()
@@ -45,6 +75,13 @@ mod tests {
             ("SP500", "SPX500"),
             ("XTIUSD", "WTICOUSD"),
             ("XBRUSD", "BCOUSD"),
+            ("IBXEUR", "SPAIN35"),
+            ("ESXEUR", "EU50EUR"),
+            ("ASXAUD", "AU200AUD"),
+            ("HSIHKD", "HK33HKD"),
+            ("F40EUR", "FR40EUR"),
+            ("SOLUSD", "SOLANA"),
+            ("DOGUSD", "DOGEUSD"),
         ] {
             let got = resolve(native).unwrap();
             let expected = instrument_lookup::resolve(canonical).unwrap().unwrap();

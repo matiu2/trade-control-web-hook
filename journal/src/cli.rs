@@ -171,6 +171,51 @@ pub fn plan_delete(trade_id: &str) -> Result<String> {
     run_trade_control(&["plan", "delete", trade_id])
 }
 
+pub fn plan_action(trade_id: &str, action: &crate::plan_admin::PlanAction) -> Result<String> {
+    run_trade_control(&plan_action_args(trade_id, action))
+}
+
+fn plan_action_args<'a>(
+    trade_id: &'a str,
+    action: &'a crate::plan_admin::PlanAction,
+) -> Vec<&'a str> {
+    use crate::plan_admin::PlanAction;
+    match action {
+        PlanAction::Paper { account } => vec![
+            "plan",
+            "paper",
+            trade_id,
+            "--account",
+            account,
+            "--detach-existing",
+        ],
+        PlanAction::SwapAccount { account } => vec![
+            "plan",
+            "swap-account",
+            trade_id,
+            "--account",
+            account,
+            "--detach-existing",
+        ],
+        PlanAction::ClosedManually => vec!["plan", "closed-manually", trade_id],
+    }
+}
+
+pub fn accounts() -> Result<Vec<crate::plan_admin::AccountChoice>> {
+    let program = "trade-control-accounts";
+    let output = Command::new(program)
+        .args(["list", "--json"])
+        .output()
+        .map_err(|e| launch_error(program, e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre!("account list failed: {}", stderr.trim()));
+    }
+    let json =
+        String::from_utf8(output.stdout).map_err(|e| eyre!("account list was not UTF-8: {e}"))?;
+    crate::plan_admin::parse_accounts(&json)
+}
+
 /// Build the argv for re-blessing ONE saved fixture cell:
 /// `--test-mode --fixture <CELL> --fixtures-dir <DIR> --rebless`.
 ///
@@ -615,6 +660,47 @@ fn strip_ansi(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confirmed_plan_actions_target_the_selected_account_and_detach_explicitly() {
+        use crate::plan_admin::PlanAction;
+        assert_eq!(
+            plan_action_args(
+                "trade-1",
+                &PlanAction::Paper {
+                    account: "reversals".into()
+                }
+            ),
+            [
+                "plan",
+                "paper",
+                "trade-1",
+                "--account",
+                "reversals",
+                "--detach-existing"
+            ]
+        );
+        assert_eq!(
+            plan_action_args(
+                "trade-1",
+                &PlanAction::SwapAccount {
+                    account: "reversals".into()
+                }
+            ),
+            [
+                "plan",
+                "swap-account",
+                "trade-1",
+                "--account",
+                "reversals",
+                "--detach-existing"
+            ]
+        );
+        assert_eq!(
+            plan_action_args("trade-1", &PlanAction::ClosedManually),
+            ["plan", "closed-manually", "trade-1"]
+        );
+    }
 
     #[test]
     fn strips_ansi_colour_codes() {

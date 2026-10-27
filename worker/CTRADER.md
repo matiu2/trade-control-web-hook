@@ -28,7 +28,8 @@ login. JSON account listings include configured quote/execution/history
 capabilities and readiness; they do not claim broker connectivity. The checker
 authenticates FIX, discovers the exact symbol and reads real bid/ask prices.
 FIX profiles support quotes only: no orders, positions, equity, candle history,
-paper plan evaluation or account swaps. Servers reject their execution/history acquisition before opening
+paper plan evaluation or account swaps. Journal shows these accounts disabled
+with a reason. Servers reject their execution/history acquisition before opening
 a socket. Existing plans are not migrated by account registration.
 
 The worker, cron programs and CLI must all see the same private named profile
@@ -131,8 +132,8 @@ override is explicit and logs that no spread forecast is available.
 
 The replay CLI has no cTrader candle source yet. Chaining a cTrader plan into
 replay is refused; replay against another broker would give misleading results.
-Instrument and sizing mappings must be audited before moving a plan between
-cTrader and another platform. Re-arm explicitly after
+Account swaps between cTrader and another platform are also refused until their
+instrument and sizing mappings have been audited. Re-arm explicitly after
 checking the new account's native contract metadata.
 
 Do the read-only broker check first. Then use a demo account to validate order

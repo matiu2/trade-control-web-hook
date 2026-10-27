@@ -2,6 +2,9 @@
 //! (what to fetch on a screen push, the delete guard) here so `main.rs` is a
 //! thin render/input loop.
 
+mod plan_actions;
+mod reports;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -107,6 +110,8 @@ pub struct App {
     pub status: Status,
     pub show_popup: bool,
     pub confirm: Option<Confirm>,
+    pub action_confirm: Option<crate::plan_admin::ActionConfirmation>,
+    pub account_picker: Option<crate::plan_admin::AccountPicker>,
     pub should_quit: bool,
     /// Sender handed to background job threads; results arrive on `job_rx`.
     job_tx: Sender<JobResult>,
@@ -184,6 +189,8 @@ impl App {
             status: Status::info("loaded plans"),
             show_popup: false,
             confirm: None,
+            action_confirm: None,
+            account_picker: None,
             should_quit: false,
             job_tx,
             job_rx,
@@ -267,9 +274,15 @@ impl App {
     /// True if any job at all is in flight for the current plan.
     pub fn current_busy(&self) -> Option<JobKind> {
         let trade_id = self.current_plan()?.trade_id.clone();
-        [JobKind::Timeline, JobKind::Replay, JobKind::LoadTv]
-            .into_iter()
-            .find(|k| self.in_flight.contains(&(trade_id.clone(), *k)))
+        [
+            JobKind::Timeline,
+            JobKind::Replay,
+            JobKind::LoadTv,
+            JobKind::PlanAction,
+            JobKind::Accounts,
+        ]
+        .into_iter()
+        .find(|k| self.in_flight.contains(&(trade_id.clone(), *k)))
     }
 
     /// The current spinner glyph (advances with `tick`).
@@ -637,6 +650,19 @@ impl App {
         } = result;
         match outcome {
             JobOutcome::Direction(direction) => self.set_direction(&trade_id, direction),
+            JobOutcome::Accounts(accounts) => self.receive_accounts(trade_id, accounts),
+            JobOutcome::PlanAction(summary) => {
+                self.data.remove(&trade_id);
+                self.start_timeline(&trade_id);
+                if self.mark_in_flight(&trade_id, JobKind::PlanList) {
+                    jobs::spawn_plan_list(self.job_tx.clone(), trade_id.clone());
+                }
+                self.status = Status::info(format!("{trade_id}: {summary}"));
+            }
+            JobOutcome::PlanList(yaml) => match parse_plan_list(&yaml) {
+                Ok(plans) => self.refresh_plan_rows(plans),
+                Err(e) => self.status = Status::error(format!("refresh plans: {e}")),
+            },
             JobOutcome::Timeline {
                 export_json,
                 timeline_json,
@@ -1394,6 +1420,8 @@ impl App {
             status: Status::info("test"),
             show_popup: false,
             confirm: None,
+            action_confirm: None,
+            account_picker: None,
             should_quit: false,
             job_tx,
             job_rx,
@@ -1788,12 +1816,15 @@ mod tests {
 
     fn row(trade_id: &str) -> PlanRow {
         PlanRow {
+            positions: Vec::new(),
+            position_sync: Vec::new(),
             trade_id: trade_id.to_string(),
             account: "acct".into(),
             instrument: "AUD_CAD".into(),
             direction: None,
             granularity: "h1".into(),
             phase: Some("await_entry".into()),
+            entries_blocked: false,
             shadow: false,
             archived_at: None,
             watermark: None,

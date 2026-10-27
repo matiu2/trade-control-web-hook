@@ -168,6 +168,7 @@ fn fixture_shell() -> Shell {
 /// scripts that reference `r_multiple` get a representative number.
 fn fixture_resolved() -> Resolved {
     Resolved {
+        setup_id: "test-setup".into(),
         id: "validator-fixture".into(),
         not_after: "2026-06-01T00:00:00Z".parse().unwrap_or_default(),
         instrument: "EUR_USD".into(),
@@ -259,6 +260,7 @@ mod tests {
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
             breakeven: None,
             include_archived: false,
+            plan_admin: None,
         }
     }
 

@@ -41,9 +41,10 @@
 //! * Global / default-account routing for a `None`-account broker intent is a
 //!   follow-up — such an intent currently returns `400 account required`.
 
-mod registration;
-
 use std::sync::Arc;
+
+mod reconciliation;
+mod registration;
 
 use axum::{
     Router,
@@ -217,7 +218,7 @@ async fn dispatch_request(state: &Arc<AppState>, body: &str) -> (StatusCode, Str
 /// For most paths `record == body` (the body is already a fine short outcome —
 /// `"replay"`, `"declined: intent-expired"`, `"ok"`). They diverge for a broker
 /// [`ActionResult`]: the caller sees the human-facing `body` (e.g. the long
-/// "entry blocked: SL too close to spread …" prose or a flat "action failed"),
+/// "entry blocked: SL too close to spread …" prose or "action failed: …"),
 /// but the record keeps the concise, information-rich gate verdict
 /// ([`ActionResult::record_outcome`]) — the same string the offline replay
 /// surfaces on its `BLOCKED — …` line — so a later `plan timeline` / `status`
@@ -240,9 +241,8 @@ impl DispatchOutcome {
     }
 
     /// Map a broker [`ActionResult`] to its HTTP response while keeping the
-    /// rich outcome string for the record. The status/body mapping matches the
-    /// wasm worker (`action_to_parts`); the `record` diverges for
-    /// `Failed`/`Rejected` (see the struct doc).
+    /// rich outcome string for the record. The `record` remains independent of
+    /// the HTTP response wording for `Failed`/`Rejected` (see the struct doc).
     fn from_action(result: &ActionResult) -> Self {
         let (status, body) = action_to_parts(result);
         Self {
@@ -290,6 +290,12 @@ async fn dispatch_inner(
             };
         }
     };
+
+    let exclusive = matches!(
+        verified.intent.action,
+        Action::PlanPaper | Action::PlanSwapAccount | Action::PlanClosedManually
+    );
+    let _operation_guard = crate::operation_lock::acquire(exclusive).await;
 
     // --- Replay protection (shared multi-shot exception). ---
     match state.store.is_seen(&verified.intent.id).await {
@@ -359,9 +365,29 @@ async fn dispatch_control(
             if let Some(refusal) = registration::unavailable(state, verified).await {
                 return Some(refusal);
             }
-            handle_register(store, &state.accounts, verified, now).await
+            match crate::plan_admin::guard::register_blocked(store, &verified.intent).await {
+                Ok(Some(reason)) => ControlResult::error(reason, 409),
+                Ok(None) => handle_register(store, &state.accounts, verified, now).await,
+                Err(error) => {
+                    tracing::error!(%error, "register plan ownership lookup failed");
+                    ControlResult::error("plan ownership lookup failed", 500)
+                }
+            }
         }
-        Action::PlanList => handle_plan_list(store, verified, now).await,
+        Action::PlanList => {
+            let result = handle_plan_list(store, verified, now).await;
+            if result.is_success() {
+                match crate::position_tracking::enrich_list(store.pool(), &result.body).await {
+                    Ok(body) => ControlResult::ok(body),
+                    Err(error) => {
+                        tracing::error!(%error, "plan-list position reporting unavailable");
+                        ControlResult::error("position reporting unavailable", 500)
+                    }
+                }
+            } else {
+                result
+            }
+        }
         Action::PlanShow => handle_plan_show(store, verified, now).await,
         // Recording-backed (reads `request_records`), so it can't be a generic
         // `core` handler like the others — it's dispatched here against the
@@ -369,6 +395,9 @@ async fn dispatch_control(
         // are worker-local.
         Action::PlanTimeline => handle_plan_timeline(store, verified, now).await,
         Action::PlanDelete => handle_plan_delete(store, verified, now).await,
+        Action::PlanPaper | Action::PlanSwapAccount | Action::PlanClosedManually => {
+            crate::plan_admin::handle(state, verified, now).await
+        }
         // Not yet supported natively — these need R2 (the `ticks/` bundles for
         // purge) or the TradeNation market-info call (MarketInfo). The wasm
         // worker dispatches them with `Env` in scope; the native glue is a
@@ -429,10 +458,26 @@ async fn handle_plan_timeline(
         }
     };
 
+    let (positions, position_sync) = match async {
+        Ok::<_, color_eyre::Report>((
+            crate::position_tracking::for_trade(store.pool(), target).await?,
+            crate::position_tracking::sync_for_trade(store.pool(), target).await?,
+        ))
+    }
+    .await
+    {
+        Ok(data) => data,
+        Err(error) => {
+            tracing::error!(%error, "plan-timeline position reporting unavailable");
+            return ControlResult::error("position reporting unavailable", 500);
+        }
+    };
     let timeline = trade_control_core::recording::PlanTimeline {
         records,
         ticks,
         notes,
+        positions,
+        position_sync,
     };
 
     if timeline.is_empty() {
@@ -466,6 +511,18 @@ async fn dispatch_broker(
     body: &str,
     now: chrono::DateTime<Utc>,
 ) -> DispatchOutcome {
+    match crate::plan_admin::guard::blocked(&state.store, &verified.intent).await {
+        Ok(Some(reason)) => return DispatchOutcome::plain(StatusCode::CONFLICT, reason),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(%error, "plan ownership guard failed");
+            return DispatchOutcome::plain(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "plan ownership lookup failed",
+            );
+        }
+    }
+
     // Resolve the account metadata. A named account that isn't in the index is a
     // 400; an unnamed account with a broker intent has no credentials to route
     // to (global/default-account routing is a follow-up) — also a 400.
@@ -491,6 +548,7 @@ async fn dispatch_broker(
     // Branch on the broker kind exactly like the wasm worker: build the concrete
     // broker, then monomorphize the shared `run_action` per arm. On acquire
     // failure, mirror the worker's statuses (OANDA → 500, TradeNation → 503).
+    let mut ctrader_broker = None;
     let result = match verified.intent.broker {
         BrokerKind::Oanda => match acquire_oanda(&meta, &state.secrets) {
             Ok(broker) => run_action(&broker, &state.store, verified, &cfg, now, body).await,
@@ -538,7 +596,11 @@ async fn dispatch_broker(
             }
         },
         BrokerKind::Ctrader => match acquire_ctrader(&meta).await {
-            Ok(broker) => run_action(&broker, &state.store, verified, &cfg, now, body).await,
+            Ok(broker) => {
+                let result = run_action(&broker, &state.store, verified, &cfg, now, body).await;
+                ctrader_broker = Some(broker);
+                result
+            }
             Err(err) => {
                 tracing::error!("ctrader acquire failed: {err}");
                 return DispatchOutcome::plain(
@@ -549,12 +611,20 @@ async fn dispatch_broker(
         },
     };
 
-    // Shared seen-index write (only `Ok` marks; `Failed`/`Rejected` log only).
+    // Preserve replay poison before any optional read-only evidence lookup.
     record_dispatcher_outcome(&state.store, verified, now, &result).await;
     // The HTTP body is caller-facing; the *record* keeps the rich outcome
     // (`ActionResult::record_outcome`) so `plan timeline` / `status` shows the
     // same concise verdict the offline replay does — see `DispatchOutcome`.
-    DispatchOutcome::from_action(&result)
+    let mut outcome = DispatchOutcome::from_action(&result);
+    if let Some(broker) = ctrader_broker
+        && let Some((status, body)) =
+            reconciliation::response(&broker, verified, &cfg, &result).await
+    {
+        outcome.status = status;
+        outcome.body = body;
+    }
+    outcome
 }
 
 /// Account-resolution failure modes at the native edge.
@@ -588,9 +658,9 @@ fn control_to_parts(c: ControlResult) -> (StatusCode, String) {
     (status, c.body)
 }
 
-/// Map a broker [`ActionResult`] to an HTTP `(status, body)`, matching the wasm
-/// worker (`Ok` → 200 "ok", `Failed` → 502 "action failed", `Rejected` → its
-/// own status + body).
+/// Map a broker [`ActionResult`] to an HTTP `(status, body)`: `Ok` uses 200
+/// "ok", `Failed` uses 502 with its reason, and `Rejected` keeps its own
+/// status and body.
 ///
 /// `AmbiguousSuccess` deliberately does NOT reuse `Failed`'s body. Both are
 /// 502s (neither is a confirmed success), but a caller that strips the status
@@ -601,15 +671,17 @@ fn control_to_parts(c: ControlResult) -> (StatusCode, String) {
 fn action_to_parts(result: &ActionResult) -> (StatusCode, String) {
     match result {
         ActionResult::Ok(_) => (StatusCode::OK, "ok".to_string()),
-        ActionResult::Failed(_) => (StatusCode::BAD_GATEWAY, "action failed".to_string()),
+        ActionResult::Failed(reason) => {
+            (StatusCode::BAD_GATEWAY, format!("action failed: {reason}"))
+        }
         ActionResult::Rejected { status, body, .. } => (
             StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             body.clone(),
         ),
         ActionResult::AmbiguousSuccess(_) => (
             StatusCode::BAD_GATEWAY,
-            "ambiguous: broker call may have succeeded, response unreadable — \
-             check the broker before retrying"
+            "ambiguous: unconfirmed execution/protection state — \
+             do not retry; check the broker and reconcile the original request"
                 .to_string(),
         ),
     }
@@ -750,12 +822,15 @@ mod tests {
     }
 
     #[test]
-    fn action_result_maps_like_the_wasm_worker() {
+    fn action_result_preserves_status_and_failure_reason() {
         let (s, b) = action_to_parts(&ActionResult::Ok("entered".into()));
         assert_eq!((s, b.as_str()), (StatusCode::OK, "ok"));
 
         let (s, b) = action_to_parts(&ActionResult::Failed("broker 500".into()));
-        assert_eq!((s, b.as_str()), (StatusCode::BAD_GATEWAY, "action failed"));
+        assert_eq!(
+            (s, b.as_str()),
+            (StatusCode::BAD_GATEWAY, "action failed: broker 500")
+        );
 
         let (s, b) = action_to_parts(&ActionResult::Rejected {
             status: 412,
@@ -776,8 +851,24 @@ mod tests {
             "entry-failed: ambiguous-success".into(),
         ));
         assert_eq!(s, StatusCode::BAD_GATEWAY);
-        assert_ne!(b, "action failed");
+        assert!(!b.contains("action failed"), "{b}");
         assert!(b.contains("check the broker"), "{b}");
+    }
+
+    #[test]
+    fn ctrader_market_failure_reason_reaches_the_caller_and_request_record() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        let reason = "entry-failed: broker-rejected (broker rejected the order: cTrader market entries are unavailable until post-fill absolute SL/TP normalization is verified; use stop or limit entries)";
+        let out = DispatchOutcome::from_action(&ActionResult::Failed(reason.into()));
+        assert_eq!(out.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(out.body, format!("action failed: {reason}"));
+        assert_eq!(out.record, reason);
     }
 
     #[test]
@@ -810,10 +901,10 @@ mod tests {
              r_at_widen=0.35 < min_r=1.00)"
         );
 
-        // Failed: body is the flat "action failed", record keeps the reason.
+        // Failed: body includes its reason, record keeps the unprefixed outcome.
         let failed = ActionResult::Failed("broker 500".into());
         let out = DispatchOutcome::from_action(&failed);
-        assert_eq!(out.body, "action failed");
+        assert_eq!(out.body, "action failed: broker 500");
         assert_eq!(out.record, "broker 500");
 
         // Ok: body "ok", record the success outcome.

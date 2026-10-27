@@ -271,7 +271,7 @@ pub fn coalesce(mut windows: Vec<ZoomWindow>) -> Vec<ZoomWindow> {
 /// ambiguity, so missing finer data can never make a replay wrong, only more
 /// conservative.
 pub async fn fetch_windows(
-    source: trade_control_cli::replay_args::CandleSource,
+    source: crate::replay_args::CandleSource,
     symbol: &str,
     finer: super::granularity::ReplayGranularity,
     windows: &[ZoomWindow],

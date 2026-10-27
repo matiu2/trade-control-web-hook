@@ -67,6 +67,15 @@ pub enum Action {
     RequestDelete,
     ConfirmYes,
     ConfirmNo,
+    PaperMode,
+    SwapAccount,
+    ClosedManually,
+    AccountNext,
+    AccountPrev,
+    AccountAccept,
+    AccountChoose(usize),
+    ConfirmManagement,
+    CancelManagement,
     /// Scroll the detail popup by N lines (negative = up).
     PopupScroll(i32),
     PopupHome,
@@ -155,6 +164,23 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
         };
     }
 
+    if app.action_confirm.is_some() {
+        return match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Action::ConfirmManagement,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Action::CancelManagement,
+            _ => Action::None,
+        };
+    }
+    if app.account_picker.is_some() {
+        return match key.code {
+            KeyCode::Down | KeyCode::Char('j') => Action::AccountNext,
+            KeyCode::Up | KeyCode::Char('k') => Action::AccountPrev,
+            KeyCode::Enter => Action::AccountAccept,
+            KeyCode::Esc => Action::CancelManagement,
+            _ => Action::None,
+        };
+    }
+
     // The detail popup is modal and scrollable: i/esc/q close it; arrows + vim
     // keys + page/home/end scroll it. One page ≈ 20 lines (the render clamps the
     // bottom, so an over-scroll just pins to the last page).
@@ -175,6 +201,15 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
             KeyCode::Char('c') => Action::Copy,
             _ => Action::None,
         };
+    }
+
+    if app.screen != Screen::List {
+        match key.code {
+            KeyCode::Char('p') => return Action::PaperMode,
+            KeyCode::Char('b') => return Action::SwapAccount,
+            KeyCode::Char('m') => return Action::ClosedManually,
+            _ => {}
+        }
     }
 
     // The Replay screen scrolls its (long) report: arrows + vim + page/home/end,
@@ -256,6 +291,22 @@ pub fn apply(app: &mut App, action: Action) {
         Action::RequestDelete => app.request_delete(),
         Action::ConfirmYes => app.resolve_confirm(true),
         Action::ConfirmNo => app.resolve_confirm(false),
+        Action::PaperMode => app.request_paper_mode(),
+        Action::SwapAccount => app.request_swap_account(),
+        Action::ClosedManually => {
+            app.request_plan_action(crate::plan_admin::PlanAction::ClosedManually)
+        }
+        Action::AccountNext => app.move_account(1),
+        Action::AccountPrev => app.move_account(-1),
+        Action::AccountAccept => app.accept_account(),
+        Action::AccountChoose(index) => {
+            if let Some(picker) = app.account_picker.as_mut() {
+                picker.selected = index;
+            }
+            app.accept_account();
+        }
+        Action::ConfirmManagement => app.confirm_plan_action(),
+        Action::CancelManagement => app.cancel_plan_action(),
         Action::PopupScroll(delta) => app.scroll_popup(delta),
         Action::PopupHome => app.scroll_popup_home(),
         Action::PopupEnd => app.scroll_popup_end(),
@@ -281,12 +332,15 @@ mod tests {
 
     fn app_with_one_plan() -> App {
         App::from_rows(vec![PlanRow {
+            positions: Vec::new(),
+            position_sync: Vec::new(),
             trade_id: "hs-eur-usd-1".into(),
             account: "demo".into(),
             instrument: "EUR_USD".into(),
             direction: None,
             granularity: "h1".into(),
             phase: Some("done".into()),
+            entries_blocked: false,
             shadow: false,
             archived_at: None,
             watermark: None,
@@ -295,6 +349,53 @@ mod tests {
 
     fn press(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn management_keys_require_an_open_plan_and_confirm_intent() {
+        let mut app = app_with_one_plan();
+        assert_eq!(map_key(&app, press('p')), Action::None);
+        app.screen = Screen::Timeline;
+        assert_eq!(map_key(&app, press('p')), Action::PaperMode);
+        assert_eq!(map_key(&app, press('b')), Action::SwapAccount);
+        assert_eq!(map_key(&app, press('m')), Action::ClosedManually);
+        apply(&mut app, Action::ClosedManually);
+        assert!(app.action_confirm.is_some());
+        assert_eq!(map_key(&app, press('m')), Action::None);
+        assert_eq!(map_key(&app, press('n')), Action::CancelManagement);
+        apply(&mut app, Action::CancelManagement);
+        assert!(app.action_confirm.is_none());
+    }
+
+    #[test]
+    fn account_picker_is_modal_and_selection_carries_original_trade() {
+        let mut app = app_with_one_plan();
+        app.account_picker = Some(crate::plan_admin::AccountPicker {
+            trade_id: "original-trade".into(),
+            purpose: crate::plan_admin::AccountPurpose::SwapAccount,
+            accounts: vec![crate::plan_admin::AccountChoice {
+                name: "reversals".into(),
+                broker: "tradenation".into(),
+                kind: "demo".into(),
+                capabilities: None,
+            }],
+            selected: 0,
+        });
+        assert_eq!(map_key(&app, press('p')), Action::None);
+        assert_eq!(map_key(&app, press('j')), Action::AccountNext);
+        assert_eq!(
+            map_key(&app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::AccountAccept
+        );
+        apply(&mut app, Action::AccountAccept);
+        let confirm = app.action_confirm.as_ref().unwrap();
+        assert_eq!(confirm.trade_id, "original-trade");
+        assert_eq!(
+            confirm.action,
+            crate::plan_admin::PlanAction::SwapAccount {
+                account: "reversals".into()
+            }
+        );
     }
 
     /// `/` opens the prompt from the list.

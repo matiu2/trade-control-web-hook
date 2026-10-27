@@ -87,7 +87,7 @@ use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan}
 use super::arm_record::ArmRecord;
 use super::economics::ReplayEconomics;
 use super::replay::Replay;
-use trade_control_cli::replay_args::CandleSource;
+use crate::replay_args::CandleSource;
 
 use super::upkeep::{FrozenUpkeep, UpkeepTicks};
 
@@ -391,9 +391,9 @@ mod tests {
     use super::super::brisbane::bne;
     use super::super::cadence::CronCadence;
     use super::*;
+    use crate::replay_args::{DetectorMarkConfig, DirectionFilter, GoldenFilter};
     use chrono::TimeZone;
     use std::path::PathBuf;
-    use trade_control_cli::replay_args::{DetectorMarkConfig, DirectionFilter, GoldenFilter};
 
     /// The uk-100 multi-shot fixture, which several tests below need
     /// specifically: it's the one exercising a **trade-expiry** flatten on an

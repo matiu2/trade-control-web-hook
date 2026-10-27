@@ -51,7 +51,7 @@ use crate::instrument_resolution::ResolvedInstrument;
 use crate::pipeline::arm_out_dir;
 use crate::plan_geometry::PlanGeometry;
 use crate::position_trade::{PositionLevels, core_direction, resolve_levels};
-use crate::register_post::post_intent_blocking;
+use crate::register_post::post_intent_with_context;
 use crate::roles::{PositionDirection, Roles};
 
 mod command;
@@ -234,6 +234,9 @@ pub(crate) fn run_position_entry(
         // Build/validation failure (bad geometry, sign error) — clean rejection.
         Err(e) => {
             eprintln!("ERROR: {e}");
+            if let Some(execution) = args.execution.as_ref() {
+                execution.update(|outcome| outcome.error = Some(format!("{e:#}")))?;
+            }
             return Ok(1);
         }
     };
@@ -246,7 +249,29 @@ pub(crate) fn run_position_entry(
 
     // The whole point of the position path: POST straight to the worker,
     // which places the order on receipt.
-    let resp = post_intent_blocking(signed_body).wrap_err("POST position enter to worker")?;
+    if let Some(execution) = args.execution.as_ref() {
+        execution.record(crate::api::ArmExecution {
+            trade_id: trade_id.clone(),
+            instrument: instrument.to_string(),
+            broker: broker.as_str().to_string(),
+            account: account.to_string(),
+            pattern: format!("position-{mode:?}"),
+            output_dir: Some(out_dir),
+            ..Default::default()
+        })?;
+    }
+    let resp = post_intent_with_context(signed_body, args.execution.as_ref())
+        .wrap_err("POST position enter to worker")?;
+    if let Some(execution) = args.execution.as_ref() {
+        let report = entry_confirmation(&trade_id, resp.trim(), args.broker_dry_run).join("\n");
+        execution.update(|outcome| {
+            outcome.report.push_str(&report);
+            if let Some(last) = outcome.executions.last_mut() {
+                last.worker_response = Some(resp.clone());
+                last.report = Some(report);
+            }
+        })?;
+    }
     info!(trade_id = %trade_id, worker_response = %resp.trim(), "position enter POSTed");
     for line in entry_confirmation(&trade_id, resp.trim(), args.broker_dry_run) {
         println!("{line}");

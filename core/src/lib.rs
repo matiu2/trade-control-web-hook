@@ -30,6 +30,7 @@ pub mod pending_lifecycle;
 pub mod plan_eval;
 pub mod plan_sentiment;
 pub mod plan_state;
+pub mod position_tracking;
 pub mod recording;
 pub mod recover_entry;
 pub mod resign;
@@ -48,3 +49,6 @@ pub mod trade_plan;
 pub mod tunable;
 
 pub mod ma_cross;
+
+#[cfg(test)]
+mod test_logging;

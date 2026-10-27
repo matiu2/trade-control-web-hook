@@ -7,10 +7,12 @@
 //! depending on that crate would drag the whole worker tree into this tool.
 
 use chrono::{DateTime, FixedOffset, Utc};
+use serde::Serialize;
 use serde_json::Value;
+mod entry_evidence;
 
 /// One line in the rendered timeline.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Event {
     /// Brisbane-formatted timestamp.
     pub ts: String,
@@ -353,15 +355,7 @@ fn compact_outcome(outcome: &str) -> String {
 /// record supplies the timestamp.
 pub fn derive_entry_ts(json: &str) -> Option<String> {
     let v: Value = serde_json::from_str(json).ok()?;
-    let records = v.get("records")?.as_array()?;
-    for rec in records {
-        let outcome = rec.get("outcome").and_then(|x| x.as_str()).unwrap_or("");
-        if outcome.starts_with("entered") {
-            let ts = rec.get("ts").and_then(|x| x.as_str()).unwrap_or("");
-            return Some(ts_to_bne(ts));
-        }
-    }
-    None
+    entry_evidence::entry_ts(&v)
 }
 
 /// Derive the final outcome for the info bar: the last non-trivial record
@@ -372,35 +366,64 @@ pub fn derive_outcome(json: &str) -> (String, bool) {
     let Ok(v) = serde_json::from_str::<Value>(json) else {
         return ("?".to_string(), false);
     };
-    let mut result: Option<(String, bool)> = None;
-    if let Some(records) = v.get("records").and_then(|r| r.as_array()) {
-        for rec in records {
-            let outcome = rec.get("outcome").and_then(|x| x.as_str()).unwrap_or("");
-            // Skip the big dump outcomes (register/plan-show) — they start with a
-            // YAML sequence or `ok`.
-            if outcome == "ok" || outcome.starts_with("- ") || outcome.contains('\n') {
-                continue;
-            }
-            if outcome.is_empty() {
-                continue;
-            }
-            // `placed` (a resting stop/limit accepted onto the broker's book)
-            // is a SUCCESS as much as `entered` (a fill) — the fire did what it
-            // set out to do. Only the *fill* question is different, and that is
-            // `derive_entry_ts`'s job, not this one's. Omitting `placed` here
-            // would paint every good resting-order placement red.
-            let ok = outcome.starts_with("entered")
-                || outcome.starts_with("placed")
-                || outcome.starts_with("closed");
-            result = Some((outcome.to_string(), ok));
-        }
+    // The latest engine-health observation states whether evaluation is
+    // currently blocked, including failures before any tick could be recorded.
+    if let Some(note) = v.get("notes").and_then(Value::as_array).and_then(|notes| {
+        notes
+            .iter()
+            .filter(|note| note.get("source").and_then(Value::as_str) == Some("engine-health"))
+            .max_by_key(|note| note.get("ts").and_then(Value::as_str).unwrap_or_default())
+    }) && note.get("severity").and_then(Value::as_str) == Some("error")
+    {
+        return (
+            note.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("plan evaluation failed")
+                .into(),
+            false,
+        );
     }
-    result.unwrap_or_else(|| ("no dispatch recorded".to_string(), false))
+    entry_evidence::last_dispatch(&v).unwrap_or_else(|| {
+        if entry_evidence::entry_ts(&v).is_some() {
+            (
+                "entry confirmed; current position status requires broker observations".into(),
+                true,
+            )
+        } else {
+            ("no dispatch recorded".into(), false)
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_failure_is_visible_without_ticks_and_recovery_clears_the_error() {
+        let failed = serde_json::json!({"records": [], "ticks": [], "notes": [
+            {"ts":"2026-10-16T01:08:24Z", "source":"engine-health", "severity":"error", "message":"MT5 account/server mismatch"}
+        ]});
+        assert_eq!(
+            derive_outcome(&failed.to_string()),
+            ("MT5 account/server mismatch".into(), false)
+        );
+        let events = parse_events(&failed.to_string());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].marker, '!');
+        assert!(
+            events[0]
+                .text
+                .contains("(error): MT5 account/server mismatch")
+        );
+        let mut recovered = failed;
+        recovered["notes"].as_array_mut().unwrap().push(serde_json::json!({"ts":"2026-10-16T04:23:37Z", "source":"engine-health", "severity":"info", "message":"plan evaluation resumed"}));
+        assert_eq!(
+            derive_outcome(&recovered.to_string()),
+            ("no dispatch recorded".into(), false)
+        );
+        assert_eq!(parse_events(&recovered.to_string()).len(), 2);
+    }
 
     #[test]
     fn confirmed_broker_exit_replaces_only_its_obsolete_warnings() {
@@ -779,12 +802,10 @@ mod tests {
     }
 
     #[test]
-    fn outcome_falls_back_without_dispatch() {
-        // The AUD/CAD fixture has only register + plan-show records (dumps), so
-        // no clean dispatch verdict — expect the fallback.
+    fn outcome_reads_tick_dispatch_when_inbound_records_are_only_dumps() {
         let (text, ok) = derive_outcome(TIMELINE);
         assert!(!ok);
-        assert_eq!(text, "no dispatch recorded");
+        assert_eq!(text, "news-window-closed");
     }
 
     /// THE INCIDENT, in journal's own terms: `reconcile` wrote a `CronNote`

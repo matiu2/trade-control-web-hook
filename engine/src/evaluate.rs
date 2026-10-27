@@ -694,8 +694,8 @@ fn evaluate_guards(
                 // bars are dominated by the spread hour; H4+ is left alone. Shared
                 // with the worker (replay == live). See
                 // SCOPING-spread-hour-rubbish-candle.md.
-                if trade_control_core::spread_blackout::suppress_on_spread_hour(
-                    &rule.intent.instrument,
+                if crate::spread_identity::suppress_intent(
+                    &rule.intent,
                     candle.time,
                     plan.granularity,
                 ) {
@@ -936,11 +936,7 @@ fn evaluate_one_entry(
     // spread hour, so H4+ entries are NOT suppressed (the other 3h of an H4 bar
     // dilute the spread-hour rubbish). Shared with the worker so replay == live.
     // See SCOPING-spread-hour-rubbish-candle.md.
-    if trade_control_core::spread_blackout::suppress_on_spread_hour(
-        &plan.instrument,
-        candle.time,
-        plan.granularity,
-    ) {
+    if crate::spread_identity::suppress_plan(plan, candle.time) {
         return;
     }
 
@@ -1720,11 +1716,7 @@ fn stamp_retest(
     // next clean bar is measured correctly. Gated on bar size — only 15m/1h bars
     // are dominated by the spread hour; an H4 retest is left to stamp. Shared
     // with the worker (replay == live). See SCOPING-spread-hour-rubbish-candle.md.
-    let spread_hour = trade_control_core::spread_blackout::suppress_on_spread_hour(
-        &plan.instrument,
-        candle.time,
-        plan.granularity,
-    );
+    let spread_hour = crate::spread_identity::suppress_plan(plan, candle.time);
     // Only stamp once: the retest is a milestone the trade passes a single
     // time. Without this latch a later re-cross would re-stamp `retest_seen_at`
     // and re-emit the prep fire every bar (the break-and-close analogue of the
@@ -1998,11 +1990,7 @@ fn stamp_pullback(
     // Spread-hour rubbish candle: a body printed in a liquidity vacuum isn't a
     // real pullback. Gated on bar size like the retest (only 15m/1h bars are
     // dominated by the spread hour).
-    if trade_control_core::spread_blackout::suppress_on_spread_hour(
-        &plan.instrument,
-        candle.time,
-        plan.granularity,
-    ) {
+    if crate::spread_identity::suppress_plan(plan, candle.time) {
         return;
     }
     // ATR is the retrace unit. Fail-closed on a cold window: warn and don't stamp
@@ -2424,11 +2412,7 @@ fn fire_rule(
         !trigger_uses_close(&rule.trigger) && !matches!(rule.trigger, Trigger::TimeReached { .. });
     if hit
         && is_wick_cross
-        && trade_control_core::spread_blackout::suppress_on_spread_hour(
-            &rule.intent.instrument,
-            candle.time,
-            granularity,
-        )
+        && crate::spread_identity::suppress_intent(&rule.intent, candle.time, granularity)
     {
         return false;
     }
@@ -3258,6 +3242,7 @@ mod tests {
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
             breakeven: None,
             include_archived: false,
+            plan_admin: None,
         }
     }
 
@@ -6902,6 +6887,42 @@ mod tests {
         );
         assert!(!eval.done, "the plan stays armed for the next clean bar");
         assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn named_account_spread_lead_suppresses_the_actual_pine_entry() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        use trade_control_core::{intent::BrokerKind, spread_blackout};
+        let at = ts("2026-06-16T20:45:00Z");
+        assert!(!spread_blackout::is_spread_hour("EURUSD", at));
+        for (broker, account) in [
+            (BrokerKind::Ctrader, "ctrader-demo"),
+            (BrokerKind::Mt5, "the5ers-competition"),
+        ] {
+            let mut p = plan(vec![pine_enter_rule(None, Direction::Short, false)]);
+            p.instrument = "EURUSD".into();
+            p.rules.iter_mut().for_each(|rule| {
+                rule.intent.instrument = p.instrument.clone();
+                rule.intent.broker = broker;
+                rule.intent.account = Some(account.into());
+            });
+            let key = spread_blackout::spread_lookup_key(&p.instrument, Some(account));
+            assert!(spread_blackout::is_spread_hour(&key, at), "{key}");
+            let window = pinbar_window_ending_at("2026-06-16T20:45:00Z");
+            let prior = seed_at(Phase::AwaitEntry, "2026-06-16T19:45:00Z");
+            let evaluated = run_window(&p, &prior, &window[3..], &window);
+            assert!(
+                evaluated.fired.is_empty(),
+                "{account}: {:?}",
+                evaluated.fired
+            );
+        }
     }
 
     #[test]

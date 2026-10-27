@@ -9,7 +9,9 @@
 mod exit;
 mod fx;
 mod oanda;
+mod order;
 mod risk;
+mod spec;
 
 pub use oanda::OANDA_ACCOUNT_ID;
 
@@ -64,18 +66,18 @@ impl OandaBroker {
     /// practice), normally derived from the account's `kind`.
     pub fn from_api_key(api_key: String, account_id: String, live: bool) -> Self {
         let client = if live {
-            OandaClient::new_live(api_key)
+            OandaClient::new_live(api_key).with_candle_account(&account_id)
         } else {
             OandaClient::new(api_key)
         };
         let client = Arc::new(client);
         let namespace = if live {
-            "candle_cache_oanda_live"
+            oanda_client::account_candle_namespace(&account_id)
         } else {
-            "candle_cache_oanda"
+            "candle_cache_oanda".to_string()
         };
         let candles = Puller::new(
-            namespace,
+            &namespace,
             OandaDataSource::with_shared_client(client.clone(), account_id.clone()),
         );
         Self {

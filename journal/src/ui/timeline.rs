@@ -25,7 +25,11 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 events
                     .iter()
                     .map(|e| {
-                        let marker_style = if e.marker == '✓' {
+                        let marker_style = if e.marker == '!' && e.text.contains("(error):") {
+                            Style::default().fg(Color::Red)
+                        } else if e.marker == '!' && e.text.contains("(warn):") {
+                            Style::default().fg(Color::Yellow)
+                        } else if e.marker == '✓' {
                             Style::default().fg(Color::Green)
                         } else if e.marker == '•' {
                             Style::default().fg(Color::Yellow)
@@ -42,7 +46,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                                 Style::default().fg(Color::DarkGray),
                             ),
                             Span::styled(format!("{} ", e.marker), marker_style),
-                            Span::raw(e.text.clone()),
+                            Span::styled(
+                                e.text.clone(),
+                                if e.marker == '!' {
+                                    marker_style
+                                } else {
+                                    Style::default()
+                                },
+                            ),
                         ]))
                     })
                     .collect()

@@ -31,7 +31,7 @@ use crate::broker_read::read_mid_blocking;
 use crate::control_bundle::{Bundle, NewsKind, PauseKind};
 use crate::pipeline::effective_arm_time;
 use crate::plan_geometry::PlanGeometry;
-use crate::register_post::{post_intent_blocking, post_register_blocking};
+use crate::register_post::post_intent_with_context;
 use crate::trade_plan_build::{append_control_rules, build_trade_plan, resolution_to_granularity};
 
 /// One registered plan as seen in the `plan-list` response — only the two
@@ -90,13 +90,15 @@ pub(crate) fn replace_existing_plan(
     instrument: &str,
     key: &[u8; KEY_LEN],
     now: DateTime<Utc>,
+    execution: Option<&crate::api::Execution>,
 ) -> Result<()> {
     // Query the registered plans so an auto-resolve can count them per
     // instrument. Live plans only (`include_archived: false`) — a terminated
     // plan in the archive must not count against the per-instrument tally.
     let list_intent = cli::build_plan_list_intent(now, &register_suffix(now), false);
     let list_body = cli::wrap_signed(&list_intent, key, now).wrap_err("sign plan-list intent")?;
-    let yaml = post_intent_blocking(list_body).wrap_err("query plan-list for --replace")?;
+    let yaml =
+        post_intent_with_context(list_body, execution).wrap_err("query plan-list for --replace")?;
     let plans: Vec<PlanListEntry> =
         serde_yaml::from_str(&yaml).wrap_err("parse plan-list response")?;
 
@@ -108,7 +110,10 @@ pub(crate) fn replace_existing_plan(
     let del_intent = cli::build_plan_delete_intent(&trade_id, now, &register_suffix(now));
     let del_body = cli::wrap_signed(&del_intent, key, now).wrap_err("sign plan-delete intent")?;
     info!(trade_id = %trade_id, instrument = %instrument, "--replace: deleting prior registered plan");
-    post_intent_blocking(del_body).wrap_err("delete prior plan for --replace")?;
+    post_intent_with_context(del_body, execution).wrap_err("delete prior plan for --replace")?;
+    if let Some(execution) = execution {
+        execution.update(|outcome| outcome.replaced_trade_ids.push(trade_id.clone()))?;
+    }
     info!(trade_id = %trade_id, "--replace: prior plan deleted");
     Ok(())
 }
@@ -163,6 +168,7 @@ pub(crate) fn register_trade_plan(
     armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
     trend: crate::trade_plan_build::TrendFollow,
     ma_requirements: crate::ma_requirements::MaRequirements<'_>,
+    execution: Option<&crate::api::Execution>,
 ) -> Result<()> {
     use cli::TradePattern;
     let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
@@ -194,6 +200,8 @@ pub(crate) fn register_trade_plan(
                 kind_to_broker(broker),
                 &built_trade.instrument,
                 &built_trade.spec.account,
+                key,
+                execution,
             )
             .wrap_err("read live mid for --pull-back anchor")?;
             Some(crate::trade_plan_build::PullbackArm {
@@ -253,6 +261,18 @@ pub(crate) fn register_trade_plan(
         fs::write(path, json).wrap_err_with(|| format!("write plan to {}", path.display()))?;
         info!(path = %path.display(), "wrote trade plan JSON");
     }
+    if let Some(execution) = execution {
+        execution.record(crate::api::ArmExecution {
+            trade_id: built_trade.trade_id.clone(),
+            instrument: built_trade.instrument.clone(),
+            broker: kind_to_broker(built_trade.spec.broker).as_str().to_string(),
+            account: account.to_string(),
+            pattern: format!("{:?}", built_trade.spec.pattern),
+            plan: Some(serde_json::to_value(&plan).wrap_err("serialize built plan")?),
+            plan_path: plan_out.map(Path::to_path_buf),
+            ..Default::default()
+        })?;
+    }
     // Offline path: `--plan-out` without `--register-plan` stops here — the JSON
     // is on disk, but we never POST the plan to the worker.
     if !register {
@@ -274,7 +294,20 @@ pub(crate) fn register_trade_plan(
         shadow = shadow,
         "registering server-side trade plan",
     );
-    post_register_blocking(body).wrap_err("register trade plan with worker")?;
+    let response =
+        post_intent_with_context(body, execution).wrap_err("register trade plan with worker")?;
+    if let Some(execution) = execution {
+        execution.update(|outcome| {
+            if let Some(last) = outcome.executions.last_mut() {
+                last.worker_response = Some(response);
+            }
+            outcome.report.push_str(&format!(
+                "Registered {} on account {account}{}\n",
+                built_trade.trade_id,
+                if shadow { " (shadow)" } else { "" }
+            ));
+        })?;
+    }
     info!(trade_id = %built_trade.trade_id, "trade plan registered");
     Ok(())
 }
@@ -392,6 +425,7 @@ mod tests {
             None,  // armed_sentiment
             crate::trade_plan_build::TrendFollow(args.trend),
             args.ma_requirements(),
+            None,
         )
         .expect("build + write plan offline");
 

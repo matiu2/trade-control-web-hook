@@ -1,17 +1,19 @@
-use crate::{Mt5Broker, mapping, sizing};
-use mt5_data_source::web::trading::{
-    Direction as Side, OrderKind, OrderRequest, SymbolInfo, Trader,
-};
+use crate::{Mt5Broker, contract, currency_conversion, mapping, sizing};
+use mt5_data_source::web::trading::{Direction as Side, OrderKind, OrderRequest, SymbolInfo};
 use trade_control_core::{
     broker::*,
     intent::{Direction, ResolvedEntry},
 };
+
+#[cfg(test)]
+mod distance_tests;
 
 pub(crate) async fn place(
     broker: &Mt5Broker,
     cap: f64,
     max_positions: u32,
     req: &EntryRequest<'_>,
+    market_band: Option<MarketEntryBand>,
 ) -> Result<Placement, EntryError> {
     // Risk decisions must bypass the short-lived snapshots used by cron reads.
     let (account, trades) = broker
@@ -33,10 +35,7 @@ pub(crate) async fn place(
         .symbol(req.instrument)
         .await
         .map_err(|_| EntryError::OrderRejected)?;
-    // FX linear contract P/L is verified. Refuse futures/options/bonds with different formulas.
-    if !matches!(symbol.calc_mode, 0 | 5) {
-        return Err(EntryError::ContractSizeUnavailable);
-    }
+    contract::validate_calc_mode(symbol.calc_mode)?;
     let quote = broker
         .trader
         .quote(req.instrument)
@@ -53,8 +52,35 @@ pub(crate) async fn place(
             .iter()
             .map(|p| p.profit + p.swap + p.commission)
             .sum::<f64>();
-    let rate = currency_rate(&broker.trader, &symbol.profit_currency, &account.currency).await?;
-    let loss = (price - stop).abs() * symbol.contract_size * rate;
+    let rate =
+        currency_conversion::rate(&broker.trader, &symbol.profit_currency, &account.currency)
+            .await?;
+    // Account/FX reads can take seconds. A market rescue needs its OWN fresh
+    // executable quote and size, rather than the pending order's reference.
+    let price = if let Some(band) = market_band {
+        let fresh = broker
+            .trader
+            .quote(req.instrument)
+            .await
+            .map_err(|_| EntryError::AccountFetch)?;
+        let (_, price) = entry_price(req, &symbol, fresh.bid, fresh.ask)?;
+        let aligned_request = EntryRequest {
+            setup_id: req.setup_id,
+            stop_loss: stop,
+            take_profit: take,
+            instrument: req.instrument,
+            direction: req.direction,
+            entry: req.entry.clone(),
+            risk: req.risk,
+            dry_run: req.dry_run,
+            contract_multiplier: req.contract_multiplier,
+        };
+        band.check(&aligned_request, price)?;
+        price
+    } else {
+        price
+    };
+    let loss = contract::loss_per_lot(symbol.calc_mode, symbol.contract_size, price, stop, rate)?;
     let lots = sizing::lots(req.risk, equity, loss, cap, &symbol.rules)?;
     let order = OrderRequest {
         symbol: req.instrument.into(),
@@ -70,8 +96,8 @@ pub(crate) async fn place(
         comment: "trade-control".into(),
     };
     broker.trader.preview(&order).await.map_err(|e| {
-        tracing::warn!(%e, "MT5 entry validation failed");
-        EntryError::OrderRejected
+        tracing::warn!(symbol = req.instrument, %e, "MT5 entry validation failed");
+        EntryError::OrderRejectedWithDetail(format!("MT5 entry validation before submission: {e}"))
     })?;
     tracing::info!(symbol=req.instrument, %lots, price, stop, take, equity, loss_per_lot=loss, dry_run=req.dry_run, "MT5 entry sized");
     if req.dry_run {
@@ -82,8 +108,8 @@ pub(crate) async fn place(
         });
     }
     let outcome = broker.trader.open(&order).await.map_err(|e| {
-        tracing::error!(%e, "MT5 entry rejected before transmission");
-        EntryError::OrderRejected
+        tracing::error!(symbol = req.instrument, %e, "MT5 entry rejected before transmission");
+        EntryError::OrderRejectedWithDetail(format!("MT5 entry rejected before transmission: {e}"))
     })?;
     mapping::placement(outcome, lots, price)
 }
@@ -114,13 +140,38 @@ fn entry_price(
         ResolvedEntry::Stop { trigger_price } => (OrderKind::Stop, align(trigger_price, s)?),
         ResolvedEntry::Limit { trigger_price } => (OrderKind::Limit, align(trigger_price, s)?),
     };
-    let distance = match (kind, req.direction) {
-        (OrderKind::Stop, Direction::Long) | (OrderKind::Limit, Direction::Short) => price - market,
-        (OrderKind::Stop, Direction::Short) | (OrderKind::Limit, Direction::Long) => market - price,
+    let pending_kind = match kind {
+        OrderKind::Stop => PendingEntryKind::Stop,
+        OrderKind::Limit => PendingEntryKind::Limit,
         _ => return Ok((kind, price)),
     };
-    if distance <= 0.0 || distance < f64::from(s.rules.stops_points.max(0)) * s.point {
-        return Err(EntryError::EntryTooCloseToMarket);
+    let snapshot = PendingEntryDistance {
+        kind: pending_kind,
+        direction: req.direction,
+        trigger_price: price,
+        quote: Quote { bid, ask },
+        minimum_distance: f64::from(s.rules.stops_points.max(0)) * s.point,
+    };
+    if !snapshot.is_valid() {
+        return Err(EntryError::OrderRejected);
+    }
+    if snapshot.is_rejected() {
+        tracing::warn!(
+            instrument = req.instrument,
+            direction = ?req.direction,
+            ?kind,
+            price,
+            bid,
+            ask,
+            distance = snapshot.signed_distance(),
+            min_distance = snapshot.minimum_distance,
+            "MT5 pending entry blocked before transmission: trigger too close to market"
+        );
+        return Err(if snapshot.is_near() {
+            EntryError::EntryWithinMinimumDistance(snapshot)
+        } else {
+            EntryError::EntryTooCloseToMarket
+        });
     }
     Ok((kind, price))
 }
@@ -138,36 +189,5 @@ pub(crate) fn validate_stops(
         Ok(())
     } else {
         Err(EntryError::OrderRejected)
-    }
-}
-/// Conservative cost conversion: paying quote currency uses ask; inverse uses bid.
-async fn leg(trader: &Trader, from: &str, to: &str) -> Option<f64> {
-    if from == to {
-        return Some(1.0);
-    }
-    if let Ok(q) = trader.quote(&format!("{from}{to}")).await {
-        return Some(q.ask);
-    }
-    trader
-        .quote(&format!("{to}{from}"))
-        .await
-        .ok()
-        .map(|q| 1.0 / q.bid)
-}
-async fn currency_rate(trader: &Trader, from: &str, to: &str) -> Result<f64, EntryError> {
-    let rate = if let Some(rate) = leg(trader, from, to).await {
-        rate
-    } else {
-        leg(trader, from, "USD")
-            .await
-            .ok_or(EntryError::AccountFetch)?
-            * leg(trader, "USD", to)
-                .await
-                .ok_or(EntryError::AccountFetch)?
-    };
-    if rate.is_finite() && rate > 0.0 {
-        Ok(rate)
-    } else {
-        Err(EntryError::AccountFetch)
     }
 }

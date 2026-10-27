@@ -136,6 +136,9 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
                     sweep_loop(state.clone(), cron.clone(), sweep_period),
                     order_control_loop(state.clone(), cron.clone(), order_control_period),
                     reconcile_loop(state.clone(), cron.clone(), reconcile_period),
+                    operator_alert_loop(state.clone()),
+                    entry_notification_loop(state.clone(), cron.clone()),
+                    position_observation_loop(state.clone(), cron.clone()),
                     expiry_gc_loop(state, expiry_gc_period),
                 );
             });
@@ -185,7 +188,12 @@ async fn run_isolated<F>(job: &str, fut: F)
 where
     F: std::future::Future<Output = ()> + 'static,
 {
-    match tokio::task::spawn_local(fut).await {
+    match tokio::task::spawn_local(async move {
+        let _operation_guard = crate::operation_lock::acquire(false).await;
+        fut.await;
+    })
+    .await
+    {
         Ok(()) => {}
         Err(err) if err.is_panic() => {
             // The panic payload is usually a `&str`/`String`; surface whatever we
@@ -382,6 +390,7 @@ async fn reconcile_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Durat
         let (state, cron) = (state.clone(), cron.clone());
         run_isolated("reconcile", async move {
             reconcile(&state.store, &cron, now).await;
+            crate::manual_close_audit::poll(&state.store, &cron).await;
         })
         .await;
     }
@@ -407,6 +416,46 @@ async fn expiry_gc_loop(state: Arc<AppState>, period: Duration) {
                 Ok(deleted) => tracing::info!("scheduler: expired-row GC deleted {deleted} row(s)"),
                 Err(err) => tracing::error!("scheduler: expired-row GC failed: {err}"),
             }
+        })
+        .await;
+    }
+}
+
+/// Notifications have their own cadence, so a stalled evaluation or a plan
+/// retiring cannot strand a committed failed-entry warning.
+async fn operator_alert_loop(state: Arc<AppState>) {
+    let mut interval = skip_interval(Duration::from_secs(15));
+    loop {
+        interval.tick().await;
+        let pool = state.store.pool().clone();
+        run_isolated("operator-alerts", async move {
+            crate::operator_alert::flush(&pool).await;
+        })
+        .await;
+    }
+}
+
+/// This observer never places orders or updates the retry ledger.
+async fn entry_notification_loop(state: Arc<AppState>, cron: NativeCronEnv) {
+    let mut interval = skip_interval(Duration::from_secs(15));
+    loop {
+        interval.tick().await;
+        let (state, cron) = (state.clone(), cron.clone());
+        run_isolated("entry-notifications", async move {
+            crate::entry_notifications::poll(&state.store, &cron).await;
+        })
+        .await;
+    }
+}
+
+/// Read-only reporting runs independently of candle fetching and entry signals.
+async fn position_observation_loop(state: Arc<AppState>, cron: NativeCronEnv) {
+    let mut interval = skip_interval(Duration::from_secs(15));
+    loop {
+        interval.tick().await;
+        let (state, cron) = (state.clone(), cron.clone());
+        run_isolated("position-observations", async move {
+            crate::position_tracking::poll(&state.store, &cron).await;
         })
         .await;
     }

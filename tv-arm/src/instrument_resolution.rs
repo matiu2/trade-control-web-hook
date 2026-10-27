@@ -24,6 +24,9 @@ use trade_control_conventions::Broker as ConvBroker;
 
 use crate::precision::CatalogPrecision;
 
+mod replay;
+pub(crate) use replay::{ResolutionPurpose, resolve_for_purpose};
+
 /// One chart-symbol → broker-canonical-symbol resolution result.
 ///
 /// Holds a static reference back into the catalog (the catalog is
@@ -69,7 +72,13 @@ pub fn resolve_for_account(
         require_spread_coverage(&format!("ctrader:{account}:{}", resolved.broker_symbol))?;
         return Ok(resolved);
     }
-    let asset = instrument_lookup::resolve(bare)?.ok_or_else(|| {
+    let asset = instrument_lookup::resolve(bare)?;
+    let asset = if broker == ConvBroker::Mt5 && asset.is_none() {
+        instrument_lookup::resolve(&crate::mt5_instrument::catalog_symbol(bare))?
+    } else {
+        asset
+    };
+    let asset = asset.ok_or_else(|| {
         let hint = instrument_lookup::user_config_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "~/.config/instrument-lookup/mappings.toml".to_string());
@@ -80,20 +89,13 @@ pub fn resolve_for_account(
     })?;
 
     if broker == ConvBroker::Mt5 {
-        if asset.class != AssetClass::Forex {
-            return Err(eyre!("MT5 adapter currently supports FX only"));
-        }
-        let broker_symbol = trade_control_conventions::instrument_for(broker, &asset.id);
+        let resolved = crate::mt5_instrument::resolve(bare, asset, account)?;
         let key = trade_control_core::spread_blackout::mt5_spread_key(
-            account.unwrap_or("<missing-account>"),
-            &broker_symbol,
+            account.ok_or_else(|| eyre!("MT5 requires an explicit named account"))?,
+            &resolved.broker_symbol,
         );
         require_spread_coverage(&key)?;
-        return Ok(ResolvedInstrument {
-            asset,
-            broker_symbol,
-            precision: CatalogPrecision::from_asset(asset),
-        });
+        return Ok(resolved);
     }
     let il_broker = to_il_broker(broker).ok_or_else(|| {
         eyre!(
@@ -118,9 +120,29 @@ pub fn resolve_for_account(
         )
     })?;
 
-    require_spread_coverage(broker_symbol)?;
+    if broker == ConvBroker::Oanda {
+        require_spread_coverage(&trade_control_core::spread_blackout::spread_lookup_key(
+            broker_symbol,
+            account,
+        ))?;
+    } else {
+        require_spread_coverage(broker_symbol)?;
+    }
 
-    Ok(finish_resolution(asset, il_broker, broker_symbol))
+    let mut resolved = finish_resolution(asset, il_broker, broker_symbol);
+    if broker == ConvBroker::Oanda && account == Some(instrument_lookup::oanda_live::ACCOUNT) {
+        let live = instrument_lookup::oanda_live::require(broker_symbol)?;
+        resolved.asset = instrument_lookup::by_id(&live.canonical)?
+            .ok_or_else(|| eyre!("Missing OANDA live canonical {}", live.canonical))?;
+        resolved.precision = CatalogPrecision {
+            tick_size: live.tick_size,
+            pip_size: live.pip_size,
+            decimal_places: live.decimal_places,
+            class: live.asset_class,
+            contract_multiplier: None,
+        };
+    }
+    Ok(resolved)
 }
 
 /// Assemble the result once both gates (broker listing, spread coverage) have
@@ -167,7 +189,7 @@ fn require_spread_coverage(broker_symbol: &str) -> Result<()> {
         return Ok(());
     }
     let rebake = if broker_symbol.starts_with("ctrader:") {
-        "cTrader account-scoped spread baseline collection is not implemented yet; collect this account's spreads before unattended arming".to_string()
+        "collect account-bound paired M1 evidence with generate-ctrader, then verify and merge the profile with bake-ctrader --merge; preserve the existing table's UTC sampling bounds when extending it".to_string()
     } else if let Some((account, symbol)) = broker_symbol
         .strip_prefix("mt5:")
         .and_then(|key| key.split_once(':'))
@@ -295,6 +317,25 @@ fn map_class(class: AssetClass) -> InstrumentType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_live_account_instrument_has_baked_resolution_and_matching_spread_units() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        for live in instrument_lookup::oanda_live::all().unwrap() {
+            let resolved =
+                resolve_for_account(&live.symbol, ConvBroker::Oanda, Some("oanda-live")).unwrap();
+            assert_eq!(resolved.broker_symbol, live.symbol);
+            assert_eq!(resolved.asset.id, live.canonical);
+            assert_eq!(resolved.precision.pip_size, live.pip_size);
+            assert_eq!(resolved.precision.tick_size, live.tick_size);
+        }
+    }
 
     /// Resolve with the coverage gate skipped.
     ///

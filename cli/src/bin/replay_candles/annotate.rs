@@ -22,7 +22,7 @@
 //! / H&S anchors untouched.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Result, WrapErr};
 use trade_control_core::intent::Direction;
@@ -51,10 +51,13 @@ const UNFILLED_TRANSPARENCY: u8 = 90;
 /// tag). Under `~/.config/trade-control/` alongside the worker configs.
 fn manifest_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").wrap_err("HOME not set — can't locate config dir")?;
-    Ok(PathBuf::from(home)
-        .join(".config")
+    Ok(manifest_path_in(Path::new(&home)))
+}
+
+fn manifest_path_in(home: &Path) -> PathBuf {
+    home.join(".config")
         .join("trade-control")
-        .join("replay-annotations.json"))
+        .join("replay-annotations.json")
 }
 
 /// Read the entity-ids recorded by a prior run. A missing/unreadable/empty
@@ -64,7 +67,11 @@ fn read_manifest() -> Vec<String> {
         Ok(p) => p,
         Err(_) => return Vec::new(),
     };
-    match fs::read_to_string(&path) {
+    read_manifest_at(&path)
+}
+
+fn read_manifest_at(path: &Path) -> Vec<String> {
+    match fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
         Err(_) => Vec::new(),
     }
@@ -238,20 +245,9 @@ mod tests {
         assert_eq!(outcome_label(FillKind::GateBlocked), "gate-blocked");
     }
 
-    /// Serializes the tests that overwrite `HOME`. `HOME` is process-global but
-    /// cargo runs tests on many threads, so without this the two tests below
-    /// clobber each other's value and fail intermittently (~1 run in 10).
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn manifest_path_is_under_config_trade_control() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: HOME_LOCK holds off the other HOME-mutating test for the
-        // duration, so nothing else in this process reads or writes it here.
-        unsafe {
-            std::env::set_var("HOME", "/home/tester");
-        }
-        let p = manifest_path().expect("HOME set");
+        let p = manifest_path_in(Path::new("/home/tester"));
         assert_eq!(
             p,
             PathBuf::from("/home/tester/.config/trade-control/replay-annotations.json")
@@ -260,11 +256,7 @@ mod tests {
 
     #[test]
     fn read_manifest_missing_file_is_empty() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: see `manifest_path_is_under_config_trade_control`.
-        unsafe {
-            std::env::set_var("HOME", "/nonexistent-home-for-replay-test");
-        }
-        assert!(read_manifest().is_empty(), "missing manifest → no ids");
+        let dir = tempfile::tempdir().expect("test directory");
+        assert!(read_manifest_at(&dir.path().join("missing.json")).is_empty());
     }
 }

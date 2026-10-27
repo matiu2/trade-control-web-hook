@@ -150,7 +150,7 @@ impl Granularity {
 pub enum CandleError {
     /// Network / 5xx / decode / other transient broker failure.
     Transient,
-    /// Account-native history unavailable, with safe operator-facing evidence.
+    /// A feed failure with a safe, operator-facing explanation.
     Unavailable(String),
     /// The requested window is degenerate (`since >= now`). A legitimate no-op:
     /// the caller may treat it as "no new candles" and widen on the next tick.

@@ -26,6 +26,13 @@ pub(super) async fn account(
     let trader = metadata::trader(broker)
         .await
         .map_err(|_| EntryError::AccountFetch)?;
+    if matches!(req.entry, ResolvedEntry::Market { .. })
+        && !is_enum(&trader, "accountType", 0, "HEDGED")
+    {
+        return Err(reject(
+            "cTrader market entries require confirmed HEDGED account metadata",
+        ));
+    }
     if !is_enum(&trader, "accountType", 0, "HEDGED") && trader.get("accountType").is_some() {
         return Err(reject(
             "cTrader netted/spread-betting accounts are not supported",

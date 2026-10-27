@@ -16,6 +16,7 @@ use trade_control_core::{broker::*, settlement::Settlement};
 mod evidence;
 mod management;
 mod mapping;
+pub(crate) mod reconciliation;
 #[cfg(test)]
 mod tests;
 
@@ -35,6 +36,13 @@ pub(crate) struct CompanionWrite {
 impl CompanionWrite {
     pub(crate) fn id(&self) -> &str {
         self.mutation.client_order_id()
+    }
+    pub(crate) fn note(&mut self, phase: &str, evidence: &serde_json::Value) -> Result<()> {
+        ensure!(
+            !self.recorded,
+            "cTrader companion outcome was already recorded"
+        );
+        self.mutation.record(phase, evidence)
     }
     pub(crate) fn record(&mut self, evidence: &serde_json::Value, confirmed: bool) -> Result<()> {
         ensure!(

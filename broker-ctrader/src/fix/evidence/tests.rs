@@ -27,6 +27,23 @@ impl Drop for Directory {
     }
 }
 #[test]
+fn reconciliation_bypasses_only_its_own_complete_unresolved_journal() -> Result<()> {
+    let directory = Directory::create()?;
+    let target = directory.journal()?;
+    assert!(check_resolved(&directory.0).is_err());
+    check_resolved_except(&directory.0, Some("operation"))?;
+    assert!(check_resolved_except(&directory.0, Some("another")).is_err());
+    let other = Journal::prepare(
+        &directory.0.join("other.jsonl"),
+        &json!({"sender_comp_id":"demo.broker.123"}),
+        &json!({"client_order_id":"other-1","operation":"cancel"}),
+    )?;
+    assert!(check_resolved_except(&directory.0, Some("operation")).is_err());
+    drop(other);
+    drop(target);
+    Ok(())
+}
+#[test]
 fn durable_intent_blocks_writes_until_positive_resolution() -> Result<()> {
     let directory = Directory::create()?;
     check_resolved(&directory.0)?;

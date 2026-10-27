@@ -12,6 +12,8 @@
 //! live TradingView Symbol-info > instrument-lookup catalog. The flags stay
 //! the operator's manual escape hatch; this module only decides the
 //! TV-vs-catalog layer beneath them.
+//! MT5 is account-specific: its live broker metadata takes precedence over
+//! TradingView, which may describe a different provider's contract.
 
 use instrument_lookup::{Asset, AssetClass, Instrument, pip_size_from};
 use tracing::warn;
@@ -147,13 +149,17 @@ pub fn resolve_effective_precision(cat: CatalogPrecision, tv: &SymbolInfo) -> Ef
     }
 }
 
-/// cTrader protection uses account-native precision even when the chart differs.
+/// MT5 resolution already read the selected account's live contract metadata.
+/// A TradingView chart for another provider must not replace its tick/pip.
 pub fn resolve_broker_precision(
     broker: trade_control_conventions::Broker,
     cat: CatalogPrecision,
     tv: &SymbolInfo,
 ) -> EffectivePrecision {
-    if broker == trade_control_conventions::Broker::Ctrader {
+    if matches!(
+        broker,
+        trade_control_conventions::Broker::Mt5 | trade_control_conventions::Broker::Ctrader
+    ) {
         EffectivePrecision::from_catalog(cat)
     } else {
         resolve_effective_precision(cat, tv)
@@ -173,12 +179,41 @@ mod tests {
     use instrument_lookup::{AssetClass, AssetSymbols};
 
     #[test]
-    fn ctrader_account_precision_cannot_be_replaced_by_chart_provider() {
+    fn mt5_live_account_precision_wins_over_a_different_chart_provider() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        let a = asset(AssetClass::Commodity, 0.001, 3, 0.001);
+        let tv = tv_info(Some(0.00001), Some(5));
+        let effective = resolve_broker_precision(
+            trade_control_conventions::Broker::Mt5,
+            CatalogPrecision::from_asset(&a),
+            &tv,
+        );
+        assert_eq!(effective.tick_size, 0.001);
+        assert_eq!(effective.pip_size, 0.001);
+        assert!(!effective.tick_from_tv);
+        let other = resolve_broker_precision(
+            trade_control_conventions::Broker::Oanda,
+            CatalogPrecision::from_asset(&a),
+            &tv,
+        );
+        assert_eq!(other.tick_size, 0.00001);
+        assert!(other.tick_from_tv);
+    }
+
+    #[test]
+    fn ctrader_live_precision_cannot_be_replaced_by_chart_provider() {
         let a = asset(AssetClass::Forex, 0.00001, 5, 0.0001);
+        let tv = tv_info(Some(0.001), Some(3));
         let effective = resolve_broker_precision(
             trade_control_conventions::Broker::Ctrader,
             CatalogPrecision::from_asset(&a),
-            &tv_info(Some(0.001), Some(3)),
+            &tv,
         );
         assert_eq!(effective.tick_size, 0.00001);
         assert_eq!(effective.pip_size, 0.0001);

@@ -187,3 +187,42 @@ Open API `clientOrderId`; confirmed broker order IDs and requested sizing inputs
 are retained. A dry run sends no mutation and remains available for diagnosis.
 Structured receipts are emitted at ERROR if journal persistence fails, including
 when normal INFO logging is disabled.
+
+
+## Known fills and demo lifecycle checks
+
+An ambiguous market result now triggers bounded read-only reconciliation. A
+verified full fill returns HTTP 409 with native order/position IDs, fill and
+current SL/TP, rather than claiming its response was unreadable. Unproven
+execution retains HTTP 502 and the no-retry warning. Neither path re-enters,
+changes protection, or releases the durable account interlock.
+
+After approving the broker's current protection, preview attachment using the
+original signed request and an explicit database configuration:
+
+```sh
+trade-control-reconcile-entry --config ~/.config/trade-control/staging-worker.toml \
+  --account ctrader-demo --trade-id ORIGINAL_TRADE_ID --audit-id ORIGINAL_AUDIT_ID
+```
+
+Supply `SIGNING_KEY` through the private environment, or `--key-file`. Add
+`--apply` only to commit tracking and its audit note. The account remains locked
+through broker verification and database commit; only a matching committed
+receipt can resolve the original journal. Rerunning the same command after a
+post-commit failure preserves existing management state. Already-closed fills
+require positive broker history and are never reopened. This operator currently
+supports ordinary demo market entries without break-even policy.
+
+The explicit demo integration runner reads metadata and plans by default:
+
+```sh
+ctrader-integration-check --account ctrader-demo --report /tmp/ctrader-plan.json
+```
+
+A fresh report path with `--execute` opts into one far-away EURUSD stop order,
+one limit order, and one native-minimum-volume market buy. It reads and cancels
+each pending order, proves terminal cancellation, then reads and closes the
+exact market position and verifies closing deals/history. It never closes by
+instrument. `--max-open-positions` is a probe-only cap, not an account settings
+change. Unknown outcomes stop subsequent writes; retain the private JSON report
+and account journal for reconciliation. Both tools install with normal deploys.

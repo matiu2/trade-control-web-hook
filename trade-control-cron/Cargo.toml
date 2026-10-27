@@ -19,6 +19,6 @@ broker-ctrader = { version = "0.1.0", path = "../broker-ctrader" }
 [dev-dependencies]
 pollster = "1.0.1"
 serde_json = "1.0.151"
-tracing-error = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-error = "0.2.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 trade-control-core = { path = "../core", features = ["test-support"] }

@@ -779,6 +779,8 @@ short stable string — one per `EntryError` variant, never reused:
 | `units-below-minimum` | sized fine, answer was zero (parks + re-checks) |
 | `contract-size-unavailable` | futures intent armed with no multiplier |
 | `too-close-to-market` | `#19-10` / `#19-9` — trigger wrong side of market |
+| `pending-entry-too-close` | verified local rejection inside the broker minimum-distance band; includes order type, trigger, bid/ask and minimum |
+| `market-recovery-declined` | market fallback refused because the fresh price, geometry, R floor or broker support did not permit it |
 | `broker-rejected` | anything else the broker refused |
 
 Before this, five of those eight rendered as `entry-failed: broker rejected the
@@ -798,8 +800,34 @@ identically. Reasons: `recover-entry-none`, `-skip`, `-limit-wrong-side`,
 no recovery attempted keeps the bare `entry-failed: too-close-to-market` string
 that existing tooling greps for.
 
-Only TradeNation has a confirmed `#19-10` today; the OANDA path maps its broker
-rejections to the generic case (the resolve-time recovery is broker-agnostic).
+MT5 can also reject a pending entry locally before transmission because its
+trigger is within `stops_points × point` of the executable ask (long) or bid
+(short). For a stop configured with limit recovery, a verified close-price
+rejection tries the limit at the same trigger. **Only when both attempts fail
+with verified proximity evidence** may it try market once. A generic wrong-side
+error, an account/risk error or an uncertain submission does not authorize this
+third attempt. Far wrong-side prices keep the existing configured recovery.
+
+Market admission requires a fresh price strictly inside the narrower of the two
+broker distance bands. An explicit `max_slippage_pips`, when supplied with the
+limit recovery, further narrows this absolute band. MT5 rechecks after account
+and FX reads, validates the unchanged SL/TP, minimum R and continuous entry veto
+levels against that price,
+and sizes afresh. These are checks on the pre-submission quote; the market fill
+can still slip. No new wire field or configuration is required for existing
+stop→limit plans. Other brokers retain their existing recovery unless they
+provide verified distance evidence and enforce bounded market placement.
+
+Timeline/journal outcomes include the stop, limit and market stage results and
+the relevant quotes/minimums. A market recovery is labelled `entered`, with its
+requested price, and records one attempt; a limit stays `placed`. Dry runs name
+the preview stages and submit no order. Uncertain responses remain uncertain
+and suppress automatic duplicate retries. The separate offline replay broker
+gap remains tracked in `BUG-replay-blind-to-broker-entry-recovery.md`; shared
+dispatcher tests exercise this chain with the recorded AUDJPY quote.
+
+TradeNation's `#19-10` and OANDA's generic broker rejections keep their existing
+behaviour (resolve-time recovery is broker-agnostic).
 
 **Arming via `tv-arm` (H&S / iH&S):** pass `--recover-entry
 market|limit|stop|abort` to bake the policy onto the `05-enter` intent

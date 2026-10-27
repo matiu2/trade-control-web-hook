@@ -23,6 +23,7 @@ mod enter;
 mod entry_origin;
 mod entry_warning;
 mod invalidate;
+mod near_market;
 mod seen;
 mod shared;
 mod veto;

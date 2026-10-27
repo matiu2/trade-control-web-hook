@@ -82,7 +82,7 @@ CLI_BINARIES=(trade-control tv-arm tv-news replay-candles journal)
 # would imply an environment binding these binaries do not have. One current
 # copy, pointed at whichever config you name.
 WORKER_CLI_PACKAGE=trade-control-worker
-WORKER_CLI_BINARIES=(trade-control-accounts trade-control-broker-check)
+WORKER_CLI_BINARIES=(trade-control-accounts trade-control-broker-check trade-control-reconcile-entry ctrader-integration-check)
 
 # roll_native_worker <env-name> <suffix>
 #

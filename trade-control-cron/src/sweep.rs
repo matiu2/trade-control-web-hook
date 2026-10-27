@@ -12,6 +12,9 @@
 //!   of where the cron tick happened to land on it. See [`maybe_breach_cancel`].
 //!
 //! Each of those is **terminal**: the setup is dead and the row goes with it.
+//! Confirmed fills retain their tracking row beyond these pending-order clocks
+//! for position management and exit reporting. Only their signed
+//! `CancelAndClose` policy may act here during an actual market blackout.
 //!
 //! # Market hours are a hold, not a sweep reason (v123)
 //!
@@ -45,7 +48,7 @@
 //! plumbing, not part of the sweep decision logic.
 
 use chrono::{DateTime, Utc};
-use trade_control_core::broker::Broker;
+use trade_control_core::broker::{AttemptState, Broker, OpenPosition};
 use trade_control_core::intent::BlackoutCloseAction;
 use trade_control_core::state::{EntryAttempt, StateStore};
 
@@ -104,6 +107,16 @@ where
     S: StateStore,
     C: CronEnv,
 {
+    if attempt.broker_trade_id.is_some() {
+        // Once filled, the alert and resting-order deadlines no longer govern
+        // this position. Keep its tracking and native broker protection, while
+        // retaining the operator's explicit close-during-blackout choice.
+        return if market_blackout_due_symbol(&attempt.instrument, now) {
+            market_blackout_act(store, cron, attempt).await
+        } else {
+            Ok(())
+        };
+    }
     if attempt.expires_at < now {
         cancel_and_delete(store, cron, attempt, "expired").await
     } else if bar_expiry_due(attempt.cancel_at, now) {
@@ -341,9 +354,9 @@ async fn cancel_and_delete<S: StateStore, C: CronEnv>(
 ///
 /// **The row is NOT deleted.** It was, when this branch also cancelled the
 /// resting order — but the hold needs the row to restore from. Deleting it would
-/// turn a nightly pause into a nightly loss of the setup. The row still retires
-/// on its own clocks (`expires_at` / `cancel_at`), which the branches above this
-/// one handle.
+/// turn a nightly pause into a nightly loss of the setup. An unfilled row still
+/// retires on its pending-order clocks (`expires_at` / `cancel_at`). A confirmed
+/// fill remains tracked for position management and broker exit reporting.
 async fn market_blackout_act<S: StateStore, C: CronEnv>(
     _store: &S,
     cron: &C,
@@ -354,21 +367,39 @@ async fn market_blackout_act<S: StateStore, C: CronEnv>(
     if !matches!(attempt.blackout_close, BlackoutCloseAction::CancelAndClose) {
         return Ok(());
     }
+    if attempt.broker_trade_id.is_some()
+        && cron
+            .broker_exit_recorded(
+                attempt.account.as_deref(),
+                &attempt.trade_id,
+                &attempt.broker_order_id,
+            )
+            .await
+            .map_err(|error| format!("blackout closure exit-note read failed: {error}"))?
+    {
+        return Ok(());
+    }
     match cron.acquire_broker(attempt.account.as_deref()).await {
         Some(BrokerHandle::Oanda(b)) => blackout_close_position(&b, attempt).await,
         Some(BrokerHandle::TradeNation(b)) => blackout_close_position(&b, attempt).await,
         Some(BrokerHandle::Ibkr(b)) => blackout_close_position(&b, attempt).await,
         Some(BrokerHandle::Mt5(b)) => blackout_close_position(&b, attempt).await,
-        Some(BrokerHandle::Ctrader(b)) => blackout_close_position(&b, attempt).await,
-        None => return Err("broker acquisition failed".into()),
+        Some(BrokerHandle::Ctrader(b)) => blackout_close_ctrader_position(&b, attempt).await,
+        None => Err("broker acquisition failed".into()),
     }
-    Ok(())
 }
 
 /// Generic-over-broker body for [`market_blackout_act`]'s `CancelAndClose` arm:
-/// flatten any open position on the instrument over the closed session.
-async fn blackout_close_position<B: Broker>(broker: &B, attempt: &EntryAttempt) {
-    let closed = broker.close_positions(&attempt.instrument).await;
+/// require the exact live position to be the symbol's sole position before
+/// invoking a broker whose interface only supports closing by instrument.
+async fn blackout_close_position<B: Broker>(
+    broker: &B,
+    attempt: &EntryAttempt,
+) -> Result<(), String> {
+    let Some(position) = blackout_target(broker, attempt, true).await? else {
+        return Ok(());
+    };
+    let closed = broker.close_positions(&position.instrument).await;
     tracing::info!(
         "cron sweep market-blackout close: account={} trade_id={} attempt_no={} \
          instrument={} close={closed}",
@@ -377,6 +408,91 @@ async fn blackout_close_position<B: Broker>(broker: &B, attempt: &EntryAttempt) 
         attempt.attempt_no,
         attempt.instrument,
     );
+    if closed.is_flat() {
+        Ok(())
+    } else {
+        Err("blackout position closure failed".into())
+    }
+}
+
+/// cTrader has an audited exact-ID close; never broaden it to a symbol close.
+async fn blackout_close_ctrader_position(
+    broker: &broker_ctrader::CtraderBroker,
+    attempt: &EntryAttempt,
+) -> Result<(), String> {
+    let Some(position) = blackout_target(broker, attempt, false).await? else {
+        return Ok(());
+    };
+    let order = broker
+        .diagnostic_order(&attempt.broker_order_id)
+        .await
+        .map_err(|error| format!("blackout opening-order read failed: {error}"))?;
+    let client = order["order"]["clientOrderId"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| "blackout opening order has no client identity".to_string())?;
+    broker
+        .close_exact_position(&attempt.broker_order_id, &position.position_id, client)
+        .await
+        .map_err(|error| format!("blackout exact-position closure failed: {error}"))?;
+    tracing::info!(account=?attempt.account,trade_id=%attempt.trade_id,position_id=%position.position_id,"cron sweep market-blackout exact position closed");
+    Ok(())
+}
+
+/// Absence is a reason to skip this mutation, never evidence that a different
+/// position on the same symbol belongs to this historical attempt.
+async fn blackout_target<B: Broker>(
+    broker: &B,
+    attempt: &EntryAttempt,
+    require_sole_symbol: bool,
+) -> Result<Option<OpenPosition>, String> {
+    let id = match &attempt.broker_trade_id {
+        Some(id) => id.clone(),
+        None => match broker
+            .lookup_attempt_state(&attempt.instrument, &attempt.broker_order_id, None)
+            .await
+            .map_err(|error| format!("blackout fill lookup failed: {error}"))?
+        {
+            AttemptState::OpenPosition { broker_trade_id } => broker_trade_id,
+            AttemptState::Unknown => return Err("blackout fill identity is unknown".into()),
+            _ => return Ok(None),
+        },
+    };
+    if id.is_empty() {
+        return Err("blackout fill identity is empty".into());
+    }
+    let positions = broker
+        .list_open_positions(attempt.account.as_deref().unwrap_or(""))
+        .await
+        .map_err(|error| format!("blackout position snapshot failed: {error}"))?;
+    let matches = positions
+        .iter()
+        .filter(|position| position.position_id == id)
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    if matches.len() != 1
+        || !same_instrument(&matches[0].instrument, &attempt.instrument)
+        || matches[0].direction != attempt.direction
+    {
+        return Err("blackout position identity does not match tracked fill".into());
+    }
+    if require_sole_symbol
+        && positions
+            .iter()
+            .filter(|position| same_instrument(&position.instrument, &attempt.instrument))
+            .count()
+            != 1
+    {
+        return Err("blackout symbol close would affect another position".into());
+    }
+    Ok(Some(matches[0].clone()))
+}
+
+fn same_instrument(left: &str, right: &str) -> bool {
+    left.replace(['/', '_'], "")
+        .eq_ignore_ascii_case(&right.replace(['/', '_'], ""))
 }
 
 /// Wrap `Broker::cancel_order` with a single log line so per-row
@@ -495,6 +611,129 @@ mod tests {
     /// Saturday: AUD/CHF's market is shut (the real baked weekend halt).
     const MARKET_CLOSED: &str = "2026-07-11T12:00:00Z";
 
+    fn init_tracing() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer())
+            .try_init()
+            .ok();
+    }
+
+    fn assert_filled_survives(mut row: EntryAttempt, now: DateTime<Utc>) {
+        init_tracing();
+        row.broker_trade_id = Some("position-keep".into());
+        let store = MemStateStore::new();
+        pollster::block_on(async {
+            store.record_entry_attempt(row.clone()).await.unwrap();
+            sweep_pending_orders(&store, &NoBrokerEnv, now).await;
+            assert_eq!(store.list_all_entry_attempts().await.unwrap(), vec![row]);
+        });
+    }
+
+    #[test]
+    fn confirmed_fill_survives_expired_alert_during_open_and_closed_markets() {
+        for now in ["2026-07-14T12:00:00Z", MARKET_CLOSED] {
+            let mut row = attempt(BlackoutCloseAction::CancelResting);
+            row.expires_at = ts("2026-07-11T00:00:00Z");
+            assert_filled_survives(row, ts(now));
+        }
+    }
+
+    #[test]
+    fn confirmed_fill_survives_pending_bar_expiry() {
+        let mut row = attempt(BlackoutCloseAction::CancelResting);
+        row.cancel_at = Some(ts("2026-07-14T11:00:00Z"));
+        assert_filled_survives(row, ts("2026-07-14T12:00:00Z"));
+    }
+
+    #[test]
+    fn confirmed_fill_skips_pending_stop_breach_without_broker_acquisition() {
+        let mut row = attempt(BlackoutCloseAction::CancelResting);
+        row.adverse_extreme = Some(0.4900);
+        assert_filled_survives(row, ts("2026-07-14T12:00:00Z"));
+    }
+
+    #[test]
+    fn signed_close_policy_does_not_close_an_expired_fill_outside_blackout() {
+        let mut row = attempt(BlackoutCloseAction::CancelAndClose);
+        row.expires_at = ts("2026-07-11T00:00:00Z");
+        row.cancel_at = Some(ts("2026-07-11T00:00:00Z"));
+        assert_filled_survives(row, ts("2026-07-14T12:00:00Z"));
+    }
+
+    #[test]
+    #[should_panic(expected = "must not reach a broker")]
+    fn signed_close_policy_still_reaches_the_broker_for_expired_fills_in_blackout() {
+        init_tracing();
+        let mut row = attempt(BlackoutCloseAction::CancelAndClose);
+        row.broker_trade_id = Some("position-close".into());
+        row.expires_at = ts("2026-07-11T00:00:00Z");
+        pollster::block_on(sweep_one(
+            &MemStateStore::new(),
+            &NoBrokerEnv,
+            &row,
+            ts(MARKET_CLOSED),
+        ))
+        .ok();
+    }
+
+    struct ExitStatusEnv(Result<bool, String>);
+
+    impl CronEnv for ExitStatusEnv {
+        async fn acquire_broker(&self, account: Option<&str>) -> Option<BrokerHandle> {
+            NoBrokerEnv.acquire_broker(account).await
+        }
+        async fn dispatch_config(&self, verified: &Verified) -> DispatchConfig {
+            NoBrokerEnv.dispatch_config(verified).await
+        }
+        fn record_tick(&self, _bundle: TickBundle) {}
+        fn record_cron_note(&self, _note: trade_control_core::recording::CronNote) {}
+        fn signing_key(&self) -> Option<Vec<u8>> {
+            None
+        }
+        async fn broker_exit_recorded(
+            &self,
+            _account: Option<&str>,
+            trade_id: &str,
+            order_id: &str,
+        ) -> Result<bool, String> {
+            assert_eq!(trade_id, "t-mh");
+            assert_eq!(order_id, "ord-1");
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn safe_blackout_recorded_closed_fill_never_acquires_a_broker() {
+        init_tracing();
+        let mut row = attempt(BlackoutCloseAction::CancelAndClose);
+        row.broker_trade_id = Some("old-closed-position".into());
+        pollster::block_on(sweep_one(
+            &MemStateStore::new(),
+            &ExitStatusEnv(Ok(true)),
+            &row,
+            ts(MARKET_CLOSED),
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn safe_blackout_exit_note_read_failure_never_acquires_a_broker() {
+        init_tracing();
+        let mut row = attempt(BlackoutCloseAction::CancelAndClose);
+        row.broker_trade_id = Some("maybe-closed-position".into());
+        let error = pollster::block_on(sweep_one(
+            &MemStateStore::new(),
+            &ExitStatusEnv(Err("exit DB unavailable".into())),
+            &row,
+            ts(MARKET_CLOSED),
+        ))
+        .unwrap_err();
+        assert!(error.contains("exit DB unavailable"));
+    }
+
     /// THE SLICE-6 BEHAVIOUR: over a closed market the sweep does nothing — no
     /// broker call, and critically **the row survives**.
     ///
@@ -561,6 +800,8 @@ mod tests {
     struct ScriptedBroker {
         quotes: RefCell<std::collections::VecDeque<f64>>,
         cancels: RefCell<Vec<String>>,
+        closes: RefCell<Vec<String>>,
+        positions: RefCell<Result<Vec<OpenPosition>, LookupError>>,
         /// What `lookup_attempt_state` answers. Pending models a resting order.
         attempt_state: RefCell<Result<AttemptState, LookupError>>,
         /// How many times the sweep asked. Counting it is what makes "the id is
@@ -574,6 +815,8 @@ mod tests {
             Self {
                 quotes: RefCell::new(quotes.iter().copied().collect()),
                 cancels: RefCell::new(Vec::new()),
+                closes: RefCell::new(Vec::new()),
+                positions: RefCell::new(Ok(vec![])),
                 attempt_state: RefCell::new(Ok(AttemptState::Pending)),
                 lookups: RefCell::new(0),
             }
@@ -623,8 +866,9 @@ mod tests {
         ) -> Result<Placement, EntryError> {
             unreachable!("the sweep never places")
         }
-        async fn close_positions(&self, _instrument: &str) -> CloseOutcome {
-            unreachable!("the SL-breach arm never closes a position")
+        async fn close_positions(&self, instrument: &str) -> CloseOutcome {
+            self.closes.borrow_mut().push(instrument.into());
+            CloseOutcome::Closed(1)
         }
         async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
             0
@@ -642,7 +886,7 @@ mod tests {
             &self,
             _account_id: &str,
         ) -> Result<Vec<OpenPosition>, LookupError> {
-            Ok(vec![])
+            self.positions.borrow().clone()
         }
         async fn amend_stop(
             &self,
@@ -667,6 +911,67 @@ mod tests {
         ) -> Result<Vec<Candle>, CandleError> {
             Ok(vec![])
         }
+    }
+
+    fn blackout_position(id: &str) -> OpenPosition {
+        OpenPosition {
+            instrument: "AUD/CHF".into(),
+            direction: Direction::Long,
+            position_id: id.into(),
+            order_id: "ord-1".into(),
+            stake: 1.0,
+            stop_loss: Some(0.5),
+            take_profit: Some(0.7),
+            entry_price: Some(0.6),
+            opened_at: Some(ts("2026-07-10T20:00:00Z")),
+        }
+    }
+
+    #[test]
+    fn safe_blackout_absent_closed_fill_cannot_close_a_later_position() {
+        init_tracing();
+        let mut row = attempt(BlackoutCloseAction::CancelAndClose);
+        row.broker_trade_id = Some("old-position".into());
+        let broker = ScriptedBroker::new(&[]);
+        *broker.positions.borrow_mut() = Ok(vec![blackout_position("later-position")]);
+        pollster::block_on(blackout_close_position(&broker, &row)).unwrap();
+        assert!(broker.closes.borrow().is_empty());
+    }
+
+    #[test]
+    fn safe_blackout_multiple_symbol_positions_prevent_a_symbol_wide_close() {
+        init_tracing();
+        let mut row = attempt(BlackoutCloseAction::CancelAndClose);
+        row.broker_trade_id = Some("expected-position".into());
+        let broker = ScriptedBroker::new(&[]);
+        *broker.positions.borrow_mut() = Ok(vec![
+            blackout_position("expected-position"),
+            blackout_position("other-position"),
+        ]);
+        assert!(pollster::block_on(blackout_close_position(&broker, &row)).is_err());
+        assert!(broker.closes.borrow().is_empty());
+    }
+
+    #[test]
+    fn safe_blackout_failed_position_snapshot_prevents_a_close() {
+        init_tracing();
+        let mut row = attempt(BlackoutCloseAction::CancelAndClose);
+        row.broker_trade_id = Some("expected-position".into());
+        let broker = ScriptedBroker::new(&[]);
+        *broker.positions.borrow_mut() = Err(LookupError::Transient);
+        assert!(pollster::block_on(blackout_close_position(&broker, &row)).is_err());
+        assert!(broker.closes.borrow().is_empty());
+    }
+
+    #[test]
+    fn safe_blackout_expected_sole_live_position_retains_the_signed_close() {
+        init_tracing();
+        let mut row = attempt(BlackoutCloseAction::CancelAndClose);
+        row.broker_trade_id = Some("expected-position".into());
+        let broker = ScriptedBroker::new(&[]);
+        *broker.positions.borrow_mut() = Ok(vec![blackout_position("expected-position")]);
+        pollster::block_on(blackout_close_position(&broker, &row)).unwrap();
+        assert_eq!(*broker.closes.borrow(), vec!["AUD/CHF"]);
     }
 
     /// A resting attempt on a 24h-open instrument (so the market-hours branch

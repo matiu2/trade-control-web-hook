@@ -65,6 +65,13 @@ pub trait CronEnv {
     /// failure); the caller logs and skips the plan for this tick.
     async fn acquire_broker(&self, account: Option<&str>) -> Option<BrokerHandle>;
 
+    /// Preserve the acquisition cause in engine-health notes when supported.
+    async fn acquire_engine_broker(&self, account: Option<&str>) -> Result<BrokerHandle, String> {
+        self.acquire_broker(account)
+            .await
+            .ok_or_else(|| "broker acquisition failed".into())
+    }
+
     /// Resolve the [`DispatchConfig`] for an enter at this edge (risk caps, pip
     /// fallback, per-account caps), so `run_enter` itself stays backend-free.
     async fn dispatch_config(&self, verified: &Verified) -> DispatchConfig;
@@ -78,6 +85,20 @@ pub trait CronEnv {
     /// is neither a dispatched-rule firing (`record_tick`) nor an inbound
     /// alert. Same fire-and-forget, fail-soft contract as `record_tick`.
     fn record_cron_note(&self, note: CronNote);
+
+    /// Await the paper entry's journal write before consuming its signal. The
+    /// native implementation deduplicates retries by account, plan and identity.
+    async fn record_paper_entry(&self, _identity: &str, _note: CronNote) -> Result<(), String> {
+        Err("durable paper-entry recording is unavailable in this runtime".into())
+    }
+
+    /// Native runtimes persist changes and retry notification delivery. A
+    /// successful evaluation is a recovery observation, never a claimed fill.
+    async fn record_engine_health(&self, note: CronNote) {
+        if note.severity != trade_control_core::recording::CronNoteSeverity::Info {
+            self.record_cron_note(note);
+        }
+    }
 
     /// Durable confirmation that this entry order's closure is already in the
     /// journal. Reporting failures must not be mistaken for a recorded exit.

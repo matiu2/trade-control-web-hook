@@ -33,7 +33,7 @@ use super::brisbane::bne;
 use super::economics::ReplayEconomics;
 use super::futures_caveats::FuturesContext;
 use super::replay::{Fire, Replay};
-use trade_control_cli::replay_args::DetectorMarkConfig;
+use crate::replay_args::DetectorMarkConfig;
 
 /// The tick size the replay report rounds order prices to — the baked
 /// `Intent::tick_size` when present, else the plan's `pip_size`. Mirrors the
@@ -430,6 +430,9 @@ pub fn render(
         out.push_str(&caveats.render());
     }
 
+    if simulate {
+        out.push_str(&format!("\nPositions: {} open at window end; Net R is realized only. Setup phase describes rule readiness.\n",tally.open_at_end));
+    }
     out.push_str(&format!(
         "\nDone: {}  |  final phase: {:?}  |  fires: {}",
         replay.done,
@@ -1252,8 +1255,8 @@ fn describe_control_action(action: Action, rule_id: &str) -> String {
 mod tests {
     use super::super::replay::EnterGateOutcome;
     use super::*;
+    use crate::replay_args::{DirectionFilter, GoldenFilter};
     use chrono::{Duration, TimeZone, Utc};
-    use trade_control_cli::replay_args::{DirectionFilter, GoldenFilter};
 
     /// Detector marking off — the summary line is empty, so report assertions
     /// that predate this feature stay byte-stable.
@@ -1264,6 +1267,7 @@ mod tests {
 
     fn resolved(direction: Direction, entry: ResolvedEntry, sl: f64, tp: f64) -> Resolved {
         Resolved {
+            setup_id: "test-setup".into(),
             id: "r".into(),
             not_after: Utc.with_ymd_and_hms(2026, 6, 30, 0, 0, 0).unwrap(),
             instrument: "NZD_CHF".into(),
@@ -1608,6 +1612,8 @@ mod tests {
             done: true,
             warnings: Vec::new(),
             traces: Vec::new(),
+            open_positions: Vec::new(),
+            position_warnings: Vec::new(),
         };
         let out = render(
             &plan_for(0.0001),

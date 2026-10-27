@@ -12,7 +12,7 @@ impl Hybrid {
         if req.dry_run {
             return entry::place(&self.data, cap, positions, req).await;
         }
-        entry::validate_entry_kind(req)?;
+        entry::validate_entry_kind(req, true)?;
         let mut guard = self
             .management
             .companion_write("open-api-entry", entry_intent(cap, positions, req))
@@ -21,7 +21,15 @@ impl Hybrid {
                 EntryError::OrderRejectedWithDetail(format!("Open API entry not sent: {error}"))
             })?;
         let id = guard.id().to_owned();
-        let result = entry::place_with_client_id(&self.data, cap, positions, req, Some(&id)).await;
+        let result = entry::place_with_client_id(
+            &self.data,
+            cap,
+            positions,
+            req,
+            Some(&id),
+            |phase, value| guard.note(phase, value),
+        )
+        .await;
         let (receipt, confirmed) = entry_receipt(&id, &result);
         if let Err(error) = guard.record(&receipt, confirmed) {
             return match result {

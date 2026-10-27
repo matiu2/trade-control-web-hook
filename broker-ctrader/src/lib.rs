@@ -3,11 +3,13 @@
 //! chart bars are exposed separately by [`market_data`] with their tick volume.
 pub mod access;
 mod candles;
+pub mod catalogue;
 mod entry;
 mod history;
 mod management;
 pub mod market_data;
 mod metadata;
+pub mod reconciliation;
 mod session;
 #[cfg(test)]
 mod tests;
@@ -25,6 +27,7 @@ use trade_control_core::broker::*;
 use trade_control_core::settlement::Settlement;
 
 mod open_api;
+pub mod protection;
 use open_api::OpenApiBroker;
 mod facade;
 mod fix;

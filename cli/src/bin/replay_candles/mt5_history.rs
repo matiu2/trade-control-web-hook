@@ -1,5 +1,6 @@
 //! Offline MT5 estimates never enter the genuine paired candle cache.
 use super::granularity::ReplayGranularity;
+use crate::replay_args::Mt5HistoryMode;
 use candle_model::CandleData;
 use chrono::{DateTime, Utc};
 use color_eyre::{
@@ -9,7 +10,6 @@ use color_eyre::{
 use mt5_data_source::cached_feed::{CachedFeed, History, HistoryMode};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use trade_control_cli::replay_args::Mt5HistoryMode;
 use trade_control_core::broker::BidAskCandle;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -21,7 +21,7 @@ pub struct EstimatedSpread {
 impl EstimatedSpread {
     fn validate(&self) -> Result<()> {
         ensure!(
-            self.median_pips.is_finite() && self.median_pips > 0.0,
+            self.median_pips.is_finite() && self.median_pips >= 0.0,
             "invalid saved replay spread"
         );
         ensure!(
@@ -195,6 +195,39 @@ mod tests {
                 .contains("not the measured historical spread")
         );
     }
+    #[test]
+    fn a_saved_measured_zero_spread_preserves_equal_bid_ask_and_mid() {
+        init();
+        let estimate = EstimatedSpread {
+            profile: "mt5:the5ers-real:AUDUSD".into(),
+            median_pips: 0.0,
+            pip_size: 0.0001,
+        };
+        estimate.validate().unwrap();
+        let bid = CandleData::new(
+            0.7,
+            0.71,
+            0.69,
+            0.705,
+            100.0,
+            "2026-10-27T09:00:00Z".parse().unwrap(),
+        )
+        .unwrap();
+        let bar = estimate.candle(&bid);
+        assert_eq!(
+            (bar.ask_o, bar.ask_h, bar.ask_l, bar.ask_c),
+            (bar.bid_o, bar.bid_h, bar.bid_l, bar.bid_c)
+        );
+        assert_eq!(
+            (bar.o, bar.h, bar.l, bar.c),
+            (bar.bid_o, bar.bid_h, bar.bid_l, bar.bid_c)
+        );
+        let saved: EstimatedSpread =
+            serde_json::from_str(&serde_json::to_string(&estimate).unwrap()).unwrap();
+        assert_eq!(saved, estimate);
+        assert!(estimate.notice().contains("ESTIMATED"));
+    }
+
     #[test]
     fn missing_account_profile_or_invalid_pip_size_cannot_invent_books() {
         init();

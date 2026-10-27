@@ -1,0 +1,53 @@
+# TEMPLATE ONLY. No purchased program or broker fee treatment has been verified.
+[accounts.prop-account]
+enabled = false
+account_id = 123456
+environment = "demo"
+state_directory = "/var/lib/trade-control/prop-risk/prop-account"
+history_from = "2026-10-27T21:00:00Z"
+initial_balance = "10000"
+rulebook_verified = false
+fees_verified = false
+fee_mode = "per_deal" # or close_detail_includes_opening; verify against statements
+commission_is_positive_cost = true
+# firm_evidence_file = "/var/lib/trade-control/firm-evidence/prop-account.json"
+
+[accounts.prop-account.risk]
+version = "1"
+base_risk_pct = 1.0
+max_account_loss_pct = 6.0
+internal_account_stop_pct = 5.0
+daily_loss_limit_pct = 3.0
+internal_daily_stop_pct = 2.0
+safety_buffer_pct = 0.25
+drawdown_reference = "static_initial_balance"
+daily_reference = "balance"
+trailing_allowance_tracks_reference = false
+
+[accounts.prop-account.risk.calendar]
+timezone = "America/New_York"
+reset_time = "17:00:00"
+
+[accounts.prop-account.risk.streak_backoff]
+enabled = true
+reset_on_win = true
+reset_on_break_even = false
+levels = [[0, 1.0], [1, 0.75], [2, 0.50], [3, 0.25], [4, 0.10]]
+
+[accounts.prop-account.risk.drawdown_backoff]
+enabled = true
+levels = [[0.0, 1.0], [2.5, 0.50], [3.5, 0.25], [4.5, 0.10], [5.0, 0.0]]
+
+[accounts.prop-account.risk.execution]
+slippage_buffer_pct_of_risk = 20.0
+max_data_age_seconds = 5
+overlap_multiplier = 1.0
+
+# No cost defaults: replace these illustrative placeholders with verified costs
+# in ACCOUNT CURRENCY per broker unit. Include conservative remaining financing.
+[accounts.prop-account.costs.EURUSD]
+opening_per_unit = "0.00004"
+closing_per_unit = "0.00004"
+future_swap_per_unit = "0.00010"
+fixed_per_order = "0"
+overlapping = false
