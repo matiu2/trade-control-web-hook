@@ -273,3 +273,27 @@ symbols. Start a fresh report when opting in for an earlier strict failure;
 existing strict reports cannot silently acquire a different policy. The
 missing-only finisher accepts and forwards both flags, and baked rows retain
 an exclusion-count and audit-digest comment.
+
+### Fixed demo stock batch, 28 October 2026
+
+`validation/ctrader-demo-stocks-run-2026-10-28.py` collects all 350 stocks/ETFs
+over the existing 24 July–22 October window with an explicit 20-minute allowance
+and the 0.1% quota. It uses pinned Rust binaries, checkpoints up to three
+collection attempts, then invokes the strict additive finisher and release
+checks. It does not place orders or deploy servers. Start it after all 93
+non-stock profiles are baked.
+
+```sh
+python3 spread-baseline-gen/validation/ctrader-demo-stocks-run-2026-10-28.py \
+  target/calibration-stocks-4e6ea256
+```
+
+Progress is recorded in `validation/ctrader-demo-stocks-job.json`; instrument
+results remain in `ctrader-demo-stocks-90d-report.json`, and the final release
+checks use `ctrader-demo-stocks-finish.json`. Source guards are captured for the
+finishing phase, after historical collection. A failed collection never bakes
+partial stock coverage.
+
+If baking succeeded but a later check or interruption stopped the job, rerun
+with `--verify-baked`. This skips collection and asks the finisher to verify
+every baked row literally before rerunning checks; mixed or changed rows fail.
