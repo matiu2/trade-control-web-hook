@@ -866,6 +866,7 @@ mod tests {
 
     #[test]
     fn setup_identity_prefers_trade_id_and_survives_resolution() {
+        crate::test_logging::init_tracing();
         let mut intent = long_market_intent();
         intent.trade_id = Some("shared-setup".into());
         let resolved = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();

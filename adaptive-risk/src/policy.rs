@@ -175,7 +175,7 @@ impl RiskPolicy {
             d.iter().all(|(n, m)| *n >= Decimal::ZERO
                 && *n <= Decimal::from(100)
                 && *m >= Decimal::ZERO
-                && *m <= self.base_risk_pct)
+                && *m <= Decimal::from(100))
                 && d.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 >= w[1].1),
             "drawdown schedule must tighten"
         );

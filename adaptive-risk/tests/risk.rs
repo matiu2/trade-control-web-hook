@@ -545,3 +545,13 @@ fn crossed_open_position_stops_block_new_risk_in_both_directions() {
         );
     }
 }
+#[test]
+fn lowering_base_risk_does_not_require_lowering_a_more_permissive_ceiling() {
+    let (mut p, mut s, a, t) = fixture();
+    p.base_risk_pct = d("0.5");
+    s.policy = p.clone();
+    p.validate().unwrap();
+    let decision = eval(&p, &s, &a, &t);
+    assert!(decision.approved);
+    assert!(decision.allowed_risk_amount <= d("50"));
+}
