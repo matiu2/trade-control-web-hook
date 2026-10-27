@@ -1128,6 +1128,8 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 ))
             } else {
                 tracing::info!("entry placed id={} order={}", verified.intent.id, order_id);
+                crate::position_tracking::record_placement(store, &verified.intent, &order_id)
+                    .await;
                 if let Some(attempt_no) = retry_attempt_no {
                     // Break-even snapshot: only when the enter carried a
                     // `breakeven` rule AND we know the trade's timeframe (engine
@@ -4383,6 +4385,12 @@ mod mw_everybar_dedup_tests {
         assert!(
             broker.cancelled().is_empty(),
             "the engine-latched path must make NO broker reconciliation calls"
+        );
+        let links = pollster::block_on(store.list_position_links()).unwrap();
+        assert_eq!(
+            links.len(),
+            1,
+            "single-shot placements need durable reporting identity independently of retry rows"
         );
     }
 }

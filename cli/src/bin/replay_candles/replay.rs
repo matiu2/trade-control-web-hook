@@ -1034,6 +1034,12 @@ pub async fn run_with_upkeep(
         .iter()
         .map(trade_control_core::position_tracking::PositionLink::from)
         .collect::<Vec<_>>();
+    match store.list_position_links().await {
+        Ok(placements) => links.extend(placements),
+        Err(error) => {
+            position_warnings.push(format!("replay placement links unavailable: {error}"))
+        }
+    }
     // Single-shot engine-latched placements do not use the retry ledger.
     // Successful broker order IDs on fires are equally strong identity evidence.
     links.extend(fires.iter().filter_map(|fire| {

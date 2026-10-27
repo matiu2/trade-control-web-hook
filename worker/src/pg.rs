@@ -1669,6 +1669,21 @@ impl PgStateStore {
 
 // AUTO-PORTED TRAIT IMPL — seen family delegates; rest todo!() until ported.
 impl StateStore for PgStateStore {
+    async fn record_position_link(
+        &self,
+        link: trade_control_core::position_tracking::PositionLink,
+    ) -> Result<(), StateError> {
+        crate::position_links::record(&self.pool, &link)
+            .await
+            .map_err(backend)
+    }
+    async fn list_position_links(
+        &self,
+    ) -> Result<Vec<trade_control_core::position_tracking::PositionLink>, StateError> {
+        crate::position_links::list(&self.pool)
+            .await
+            .map_err(backend)
+    }
     async fn record_attempt_diagnostic(
         &self,
         attempt: &EntryAttempt,

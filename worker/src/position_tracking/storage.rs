@@ -15,20 +15,59 @@ const JOIN_EXIT: &str = "LEFT JOIN LATERAL (
 
 pub(super) async fn candidate_links(pool: &sqlx::PgPool) -> Result<Vec<PositionLink>> {
     let mut links = active_links(pool).await?;
+    let placements: Vec<Value> = sqlx::query_scalar(
+        "SELECT l.body FROM position_links l
+        WHERE NOT l.resolved AND NOT EXISTS(SELECT 1 FROM cron_notes n WHERE COALESCE(n.account,'')=l.account
+          AND n.correlation_id=l.trade_id AND n.body->'broker_exit'->>'broker_order_id'=l.order_id)
+        AND NOT EXISTS(SELECT 1 FROM position_observations p WHERE p.account=l.account
+          AND p.trade_id=l.trade_id AND p.order_id=l.order_id AND p.closed_exit IS NOT NULL)",
+    )
+    .fetch_all(pool)
+    .await?;
+    for body in placements {
+        append_link(&mut links, serde_json::from_value(body)?)?;
+    }
     let attempts: Vec<Value> = sqlx::query_scalar("SELECT a.body FROM entry_attempt a
         WHERE NOT EXISTS (SELECT 1 FROM cron_notes n WHERE COALESCE(n.account,'')=COALESCE(a.account,'')
           AND n.correlation_id=a.trade_id AND n.body->'broker_exit'->>'broker_order_id'=a.body->>'broker_order_id')
+        AND NOT EXISTS(SELECT 1 FROM position_links l WHERE l.account=COALESCE(a.account,'')
+          AND l.trade_id=a.trade_id AND l.order_id=a.body->>'broker_order_id' AND l.resolved)
         AND NOT EXISTS (SELECT 1 FROM position_observations p WHERE p.account=COALESCE(a.account,'')
           AND p.trade_id=a.trade_id AND p.order_id=a.body->>'broker_order_id' AND p.closed_exit IS NOT NULL)")
         .fetch_all(pool).await?;
     for body in attempts {
         let attempt = serde_json::from_value::<trade_control_core::state::EntryAttempt>(body)?;
         let link = PositionLink::from(&attempt);
-        if !links.contains(&link) {
-            links.push(link);
-        }
+        append_link(&mut links, link)?;
     }
     Ok(links)
+}
+
+fn append_link(links: &mut Vec<PositionLink>, link: PositionLink) -> Result<()> {
+    if let Some(existing) = links.iter_mut().find(|existing| {
+        existing.account == link.account
+            && existing.trade_id == link.trade_id
+            && existing.broker_order_id == link.broker_order_id
+    }) {
+        color_eyre::eyre::ensure!(
+            existing.instrument == link.instrument && existing.direction == link.direction,
+            "conflicting instrument/direction for broker order {}",
+            link.broker_order_id
+        );
+        if let (Some(old), Some(new)) = (&existing.broker_position_id, &link.broker_position_id) {
+            color_eyre::eyre::ensure!(
+                old == new,
+                "conflicting position IDs for broker order {}",
+                link.broker_order_id
+            );
+        }
+        if existing.broker_position_id.is_none() {
+            existing.broker_position_id = link.broker_position_id;
+        }
+    } else {
+        links.push(link);
+    }
+    Ok(())
 }
 
 pub(super) async fn active_links(pool: &sqlx::PgPool) -> Result<Vec<PositionLink>> {
@@ -193,7 +232,8 @@ mod tests;
 pub(crate) async fn sync_for_trade(pool: &sqlx::PgPool, trade: &str) -> Result<Vec<PositionSync>> {
     let rows: Vec<(String,DateTime<Utc>,Option<String>)> = sqlx::query_as("SELECT s.account,s.checked_at,s.error FROM position_sync s
         WHERE EXISTS (SELECT 1 FROM position_observations p WHERE p.account=s.account AND p.trade_id=$1)
-        OR EXISTS (SELECT 1 FROM entry_attempt a WHERE COALESCE(a.account,'')=s.account AND a.trade_id=$1)")
+        OR EXISTS (SELECT 1 FROM entry_attempt a WHERE COALESCE(a.account,'')=s.account AND a.trade_id=$1)
+        OR EXISTS (SELECT 1 FROM position_links l WHERE l.account=s.account AND l.trade_id=$1)")
         .bind(trade).fetch_all(pool).await?;
     Ok(rows
         .into_iter()

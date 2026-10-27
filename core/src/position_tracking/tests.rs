@@ -209,3 +209,40 @@ fn observer_exposes_conflicting_ownership_in_refresh_evidence() {
     assert!(result.positions.is_empty());
     assert_eq!(result.warnings.len(), 1);
 }
+
+#[test]
+fn positive_unfilled_cancellation_resolves_the_order_without_inventing_a_position() {
+    init_tracing();
+    let broker = ReadOnlyBroker {
+        state: Ok(AttemptState::Cancelled),
+        snapshots: vec![],
+    };
+    let result = pollster::block_on(observe(&broker, "demo", &mut [link()], Utc::now())).unwrap();
+    assert_eq!(result.cancelled.len(), 1);
+    assert!(result.positions.is_empty());
+    assert!(result.exits.is_empty());
+    let mut filled = link();
+    filled.broker_position_id = Some("17074690".into());
+    let result = pollster::block_on(observe(&broker, "demo", &mut [filled], Utc::now())).unwrap();
+    assert!(result.cancelled.is_empty());
+    assert_eq!(result.warnings.len(), 1);
+}
+
+#[test]
+fn placement_links_are_idempotent_and_exclude_dry_runs_and_unidentified_trades() {
+    init_tracing();
+    use crate::state::{MemStateStore, StateStore};
+    let mut intent:crate::intent::Intent=serde_json::from_value(serde_json::json!({"v":1,"id":"single-shot","action":"enter","instrument":"USDJPY","direction":"long","trade_id":"tracked","not_after":"2099-01-01T00:00:00Z","dry_run":true})).unwrap();
+    let store = MemStateStore::new();
+    pollster::block_on(async {
+        record_placement(&store, &intent, "dry-order").await;
+        assert!(store.list_position_links().await.unwrap().is_empty());
+        intent.dry_run = Some(false);
+        record_placement(&store, &intent, "live-order").await;
+        record_placement(&store, &intent, "live-order").await;
+        assert_eq!(store.list_position_links().await.unwrap().len(), 1);
+        intent.trade_id = None;
+        record_placement(&store, &intent, "anonymous-order").await;
+        assert_eq!(store.list_position_links().await.unwrap().len(), 1);
+    });
+}

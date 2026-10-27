@@ -11,6 +11,7 @@ pub struct PositionCheck {
     pub positions: Vec<TrackedPosition>,
     pub exits: Vec<(PositionLink, BrokerTradeExit)>,
     pub warnings: Vec<String>,
+    pub cancelled: Vec<PositionLink>,
 }
 
 /// Same observational path for native reporting and the replay broker.
@@ -25,6 +26,7 @@ pub async fn observe<B: Broker>(
         positions: Vec::new(),
         exits: Vec::new(),
         warnings: Vec::new(),
+        cancelled: Vec::new(),
     };
     let snapshots = broker.position_snapshots(account).await?;
     for link in links.iter_mut() {
@@ -84,7 +86,15 @@ pub async fn observe<B: Broker>(
                 link,
                 format!("ownership/state lookup failed: {error:?}"),
             ),
-            Ok(AttemptState::Pending | AttemptState::Cancelled | AttemptState::Unknown) => {}
+            Ok(AttemptState::Cancelled) if link.broker_position_id.is_none() => {
+                result.cancelled.push(link.clone())
+            }
+            Ok(AttemptState::Cancelled) => warn(
+                &mut result,
+                link,
+                "filled position cannot be resolved as an unfilled cancellation".into(),
+            ),
+            Ok(AttemptState::Pending | AttemptState::Unknown) => {}
         }
     }
     result.positions = match_positions(links, &snapshots);

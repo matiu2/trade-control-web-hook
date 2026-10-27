@@ -113,3 +113,5 @@ mod tests;
 
 mod observation;
 pub use observation::{PositionCheck, observe};
+mod placement;
+pub use placement::record_placement;

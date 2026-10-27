@@ -62,9 +62,43 @@ async fn durable_snapshots_survive_outages_missing_positions_and_retry_expiry() 
 
 async fn exercise(pool: &sqlx::PgPool) -> Result<()> {
     sqlx::migrate!("./migrations").run(pool).await?;
+    let mut link = tracked().link;
+    link.broker_position_id = None;
+    crate::position_links::record(pool, &link).await?;
+    crate::position_links::record(pool, &link).await?;
+    assert_eq!(
+        candidate_links(pool).await?.len(),
+        1,
+        "a single-shot placement is observed without retry rows or position snapshots"
+    );
+    let mut conflicting = link;
+    conflicting.trade_id = "different-owner".into();
+    assert!(
+        crate::position_links::record(pool, &conflicting)
+            .await
+            .is_err()
+    );
     // Postgres timestamps have microsecond precision.
     let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
     let trade = "ihs-usdjpy-3e9eb418";
+    let known = serde_json::json!({"account":"demo","trade_id":trade,"attempt_no":99,"instrument":"USDJPY","direction":"long","broker_order_id":"17074689","broker_trade_id":"17074690","placed_at":now,"shell_time":now,"expires_at":now});
+    sqlx::query(
+        "INSERT INTO entry_attempt(account,trade_id,attempt_no,body) VALUES ('demo',$1,99,$2)",
+    )
+    .bind(trade)
+    .bind(known)
+    .execute(pool)
+    .await?;
+    assert_eq!(
+        candidate_links(pool).await?[0]
+            .broker_position_id
+            .as_deref(),
+        Some("17074690"),
+        "proven retry fill identity must upgrade a permanent placement with no position ID"
+    );
+    sqlx::query("DELETE FROM entry_attempt WHERE attempt_no=99")
+        .execute(pool)
+        .await?;
     record(pool, Some("demo"), now, &[tracked()], &[], &[]).await?;
     failure(
         pool,
@@ -172,6 +206,14 @@ async fn exercise(pool: &sqlx::PgPool) -> Result<()> {
         1,
         "only the other account remains open"
     );
+    assert!(
+        candidate_links(pool)
+            .await?
+            .iter()
+            .all(|link| !(link.account.as_deref() == Some("demo")
+                && link.broker_order_id == "17074689")),
+        "closed permanent placement links must not resume polling"
+    );
     // A complete fill+close can arrive without a prior open snapshot.
     let mut rapid = tracked().link;
     rapid.broker_position_id = Some("rapid".into());
@@ -228,5 +270,27 @@ async fn exercise(pool: &sqlx::PgPool) -> Result<()> {
     assert_eq!(note_position.status, PositionStatus::Closed);
     assert!(note_position.snapshot.is_none());
     assert_eq!(note_position.exit.unwrap().realized_pl, Some(123.0));
+    let mut cancelled = tracked().link;
+    cancelled.broker_order_id = "cancelled-order".into();
+    cancelled.broker_position_id = None;
+    crate::position_links::record(pool, &cancelled).await?;
+    assert!(
+        candidate_links(pool)
+            .await?
+            .iter()
+            .any(|link| link.broker_order_id == "cancelled-order")
+    );
+    crate::position_links::finish_cancelled(pool, &[cancelled]).await?;
+    assert!(
+        candidate_links(pool)
+            .await?
+            .iter()
+            .all(|link| link.broker_order_id != "cancelled-order"),
+        "unfilled cancellations must not be polled forever"
+    );
+    let mut links = vec![tracked().link];
+    let mut conflict = tracked().link;
+    conflict.broker_position_id = Some("conflicting-position".into());
+    assert!(append_link(&mut links, conflict).is_err());
     Ok(())
 }

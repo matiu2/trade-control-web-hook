@@ -41,14 +41,19 @@ async fn poll_inner(store: &PgStateStore, cron: &NativeCronEnv) -> Result<()> {
         let now = Utc::now();
         let recorded = match result {
             Ok(observation) => {
-                storage::record(
-                    store.pool(),
-                    account.as_deref(),
-                    observation.observed_at,
-                    &observation.positions,
-                    &observation.exits,
-                    &observation.warnings,
-                )
+                async {
+                    storage::record(
+                        store.pool(),
+                        account.as_deref(),
+                        observation.observed_at,
+                        &observation.positions,
+                        &observation.exits,
+                        &observation.warnings,
+                    )
+                    .await?;
+                    crate::position_links::finish_cancelled(store.pool(), &observation.cancelled)
+                        .await
+                }
                 .await
             }
             Err(error) => {
