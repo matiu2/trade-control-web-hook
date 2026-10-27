@@ -1,0 +1,37 @@
+{
+  "account": {
+    "profile": "ctrader-demo",
+    "environment": "demo",
+    "endpoint": "wss://demo.ctraderapi.com:5036",
+    "account_id": 49247794,
+    "broker": "Spotware",
+    "login": 5944473
+  },
+  "from_utc": "2026-07-24T16:26:00Z",
+  "to_utc": "2026-10-22T16:26:00Z",
+  "paired_cache_namespace": "ctrader-paired-v2",
+  "profile": "ETHEUR",
+  "native_symbol_id": 22398,
+  "retained_m1_candles": 123524,
+  "quarantined_minutes": 8,
+  "excluded_percent": 0.006476054787423502,
+  "policy": {
+    "max_minutes_per_instrument": 20
+  },
+  "quality_fraction_max": 0.001,
+  "review": "Reviewed",
+  "profiles_before": 92,
+  "profiles_after": 93,
+  "all_original_rows_byte_identical": true,
+  "report_sha256": "76c27c0eaf9cd8cea1711716e95c4e2b89183093bbd07e4b7660c1eadfb54df8",
+  "audit_sha256": "24f9eb6167351d1662b36c7874450a4ccbc10a7b23e8c375a80b2d1c0b89a463",
+  "table_sha256": "c5edbe2249fa60f61edf75bf39cd18579b6521ef0e0c97b55030d2c13632172c",
+  "pinned_tool_manifest": {
+    "source_commit": "4e6ea256",
+    "binaries": {
+      "generate-ctrader": "38c4a41c256cb6f689e1449f71161794427566a6c246e879b79f873adbcb13e4",
+      "bake-ctrader": "9de57dc62c02f0a28823d5678d22395022b15ddb207dd06c079307d60a858c5a",
+      "finish-ctrader-nonstocks": "44fbace1354c61ea129c12e1bfdd552ce4f3ec59bb2a6b0a2926cc0fbe9a9eb8"
+    }
+  }
+}
