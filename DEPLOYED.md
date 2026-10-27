@@ -60,9 +60,9 @@ cut a fresh `staging` from `main` carrying the week's accumulated changes.
 | part | version | deployed (Brisbane) | notes |
 |---|---|---|---|
 | pine | `v2.4` (study title `Candle Signals v24`) | — | pinned to the pre-`open` version; chart **unchanged** this deploy. v25 worker degrades gracefully when `open` is absent (rides baked geometry). `tv-arm-staging` bakes this study title. |
-| tv-arm | `v155` | 2026-10-11 09:50 | Installed as `tv-arm-staging`; shares the cache-owned account spread profiles and MT5 replay history flags. |
-| trade-control | `v155` | 2026-10-11 09:50 | Matching staging CLIs installed with `http://127.0.0.1:8788`; replay labels estimated historical ask/mid and pins the calibrated spread in fixtures. |
-| backend | `v155` @ `f9ccc36d` | 2026-10-11 09:50 | Rebuilt staging worker active; health HTTP 200. Spread policy reads candle-cache profiles; live bid/ask remains genuine. |
+| tv-arm | `v155-116-gfe5838f4-dirty` | 2026-10-28 06:25 | Installed as `tv-arm-staging`; adds `--be-offside` for directional per-signal MA requirements while retaining `--must-touch`. |
+| trade-control | `v155-116-gfe5838f4-dirty` | 2026-10-28 06:25 | Matching staging CLIs and shared worker operator tools rebuilt and installed with `http://127.0.0.1:8788`. |
+| backend | `staging` @ `fe5838f4` | 2026-10-28 06:25 | Staging worker rebuilt, installed and active; health HTTP 200. Live/replay accept touching or above selected MAs for shorts, touching or below for longs. Existing strict-touch plans retain their behavior. Chart `main` @ `1429f05` rebuilt and restarted on :8790; served schema and browser checks pass. Existing unrelated working changes retained. |
 | contract | `v3` | — | unchanged by v23 (recording is observe-only) |
 
 
