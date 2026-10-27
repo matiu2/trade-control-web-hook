@@ -55,6 +55,8 @@ use crate::precision::EffectivePrecision;
 /// plan-building half, which cannot tell which. See the module doc.
 #[derive(Debug, Clone)]
 pub struct SetupInputs {
+    /// Account identity retained when loading a frozen feed selection.
+    pub trading_account: Option<String>,
     /// The drawn setup, as plain data.
     pub geom: PlanGeometry,
     /// Calendar-derived pause/news windows, already pruned against
@@ -104,6 +106,7 @@ pub(crate) mod tests {
             crate::instrument_resolution::resolve_for_broker("OANDA:EURUSD", Broker::Oanda)
                 .expect("EURUSD is in the baseline catalog");
         SetupInputs {
+            trading_account: None,
             geom: PlanGeometry {
                 neckline: Some(Line {
                     a: Anchor::new(1000, 1.10),

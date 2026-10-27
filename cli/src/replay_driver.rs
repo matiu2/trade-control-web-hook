@@ -174,6 +174,14 @@ fn run_live(
                 &plan,
             )?;
         }
+        if args.source == CandleSource::Oanda {
+            args.oanda_account = crate::replay_candles::history::resolve_account(
+                args.source,
+                args.oanda_account.as_deref(),
+                None,
+                &plan,
+            )?;
+        }
         if args.source == CandleSource::Ctrader {
             args.ctrader_account = crate::replay_candles::history::resolve_account(
                 args.source,
@@ -212,6 +220,11 @@ fn run_live(
             args.ctrader_account.as_deref(),
             args.mt5_history,
             plan.pip_size,
+        )
+        .with_oanda_account(args.oanda_account.as_deref())
+        .with_oanda_destination(
+            args.oanda_worker_url.as_deref(),
+            args.oanda_key_file.as_deref(),
         );
 
         let start = window.start;
@@ -471,10 +484,14 @@ fn run_live(
         let positions = positions_out::PositionsFile::new(
             raw_instrument,
             granularity::engine_label(gran.engine()),
-            &local_chart_client::chart_feed(
-                args.source.as_str(),
-                mt5_history.account().unwrap_or_default(),
-            ),
+            &if mt5_history.uses_live_oanda() {
+                "oanda-live".to_string()
+            } else {
+                local_chart_client::chart_feed(
+                    args.source.as_str(),
+                    mt5_history.account().unwrap_or_default(),
+                )
+            },
             &fires,
         );
         let outcome = ReplayOutcome::compute(&replay, simulate, Some(&rendered.economics));
@@ -1130,6 +1147,7 @@ async fn replay_one_fixture(
     // scoring it as a stop. The fixture's own `meta` says which source and symbol
     // it came from, so the refetch targets the same feed that produced it.
     let explicit_account = match inputs.meta.source {
+        CandleSource::Oanda => args.oanda_account.as_deref(),
         CandleSource::Mt5 => args.mt5_account.as_deref(),
         CandleSource::Ctrader => args.ctrader_account.as_deref(),
         _ => None,
@@ -1149,7 +1167,10 @@ async fn replay_one_fixture(
         inputs.plan.pip_size,
         inputs.meta.estimated_spread.clone(),
     ) {
-        Ok(history) => history,
+        Ok(history) => history.with_oanda_destination(
+            args.oanda_worker_url.as_deref(),
+            args.oanda_key_file.as_deref(),
+        ),
         Err(error) => return FixtureRun::failed(name, error),
     };
     let refetch = FixtureRefetch {
@@ -2340,6 +2361,9 @@ mod tests {
             source: CandleSource::TradeNation,
             mt5_account: None,
             ctrader_account: None,
+            oanda_account: None,
+            oanda_worker_url: None,
+            oanda_key_file: None,
             mt5_history: crate::replay_args::Mt5HistoryMode::Auto,
             start: None,
             end: None,

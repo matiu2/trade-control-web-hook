@@ -315,7 +315,7 @@ pub fn run_replay(
     let positions_path = new_tv
         .filter(|_| execution.is_none())
         .map(|_| std::env::temp_dir().join(format!("tv-arm-positions-{trade_id}.json")));
-    let argv = build_argv(
+    let mut argv = build_argv(
         &bin,
         &plan,
         source,
@@ -323,6 +323,9 @@ pub fn run_replay(
         arm,
         positions_path.as_deref(),
     );
+    if source == CandleSource::Oanda {
+        argv.extend(oanda_destination_args(execution)?);
+    }
 
     // Validate the full invocation against the shared clap definition before
     // shelling out, so a bad passthrough flag fails with replay-candles' own
@@ -381,6 +384,20 @@ pub fn run_replay(
     Ok(())
 }
 
+fn oanda_destination_args(execution: Option<&crate::api::Execution>) -> Result<Vec<String>> {
+    let url = crate::register_post::worker_url(execution);
+    let key = match execution {
+        Some(execution) => execution.context.key_file.clone(),
+        None => crate::pipeline::key_path_resolved()?,
+    };
+    Ok(vec![
+        "--oanda-worker-url".into(),
+        url.into(),
+        "--oanda-key-file".into(),
+        key.display().to_string(),
+    ])
+}
+
 fn record_completed_replay(
     execution: &crate::api::Execution,
     result: trade_control_cli::replay_driver::ReplayResult,
@@ -418,7 +435,9 @@ fn record_completed_replay(
     Ok(())
 }
 
-pub(crate) fn run_corpus(parsed: ReplayArgs, execution: &crate::api::Execution) -> Result<()> {
+pub(crate) fn run_corpus(mut parsed: ReplayArgs, execution: &crate::api::Execution) -> Result<()> {
+    parsed.oanda_worker_url = Some(execution.context.worker_url.clone());
+    parsed.oanda_key_file = Some(execution.context.key_file.clone());
     let runtime = tokio::runtime::Runtime::new().wrap_err("starting corpus replay runtime")?;
     let result = runtime.block_on(trade_control_cli::replay_driver::run_corpus(parsed));
     let success = result.success;
@@ -494,6 +513,26 @@ mod drawing_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oanda_replay_pins_the_selected_workers_metadata_and_key_path() {
+        let execution = crate::api::Execution::new(crate::api::ArmContext {
+            worker_url: "http://127.0.0.1:9999".into(),
+            key_file: "/private/selected-key.hex".into(),
+            broker: crate::args::BrokerArg::Oanda,
+            account_id: Some("oanda-live".into()),
+        });
+        let flags = oanda_destination_args(Some(&execution)).unwrap();
+        assert_eq!(
+            flags,
+            vec![
+                "--oanda-worker-url",
+                "http://127.0.0.1:9999",
+                "--oanda-key-file",
+                "/private/selected-key.hex"
+            ]
+        );
+    }
 
     #[test]
     fn completed_measurements_survive_an_artifact_write_failure() {

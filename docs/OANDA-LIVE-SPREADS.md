@@ -24,6 +24,11 @@ Recent-day close-spread medians in OANDA's broker pip units:
 
 Runtime profiles use the existing `instrument-lookup` pip convention so entry
 and stop calculations remain in the same units as the instrument definition.
+The complete `instrument_lookup::oanda_live` account catalogue now supplies those
+units, including the 33 instruments missing from the older native catalogue.
+Their profiles have been regenerated from the same account-scoped history so
+spread thresholds and live sizing stay aligned. The catalogue also records
+broker quantity precision, minimum sizes and observed H1 session masks.
 OANDA describes pricing-group differences in its
 [historical data guidance](https://help.oanda.com/au/en/faqs/rest-v20-api-troubleshooting-guide.htm).
 
@@ -59,3 +64,19 @@ those keys for the live account. Missing instruments in a calibrated account
 remain account-qualified and cannot borrow the generic demo profile. Raw
 historical bid/ask candles retain their measured spreads; the baked table is a
 forecast and normal-spread estimate, not a replacement for historical quotes.
+
+OANDA execution is enabled for live account metadata. `dry_run` defaults to
+false; it is enabled only by an explicit dry-run intent. For every entry and
+stop amendment the adapter reads current instrument rules from the selected
+account. Quantities are floored to `tradeUnitsPrecision`, checked against
+`minimumTradeSize` and `maximumOrderUnits`, and submitted as decimal strings.
+Market, stop and limit orders retain their attached stop-loss and take-profit.
+Prices use the broker's `displayPrecision`; they are not padded to five places
+for instruments that reject that precision.
+
+Live replay infers `oanda-live` from the plan's OANDA rules, or accepts
+`--oanda-account oanda-live`. Its initial history and sub-bar zoom share the same
+account-pinned cache as the live chart. Fixture metadata preserves that account;
+mixed demo/live plans and conflicting fixture overrides are refused. Live replay
+position drawings retain `broker=oanda-live`. Broker metadata and the live token
+are loaded through the same native profile loader used by Local Chart.

@@ -2,10 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use oanda_client::OandaClient;
-use oanda_client::orders::{
-    LimitOrder, OrderPositionFill, OrderType, PendingOrder, StopLossDetails, StopOrder,
-    TakeProfitDetails, TimeInForce,
-};
+use oanda_client::orders::{Order, OrderType, PendingOrder, StopLossDetails, TimeInForce};
 use oanda_client::positions::{ClosePositionResponse, Position};
 use oanda_client::trades::{Trade, TradeQueryParams, TradeState};
 
@@ -205,17 +202,35 @@ pub async fn place_entry(
         .map_err(|_| EntryError::EquityParse)?;
     let account_ccy = account.account.currency.clone();
 
+    let details = client
+        .get_instrument_details(account_id)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "OANDA account instrument rules unavailable");
+            EntryError::AccountFetch
+        })?;
+    let details = details
+        .iter()
+        .find(|row| row.name == req.instrument)
+        .ok_or(EntryError::OrderRejected)?;
+    let spec = crate::spec::Spec::from_details(details)?;
+    let stop_loss = spec
+        .price(req.stop_loss)
+        .parse::<f64>()
+        .map_err(|_| EntryError::OrderRejected)?;
     let reference_price = match req.entry {
         ResolvedEntry::Market { reference_price } => reference_price,
-        ResolvedEntry::Stop { trigger_price } => trigger_price,
-        ResolvedEntry::Limit { trigger_price } => trigger_price,
+        ResolvedEntry::Stop { trigger_price } | ResolvedEntry::Limit { trigger_price } => spec
+            .price(trigger_price)
+            .parse::<f64>()
+            .map_err(|_| EntryError::OrderRejected)?,
     };
 
     // Resolve units + effective percent. For `Units` we skip sizing
     // math entirely and reconstruct the implied money risk for the cap
     // check. For `Amount` we translate to percent so the cap applies.
     // For `Percent` we already validated above; recompute the budget.
-    let stop_distance = (reference_price - req.stop_loss).abs();
+    let stop_distance = (reference_price - stop_loss).abs();
     if stop_distance <= 0.0 || !stop_distance.is_finite() {
         return Err(EntryError::OrderRejected);
     }
@@ -242,7 +257,7 @@ pub async fn place_entry(
         RiskBudget::Percent(pct) => {
             let budget = equity * pct / 100.0;
             (
-                risk::units_for_budget(budget, reference_price, req.stop_loss, fx_rate),
+                risk::raw_units_for_budget(budget, reference_price, stop_loss, fx_rate),
                 pct,
             )
         }
@@ -258,7 +273,7 @@ pub async fn place_entry(
                 });
             }
             (
-                risk::units_for_budget(amount, reference_price, req.stop_loss, fx_rate),
+                risk::raw_units_for_budget(amount, reference_price, stop_loss, fx_rate),
                 pct,
             )
         }
@@ -276,15 +291,10 @@ pub async fn place_entry(
                     cap: max_risk_pct,
                 });
             }
-            // OANDA only takes integer units; floor the literal.
-            let u = if !literal.is_finite() || literal <= 0.0 {
-                0
-            } else {
-                literal.floor() as u32
-            };
-            (u, pct)
+            (literal, pct)
         }
     };
+    let units = spec.units(units)?;
     let dry = if req.dry_run { "DRY-RUN " } else { "" };
     tracing::info!(
         "{dry}oanda sizing: instrument={} mode={:?} equity={equity} account_ccy={account_ccy} quote_ccy={quote_ccy} fx_quote_to_account={fx_rate} effective_pct={effective_pct:.4} entry_ref={reference_price} sl={} units={units}",
@@ -292,9 +302,6 @@ pub async fn place_entry(
         req.risk,
         req.stop_loss,
     );
-    if units == 0 {
-        return Err(EntryError::UnitsBelowMinimum);
-    }
     if req.dry_run {
         // Sizing succeeded — synthetic order id so the caller treats it
         // as success. The order is intentionally not placed. The size IS
@@ -302,99 +309,18 @@ pub async fn place_entry(
         // exists precisely to show what would have been placed.
         return Ok(Placement {
             order_id: format!("dry-run-{}", req.instrument),
-            size: Some(f64::from(units)),
+            size: Some(units),
             price: Some(reference_price),
         });
     }
 
-    let sl_details = StopLossDetails {
-        price: Some(format_price(req.stop_loss)),
-        distance: None,
-        time_in_force: TimeInForce::Gtc,
-    };
-    let tp_details = TakeProfitDetails {
-        price: format_price(req.take_profit),
-        time_in_force: TimeInForce::Gtc,
-    };
-
-    let response = match (&req.entry, req.direction) {
-        (ResolvedEntry::Market { .. }, Direction::Long) => client
-            .buy_with_stops(
-                account_id,
-                req.instrument,
-                units,
-                Some(sl_details),
-                Some(tp_details),
-                None,
-            )
-            .await
-            .map_err(|err| {
-                tracing::error!("buy_with_stops: {err:?}");
-                classify_order_placement_error(err)
-            })?,
-        (ResolvedEntry::Market { .. }, Direction::Short) => client
-            .sell_with_stops(
-                account_id,
-                req.instrument,
-                units,
-                Some(sl_details),
-                Some(tp_details),
-                None,
-            )
-            .await
-            .map_err(|err| {
-                tracing::error!("sell_with_stops: {err:?}");
-                classify_order_placement_error(err)
-            })?,
-        (ResolvedEntry::Stop { trigger_price }, dir) => {
-            let signed_units = match dir {
-                Direction::Long => units.to_string(),
-                Direction::Short => format!("-{units}"),
-            };
-            let order = StopOrder {
-                r#type: OrderType::Stop,
-                instrument: req.instrument.to_string(),
-                units: signed_units,
-                price: format_price(*trigger_price),
-                time_in_force: TimeInForce::Gtc,
-                position_fill: OrderPositionFill::Default,
-                take_profit_on_fill: Some(tp_details),
-                stop_loss_on_fill: Some(sl_details),
-                trailing_stop_loss_on_fill: None,
-            };
-            client
-                .place_stop_order(account_id, order)
-                .await
-                .map_err(|err| {
-                    tracing::error!("place_stop_order: {err:?}");
-                    classify_order_placement_error(err)
-                })?
-        }
-        (ResolvedEntry::Limit { trigger_price }, dir) => {
-            let signed_units = match dir {
-                Direction::Long => units.to_string(),
-                Direction::Short => format!("-{units}"),
-            };
-            let order = LimitOrder {
-                r#type: OrderType::Limit,
-                instrument: req.instrument.to_string(),
-                units: signed_units,
-                price: format_price(*trigger_price),
-                time_in_force: TimeInForce::Gtc,
-                position_fill: OrderPositionFill::Default,
-                take_profit_on_fill: Some(tp_details),
-                stop_loss_on_fill: Some(sl_details),
-                trailing_stop_loss_on_fill: None,
-            };
-            client
-                .place_limit_order(account_id, order)
-                .await
-                .map_err(|err| {
-                    tracing::error!("place_limit_order: {err:?}");
-                    classify_order_placement_error(err)
-                })?
-        }
-    };
+    let order = crate::order::build(req, &spec, units);
+    let response = match order {
+        Order::Market(order) => client.place_market_order(account_id, order).await,
+        Order::Stop(order) => client.place_stop_order(account_id, order).await,
+        Order::Limit(order) => client.place_limit_order(account_id, order).await,
+    }
+    .map_err(classify_order_placement_error)?;
 
     // `units` is the size OANDA was actually asked for, and `reference_price`
     // the price the risk math used (the trigger for a stop/limit — NOT the
@@ -402,16 +328,9 @@ pub async fn place_entry(
     // computed here and only logged.
     Ok(Placement {
         order_id: response.order_create_transaction.id,
-        size: Some(f64::from(units)),
+        size: Some(units),
         price: Some(reference_price),
     })
-}
-
-/// OANDA prices are strings with instrument-appropriate precision. Five decimal
-/// places covers all major FX pairs except JPY crosses (3); indices use 1-2.
-/// OANDA will round to the instrument's tick on its end; over-precision is fine.
-fn format_price(price: f64) -> String {
-    format!("{price:.5}")
 }
 
 /// Look up the broker-side state of an entry attempt placed earlier.
@@ -655,8 +574,20 @@ pub async fn amend_stop(
             // re-lists on the next sweep regardless.
             AmendError::NotFound
         })?;
+    let details = client
+        .get_instrument_details(account_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "OANDA stop amendment instrument rules unavailable");
+            AmendError::Transient
+        })?;
+    let detail = details
+        .iter()
+        .find(|row| row.name == trade.instrument)
+        .ok_or(AmendError::Transient)?;
+    let spec = crate::spec::Spec::from_details(detail).map_err(|_| AmendError::Transient)?;
     let stop_loss = StopLossDetails {
-        price: Some(format_price(new_stop)),
+        price: Some(spec.price(new_stop)),
         distance: None,
         time_in_force: TimeInForce::Gtc,
     };

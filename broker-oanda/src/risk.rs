@@ -79,18 +79,28 @@ pub fn units_for_risk(
 /// to `budget` and solving for units gives `budget / (stop_distance *
 /// rate)`.
 pub fn units_for_budget(budget: f64, entry: f64, stop_loss: f64, fx_quote_to_account: f64) -> u32 {
+    raw_units_for_budget(budget, entry, stop_loss, fx_quote_to_account).floor() as u32
+}
+
+/// Unrounded budget quantity; the selected account's instrument sets the step.
+pub fn raw_units_for_budget(
+    budget: f64,
+    entry: f64,
+    stop_loss: f64,
+    fx_quote_to_account: f64,
+) -> f64 {
     let stop_distance = (entry - stop_loss).abs();
     if stop_distance <= 0.0 || budget <= 0.0 || !budget.is_finite() {
-        return 0;
+        return 0.0;
     }
     if fx_quote_to_account <= 0.0 || !fx_quote_to_account.is_finite() {
-        return 0;
+        return 0.0;
     }
     let units = budget / (stop_distance * fx_quote_to_account);
     if units <= 0.0 || !units.is_finite() {
-        0
+        0.0
     } else {
-        units.floor() as u32
+        units
     }
 }
 

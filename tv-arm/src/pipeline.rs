@@ -202,13 +202,14 @@ fn default_fixtures_dir(args: &Args) -> PathBuf {
 
 /// Write the chart-derived setup to a `--spec-out` file for later `--spec-in`.
 fn freeze_setup(args: &Args, setup: &SetupInputs, path: &Path) -> Result<()> {
-    let frozen = crate::frozen_setup::FrozenSetup::capture(
+    let mut frozen = crate::frozen_setup::FrozenSetup::capture(
         setup.geom.clone(),
         setup.resolution.clone(),
         setup.chart_symbol.clone(),
         setup.start,
         args.spec_note.clone(),
     );
+    frozen.trading_account = setup.trading_account.clone();
     frozen.write(path)?;
     info!(
         path = %path.display(),
@@ -469,7 +470,18 @@ fn setup_from_frozen(
     }
 
     let broker = resolve_broker(args, &frozen.chart_symbol)?;
-    let account = resolve_account(args, broker, &frozen.chart_symbol)?;
+    let account = match frozen.trading_account.as_deref() {
+        Some(account) => {
+            color_eyre::eyre::ensure!(
+                args.account_id
+                    .as_deref()
+                    .is_none_or(|selected| selected == account),
+                "Frozen setup targets account {account}; the supplied account override conflicts"
+            );
+            account.to_string()
+        }
+        None => resolve_account(args, broker, &frozen.chart_symbol)?,
+    };
     let resolved = crate::instrument_resolution::resolve_for_purpose(
         &frozen.chart_symbol,
         broker,
@@ -534,6 +546,7 @@ fn setup_from_frozen(
 
     let raw_symbol = split_symbol(&frozen.chart_symbol).1.to_string();
     Ok(SetupInputs {
+        trading_account: Some(account),
         geom: frozen.geom,
         control,
         position: frozen.position,
@@ -744,6 +757,7 @@ fn read_setup_from_chart(args: &Args) -> Result<(SetupInputs, Roles)> {
 
     Ok((
         SetupInputs {
+            trading_account: Some(account),
             geom,
             control,
             // A live arm reads its position tool from `roles` (TradingView
@@ -781,6 +795,7 @@ fn read_setup_from_chart(args: &Args) -> Result<(SetupInputs, Roles)> {
 /// satisfied by **either** source, and refused only when neither is present.
 fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Result<i32> {
     let SetupInputs {
+        trading_account,
         geom,
         control,
         position: frozen_position,
@@ -796,7 +811,10 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
     } = setup;
 
     let key = read_key(args)?;
-    let account = resolve_account(args, broker, &chart_symbol)?;
+    let account = match trading_account {
+        Some(account) => account,
+        None => resolve_account(args, broker, &chart_symbol)?,
+    };
     let out_dir = arm_out_dir(&raw_symbol)?;
     let now = Utc::now();
     // The time this arm treats as "now" for everything time-derived on the plan:
@@ -1380,7 +1398,7 @@ fn default_key_path() -> Result<PathBuf> {
 /// Same precedence as [`read_key`] but returns the path instead of
 /// the bytes — needed when a downstream builder wants the key-file path
 /// rather than the loaded key material.
-fn key_path_resolved() -> Result<PathBuf> {
+pub(crate) fn key_path_resolved() -> Result<PathBuf> {
     if let Ok(env) = env::var("TRADE_CONTROL_KEY_FILE")
         && !env.trim().is_empty()
     {
@@ -2296,6 +2314,30 @@ mod tests {
 
         assert_eq!(setup.start, Some(frozen_at));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn frozen_live_account_survives_loading_and_conflicting_overrides_fail() {
+        let mut spec = crate::frozen_setup::FrozenSetup::capture(
+            PlanGeometry::default(),
+            "60".into(),
+            "OANDA:XAG_CAD".into(),
+            Some(1_750_000_000),
+            None,
+        );
+        spec.trading_account = Some("oanda-live".into());
+        let setup =
+            setup_from_frozen(&mw_args(&["register"]), spec.clone(), "live fixture").unwrap();
+        assert_eq!(setup.trading_account.as_deref(), Some("oanda-live"));
+        assert_eq!(setup.effective.tick_size, 0.00001);
+        assert!(
+            setup_from_frozen(
+                &mw_args(&["--account-id", "m-and-w", "register"]),
+                spec,
+                "live fixture"
+            )
+            .is_err()
+        );
     }
 
     // ===== M / W trade-spec resolution ==================================

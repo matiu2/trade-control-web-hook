@@ -14,6 +14,7 @@ mod history;
 mod instruments;
 mod interactive;
 mod news_pattern;
+pub mod oanda_live_profile;
 mod pause_pattern;
 mod prompts;
 pub mod replay_args;

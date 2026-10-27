@@ -61,3 +61,6 @@ pub mod tv;
 pub mod upkeep;
 #[path = "bin/replay_candles/verbose.rs"]
 pub mod verbose;
+
+#[path = "bin/replay_candles/oanda_history.rs"]
+pub mod oanda_history;

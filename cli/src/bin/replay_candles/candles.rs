@@ -37,7 +37,8 @@ pub async fn pull(
     cache_dir: Option<PathBuf>,
     mt5_history: &super::history::SourceHistory<'_>,
 ) -> Result<Vec<EngineCandle>> {
-    if matches!(source, CandleSource::Mt5 | CandleSource::Ctrader) {
+    if matches!(source, CandleSource::Mt5 | CandleSource::Ctrader) || mt5_history.uses_live_oanda()
+    {
         color_eyre::eyre::ensure!(
             cache_dir.is_none(),
             "{source:?} uses its pinned account cache namespace; --cache-dir is unsupported"

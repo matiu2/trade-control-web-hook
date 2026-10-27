@@ -177,6 +177,19 @@ fn catalogue_items(catalogue: &[String], only: Option<&str>) -> Result<Vec<WorkI
     let items = catalogue
         .iter()
         .map(|symbol| {
+            if let Some(live) = instrument_lookup::oanda_live::get(symbol)? {
+                let asset = instrument_lookup::by_id(&live.canonical)?
+                    .ok_or_else(|| eyre!("Missing live canonical {}", live.canonical))?;
+                return Ok(WorkItem {
+                    broker: Broker::Oanda,
+                    symbol: symbol.clone(),
+                    class: live.asset_class,
+                    display_name: live.display_name.clone(),
+                    spread_schedule: asset.spread_schedule.clone(),
+                    spread_schedule_tz: asset.spread_schedule_tz(),
+                    pip_size: live.pip_size,
+                });
+            }
             if let Some(native) = instrument_lookup::by_broker_symbol_instrument(
                 instrument_lookup::Broker::Oanda,
                 symbol,

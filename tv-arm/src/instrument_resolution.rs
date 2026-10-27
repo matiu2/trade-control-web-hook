@@ -129,7 +129,20 @@ pub fn resolve_for_account(
         require_spread_coverage(broker_symbol)?;
     }
 
-    Ok(finish_resolution(asset, il_broker, broker_symbol))
+    let mut resolved = finish_resolution(asset, il_broker, broker_symbol);
+    if broker == ConvBroker::Oanda && account == Some(instrument_lookup::oanda_live::ACCOUNT) {
+        let live = instrument_lookup::oanda_live::require(broker_symbol)?;
+        resolved.asset = instrument_lookup::by_id(&live.canonical)?
+            .ok_or_else(|| eyre!("Missing OANDA live canonical {}", live.canonical))?;
+        resolved.precision = CatalogPrecision {
+            tick_size: live.tick_size,
+            pip_size: live.pip_size,
+            decimal_places: live.decimal_places,
+            class: live.asset_class,
+            contract_multiplier: None,
+        };
+    }
+    Ok(resolved)
 }
 
 /// Assemble the result once both gates (broker listing, spread coverage) have
@@ -304,6 +317,25 @@ fn map_class(class: AssetClass) -> InstrumentType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_live_account_instrument_has_baked_resolution_and_matching_spread_units() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        for live in instrument_lookup::oanda_live::all().unwrap() {
+            let resolved =
+                resolve_for_account(&live.symbol, ConvBroker::Oanda, Some("oanda-live")).unwrap();
+            assert_eq!(resolved.broker_symbol, live.symbol);
+            assert_eq!(resolved.asset.id, live.canonical);
+            assert_eq!(resolved.precision.pip_size, live.pip_size);
+            assert_eq!(resolved.precision.tick_size, live.tick_size);
+        }
+    }
 
     /// Resolve with the coverage gate skipped.
     ///

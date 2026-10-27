@@ -9,7 +9,9 @@
 mod exit;
 mod fx;
 mod oanda;
+mod order;
 mod risk;
+mod spec;
 
 pub use oanda::OANDA_ACCOUNT_ID;
 
