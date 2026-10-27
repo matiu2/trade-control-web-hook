@@ -14,7 +14,10 @@ fn init_tracing() {
         .ok();
 }
 
-fn mock_worker(status: &str, body: &str) -> (JournalClient, std::thread::JoinHandle<String>) {
+pub(super) fn mock_worker(
+    status: &str,
+    body: &str,
+) -> (JournalClient, std::thread::JoinHandle<String>) {
     init_tracing();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
