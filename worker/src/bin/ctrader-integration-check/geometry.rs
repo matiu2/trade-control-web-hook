@@ -49,6 +49,7 @@ pub fn request<'a>(
         },
     };
     Ok(EntryRequest {
+        setup_id: None,
         instrument: &meta.name,
         direction: Direction::Long,
         entry,

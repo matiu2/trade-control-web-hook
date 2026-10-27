@@ -200,6 +200,8 @@ impl std::error::Error for AmendError {}
 /// Inputs for placing an entry order. Borrowed because it is built per-request
 /// from the resolved intent and never outlives the dispatch frame.
 pub struct EntryRequest<'a> {
+    /// Stable completed-setup identity. Required by protected prop accounts.
+    pub setup_id: Option<&'a str>,
     pub instrument: &'a str,
     pub direction: Direction,
     pub entry: ResolvedEntry,

@@ -19,6 +19,7 @@ candle-cache = { version = "0.1.2", path = "../../candle-cache", features = ["ct
 ctrader-data-source = { version = "0.1.0", path = "../../ctrader-data-source" }
 candle-model = { version = "0.1.0", path = "../../candle-model" }
 instrument-lookup = { version = "0.7.0", path = "../../instrument-lookup", default-features = false }
+adaptive-risk = { version = "0.1.0", path = "../adaptive-risk" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

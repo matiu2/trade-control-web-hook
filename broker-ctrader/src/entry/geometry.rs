@@ -67,7 +67,7 @@ pub(crate) fn payload(
     Ok(p)
 }
 
-pub(super) fn price(req: &EntryRequest<'_>, quote: Quote) -> std::result::Result<f64, EntryError> {
+pub(crate) fn price(req: &EntryRequest<'_>, quote: Quote) -> std::result::Result<f64, EntryError> {
     let price = match req.entry {
         ResolvedEntry::Market { .. } => {
             if req.direction == Direction::Long {

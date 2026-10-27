@@ -49,3 +49,6 @@ pub mod trade_plan;
 pub mod tunable;
 
 pub mod ma_cross;
+
+#[cfg(test)]
+mod test_logging;

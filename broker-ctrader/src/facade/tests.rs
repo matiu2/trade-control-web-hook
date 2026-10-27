@@ -67,6 +67,7 @@ async fn explicit_units_do_not_bypass_required_entry_protection_or_risk_data() {
         .await
         .unwrap();
     let request = EntryRequest {
+        setup_id: None,
         instrument: "EURUSD",
         direction: Direction::Long,
         entry: ResolvedEntry::Stop { trigger_price: 1.1 },
@@ -149,6 +150,7 @@ async fn hybrid_market_dry_run_validates_native_eurgbp_without_submission() {
     let scale = 10_f64.powi(symbol.digits as i32);
     let snap = |price: f64| (price * scale).round() / scale;
     let request = EntryRequest {
+        setup_id: None,
         instrument: &symbol.name,
         direction: Direction::Short,
         entry: ResolvedEntry::Market {

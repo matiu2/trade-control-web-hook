@@ -249,6 +249,9 @@ pub(crate) async fn amend(
         } else {
             (2109, "order")
         };
+        if crate::protection::enabled(broker)? {
+            crate::protection::stop_tightens(source, stop)?;
+        }
         let payload = amend_payload(source, is_position, stop)?;
         let response = broker.mutate(kind, payload).await?;
         let actual = &response[field];

@@ -245,3 +245,134 @@ After the default-index registration, both `trade-control-accounts list` and
 `trade-control-staging account names` returned `the5ers-competition`. Both
 worker health endpoints passed. The nine CLI history tests, formatting check
 and strict workspace Clippy check passed for this follow-up.
+
+## cTrader credentials and prop risk in one operation
+
+Run the accounts CLI on the host whose worker reads the local profiles. Database
+selection is independent (`--config`/`--database-url` still choose the account
+index). The command creates local configuration; it does not deploy/restart
+workers, place a trade, or change desktop platform credentials.
+
+Interactive setup now handles the cTrader Open API account ID, hidden OAuth
+credentials, optional FIX credentials and binding, prop policy, instrument costs,
+and initial risk enrollment:
+
+```sh
+trade-control-accounts add my-prop-account --broker ctrader --kind demo \
+  --prop-firm --ctrader-fix
+```
+
+Choose `demo`/`live` to match the actual broker environment; purchasing a prop
+account does not determine that value. `--ctrader-fix` prompts for separate QUOTE
+and TRADE endpoint details/passwords and the exact Open API broker name. This
+configures the existing hybrid backend, currently demo-only. Without that flag,
+Open API credentials can be registered and the existing restriction on
+Open API-only market entries remains. Existing adapter connection/account
+limitations are unchanged; registration does not claim connectivity or execution
+readiness.
+
+Existing FIX-only quote/management profiles can still be registered into another
+account index without OAuth by omitting credential and risk flags. Prop protection
+requires Open API account data.
+
+The Open API uses application client ID/client secret/access token. A normal
+cTrader username/password is not an OAuth access grant. Obtain/authorize the
+application grant first; this command stores it and the existing cTrader API
+validates it when connecting. `--ctrader-reuse <existing-profile>` reuses that
+profile's application/grant for another explicitly selected account ID. The grant
+must authorize that account. New account names must use letters, numbers, dashes
+or underscores. The Open API account ID is distinct from the terminal/FIX login;
+the CLI records the backend's correct metadata identity pin automatically.
+
+Secret values have no argv options. For automation, `--ctrader-secrets-stdin`
+reads one JSON document, up to 64 KiB. Supply it through stdin from a secret
+manager or an owner-only file; never put tokens into shell command arguments:
+
+```sh
+trade-control-accounts add another-account --broker ctrader --kind demo \
+  --ctrader-account-id 123456 --ctrader-secrets-stdin < /private/credentials.json
+```
+
+The JSON fields are `client_id`, `client_secret`, `access_token` and optional
+`fix`. The `fix` object has `quote` and `trade` objects containing `host`, `port`,
+`sender_comp_id`, `target_comp_id`, `sender_sub_id` and `password`, plus a
+`broker_name` string. QUOTE/TRADE sub-IDs must match their session names. The
+supplied endpoint and account identities are validated together. Every generated
+credential/binding file is private (`0600` on Unix); unrelated profiles and TOML
+comments are preserved. Malformed credential input errors withhold secret values.
+
+For repeat purchases, verified program policy and cost files make registration
+repeatable. Replace the example identity/balance below with actual values:
+
+```sh
+trade-control-accounts add my-next-prop --broker ctrader --kind demo \
+  --ctrader-account-id 123456 --ctrader-reuse existing-app-profile \
+  --prop-firm --initial-balance 10000 --new-flat-account \
+  --risk-policy-file /path/verified-program-risk.toml \
+  --risk-costs-file /path/verified-instrument-costs.toml \
+  --rules-verified --fees-verified
+```
+
+The policy file is a standalone `adaptive-risk::RiskPolicy` TOML (the contents of
+an account's `.risk` table). The costs file maps native instrument names to
+`opening_per_unit`, `closing_per_unit`, `future_swap_per_unit`,
+`fixed_per_order` and `overlapping`, in account currency per broker unit.
+Alternatively repeat `--risk-cost SYMBOL:OPEN:CLOSE:FUTURE_SWAP[:FIXED]`.
+Cost estimates and commission conventions are explicit; zero means verified zero.
+The command does not infer a firm's rulebook, estimate fees from the signup price,
+or query authenticated broker state during registration.
+
+Individual flags override the policy file. The main ones are `--risk-base-pct`,
+`--daily-loss-limit-pct`, `--internal-daily-stop-pct`, `--max-account-loss-pct`,
+`--internal-account-stop-pct`, `--daily-reset`, `--risk-timezone`,
+`--drawdown-reference`, `--daily-reference`, `--streak-levels`,
+`--drawdown-levels`, `--slippage-buffer-pct-of-risk` and `--max-data-age-seconds`.
+For example streak tiers are `0:1,1:0.75,2:0.5,3:0.25,4:0.1`; drawdown tiers
+are `0:1,2.5:0.5,3.5:0.25,4.5:0.1,5:0`. Disabling a backoff is explicit through
+`--no-streak-backoff` or `--no-drawdown-backoff`; the other loss budgets remain.
+Without a policy file, firm limits and reference formulas must be supplied
+explicitly or entered interactively; the generic 3%/6% example limits are not
+silently treated as purchased-program terms.
+
+`--new-flat-account` attests that the account is unused/flat and its firm day-start
+references equal its verified initial balance. Otherwise provide
+`--day-start-balance` and `--day-start-equity`. `--history-from` overrides the
+initial enrollment timestamp and must not be in the future. Initial enrollment
+starts with reconciliation required; runtime broker checks must succeed before
+any entry. Existing risk state is never reenrolled or reset by this command.
+
+For equity-based daily references or trailing-equity peaks, set
+`--firm-evidence-file /absolute/path/to/authoritative-report.json`. The CLI records
+the path, not an invented report. An account-specific authoritative producer is
+still needed, including coverage of unobserved intervals with open risk. Missing
+or stale evidence blocks entries. See the [risk guide](adaptive-risk/README.md).
+
+The CLI writes the named OAuth profile, optional FIX profiles/binding, enabled
+risk policy, durable initial state and sticky physical-account activation record,
+then registers metadata. File updates are serialized and staged. Risk state is
+locked throughout enrollment. Ordinary credential-file/metadata errors roll back
+non-prop additions; if a prop metadata insert fails, protection/configuration is
+retained because the database outcome could be ambiguous. Inspect `get`/`risk`,
+then retry `add` without risk flags to reuse those files/state. Never delete state
+or activation records to retry. PostgreSQL and local files are not a distributed
+crash-atomic transaction; interrupted registrations fail closed and require
+inspection.
+
+List/get output now shows prop risk parameters; `list --json` includes the
+non-secret `prop_risk` profile. The local risk command also shows the persisted
+streak, locks, day reference and reservation count, without requiring a database:
+
+```sh
+trade-control-accounts risk my-prop-account
+trade-control-accounts credentials my-prop-account
+trade-control-accounts credentials my-prop-account --ctrader-secrets-stdin \
+  < /private/replacement-credentials.json
+```
+
+Credential rotation preserves metadata caps, risk references, outcomes, streaks
+and reservations. An enrolled policy/physical identity cannot be replaced through
+credential rotation or another `add --prop-firm`; that requires explicit
+migration. Register a different physical account under a new name. Removing a
+metadata row does not remove its credentials or sticky risk protection. To add
+the same already-configured account to another database, omit risk/credential
+flags so its existing profile and risk state are reused.

@@ -1,7 +1,7 @@
 //! Operator actions for a plan and the account picker used by the journal.
 
 use color_eyre::eyre::{Result, eyre};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanAction {
@@ -34,7 +34,7 @@ impl PlanAction {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AccountChoice {
     pub name: String,
     pub broker: String,
@@ -43,7 +43,7 @@ pub struct AccountChoice {
     pub capabilities: Option<AccountCapabilities>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AccountCapabilities {
     pub quotes: bool,
     pub execution: bool,
@@ -122,6 +122,22 @@ impl AccountPicker {
 pub struct ActionConfirmation {
     pub trade_id: String,
     pub action: PlanAction,
+}
+
+/// Read account metadata using the same local configuration as the terminal journal.
+/// Credentials are never included in this projection.
+pub fn load_accounts() -> Result<Vec<AccountChoice>> {
+    let output = std::process::Command::new("trade-control-accounts")
+        .args(["list", "--json"])
+        .output()
+        .map_err(|error| eyre!("launch trade-control-accounts: {error}"))?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "account list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_accounts(std::str::from_utf8(&output.stdout)?)
 }
 
 #[cfg(test)]

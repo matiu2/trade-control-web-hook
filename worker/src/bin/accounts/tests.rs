@@ -142,7 +142,7 @@ async fn rotation_rejects_unknown_foreign_and_live_accounts_before_prompting() {
     assert!(!path.exists());
 }
 
-struct FailingStore;
+pub(super) struct FailingStore;
 impl MetadataStore for FailingStore {
     async fn get(&self, name: &str) -> std::result::Result<AccountMetadata, MetadataError> {
         Err(MetadataError::NotFound(name.into()))
@@ -189,6 +189,8 @@ async fn non_mt5_add_rejects_mt5_options_without_writing_metadata() {
         oanda_account_id: None,
         max_risk_pct: None,
         max_open_positions: None,
+        ctrader: ctrader::Options::default(),
+        risk: risk::Options::default(),
         mt5: mt5::Options {
             login: Some(42),
             ..mt5::Options::default()
@@ -196,4 +198,60 @@ async fn non_mt5_add_rejects_mt5_options_without_writing_metadata() {
     };
     assert!(add(&store, args).await.is_err());
     assert!(store.list().await.unwrap().is_empty());
+}
+
+#[test]
+fn parses_ctrader_identity_and_prop_backoff_without_argv_secrets() {
+    init();
+    let cli = Cli::try_parse_from([
+        "trade-control-accounts",
+        "add",
+        "prop-one",
+        "--broker",
+        "ctrader",
+        "--kind",
+        "demo",
+        "--ctrader-account-id",
+        "123",
+        "--ctrader-secrets-stdin",
+        "--prop-firm",
+        "--initial-balance",
+        "10000",
+        "--new-flat-account",
+        "--daily-loss-limit-pct",
+        "3",
+        "--max-account-loss-pct",
+        "6",
+        "--daily-reference",
+        "balance",
+        "--drawdown-reference",
+        "static-initial-balance",
+        "--risk-base-pct",
+        "0.5",
+        "--daily-reset",
+        "17:00",
+        "--risk-timezone",
+        "America/New_York",
+        "--rules-verified",
+        "--fees-verified",
+        "--risk-cost",
+        "EURUSD:0.00004:0.00004:0.00010",
+    ])
+    .unwrap();
+    let Command::Add(args) = cli.command else {
+        panic!("expected add")
+    };
+    assert_eq!(args.ctrader.account_id, Some(123));
+    assert!(args.risk.prop_firm);
+    assert_eq!(args.risk.base_risk_pct.unwrap().to_string(), "0.5");
+    assert!(
+        Cli::try_parse_from([
+            "trade-control-accounts",
+            "credentials",
+            "prop-one",
+            "--ctrader-client-secret",
+            "SECRET"
+        ])
+        .is_err()
+    );
 }

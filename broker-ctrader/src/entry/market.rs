@@ -43,6 +43,7 @@ pub(super) trait Transport: Send {
 pub(super) struct Api<'a, F> {
     pub broker: &'a OpenApiBroker,
     pub audit: &'a mut F,
+    pub submission: &'a mut SubmissionEvidence,
 }
 impl<F> Transport for Api<'_, F>
 where
@@ -56,7 +57,14 @@ where
         kind: u32,
         payload: Value,
     ) -> std::result::Result<Value, ctrader_api::RequestError> {
-        self.broker.mutate(kind, payload).await
+        if kind == 2106 {
+            self.submission.attempted = true;
+        }
+        let result = self.broker.mutate(kind, payload).await;
+        if kind == 2106 {
+            self.submission.observe(&result);
+        }
+        result
     }
     fn note(&mut self, phase: &str, evidence: &Value) -> Result<()> {
         (self.audit)(phase, evidence)

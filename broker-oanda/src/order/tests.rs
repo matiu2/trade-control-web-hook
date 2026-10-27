@@ -42,6 +42,7 @@ fn real_orders_preserve_fractional_units_price_precision_and_protective_stops() 
     ] {
         for direction in [Direction::Long, Direction::Short] {
             let request = EntryRequest {
+                setup_id: None,
                 instrument: "BTC_USD",
                 direction,
                 entry: entry.clone(),

@@ -1267,6 +1267,7 @@ mod tests {
 
     fn resolved(direction: Direction, entry: ResolvedEntry, sl: f64, tp: f64) -> Resolved {
         Resolved {
+            setup_id: "test-setup".into(),
             id: "r".into(),
             not_after: Utc.with_ymd_and_hms(2026, 6, 30, 0, 0, 0).unwrap(),
             instrument: "NZD_CHF".into(),

@@ -5,6 +5,9 @@
 //! path must come from trusted server configuration, never browser input.
 
 #[cfg(test)]
+mod admin_tests;
+mod administration;
+#[cfg(test)]
 mod deletion_tests;
 mod evidence;
 #[cfg(test)]

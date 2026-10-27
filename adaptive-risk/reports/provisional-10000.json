@@ -1,0 +1,341 @@
+{
+  "confidence_level": 0.95,
+  "policy": {
+    "base_risk_pct": "1",
+    "calendar": {
+      "reset_time": "17:00:00",
+      "timezone": "America/New_York"
+    },
+    "daily_loss_limit_pct": "3",
+    "daily_reference": "balance",
+    "drawdown_backoff": {
+      "enabled": true,
+      "levels": [
+        [
+          "0",
+          "1"
+        ],
+        [
+          "2.5",
+          "0.50"
+        ],
+        [
+          "3.5",
+          "0.25"
+        ],
+        [
+          "4.5",
+          "0.10"
+        ],
+        [
+          "5",
+          "0"
+        ]
+      ]
+    },
+    "drawdown_reference": "static_initial_balance",
+    "execution": {
+      "max_data_age_seconds": 5,
+      "overlap_multiplier": "1",
+      "slippage_buffer_pct_of_risk": "20"
+    },
+    "internal_account_stop_pct": "5",
+    "internal_daily_stop_pct": "2",
+    "max_account_loss_pct": "6",
+    "safety_buffer_pct": "0.25",
+    "streak_backoff": {
+      "enabled": true,
+      "levels": [
+        [
+          0,
+          "1"
+        ],
+        [
+          1,
+          "0.75"
+        ],
+        [
+          2,
+          "0.50"
+        ],
+        [
+          3,
+          "0.25"
+        ],
+        [
+          4,
+          "0.10"
+        ]
+      ],
+      "reset_on_break_even": false,
+      "reset_on_win": true
+    },
+    "trailing_allowance_tracks_reference": false,
+    "version": "1"
+  },
+  "results": [
+    {
+      "account_limit_breaches": {
+        "lower": 0.0016018423419763706,
+        "mean": 0.0026,
+        "upper": 0.003598157658023629
+      },
+      "average_reserved_risk_pct": {
+        "lower": 0.9999999960000392,
+        "mean": 0.99999999600004,
+        "upper": 0.9999999960000407
+      },
+      "average_risk_pct": {
+        "lower": 0.8333333299999008,
+        "mean": 0.8333333299999027,
+        "upper": 0.8333333299999046
+      },
+      "daily_firm_limit_breaches": {
+        "lower": 0.0,
+        "mean": 0.0,
+        "upper": 0.0
+      },
+      "daily_lockouts": {
+        "lower": 0.0,
+        "mean": 0.0,
+        "upper": 0.0
+      },
+      "dataset": "synthetic_provisional",
+      "funding_probability": {
+        "lower": 0.996192960451946,
+        "mean": 0.9974,
+        "upper": 0.9982250239351717
+      },
+      "longest_losing_streak": {
+        "lower": 2.5630530603368182,
+        "mean": 2.5935,
+        "upper": 2.623946939663182
+      },
+      "max_drawdown_pct": {
+        "lower": 2.0956583354955125,
+        "mean": 2.121596678209444,
+        "upper": 2.1475350209233754
+      },
+      "net_return_pct": {
+        "lower": 10.694135061945687,
+        "mean": 10.714296623810284,
+        "upper": 10.734458185674882
+      },
+      "seed": 42,
+      "simulations": 10000,
+      "skipped_trades": {
+        "lower": 0.0,
+        "mean": 0.0,
+        "upper": 0.0
+      },
+      "strategy": "Fixed",
+      "trades_to_target": {
+        "lower": 15.59127115329769,
+        "mean": 15.735211550030078,
+        "upper": 15.879151946762466
+      }
+    },
+    {
+      "account_limit_breaches": {
+        "lower": 0.00006181834780985183,
+        "mean": 0.0005,
+        "upper": 0.0009381816521901482
+      },
+      "average_reserved_risk_pct": {
+        "lower": 0.857038550247343,
+        "mean": 0.8584917142991948,
+        "upper": 0.8599448783510466
+      },
+      "average_risk_pct": {
+        "lower": 0.7141987918727836,
+        "mean": 0.7154097619159935,
+        "upper": 0.7166207319592034
+      },
+      "daily_firm_limit_breaches": {
+        "lower": 0.0,
+        "mean": 0.0,
+        "upper": 0.0
+      },
+      "daily_lockouts": {
+        "lower": 0.0,
+        "mean": 0.0,
+        "upper": 0.0
+      },
+      "dataset": "synthetic_provisional",
+      "funding_probability": {
+        "lower": 0.9988299568100467,
+        "mean": 0.9995,
+        "upper": 0.9997864147246645
+      },
+      "longest_losing_streak": {
+        "lower": 2.7195739106856887,
+        "mean": 2.7514,
+        "upper": 2.783226089314311
+      },
+      "max_drawdown_pct": {
+        "lower": 1.8226232021621553,
+        "mean": 1.8420633034381113,
+        "upper": 1.8615034047140673
+      },
+      "net_return_pct": {
+        "lower": 10.78555927110838,
+        "mean": 10.798101163697021,
+        "upper": 10.810643056285663
+      },
+      "seed": 42,
+      "simulations": 10000,
+      "skipped_trades": {
+        "lower": 0.0,
+        "mean": 0.0,
+        "upper": 0.0
+      },
+      "strategy": "StreakOnly",
+      "trades_to_target": {
+        "lower": 18.962920163310418,
+        "mean": 19.158179089544774,
+        "upper": 19.35343801577913
+      }
+    },
+    {
+      "account_limit_breaches": {
+        "lower": 0.0,
+        "mean": 0.0,
+        "upper": 0.0
+      },
+      "average_reserved_risk_pct": {
+        "lower": 0.9929329594596197,
+        "mean": 0.9936225747170881,
+        "upper": 0.9943121899745566
+      },
+      "average_risk_pct": {
+        "lower": 0.8274441328828945,
+        "mean": 0.8280188122641182,
+        "upper": 0.8285934916453419
+      },
+      "daily_firm_limit_breaches": {
+        "lower": 0.0,
+        "mean": 0.0,
+        "upper": 0.0
+      },
+      "daily_lockouts": {
+        "lower": 0.0,
+        "mean": 0.0,
+        "upper": 0.0
+      },
+      "dataset": "synthetic_provisional",
+      "funding_probability": {
+        "lower": 0.9996159875222334,
+        "mean": 1.0,
+        "upper": 0.9999999999999999
+      },
+      "longest_losing_streak": {
+        "lower": 2.565914382039223,
+        "mean": 2.5965,
+        "upper": 2.6270856179607764
+      },
+      "max_drawdown_pct": {
+        "lower": 2.077551647061196,
+        "mean": 2.102534182593439,
+        "upper": 2.127516718125682
+      },
+      "net_return_pct": {
+        "lower": 10.747415085731362,
+        "mean": 10.757829789068877,
+        "upper": 10.768244492406392
+      },
+      "seed": 42,
+      "simulations": 10000,
+      "skipped_trades": {
+        "lower": 0.0,
+        "mean": 0.0,
+        "upper": 0.0
+      },
+      "strategy": "DrawdownOnly",
+      "trades_to_target": {
+        "lower": 15.863781469245858,
+        "mean": 16.0209,
+        "upper": 16.178018530754144
+      }
+    },
+    {
+      "account_limit_breaches": {
+        "lower": 0.0,
+        "mean": 0.0,
+        "upper": 0.0
+      },
+      "average_reserved_risk_pct": {
+        "lower": 0.8559938549466225,
+        "mean": 0.8574823782212989,
+        "upper": 0.8589709014959753
+      },
+      "average_risk_pct": {
+        "lower": 0.7133282124555157,
+        "mean": 0.7145686485177462,
+        "upper": 0.7158090845799766
+      },
+      "daily_firm_limit_breaches": {
+        "lower": 0.0,
+        "mean": 0.0,
+        "upper": 0.0
+      },
+      "daily_lockouts": {
+        "lower": 0.0,
+        "mean": 0.0,
+        "upper": 0.0
+      },
+      "dataset": "synthetic_provisional",
+      "funding_probability": {
+        "lower": 0.9996159875222334,
+        "mean": 1.0,
+        "upper": 0.9999999999999999
+      },
+      "longest_losing_streak": {
+        "lower": 2.720157630223062,
+        "mean": 2.752,
+        "upper": 2.7838423697769374
+      },
+      "max_drawdown_pct": {
+        "lower": 1.8173504872548596,
+        "mean": 1.8364450095903408,
+        "upper": 1.855539531925822
+      },
+      "net_return_pct": {
+        "lower": 10.796621793743725,
+        "mean": 10.806688538091217,
+        "upper": 10.81675528243871
+      },
+      "seed": 42,
+      "simulations": 10000,
+      "skipped_trades": {
+        "lower": 0.0,
+        "mean": 0.0,
+        "upper": 0.0
+      },
+      "strategy": "Combined",
+      "trades_to_target": {
+        "lower": 19.03749577715421,
+        "mean": 19.2361,
+        "upper": 19.43470422284579
+      }
+    }
+  ],
+  "sampler": "provisional_binary",
+  "simulation_config": {
+    "average_loser_r": "-1",
+    "average_winner_r": "2.13",
+    "block_size": 5,
+    "initial_balance": "10000",
+    "seed": 42,
+    "simulations": 10000,
+    "start": "2026-01-05T22:00:00Z",
+    "target_pct": "10",
+    "trades": 200,
+    "trades_per_day": [
+      1,
+      2,
+      3
+    ],
+    "win_probability": "0.58"
+  },
+  "timestamp_model": "configured_trades_per_day"
+}

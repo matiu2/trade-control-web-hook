@@ -27,6 +27,7 @@ use trade_control_core::broker::*;
 use trade_control_core::settlement::Settlement;
 
 mod open_api;
+pub mod protection;
 use open_api::OpenApiBroker;
 mod facade;
 mod fix;

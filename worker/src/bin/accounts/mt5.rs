@@ -2,8 +2,7 @@
 
 #[path = "mt5/document.rs"]
 mod document;
-#[path = "mt5/files.rs"]
-mod files;
+use crate::files;
 #[path = "mt5/options.rs"]
 mod options;
 

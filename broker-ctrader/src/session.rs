@@ -9,6 +9,9 @@ use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
 
 pub(crate) struct Shared {
     pub client: Client,
+    risk_revision: std::sync::atomic::AtomicU64,
+    risk_healthy: std::sync::atomic::AtomicBool,
+    pub(crate) risk_monitor_started: std::sync::atomic::AtomicBool,
     config: Config,
     candles: OnceCell<Arc<candle_cache::ctrader::CachedFeed>>,
     quotes: RwLock<HashMap<i64, Book>>,
@@ -36,7 +39,7 @@ pub(crate) async fn acquire(config: Config) -> Result<Arc<Shared>> {
     let mut slots = SESSIONS.get_or_init(|| Mutex::new(Vec::new())).lock().await;
     if let Some(slot) = slots
         .iter()
-        .find(|slot| same(&slot.config, &config) && !slot.session.client.is_closed())
+        .find(|slot| same(&slot.config, &config) && slot.session.risk_healthy())
     {
         return Ok(slot.session.clone());
     }
@@ -56,6 +59,9 @@ pub(crate) async fn acquire(config: Config) -> Result<Arc<Shared>> {
     let mut events = client.events();
     let shared = Arc::new(Shared {
         client,
+        risk_revision: std::sync::atomic::AtomicU64::new(0),
+        risk_healthy: std::sync::atomic::AtomicBool::new(true),
+        risk_monitor_started: std::sync::atomic::AtomicBool::new(false),
         config: config.clone(),
         candles: OnceCell::new(),
         quotes: RwLock::new(HashMap::new()),
@@ -72,11 +78,19 @@ pub(crate) async fn acquire(config: Config) -> Result<Arc<Shared>> {
             let event = match event {
                 Ok(event) => event,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    shared
+                        .risk_healthy
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
                     shared.quotes.write().await.clear();
                     continue;
                 }
                 Err(_) => break,
             };
+            if matches!(event.payload_type, 2107 | 2123 | 2126 | 2132) {
+                shared
+                    .risk_revision
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             if event.payload_type != 2131
                 || wire::integer(&event.payload, "ctidTraderAccountId").ok()
                     != Some(shared.client.account_id())
@@ -113,6 +127,39 @@ pub(crate) async fn acquire(config: Config) -> Result<Arc<Shared>> {
     Ok(shared)
 }
 impl Shared {
+    pub(crate) fn risk_revision(&self) -> u64 {
+        self.risk_revision.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub(crate) fn risk_healthy(&self) -> bool {
+        self.risk_healthy.load(std::sync::atomic::Ordering::SeqCst) && !self.client.is_closed()
+    }
+    pub(crate) async fn risk_quote(&self, symbol: i64, age: i64) -> Result<(Quote, DateTime<Utc>)> {
+        self.quote(symbol).await?;
+        let books = self.quotes.read().await;
+        let book = books
+            .get(&symbol)
+            .ok_or_else(|| eyre!("risk quote missing"))?;
+        let (bid, ask) = book
+            .bid
+            .zip(book.ask)
+            .ok_or_else(|| eyre!("paired risk quote missing"))?;
+        let timestamp = DateTime::from_timestamp_millis(bid.2.min(ask.2))
+            .ok_or_else(|| eyre!("invalid risk quote timestamp"))?;
+        ensure!(
+            crate::protection::quote_fresh(Utc::now(), timestamp, age)
+                && bid.1.elapsed().as_secs_f64() <= age as f64
+                && ask.1.elapsed().as_secs_f64() <= age as f64,
+            "risk quote stale"
+        );
+        Ok((
+            Quote {
+                bid: bid.0,
+                ask: ask.0,
+            },
+            timestamp,
+        ))
+    }
+
     pub async fn candles(&self) -> Result<Arc<candle_cache::ctrader::CachedFeed>> {
         Ok(self
             .candles

@@ -400,5 +400,7 @@ should accept either and normalise internally.
       backlog size, time span, and actual evaluated range (terminal vetoes stop early).
 - [x] All 1,675 core/engine/cron tests pass; clippy with warnings as errors,
       formatting and both independent reviews pass.
+- [x] Backport to main: all 1,622 applicable tests, clippy, formatting and
+      both integration reviews pass; preserve main's persistence failure paths.
 - [x] Merge onto current staging: all 1,685 applicable tests, clippy, formatting
       and both integration reviews pass.
