@@ -1910,6 +1910,13 @@ mod tests {
 
     #[tokio::test]
     async fn single_shot_open_position_is_tracked_without_a_retry_attempt() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
         let mut candles: Vec<_> = (0..10)
             .map(|h| {
                 ohlc_at(
