@@ -45,6 +45,8 @@ pub struct ArmOutcome {
     pub executions: Vec<ArmExecution>,
     pub report: String,
     pub positions: Option<Value>,
+    pub open_positions: Option<Value>,
+    pub position_warnings: Vec<String>,
     pub replaced_trade_ids: Vec<String>,
 }
 
@@ -62,6 +64,8 @@ pub struct ArmExecution {
     pub replay_outcome: Option<Value>,
     pub report: Option<String>,
     pub positions: Option<Value>,
+    pub open_positions: Option<Value>,
+    pub position_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

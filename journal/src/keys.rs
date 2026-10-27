@@ -332,6 +332,8 @@ mod tests {
 
     fn app_with_one_plan() -> App {
         App::from_rows(vec![PlanRow {
+            positions: Vec::new(),
+            position_sync: Vec::new(),
             trade_id: "hs-eur-usd-1".into(),
             account: "demo".into(),
             instrument: "EUR_USD".into(),

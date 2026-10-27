@@ -154,6 +154,11 @@ fn first_parenthesised(line: &str) -> Option<String> {
     let open = line.find('(')?;
     let rest = &line[open + 1..];
     let close = rest.find(')')?;
+    // A real rule group precedes its description. Parenthesised price and
+    // backstop annotations in fill/blocked lines carry no rule identity.
+    if !rest[close + 1..].trim_start().starts_with('—') {
+        return None;
+    }
     Some(rest[..close].to_string())
 }
 

@@ -200,6 +200,8 @@ mod tests {
 
     fn app_with(screenshot_url: Option<&str>) -> App {
         let row = PlanRow {
+            positions: Vec::new(),
+            position_sync: Vec::new(),
             trade_id: "t-1".into(),
             account: "demo".into(),
             instrument: "EUR_USD".into(),

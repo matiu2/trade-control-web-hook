@@ -387,15 +387,22 @@ fn record_completed_replay(
 ) -> Result<()> {
     let positions =
         serde_json::to_value(result.positions).wrap_err("serialize replay positions")?;
+    let open_positions =
+        serde_json::to_value(result.open_positions).wrap_err("serialize replay open positions")?;
+    let position_warnings = result.position_warnings;
     let replay_outcome =
         serde_json::to_value(result.outcome).wrap_err("serialize replay outcome")?;
     execution.update(|outcome| {
         outcome.report.push_str(&result.report);
         outcome.positions = Some(positions.clone());
+        outcome.open_positions = Some(open_positions.clone());
+        outcome.position_warnings = position_warnings.clone();
         if let Some(last) = outcome.executions.last_mut() {
             last.report = Some(result.report);
             last.positions = Some(positions);
             last.replay_outcome = Some(replay_outcome);
+            last.open_positions = Some(open_positions);
+            last.position_warnings = position_warnings;
         }
     })?;
     if !result.success {
@@ -511,6 +518,8 @@ mod tests {
             .unwrap();
         let result = trade_control_cli::replay_driver::ReplayResult {
             report: "Measured trade: -1.00R".into(),
+            open_positions: Vec::new(),
+            position_warnings: vec!["position history unavailable".into()],
             positions: serde_json::from_value(serde_json::json!({
                 "version": 1, "instrument": "EUR_USD", "granularity": "1h", "broker": "oanda", "positions": [],
             })).unwrap(),
@@ -525,6 +534,16 @@ mod tests {
             .update(|outcome| {
                 assert_eq!(outcome.report, "Measured trade: -1.00R");
                 assert!(outcome.positions.is_some());
+                assert_eq!(outcome.open_positions, Some(serde_json::json!([])));
+                assert_eq!(
+                    outcome.position_warnings,
+                    vec!["position history unavailable"]
+                );
+                assert_eq!(
+                    outcome.executions[0].position_warnings,
+                    outcome.position_warnings
+                );
+                assert_eq!(outcome.executions[0].open_positions, outcome.open_positions);
                 assert_eq!(
                     outcome.executions[0].report.as_deref(),
                     Some("Measured trade: -1.00R")

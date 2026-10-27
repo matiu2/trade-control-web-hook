@@ -8,6 +8,9 @@
 mod deletion_tests;
 mod evidence;
 #[cfg(test)]
+mod position_tests;
+mod structured;
+#[cfg(test)]
 mod tests;
 
 use std::path::Path;
@@ -26,6 +29,7 @@ use trade_control_core::sig::{KEY_LEN, parse_key_hex};
 
 use crate::plan::{PlanRow, parse_plan_list};
 pub use evidence::{RecordedTimeline, ReplayComparison, StoredPlan, compare_timeline_with_replay};
+pub use structured::compare_timeline_with_replay_result;
 
 /// A native worker journal client. Private signing material is never serialized or
 /// included in `Debug` output; clones reuse the bounded HTTP connection pool.

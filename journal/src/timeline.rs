@@ -9,6 +9,7 @@
 use chrono::{DateTime, FixedOffset, Utc};
 use serde::Serialize;
 use serde_json::Value;
+mod entry_evidence;
 
 /// One line in the rendered timeline.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -354,15 +355,7 @@ fn compact_outcome(outcome: &str) -> String {
 /// record supplies the timestamp.
 pub fn derive_entry_ts(json: &str) -> Option<String> {
     let v: Value = serde_json::from_str(json).ok()?;
-    let records = v.get("records")?.as_array()?;
-    for rec in records {
-        let outcome = rec.get("outcome").and_then(|x| x.as_str()).unwrap_or("");
-        if outcome.starts_with("entered") {
-            let ts = rec.get("ts").and_then(|x| x.as_str()).unwrap_or("");
-            return Some(ts_to_bne(ts));
-        }
-    }
-    None
+    entry_evidence::entry_ts(&v)
 }
 
 /// Derive the final outcome for the info bar: the last non-trivial record
@@ -390,30 +383,16 @@ pub fn derive_outcome(json: &str) -> (String, bool) {
             false,
         );
     }
-    let mut result: Option<(String, bool)> = None;
-    if let Some(records) = v.get("records").and_then(|r| r.as_array()) {
-        for rec in records {
-            let outcome = rec.get("outcome").and_then(|x| x.as_str()).unwrap_or("");
-            // Skip the big dump outcomes (register/plan-show) — they start with a
-            // YAML sequence or `ok`.
-            if outcome == "ok" || outcome.starts_with("- ") || outcome.contains('\n') {
-                continue;
-            }
-            if outcome.is_empty() {
-                continue;
-            }
-            // `placed` (a resting stop/limit accepted onto the broker's book)
-            // is a SUCCESS as much as `entered` (a fill) — the fire did what it
-            // set out to do. Only the *fill* question is different, and that is
-            // `derive_entry_ts`'s job, not this one's. Omitting `placed` here
-            // would paint every good resting-order placement red.
-            let ok = outcome.starts_with("entered")
-                || outcome.starts_with("placed")
-                || outcome.starts_with("closed");
-            result = Some((outcome.to_string(), ok));
+    entry_evidence::last_dispatch(&v).unwrap_or_else(|| {
+        if entry_evidence::entry_ts(&v).is_some() {
+            (
+                "entry confirmed; current position status requires broker observations".into(),
+                true,
+            )
+        } else {
+            ("no dispatch recorded".into(), false)
         }
-    }
-    result.unwrap_or_else(|| ("no dispatch recorded".to_string(), false))
+    })
 }
 
 #[cfg(test)]
@@ -823,12 +802,10 @@ mod tests {
     }
 
     #[test]
-    fn outcome_falls_back_without_dispatch() {
-        // The AUD/CAD fixture has only register + plan-show records (dumps), so
-        // no clean dispatch verdict — expect the fallback.
+    fn outcome_reads_tick_dispatch_when_inbound_records_are_only_dumps() {
         let (text, ok) = derive_outcome(TIMELINE);
         assert!(!ok);
-        assert_eq!(text, "no dispatch recorded");
+        assert_eq!(text, "news-window-closed");
     }
 
     /// THE INCIDENT, in journal's own terms: `reconcile` wrote a `CronNote`

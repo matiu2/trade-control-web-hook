@@ -1862,6 +1862,28 @@ mod tests {
             matches!(early, AttemptState::OpenPosition { .. }),
             "filled on bar 1, not yet stopped → open, got {early:?}"
         );
+        let mut links = vec![trade_control_core::position_tracking::PositionLink {
+            account: None,
+            trade_id: "live-replay-parity".into(),
+            instrument: "EUR/USD".into(),
+            direction: Direction::Short,
+            broker_order_id: "o1".into(),
+            broker_position_id: None,
+        }];
+        let tracked = trade_control_core::position_tracking::observe(
+            &b,
+            "",
+            &mut links,
+            Utc.timestamp_opt(3600, 0).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tracked.positions.len(), 1);
+        assert_eq!(tracked.positions[0].link.trade_id, "live-replay-parity");
+        assert!(
+            tracked.positions[0].snapshot.unrealized_pl.is_none(),
+            "replay must not invent account-currency money"
+        );
 
         // As-of bar 2: SL hit → closed.
         b.set_as_of(Utc.timestamp_opt(7200, 0).unwrap());
@@ -1870,6 +1892,15 @@ mod tests {
             matches!(late, AttemptState::ClosedLossOrBreakeven { .. }),
             "SL hit by bar 2 → closed, got {late:?}"
         );
+        let tracked = trade_control_core::position_tracking::observe(
+            &b,
+            "",
+            &mut links,
+            Utc.timestamp_opt(7200, 0).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(tracked.positions.is_empty());
     }
 
     // --- bug ③: place_entry enforces the caps the real broker enforces ---
