@@ -6,6 +6,8 @@ use color_eyre::{
 };
 use std::path::{Path, PathBuf};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+#[path = "finish-ctrader/runtime.rs"]
+mod runtime;
 #[path = "finish-ctrader/source.rs"]
 mod source;
 #[path = "finish-ctrader/status.rs"]
@@ -187,16 +189,12 @@ fn verify_full_universe(
         "verifying-full-catalogue",
         "verify report identity and every currently supported FX pair before baking",
     )?;
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(async {
-            let report = report_lock.read_resume().await?.ok_or_else(|| {
-                color_eyre::eyre::eyre!("completed calibration report is unavailable")
-            })?;
-            spread_baseline_gen::ctrader::generate::verify_full_universe(&args.account, &report)
-                .await
-        })
+    runtime::build()?.block_on(async {
+        let report = report_lock.read_resume().await?.ok_or_else(|| {
+            color_eyre::eyre::eyre!("completed calibration report is unavailable")
+        })?;
+        spread_baseline_gen::ctrader::generate::verify_full_universe(&args.account, &report).await
+    })
 }
 fn require_staging(workspace: &Path) -> Result<()> {
     source::require_staging(&source::output(workspace, &["branch", "--show-current"])?)

@@ -7,6 +7,9 @@ use color_eyre::{
 use spread_baseline_gen::ctrader::{self, checkpoint::Destination};
 use std::path::{Path, PathBuf};
 
+#[path = "../finish-ctrader/runtime.rs"]
+mod runtime;
+
 struct Pinned {
     workspace: source::Source,
     cache: source::Source,
@@ -56,9 +59,7 @@ pub fn finish(args: &Args, status: &status::Status) -> Result<()> {
     if args.deploy_staging {
         require_staging(&args.workspace)?;
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let runtime = runtime::build()?;
     // Recovery never invokes the generator or baker, and holds the report lock throughout gates.
     let _report_lock = if args.verify_baked {
         verify_baked(args, &pinned, status, &runtime)?
