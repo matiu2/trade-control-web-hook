@@ -41,6 +41,8 @@ mod tests {
             to_utc: "2026-10-01T00:00:00Z".parse().unwrap(),
             requested_symbols: vec!["EURUSD".into()],
             complete: false,
+            quarantine_policy: None,
+            quarantine_audit: None,
             excluded: vec![],
             instruments: vec![],
             failures: vec![],

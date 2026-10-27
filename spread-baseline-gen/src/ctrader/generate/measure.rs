@@ -18,6 +18,7 @@ pub(super) async fn measure(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     window_hours: u32,
+    mut audit: Option<&mut crate::ctrader::quarantine::audit::Audit>,
 ) -> Result<InstrumentReport> {
     let asset = super::super::calibration::asset(symbol, true)?;
     let metadata = super::super::calibration::metadata(data, symbol, true).await?;
@@ -41,16 +42,31 @@ pub(super) async fn measure(
     let mut cursor = from;
     while cursor < to {
         let end = (cursor + Duration::hours(i64::from(window_hours))).min(to);
-        let chunk = feed
-            .range_bid_ask(
+        let fetch = |from: DateTime<Utc>, to: DateTime<Utc>| async move {
+            feed.range_bid_ask(
                 symbol,
-                cursor.fixed_offset(),
-                end.fixed_offset(),
+                from.fixed_offset(),
+                to.fixed_offset(),
                 Granularity::OneMinute,
             )
             .await
-            .wrap_err_with(|| format!("paired cTrader {symbol} [{cursor},{end})"))?;
-        candles.extend(chunk.candles);
+            .map(|chunk| chunk.candles)
+            .wrap_err_with(|| format!("paired cTrader {symbol} [{from},{to})"))
+        };
+        let chunk = if let Some(audit) = audit.as_deref_mut() {
+            crate::ctrader::quarantine::collect::collect(
+                cursor,
+                end,
+                symbol,
+                metadata.id,
+                audit,
+                fetch,
+            )
+            .await?
+        } else {
+            fetch(cursor, end).await?
+        };
+        candles.extend(chunk);
         cursor = end;
         tracing::info!(symbol,through=%cursor,minutes=candles.len(),"paired calibration window cached");
     }
@@ -64,6 +80,10 @@ pub(super) async fn measure(
     .wrap_err("cTrader paired spread calculation")?;
     Ok(InstrumentReport {
         symbol_id: metadata.id,
+        quarantined_minutes: audit
+            .map(|a| a.minutes(symbol, metadata.id))
+            .transpose()?
+            .unwrap_or_default(),
         measurement,
     })
 }

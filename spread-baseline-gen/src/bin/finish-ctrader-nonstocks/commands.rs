@@ -12,6 +12,13 @@ pub fn generate(args: &Args, binary: &Path, resume: bool) -> Step {
         "--window-hours".into(),
         args.window_hours.to_string(),
     ];
+    if args.quarantine_crossed_minutes {
+        flags.extend([
+            "--quarantine-crossed-minutes".into(),
+            "--max-quarantined-minutes".into(),
+            args.max_quarantined_minutes.to_string(),
+        ]);
+    }
     if resume {
         flags.extend(["--resume".into(), args.report.to_string_lossy().into()]);
     } else {
@@ -90,6 +97,22 @@ mod tests {
         let bake = bake(&a, Path::new("bake-ctrader"), Path::new("ctrader.rs"));
         assert!(bake.args.contains(&"--merge".into()));
         assert!(!bake.args.contains(&"--allow-partial".into()));
+    }
+    #[test]
+    fn explicit_quality_policy_is_forwarded_for_fresh_and_resume() {
+        crate::test_logging();
+        let mut a = super::super::args::tests::args();
+        a.quarantine_crossed_minutes = true;
+        a.max_quarantined_minutes = 2;
+        for resume in [false, true] {
+            let command = generate(&a, Path::new("generate-ctrader"), resume);
+            let parsed = spread_baseline_gen::ctrader::generate::Args::try_parse_from(
+                std::iter::once("generate-ctrader".to_string()).chain(command.args),
+            )
+            .unwrap();
+            assert!(parsed.quarantine_crossed_minutes);
+            assert_eq!(parsed.max_quarantined_minutes, 2);
+        }
     }
     #[test]
     fn failed_step_stops_following_commands() {

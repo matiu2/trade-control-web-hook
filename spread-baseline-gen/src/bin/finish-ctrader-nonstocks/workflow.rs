@@ -18,7 +18,7 @@ struct Pinned {
 }
 impl Pinned {
     fn capture(args: &Args, status: &status::Status) -> Result<Self> {
-        let artifacts = [args.report.clone(), args.status.clone()];
+        let artifacts = artifacts(args);
         let cache_path = args.workspace.join("../candle-cache").canonicalize()?;
         let workspace = source::Source::pin(&args.workspace, false, &artifacts)?;
         let cache = source::Source::pin(&cache_path, true, &artifacts)?;
@@ -170,6 +170,14 @@ async fn preflight_report(args: &Args, identity: &ctrader::Identity) -> Result<b
     Ok(resume)
 }
 
+fn artifacts(args: &Args) -> Vec<PathBuf> {
+    let mut paths = vec![args.report.clone(), args.status.clone()];
+    if args.quarantine_crossed_minutes {
+        paths.push(args.report.with_extension("quarantine.json"));
+    }
+    paths
+}
+
 fn require_staging(workspace: &Path) -> Result<()> {
     source::require_staging(&source::output(workspace, &["branch", "--show-current"])?)
 }
@@ -224,5 +232,59 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read_to_string(&args.report).unwrap(), original);
+    }
+    #[test]
+    fn report_audit_and_lock_do_not_invalidate_the_requested_source_pin() {
+        crate::test_logging();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "// fixture").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+        )
+        .unwrap();
+        source::output(root, &["init", "--quiet"]).unwrap();
+        assert!(
+            std::process::Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        source::output(root, &["add", "--", "."]).unwrap();
+        source::output(
+            root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        )
+        .unwrap();
+        let mut args = super::super::args::tests::args();
+        args.report = root.join("r.json");
+        args.status = root.join("s.json");
+        args.quarantine_crossed_minutes = true;
+        let pinned = source::Source::pin(root, false, &artifacts(&args)).unwrap();
+        let audit = args.report.with_extension("quarantine.json");
+        for path in [
+            args.report.clone(),
+            args.status.clone(),
+            audit.clone(),
+            audit.with_extension("json.lock"),
+        ] {
+            std::fs::write(path, "generated artifact").unwrap();
+            pinned.verify(false).unwrap();
+        }
+        std::fs::write(root.join("unrelated.json"), "real build input").unwrap();
+        assert!(pinned.verify(false).is_err());
     }
 }

@@ -26,6 +26,12 @@ pub struct Args {
     /// Missing mappings/schedules are retained as explicit exclusions in the report.
     #[arg(long, conflicts_with_all = ["only", "resume"])]
     pub all_instruments: bool,
+    /// Exclude and durably audit at most five crossed whole M1 minutes per instrument.
+    /// Runtime feeds remain strict; every other historical-data failure stays fatal.
+    #[arg(long)]
+    pub quarantine_crossed_minutes: bool,
+    #[arg(long, default_value_t=5, value_parser=clap::value_parser!(u32).range(1..=5), requires="quarantine_crossed_minutes")]
+    pub max_quarantined_minutes: u32,
     #[arg(long)]
     pub out: PathBuf,
     /// Preserve complete symbols and use cached windows to resume interrupted symbols.
@@ -34,6 +40,16 @@ pub struct Args {
     /// Authenticate and list the intended sampling workload without fetching historical ticks.
     #[arg(long)]
     pub plan: bool,
+}
+
+impl Args {
+    pub(super) fn quarantine_policy(
+        &self,
+    ) -> color_eyre::Result<Option<crate::ctrader::quarantine::Policy>> {
+        self.quarantine_crossed_minutes
+            .then(|| crate::ctrader::quarantine::Policy::new(self.max_quarantined_minutes))
+            .transpose()
+    }
 }
 
 #[cfg(test)]
@@ -61,6 +77,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn quarantine_is_explicit_and_hard_bounded() {
+        crate::ctrader::test_logging();
+        let base = [
+            "generate-ctrader",
+            "--account",
+            "demo",
+            "--out",
+            "/tmp/report.json",
+        ];
+        assert!(
+            Args::try_parse_from(base)
+                .unwrap()
+                .quarantine_policy()
+                .unwrap()
+                .is_none()
+        );
+        let args =
+            Args::try_parse_from(base.into_iter().chain(["--quarantine-crossed-minutes"])).unwrap();
+        assert_eq!(
+            args.quarantine_policy()
+                .unwrap()
+                .unwrap()
+                .max_minutes_per_instrument,
+            5
+        );
+        for tail in [
+            vec!["--max-quarantined-minutes", "1"],
+            vec![
+                "--quarantine-crossed-minutes",
+                "--max-quarantined-minutes",
+                "0",
+            ],
+            vec![
+                "--quarantine-crossed-minutes",
+                "--max-quarantined-minutes",
+                "6",
+            ],
+        ] {
+            assert!(Args::try_parse_from(base.into_iter().chain(tail)).is_err());
+        }
+    }
     #[test]
     fn default_is_all_supported_fx_with_ninety_days_and_dry_plan_available() {
         crate::ctrader::test_logging();
