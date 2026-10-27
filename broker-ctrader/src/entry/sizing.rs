@@ -1,4 +1,5 @@
 use super::*;
+mod conversion;
 mod risk;
 
 pub(super) struct SizedEntry {
@@ -28,45 +29,6 @@ pub(crate) fn volume(
     }
     Ok(volume)
 }
-async fn conversion(
-    broker: &OpenApiBroker,
-    from: i64,
-    to: i64,
-) -> std::result::Result<f64, EntryError> {
-    if from == to {
-        return Ok(1.0);
-    }
-    let symbols = metadata::symbols(broker)
-        .await
-        .map_err(|e| reject(format!("conversion symbol lookup: {e}")))?;
-    let pairs: Vec<_> = symbols
-        .iter()
-        .filter(|s| {
-            let b = integer(s, "baseAssetId").ok();
-            let q = integer(s, "quoteAssetId").ok();
-            (b == Some(from) && q == Some(to)) || (b == Some(to) && q == Some(from))
-        })
-        .collect();
-    if pairs.len() != 1 {
-        return Err(EntryError::CurrencyConversion {
-            from: from.to_string(),
-            to: to.to_string(),
-            detail: "no unique direct conversion pair; cross conversion unsupported".into(),
-        });
-    }
-    let pair = pairs[0];
-    let name = pair["symbolName"]
-        .as_str()
-        .ok_or_else(|| reject("conversion symbol name missing"))?;
-    let quote = metadata::quote(broker, name)
-        .await
-        .map_err(|e| reject(format!("conversion quote unavailable: {e}")))?;
-    Ok(if integer(pair, "baseAssetId").ok() == Some(from) {
-        quote.ask
-    } else {
-        1.0 / quote.bid
-    })
-}
 pub(super) async fn size(
     broker: &OpenApiBroker,
     req: &EntryRequest<'_>,
@@ -81,7 +43,7 @@ pub(super) async fn size(
     } else {
         distance
     };
-    let rate = conversion(
+    let rate = conversion::rate(
         broker,
         symbol.quote_asset,
         integer(trader, "depositAssetId").map_err(|_| EntryError::AccountFetch)?,
