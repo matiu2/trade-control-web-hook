@@ -28,6 +28,11 @@ pub struct Args {
     pub to: DateTime<Utc>,
     #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u32).range(1..=24))]
     pub window_hours: u32,
+    /// Explicit bounded whole-minute quality exclusions, forwarded to the generator.
+    #[arg(long)]
+    pub quarantine_crossed_minutes: bool,
+    #[arg(long, default_value_t=5, value_parser=clap::value_parser!(u32).range(1..=5), requires="quarantine_crossed_minutes")]
+    pub max_quarantined_minutes: u32,
     #[arg(long)]
     pub deploy_staging: bool,
     /// Recover after a successful merge: verify identical baked rows and rerun gates only.

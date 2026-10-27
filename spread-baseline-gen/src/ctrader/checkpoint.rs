@@ -46,6 +46,7 @@ pub fn validate(report: &Report, identity: &Identity, symbols: &[String]) -> Res
             && failed.is_disjoint(&measured),
         "checkpoint profiles are duplicated or unexpected"
     );
+    super::quarantine::validate_report(report, false)?;
     Ok(())
 }
 pub fn remaining(report: &Report) -> Vec<String> {
@@ -87,6 +88,8 @@ mod tests {
             to_utc: "2026-10-01T00:00:00Z".parse().unwrap(),
             requested_symbols: vec!["EURUSD".into()],
             complete: false,
+            quarantine_policy: None,
+            quarantine_audit: None,
             excluded: vec![],
             instruments: vec![],
             failures: vec![],

@@ -93,6 +93,14 @@ pub fn table(args: &Args, identity: &Identity, info: &TableInfo) -> Result<()> {
 
 pub fn report(args: &Args, identity: &Identity, report: &Report, finished: bool) -> Result<()> {
     ctrader::checkpoint::validate(report, identity, &args.only)?;
+    let policy = args
+        .quarantine_crossed_minutes
+        .then(|| ctrader::quarantine::Policy::new(args.max_quarantined_minutes))
+        .transpose()?;
+    ensure!(
+        report.quarantine_policy == policy,
+        "completion must explicitly retain the report's crossed-minute quarantine policy"
+    );
     ensure!(
         report.from_utc == args.from && report.to_utc == args.to,
         "existing report sampling window differs from explicit completion bounds"

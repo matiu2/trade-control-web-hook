@@ -8,6 +8,7 @@ pub mod calibration;
 pub mod checkpoint;
 pub mod generate;
 pub mod output;
+pub mod quarantine;
 
 /// Non-secret, broker-verified account identity. CLI and FIX credentials cannot substitute.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +55,10 @@ pub struct Report {
     pub to_utc: DateTime<Utc>,
     pub requested_symbols: Vec<String>,
     pub complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine_policy: Option<quarantine::Policy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine_audit: Option<quarantine::AuditEvidence>,
     /// Catalogue instruments intentionally outside the supported FX universe.
     #[serde(default)]
     pub excluded: Vec<crate::mt5::Failure>,
@@ -63,6 +68,8 @@ pub struct Report {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InstrumentReport {
     pub symbol_id: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarantined_minutes: Vec<quarantine::Minute>,
     #[serde(flatten)]
     pub measurement: crate::mt5::InstrumentReport,
 }
