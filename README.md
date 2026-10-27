@@ -429,7 +429,17 @@ The day-to-day loop, end to end:
      runs **in parallel** with the TV alerts until proven on demo; the
      `*/15` cadence stays for now. A plan's first tick *seeds*
      its watermark without firing, so conditions already true at register
-     don't back-fire. Both strategy families are now evaluated
+     don't back-fire. Failed candle reads leave the watermark unchanged; the
+     next successful evaluation processes every returned closed candle after it,
+     oldest first, through the normal entry, control and protection rules. A
+     catch-up with two or more bars records an `engine-catchup`
+     warning in the journal after state persistence, showing backlog size,
+     oldest candle's open time and age, and the actual evaluated range. Journal
+     recording is best-effort; the warning is also emitted to tracing. A terminal veto stops
+     the batch early; the warning does not imply successful broker dispatch.
+     Pre-registration breaches are not retroactive vetoes (EURGBP
+     `hs-eurgbp-67943809`: 18:00/19:00 Brisbane closes exceeded 0.8395, but
+     registration occurred at 23:21). Both strategy families are now evaluated
      server-side: **M/W** fires the enter heartbeat every closed bar
      (`run_enter` owns the live neckline geometry), and **H&S** fires its
      `PinePattern` enter from the Rust port of the `candle-signals-v2.pine`
