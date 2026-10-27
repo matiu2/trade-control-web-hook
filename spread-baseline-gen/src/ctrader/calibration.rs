@@ -10,7 +10,11 @@ use instrument_lookup::{Asset, AssetClass};
 /// Keep legacy FX discovery; explicit selection uses the audited native non-stock catalogue.
 pub fn asset(symbol: &str, explicit: bool) -> Result<&'static Asset> {
     let asset = if explicit {
-        broker_ctrader::catalogue::replay_asset(symbol)?
+        if broker_ctrader::catalogue::stock_symbols()?.contains(&symbol) {
+            broker_ctrader::catalogue::stock_asset(symbol)?
+        } else {
+            broker_ctrader::catalogue::replay_asset(symbol)?
+        }
     } else {
         catalog_asset(symbol)?
     };
@@ -20,6 +24,10 @@ pub fn asset(symbol: &str, explicit: bool) -> Result<&'static Asset> {
 
 /// Broad discovery is the non-stock rollout; explicit symbols remain deliberate.
 pub fn discovery_asset(symbol: &str, all_instruments: bool) -> Result<&'static Asset> {
+    ensure!(
+        !broker_ctrader::catalogue::stock_symbols()?.contains(&symbol),
+        "stock calibration requires explicit --stocks selection"
+    );
     let legacy = instrument_lookup::resolve(symbol)?;
     ensure!(
         !all_instruments || legacy.is_none_or(|asset| asset.class != AssetClass::Stock),
@@ -56,6 +64,10 @@ pub async fn metadata(
     symbol: &str,
     explicit: bool,
 ) -> Result<InstrumentMetadata> {
+    if broker_ctrader::catalogue::stock_symbols()?.contains(&symbol) {
+        ensure!(explicit, "stock calibration requires explicit selection");
+        return data.verified_stock_metadata(symbol).await;
+    }
     let asset = asset(symbol, explicit)?;
     let metadata = if asset.class == AssetClass::Forex {
         data.forex_instrument_metadata(symbol).await?
@@ -129,6 +141,22 @@ mod tests {
     }
 
     #[test]
+    fn exact_stocks_use_native_metadata_and_utc_without_global_aliases() {
+        crate::ctrader::test_logging();
+        for name in broker_ctrader::catalogue::stock_symbols().unwrap() {
+            let stock = asset(name, true).unwrap();
+            assert_eq!(stock.id, name);
+            assert_eq!(stock.class, AssetClass::Stock);
+            assert_eq!(timezone(stock).unwrap(), chrono_tz::UTC);
+            assert!(asset(name, false).is_err());
+            assert!(discovery_asset(name, true).is_err());
+        }
+        let aia = asset("AIA", true).unwrap();
+        assert_eq!(aia.news_currencies, ["HKD"]);
+        assert!(aia.description.contains("AIA GROUP"));
+    }
+
+    #[test]
     fn absent_or_unknown_schedule_is_not_guessed_from_the_asset_class() {
         crate::ctrader::test_logging();
         let mut sample = catalog_asset("EURUSD").unwrap().clone();
@@ -165,8 +193,8 @@ mod tests {
         }
         assert_eq!(asset("NOKJPY", true).unwrap().pip_size, 0.0001);
         assert!(asset("NOKJPY", false).is_err());
-        assert!(asset("AMP", true).is_err());
-        assert!(asset("APA", true).is_err());
+        assert!(asset("AMP", true).is_ok());
+        assert!(asset("APA", true).is_ok());
     }
 
     #[test]

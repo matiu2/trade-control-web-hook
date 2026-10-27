@@ -1,4 +1,4 @@
-//! Durable missing-only non-stock calibration completion; never submits broker orders.
+//! Durable missing-only native calibration completion; never submits broker orders.
 use clap::Parser;
 use color_eyre::{Result, eyre::Context};
 use std::path::{Path, PathBuf};

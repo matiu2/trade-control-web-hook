@@ -26,6 +26,10 @@ pub struct Args {
     /// Missing mappings/schedules are retained as explicit exclusions in the report.
     #[arg(long, conflicts_with_all = ["only", "resume"])]
     pub all_instruments: bool,
+    /// Discover the audited demo account's exact native stock/ETF catalogue.
+    /// With --only, sample an explicit stock subset; this never enables stock orders.
+    #[arg(long, conflicts_with_all = ["all_instruments", "resume"])]
+    pub stocks: bool,
     #[arg(long)]
     pub out: PathBuf,
     /// Preserve complete symbols and use cached windows to resume interrupted symbols.
@@ -59,6 +63,33 @@ mod tests {
         ] {
             assert!(Args::try_parse_from(base.into_iter().chain(tail)).is_err());
         }
+    }
+
+    #[test]
+    fn stock_discovery_is_explicit_and_preserves_exact_native_names() {
+        crate::ctrader::test_logging();
+        let base = [
+            "generate-ctrader",
+            "--account",
+            "ctrader-demo",
+            "--out",
+            "stocks.json",
+        ];
+        let args = Args::try_parse_from(base.into_iter().chain([
+            "--stocks",
+            "--only",
+            "AIA",
+            "--only",
+            "REDES ENERGETICAS NACIONAIS",
+        ]))
+        .unwrap();
+        assert!(args.stocks);
+        assert_eq!(args.only, ["AIA", "REDES ENERGETICAS NACIONAIS"]);
+        assert!(
+            Args::try_parse_from(base.into_iter().chain(["--stocks", "--all-instruments"]))
+                .is_err()
+        );
+        assert!(!Args::try_parse_from(base).unwrap().stocks);
     }
 
     #[test]

@@ -1,13 +1,20 @@
-//! Audited non-stock underlyings for native cTrader price/R replay.
+//! Audited native cTrader underlying metadata for read-only price/R replay.
 //!
 //! This is an underlying lookup, not an order-sizing model or a replacement
 //! for the caller's live account/symbol identity and precision validation.
+//! Non-stock lookups retain their existing behavior. Stocks have a separate
+//! demo-account audit and require fresh verification before history/replay use.
 use color_eyre::{Result, eyre::eyre};
 use instrument_lookup::Asset;
 use std::{collections::BTreeMap, sync::LazyLock};
 
 mod build;
 mod facts;
+mod stocks;
+pub use stocks::{
+    NativeStockMetadata, StockAssetIdentity, StockCategory, StockClass, StockMetadata,
+    StockWeeklyInterval, stock_asset, stock_metadata, stock_symbols, verify_stock_metadata,
+};
 
 static ASSETS: LazyLock<Result<BTreeMap<String, Asset>>> = LazyLock::new(|| {
     let snapshot = facts::snapshot()?;
@@ -41,5 +48,7 @@ pub fn non_stock_symbols() -> Result<Vec<&'static str>> {
     Ok(assets()?.keys().map(String::as_str).collect())
 }
 
+#[cfg(test)]
+mod stock_tests;
 #[cfg(test)]
 mod tests;

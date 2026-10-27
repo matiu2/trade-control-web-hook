@@ -18,6 +18,11 @@ async fn fresh_data(args: &Args) -> Result<(Identity, ChartData)> {
     let data = ChartData::connect_profile(&args.account, profile).await?;
     let identity = ctrader::generate::identity(&args.account, &data).await?;
     catalogue(&data.catalogue().await?, &args.only)?;
+    if args.stocks {
+        for symbol in &args.only {
+            data.verified_stock_metadata(symbol).await?;
+        }
+    }
     Ok((identity, data))
 }
 

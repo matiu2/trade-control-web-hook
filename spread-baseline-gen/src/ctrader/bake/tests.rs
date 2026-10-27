@@ -294,3 +294,45 @@ fn gold_cross_uses_native_identity_without_a_class_specific_exemption() {
     assert!(verify_broker_metadata(&r.instruments[0], 22312, "XAU_EUR", 0.01).is_err());
     assert!(verify_broker_metadata(&r.instruments[0], 22312, "XAUEUR", 0.1).is_err());
 }
+
+#[test]
+fn stock_bake_retains_all_exact_native_names_and_short_session_quality_rules() {
+    crate::ctrader::test_logging();
+    let mut r = report();
+    r.identity.profile = "ctrader-demo".into();
+    r.identity.account_id = 49247794;
+    r.identity.broker = "Spotware".into();
+    r.identity.login = 5944473;
+    let template = r.instruments[0].clone();
+    r.instruments = broker_ctrader::catalogue::stock_symbols()
+        .unwrap()
+        .into_iter()
+        .map(|symbol| {
+            let native = broker_ctrader::catalogue::stock_metadata(symbol).unwrap();
+            let mut row = template.clone();
+            row.symbol_id = native.id;
+            row.measurement.symbol = symbol.into();
+            row.measurement.pip_size = 10_f64.powi(-native.pip_position);
+            row.measurement.schedule = "utc".into();
+            row.measurement.timezone = "UTC".into();
+            row.measurement.profile.review = ReviewStatus::MaskNotComputable;
+            row
+        })
+        .collect();
+    r.requested_symbols = r
+        .instruments
+        .iter()
+        .map(|row| row.measurement.symbol.clone())
+        .collect();
+    let output = render(&r, &r.identity).unwrap();
+    let info = super::super::output::table_info(&output).unwrap();
+    assert_eq!(info.keys.len(), 350);
+    for symbol in &r.requested_symbols {
+        assert!(
+            info.keys
+                .contains(&format!("ctrader:ctrader-demo:{symbol}"))
+        );
+    }
+    r.instruments[0].measurement.profile.n_bars = MIN_INSTRUMENT_BARS - 1;
+    assert!(render(&r, &r.identity).is_err());
+}

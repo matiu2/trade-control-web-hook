@@ -32,7 +32,15 @@ pub async fn run(args: Args) -> Result<()> {
         .as_ref()
         .map(|r| r.requested_symbols.as_slice())
         .unwrap_or(&args.only);
-    let (requested, excluded) = universe::select(&data, only, args.all_instruments).await?;
+    let native_stocks = broker_ctrader::catalogue::stock_symbols()?;
+    let stocks = args.stocks
+        || previous.as_ref().is_some_and(|report| {
+            report
+                .requested_symbols
+                .iter()
+                .any(|name| native_stocks.contains(&name.as_str()))
+        });
+    let (requested, excluded) = universe::select(&data, only, args.all_instruments, stocks).await?;
     let end = closed_minute(args.to.unwrap_or_else(Utc::now));
     let start = args
         .from

@@ -32,10 +32,12 @@ target/release/bake-ctrader --account ctrader-demo \
 ```
 
 `--only EURUSD,AUDUSD` restricts a fresh run to exact native broker names.
-Explicit selection uses the 93 audited native non-stock mappings in
-`broker_ctrader::catalogue`, each with a verified spread schedule. Stocks, ETFs
-and unverified aliases are refused, even if a generic catalogue recognises the
-name. This does not enable broker order sizing or live trading.
+Without `--stocks`, explicit selection uses the 93 audited native non-stock
+mappings in `broker_ctrader::catalogue`, each with a verified spread schedule.
+`--stocks` selects the separate audited 350 stock/ETF catalogue for `ctrader-demo`;
+combine it with repeated `--only 'EXACT NATIVE NAME'` for a subset. Unverified
+aliases are refused, even if a generic catalogue recognises the name. These
+read-only selections do not enable broker order sizing or live trading.
 `--all-instruments` explicitly discovers enabled, recognized **non-stock**
 markets for this rollout. Stocks, missing mappings and missing/unknown schedule
 timezones remain explicit exclusions; no class-derived calendar is guessed.
@@ -171,8 +173,8 @@ target/release/finish-ctrader-nonstocks --account ctrader-demo \
 
 Select exact native names from the current audited inventory and subtract the
 latest table's account-qualified keys **after any ongoing bake finishes**. Quote
-`--only` values containing spaces. The runner accepts only audited non-stock
-names and explicit closed-minute bounds of 90–366 days. Before collection, it
+`--only` values containing spaces. The runner accepts audited non-stock names by default, or audited stock/ETF
+names with `--stocks`, and explicit closed-minute bounds of 90–366 days. Before collection, it
 reauthenticates the demo account and verifies selected symbols are enabled and
 unambiguous, the existing table has the same identity and exact UTC window, and
 every selected key is missing. Existing reports must match that identity, subset
@@ -204,3 +206,39 @@ metadata, then reruns the release/deployment gates under source and table guards
 It never invokes collection or baking, and accepts neither mixed present/missing
 coverage nor an incomplete, stale or different report. Ordinary missing-only
 mode continues to refuse already measured keys.
+
+
+## Native stock and ETF collection
+
+Stock history uses the exact demo broker name and ID, including spaces and
+punctuation. Fresh native light/full symbol, asset, category and asset-class reads
+must match the account-scoped audit before collection and again before baking.
+This prevents aliases such as `AIA` from being mapped to a different company's
+prices or currency. Native precision and pip units are retained. Close-only
+instruments may supply history; no stock order permission or sizing is added.
+
+```sh
+# Inspect all 350 audited native stocks/ETFs, without downloading history.
+target/release/generate-ctrader --account ctrader-demo --stocks \
+  --out spread-baseline-gen/validation/ctrader-demo-stocks-90d-report.json --plan
+
+# A fresh stock subset using the existing table's fixed 90-day bounds.
+target/release/generate-ctrader --account ctrader-demo --stocks --only AIA \
+  --only 'REDES ENERGETICAS NACIONAIS' \
+  --from 2026-07-24T16:26:00Z --to 2026-10-22T16:26:00Z \
+  --out spread-baseline-gen/validation/ctrader-demo-stock-subset-90d-report.json
+```
+
+Omit `--only` with `--stocks` for all 350. Resume with the original report and
+`--resume`, without `--stocks`; the report's exact native list determines stock
+scope. Stock and non-stock symbols cannot be mixed. The durable missing-only
+runner keeps its historical `finish-ctrader-nonstocks` name and accepts `--stocks`
+with an explicit missing stock list, forwarding stock selection to the generator
+and retaining strict additive baking and all release gates.
+
+All stock observations pass through the same paired candle-cache path. The
+broker explicitly declares UTC sessions; `utc` is the spread learning clock,
+not an inferred exchange timezone or historical holiday calendar. Current weekly
+sessions do not filter historical candles. Sparse daily sessions retain the
+existing minimum observation and hour-bucket thresholds; a measured baseline
+with `MaskNotComputable` remains eligible, while insufficient history fails.

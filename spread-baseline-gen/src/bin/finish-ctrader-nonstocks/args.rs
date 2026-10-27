@@ -6,7 +6,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 #[derive(Parser)]
 #[command(
-    about = "Complete an explicit missing-only cTrader DEMO non-stock calibration; strict additive bake, release gates, optional staging deployment; no Git writes"
+    about = "Complete an explicit missing-only cTrader DEMO calibration (non-stocks, or --stocks); strict additive bake, release gates, optional staging deployment; no Git writes"
 )]
 pub struct Args {
     #[arg(long)]
@@ -19,6 +19,9 @@ pub struct Args {
     pub workspace: PathBuf,
     #[arg(long, value_delimiter = ',', required = true)]
     pub only: Vec<String>,
+    /// Select the separately audited native demo stock/ETF catalogue, read-only.
+    #[arg(long)]
+    pub stocks: bool,
     #[arg(long)]
     pub from: DateTime<Utc>,
     #[arg(long)]
@@ -39,12 +42,16 @@ impl Args {
             .iter()
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
-        let audited = broker_ctrader::catalogue::non_stock_symbols()?;
+        let audited = if self.stocks {
+            broker_ctrader::catalogue::stock_symbols()?
+        } else {
+            broker_ctrader::catalogue::non_stock_symbols()?
+        };
         ensure!(
             !names.is_empty()
                 && names.len() == self.only.len()
                 && names.iter().all(|name| audited.contains(name)),
-            "--only must contain unique exact audited native non-stock symbols"
+            "--only must contain unique exact audited native symbols matching the selected stock/non-stock scope"
         );
         ensure!(
             self.to <= Utc::now()
@@ -86,6 +93,22 @@ pub(super) mod tests {
         ])
         .unwrap()
     }
+    #[test]
+    fn stock_scope_is_explicit_native_only_and_rejects_mixed_batches() {
+        crate::test_logging();
+        let mut a = args();
+        a.only = vec![
+            "AIA".into(),
+            "AMP".into(),
+            "REDES ENERGETICAS NACIONAIS".into(),
+        ];
+        assert!(a.validate().is_err());
+        a.stocks = true;
+        a.validate().unwrap();
+        a.only.push("EURUSD".into());
+        assert!(a.validate().is_err());
+    }
+
     #[test]
     fn explicit_scope_has_no_stocks_aliases_duplicates_or_rolling_bounds() {
         crate::test_logging();

@@ -79,7 +79,7 @@ pub fn finish(args: &Args, status: &status::Status) -> Result<()> {
         commands::execute(&step, &args.workspace, status)?;
     }
     pinned.verify(&baked)?;
-    status.write("complete", &format!("strict non-stock row verification and release gates passed; {} symbols; verify_baked={}; workspace HEAD={}, SHA256={}; candle-cache HEAD={}, SHA256={}; staging_deployed={}; no Git writes", args.only.len(), args.verify_baked, pinned.workspace.head(), pinned.workspace.digest(), pinned.cache.head(), pinned.cache.digest(), args.deploy_staging))
+    status.write("complete", &format!("strict native row verification and release gates passed; {} symbols; verify_baked={}; workspace HEAD={}, SHA256={}; candle-cache HEAD={}, SHA256={}; staging_deployed={}; no Git writes", args.only.len(), args.verify_baked, pinned.workspace.head(), pinned.workspace.digest(), pinned.cache.head(), pinned.cache.digest(), args.deploy_staging))
 }
 
 fn collect(
@@ -111,7 +111,7 @@ fn collect(
     )?;
     // Hold the writer lock throughout verification, merge and release gates.
     let report_lock = Destination::acquire(&args.report, Some(&args.report))?;
-    status.write("verifying-complete-nonstocks", "reauthenticate selected native catalogue and require every requested profile to pass strict complete/quality gates")?;
+    status.write("verifying-complete-native", "reauthenticate selected native catalogue and require every requested profile to pass strict complete/quality gates")?;
     runtime.block_on(async {
         let fresh = scope::fresh(args).await?;
         ensure!(
@@ -145,7 +145,7 @@ fn verify_baked(
         "--verify-baked requires the existing complete batch report"
     );
     let report_lock = Destination::acquire(&args.report, Some(&args.report))?;
-    status.write("verifying-baked-nonstocks", "reauthenticate demo identity/native metadata, require complete exact-scope report and literal baked row equality; collection and baking are skipped")?;
+    status.write("verifying-baked-native", "reauthenticate demo identity/native metadata, require complete exact-scope report and literal baked row equality; collection and baking are skipped")?;
     runtime.block_on(async {
         let report = report_lock
             .read_resume()
