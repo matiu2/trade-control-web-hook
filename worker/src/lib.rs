@@ -3,6 +3,7 @@
 //! (`PgStateStore`); Phase 1 adds the account metadata store, runtime config,
 //! the axum HTTP receiver, and the tokio scheduler. See `MIGRATION-VM-POSTGRES.md`.
 
+pub mod account_reads;
 mod broker_factory;
 mod config;
 mod dispatch_config_native;

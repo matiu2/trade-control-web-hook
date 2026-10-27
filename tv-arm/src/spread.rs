@@ -132,7 +132,7 @@ fn validated_spread(broker: Broker, bid: f64, ask: f64) -> Result<f64> {
     spread_from_bid_ask(bid, ask)
 }
 
-fn spread_from_bid_ask(bid: f64, ask: f64) -> Result<f64> {
+pub(crate) fn spread_from_bid_ask(bid: f64, ask: f64) -> Result<f64> {
     if !bid.is_finite() || !ask.is_finite() {
         return Err(eyre!(
             "broker returned a non-finite quote: bid={bid}, ask={ask}"

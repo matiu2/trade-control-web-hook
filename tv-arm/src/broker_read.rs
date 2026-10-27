@@ -16,6 +16,7 @@
 use color_eyre::eyre::{Context, Result};
 use trade_control_conventions::Broker;
 
+use crate::args::Args;
 use crate::resolve_error::ResolveError;
 
 /// Read the live broker spread (in pips) on the shared CLI runtime so pooled
@@ -24,11 +25,15 @@ use crate::resolve_error::ResolveError;
 /// degenerate spread) surfaces as a `Fatal` resolve error carrying the
 /// actionable message from `spread::read_spread_pips`.
 pub fn read_spread_blocking(
+    args: &Args,
     broker: Broker,
     instrument: &str,
     pip_size: f64,
     account: &str,
 ) -> std::result::Result<f64, ResolveError> {
+    if broker == Broker::Oanda {
+        return read_oanda_spread(args, instrument, pip_size, account).map_err(ResolveError::Fatal);
+    }
     trade_control_cli::blocking::run_blocking(crate::spread::read_spread_pips(
         broker,
         instrument,
@@ -41,7 +46,23 @@ pub fn read_spread_blocking(
 /// Blocking live **mid** read — the pullback prep's arm-time anchor. Same
 /// runtime-bridge shape as [`read_spread_blocking`]; hard-errors on a
 /// stale/degenerate quote so a bad anchor can't silently mis-fire the pullback.
-pub fn read_mid_blocking(broker: Broker, instrument: &str, account: &str) -> Result<f64> {
+pub fn read_mid_blocking(
+    broker: Broker,
+    instrument: &str,
+    account: &str,
+    key: &[u8; trade_control_core::sig::KEY_LEN],
+    execution: Option<&crate::api::Execution>,
+) -> Result<f64> {
+    if broker == Broker::Oanda {
+        let client = crate::account_reads::AccountReads::new(
+            crate::register_post::worker_url(execution),
+            key,
+        )?;
+        let (bid, ask) =
+            trade_control_cli::blocking::run_blocking(client.quote(account, instrument))?;
+        crate::spread::spread_from_bid_ask(bid, ask)?;
+        return Ok((bid + ask) / 2.0);
+    }
     trade_control_cli::blocking::run_blocking(crate::spread::read_mid(
         broker,
         instrument,
@@ -49,3 +70,26 @@ pub fn read_mid_blocking(broker: Broker, instrument: &str, account: &str) -> Res
     ))
     .context("reading live broker mid")
 }
+
+fn read_oanda_spread(args: &Args, instrument: &str, pip_size: f64, account: &str) -> Result<f64> {
+    if !pip_size.is_finite() || pip_size <= 0.0 {
+        return Err(color_eyre::eyre::eyre!(
+            "pip_size must be finite and positive; got {pip_size}"
+        ));
+    }
+    let (bid, ask) = read_oanda_quote(args, instrument, account)?;
+    Ok(crate::spread::spread_from_bid_ask(bid, ask)? / pip_size)
+}
+
+fn read_oanda_quote(args: &Args, instrument: &str, account: &str) -> Result<(f64, f64)> {
+    let key = crate::pipeline::read_key(args)?;
+    let client = crate::account_reads::AccountReads::new(
+        crate::register_post::worker_url(args.execution.as_ref()),
+        &key,
+    )?;
+    trade_control_cli::blocking::run_blocking(client.quote(account, instrument))
+        .context("Read selected OANDA account quote from worker")
+}
+
+#[cfg(test)]
+mod tests;

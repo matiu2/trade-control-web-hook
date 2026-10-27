@@ -200,6 +200,8 @@ pub(crate) fn register_trade_plan(
                 kind_to_broker(broker),
                 &built_trade.instrument,
                 &built_trade.spec.account,
+                key,
+                execution,
             )
             .wrap_err("read live mid for --pull-back anchor")?;
             Some(crate::trade_plan_build::PullbackArm {

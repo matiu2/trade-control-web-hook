@@ -23,6 +23,12 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 /// URL (see the per-env deploy scripts).
 const BAKED_WEBHOOK: &str = env!("BAKED_WEBHOOK");
 
+pub(crate) fn worker_url(execution: Option<&crate::api::Execution>) -> &str {
+    execution
+        .map(|execution| execution.context.worker_url.as_str())
+        .unwrap_or(BAKED_WEBHOOK)
+}
+
 /// Direct entries also authenticate, validate candles and preview broker sizing.
 /// The MT5 dry run took 41 seconds; keep waiting for its result without retrying.
 const POST_TIMEOUT: Duration = Duration::from_secs(120);

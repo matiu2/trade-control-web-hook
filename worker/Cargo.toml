@@ -55,7 +55,9 @@ ctrader-fix = { version = "0.1.0", path = "../../ctrader-fix" }
 rpassword = "7.5.4"
 tempfile = "3.27.0"
 toml_edit = "0.25.15"
+subtle = "2.6.1"
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+tower = { version = "0.5.3", features = ["util"] }
 trade-control-core = { path = "../core", features = ["test-support"] }

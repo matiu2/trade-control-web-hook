@@ -76,7 +76,10 @@ async fn main() -> Result<()> {
     // so it runs on a dedicated current-thread + `LocalSet` thread owned by the
     // dispatcher; axum handlers stay `Send` and just ferry the body across.
     let dispatcher = Dispatcher::spawn(state.clone());
-    let app = router(dispatcher);
+    let app = router(dispatcher).merge(trade_control_worker::account_reads::router(
+        state.accounts.clone(),
+        state.secrets.clone(),
+    ));
 
     // Start the cron scheduler on its own dedicated current-thread + `LocalSet`
     // thread (the engine tick drives the `?Send` broker SDKs, same as the HTTP

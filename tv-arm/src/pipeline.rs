@@ -1347,7 +1347,7 @@ fn resolve_account(args: &Args, broker: Broker, chart_symbol: &str) -> Result<St
 /// relocate the same fields.
 /// Load the signing key from `TRADE_CONTROL_KEY_FILE` env or the
 /// default `~/.config/trade-control/key.hex`.
-fn read_key(args: &Args) -> Result<[u8; KEY_LEN]> {
+pub(crate) fn read_key(args: &Args) -> Result<[u8; KEY_LEN]> {
     let path = match args.execution.as_ref() {
         Some(execution) => execution.context.key_file.clone(),
         None => key_path_resolved()?,
