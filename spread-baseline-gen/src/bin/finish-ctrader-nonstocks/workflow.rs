@@ -102,15 +102,16 @@ fn collect(
     status.write("verifying-missing-scope", "reauthenticate demo account and verify explicit native subset, table identity/window and missing keys before collection")?;
     let identity = runtime.block_on(scope::fresh(args))?;
     scope::table(args, &identity, &info)?;
-    let resume = runtime.block_on(preflight_report(args, &identity))?;
+    let checkpoint = runtime.block_on(preflight_report(args, &identity))?;
     pinned.verify(&pinned.original)?;
-    commands::execute(
-        &commands::generate(args, &generator, resume),
-        &args.workspace,
-        status,
-    )?;
-    // Hold the writer lock throughout verification, merge and release gates.
-    let report_lock = Destination::acquire(&args.report, Some(&args.report))?;
+    let report_lock = finish_collection(checkpoint, |resume| {
+        commands::execute(
+            &commands::generate(args, &generator, resume),
+            &args.workspace,
+            status,
+        )?;
+        Destination::acquire(&args.report, Some(&args.report))
+    })?;
     status.write("verifying-complete-native", "reauthenticate selected native catalogue and require every requested profile to pass strict complete/quality gates")?;
     runtime.block_on(async {
         let fresh = scope::fresh(args).await?;
@@ -157,7 +158,24 @@ fn verify_baked(
     Ok(report_lock)
 }
 
-async fn preflight_report(args: &Args, identity: &ctrader::Identity) -> Result<bool> {
+enum Checkpoint {
+    Fresh,
+    Resume,
+    Complete(Destination),
+}
+
+fn finish_collection(
+    checkpoint: Checkpoint,
+    generate: impl FnOnce(bool) -> Result<Destination>,
+) -> Result<Destination> {
+    match checkpoint {
+        Checkpoint::Complete(lock) => Ok(lock),
+        Checkpoint::Fresh => generate(false),
+        Checkpoint::Resume => generate(true),
+    }
+}
+
+async fn preflight_report(args: &Args, identity: &ctrader::Identity) -> Result<Checkpoint> {
     let resume = args.report.try_exists()?;
     let lock = Destination::acquire(&args.report, resume.then_some(args.report.as_path()))?;
     if resume {
@@ -165,9 +183,18 @@ async fn preflight_report(args: &Args, identity: &ctrader::Identity) -> Result<b
             .read_resume()
             .await?
             .ok_or_else(|| eyre!("existing calibration report is unavailable"))?;
-        scope::report(args, identity, &report, false)?;
+        // A claimed complete checkpoint must pass every strict gate before it
+        // can bypass generation. Keep its lock through verification and baking.
+        scope::report(args, identity, &report, report.complete)?;
+        if report.complete {
+            return Ok(Checkpoint::Complete(lock));
+        }
     }
-    Ok(resume)
+    Ok(if resume {
+        Checkpoint::Resume
+    } else {
+        Checkpoint::Fresh
+    })
 }
 
 fn artifacts(args: &Args) -> Vec<PathBuf> {
@@ -220,11 +247,12 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        assert!(
+        assert!(matches!(
             runtime
                 .block_on(preflight_report(&args, &report.identity))
-                .unwrap()
-        );
+                .unwrap(),
+            Checkpoint::Complete(_)
+        ));
         args.only = vec!["XAUEUR".into()];
         assert!(
             runtime
@@ -232,6 +260,55 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read_to_string(&args.report).unwrap(), original);
+    }
+    #[test]
+    fn complete_reports_skip_generation_but_incomplete_reports_use_it_and_invalid_complete_fail() {
+        crate::test_logging();
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = super::super::args::tests::args();
+        args.report = dir.path().join("report.json");
+        let original = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/validation/ctrader-demo-xpdusd-90d-report.json"
+        ));
+        std::fs::write(&args.report, original).unwrap();
+        let mut report: ctrader::Report = serde_json::from_str(original).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let checkpoint = runtime
+            .block_on(preflight_report(&args, &report.identity))
+            .unwrap();
+        let lock = finish_collection(checkpoint, |_| {
+            color_eyre::eyre::bail!("complete report invoked generator")
+        })
+        .unwrap();
+        assert!(Destination::acquire(&args.report, Some(&args.report)).is_err());
+        assert_eq!(std::fs::read_to_string(&args.report).unwrap(), original);
+        drop(lock);
+        report.complete = false;
+        std::fs::write(&args.report, serde_json::to_vec(&report).unwrap()).unwrap();
+        let checkpoint = runtime
+            .block_on(preflight_report(&args, &report.identity))
+            .unwrap();
+        let mut called = false;
+        let lock = finish_collection(checkpoint, |resume| {
+            assert!(resume);
+            called = true;
+            Destination::acquire(&args.report, Some(&args.report))
+        })
+        .unwrap();
+        assert!(called);
+        drop(lock);
+        report.complete = true;
+        report.instruments[0].measurement.profile.n_bars = 0;
+        std::fs::write(&args.report, serde_json::to_vec(&report).unwrap()).unwrap();
+        assert!(
+            runtime
+                .block_on(preflight_report(&args, &report.identity))
+                .is_err()
+        );
     }
     #[test]
     fn report_audit_and_lock_do_not_invalidate_the_requested_source_pin() {

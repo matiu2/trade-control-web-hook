@@ -182,7 +182,10 @@ and window before resume; unrelated reports are never selected for overwrite.
 
 On completion it rechecks account/catalogue identity, requires every selected
 profile to pass the strict quality gates, and invokes `bake-ctrader --merge`
-without partial promotion. A report lock spans verification, merge and checks.
+without partial promotion. A report lock spans verification, merge and checks. An already complete checkpoint
+must pass every strict report/audit/quality gate, then retains that lock and skips
+the no-op generator; its report and audit bytes stay unchanged. Incomplete
+checkpoints still use the real generator, and invalid complete reports fail.
 The original table bytes must remain unchanged during collection. Source and
 dependency snapshots include existing drafts; any later source change stops
 activation while retaining the report and cached windows. The runner reuses the
@@ -276,24 +279,55 @@ an exclusion-count and audit-digest comment.
 
 ### Fixed demo stock batch, 28 October 2026
 
-`validation/ctrader-demo-stocks-run-2026-10-28.py` collects all 350 stocks/ETFs
+`validation/ctrader-demo-stocks-run-2026-10-28.py` scans all 350 stocks/ETFs
 over the existing 24 July–22 October window with an explicit 20-minute allowance
-and the 0.1% quota. It uses pinned Rust binaries, checkpoints up to three
-collection attempts, then invokes the strict additive finisher and release
-checks. It does not place orders or deploy servers. Start it after all 93
-non-stock profiles are baked.
+and the 0.1% quota. It uses pinned Rust binaries and up to three total collection
+attempts (initial plus two checkpoint resumes). It never places orders or deploys
+servers. Start it after all 93 non-stock profiles are baked.
 
 ```sh
 python3 spread-baseline-gen/validation/ctrader-demo-stocks-run-2026-10-28.py \
-  target/calibration-stocks-4e6ea256
+  target/APPROVED-STOCK-CALIBRATION-BINARIES
 ```
 
-Progress is recorded in `validation/ctrader-demo-stocks-job.json`; instrument
-results remain in `ctrader-demo-stocks-90d-report.json`, and the final release
-checks use `ctrader-demo-stocks-finish.json`. Source guards are captured for the
-finishing phase, after historical collection. A failed collection never bakes
-partial stock coverage.
+The complete scan must account for each requested native symbol exactly once as
+a measured row or a failure. An interrupted scan with unattempted symbols cannot
+produce a subset or bake. The original `ctrader-demo-stocks-90d-report.json` and
+its full audit retain all measurements, failures and exclusions verbatim after
+collection, including audit records for failed symbols.
 
-If baking succeeded but a later check or interruption stopped the job, rerun
-with `--verify-baked`. This skips collection and asks the finisher to verify
-every baked row literally before rerunning checks; mixed or changed rows fail.
+When some measured rows pass every quality gate, the runner creates a separate
+`ctrader-demo-stocks-ready-90d-report.json` marked complete only for those exact
+native symbols, plus a matching `.quarantine.json` with the selected audit records.
+`Reviewed` and `MaskNotComputable` rows must retain verified native metadata,
+statistical thresholds, the 0.1% quota and exact per-row exclusion evidence.
+Failed or unqualified rows remain uncovered and appear explicitly in
+`ctrader-demo-stocks-ready-provenance.json`. That manifest binds the original and
+selected report/audit SHA256 hashes, catalogue hash, source failures and quality
+exclusions; its `.sha256` seal detects manifest changes. If all 350 rows qualify,
+the original complete report can be used directly without rewriting it.
+
+Only the strict additive finisher receives the selected complete scope, original
+window, stock mode and policy20. It uses `bake-ctrader --merge` and the existing
+release checks, never `--allow-partial` or an overwrite bake. Source guards are
+captured after collection; the original 93 non-stock rows remain intact. No
+eligible rows means `failed` with no bake. Success with excluded rows ends as
+`complete-with-failures`, with explicit ready/failed counts and symbol lists;
+only all350 qualified rows can end as `complete`.
+
+Evidence files are published from synced complete temporary files with atomic
+no-replacement links. A `ctrader-demo-stocks-ready-preparation.json` marker freezes
+the source hashes before subset publication. A normal restart after interrupted
+preparation validates every existing byte, completes missing artifacts or the
+manifest seal, and never recollects into the frozen full report. Orphaned publish
+temps are not trusted or promoted; truncated legacy final files are refused
+rather than silently replaced. `--verify-baked` cannot create a missing seal.
+
+Progress is recorded in `ctrader-demo-stocks-job.json`, and initial finishing
+checks use `ctrader-demo-stocks-finish.json`. If baking succeeded but a later
+check failed, rerun with `--verify-baked`. Recovery verifies every sealed hash and
+recomputes the subset relationship in memory, skips collection and derivation,
+and asks the finisher to verify each baked row literally before rerunning gates.
+It writes a separate recovery finishing status and archives the previous job
+status, preserving original gate-failure evidence. Changed or mixed rows fail;
+report, audit and provenance files are never regenerated during recovery.
