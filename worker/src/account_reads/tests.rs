@@ -44,8 +44,23 @@ fn quote_selection_requires_the_named_oanda_account() {
     meta.oanda_account_id = Some("001-011-test-001".into());
     assert!(validate_quote_account(&meta).is_ok());
     meta.broker = BrokerKind::TradeNation;
-    assert!(validate_quote_account(&meta).is_err());
+    meta.oanda_account_id = None;
+    assert!(validate_quote_account(&meta).is_ok());
     meta.broker = BrokerKind::Oanda;
     meta.oanda_account_id = None;
     assert!(validate_quote_account(&meta).is_err());
+}
+
+#[test]
+fn tradenation_quotes_accept_both_registered_account_kinds() {
+    use trade_control_core::account::{AccountKind, AccountMetadata};
+    for (name, kind) in [
+        ("reversals", AccountKind::Demo),
+        ("tradenation-live", AccountKind::Live),
+    ] {
+        let meta = AccountMetadata::new(name, BrokerKind::TradeNation, kind);
+        assert!(validate_quote_account(&meta).is_ok());
+    }
+    let unsupported = AccountMetadata::new("other", BrokerKind::Ibkr, AccountKind::Live);
+    assert!(validate_quote_account(&unsupported).is_err());
 }

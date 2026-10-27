@@ -18,6 +18,7 @@ use trade_control_engine::{BidAskCandle, TradePlan};
 pub struct SourceHistory<'a> {
     source: CandleSource,
     oanda_account: Option<&'a str>,
+    tradenation_account: Option<&'a str>,
     oanda_live: super::oanda_history::Live,
     mt5: Mt5Replay<'a>,
     ctrader_account: Option<&'a str>,
@@ -34,6 +35,7 @@ impl<'a> SourceHistory<'a> {
         Self {
             source,
             oanda_account: None,
+            tradenation_account: None,
             oanda_live: super::oanda_history::Live::default(),
             mt5: Mt5Replay::new(mt5_account, mode, pip_size),
             ctrader_account,
@@ -53,6 +55,9 @@ impl<'a> SourceHistory<'a> {
         Ok(Self {
             source,
             oanda_account: (source == CandleSource::Oanda).then_some(account).flatten(),
+            tradenation_account: (source == CandleSource::TradeNation)
+                .then_some(account)
+                .flatten(),
             oanda_live: super::oanda_history::Live::default(),
             mt5: Mt5Replay::from_saved(account, pip_size, saved),
             ctrader_account: (source == CandleSource::Ctrader)
@@ -63,6 +68,10 @@ impl<'a> SourceHistory<'a> {
     }
     pub fn with_oanda_account(mut self, account: Option<&'a str>) -> Self {
         self.oanda_account = account;
+        self
+    }
+    pub fn with_tradenation_account(mut self, account: Option<&'a str>) -> Self {
+        self.tradenation_account = account;
         self
     }
     pub fn with_oanda_destination(
@@ -88,7 +97,7 @@ impl<'a> SourceHistory<'a> {
             CandleSource::Oanda => self.oanda_account,
             CandleSource::Ctrader => self.ctrader_account,
             CandleSource::Mt5 => self.mt5.account(),
-            _ => None,
+            CandleSource::TradeNation => self.tradenation_account,
         }
     }
     pub async fn pull(
@@ -140,6 +149,30 @@ pub fn resolve_account(
     saved: Option<&str>,
     plan: &TradePlan,
 ) -> Result<Option<String>> {
+    if source == CandleSource::TradeNation {
+        let names: BTreeSet<_> = plan
+            .rules
+            .iter()
+            .filter(|rule| rule.intent.broker == BrokerKind::TradeNation)
+            .map(|rule| rule.intent.account.as_deref())
+            .collect();
+        let live = names.contains(&Some("tradenation-live"))
+            || explicit == Some("tradenation-live")
+            || saved == Some("tradenation-live");
+        if !live {
+            return Ok(None);
+        }
+        ensure!(
+            names.iter().all(|name| *name == Some("tradenation-live")),
+            "Live TradeNation replay cannot mix practice or unnamed plan accounts"
+        );
+        ensure!(
+            explicit.is_none_or(|name| name == "tradenation-live")
+                && saved.is_none_or(|name| name == "tradenation-live"),
+            "Live TradeNation replay account override conflicts with plan or fixture"
+        );
+        return Ok(Some("tradenation-live".into()));
+    }
     if source == CandleSource::Oanda {
         let names: BTreeSet<_> = plan
             .rules
@@ -323,6 +356,37 @@ mod tests {
         plan.rules
             .push(serde_json::from_value(rule("demo", "oanda", "m-and-w")).unwrap());
         assert!(resolve_account(CandleSource::Oanda, None, None, &plan).is_err());
+    }
+
+    #[test]
+    fn tradenation_live_replay_keeps_account_identity_and_rejects_mixed_accounts() {
+        init_tracing();
+        let rule = |id: &str, account: &str| {
+            serde_json::json!({
+                "rule_id":id,"trigger":{"type":"time_reached","at_epoch":1},"fire_mode":"once",
+                "intent":{"v":1,"id":id,"not_after":"2027-01-01T00:00:00Z","action":"veto","instrument":"EUR/USD","broker":"tradenation","account":account}
+            })
+        };
+        let mut plan: TradePlan = serde_json::from_value(serde_json::json!({
+            "trade_id":"live","instrument":"EUR/USD","direction":"long","granularity":"h1","pip_size":0.0001,
+            "rules":[rule("live","tradenation-live")]
+        })).unwrap();
+        let account = resolve_account(CandleSource::TradeNation, None, None, &plan).unwrap();
+        assert_eq!(account.as_deref(), Some("tradenation-live"));
+        let history =
+            SourceHistory::from_saved(CandleSource::TradeNation, account.as_deref(), 0.0001, None)
+                .unwrap();
+        assert_eq!(history.account(), Some("tradenation-live"));
+        assert_eq!(
+            local_chart_client::chart_feed("tradenation", history.account().unwrap()),
+            "tradenation-live"
+        );
+        assert!(
+            resolve_account(CandleSource::TradeNation, Some("reversals"), None, &plan).is_err()
+        );
+        plan.rules
+            .push(serde_json::from_value(rule("practice", "reversals")).unwrap());
+        assert!(resolve_account(CandleSource::TradeNation, None, None, &plan).is_err());
     }
 
     #[tokio::test]

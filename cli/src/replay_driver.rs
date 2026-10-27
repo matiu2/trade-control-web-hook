@@ -214,6 +214,11 @@ fn run_live(
 
         let raw_instrument = window.instrument.as_deref().unwrap_or(&plan.instrument);
         let symbol = instrument::resolve_for(raw_instrument, args.source)?;
+        let tradenation_account = if args.source == CandleSource::TradeNation {
+            crate::replay_candles::history::resolve_account(args.source, None, None, &plan)?
+        } else {
+            None
+        };
         let mt5_history = crate::replay_candles::history::SourceHistory::new(
             args.source,
             args.mt5_account.as_deref(),
@@ -222,6 +227,7 @@ fn run_live(
             plan.pip_size,
         )
         .with_oanda_account(args.oanda_account.as_deref())
+        .with_tradenation_account(tradenation_account.as_deref())
         .with_oanda_destination(
             args.oanda_worker_url.as_deref(),
             args.oanda_key_file.as_deref(),
