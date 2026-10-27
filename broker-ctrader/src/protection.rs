@@ -13,6 +13,7 @@ mod history;
 mod inventory;
 mod numbers;
 mod reconcile;
+pub mod registration;
 #[cfg(test)]
 mod tests;
 pub use config::{Costs, FeeMode, FirmEvidence, PropAccount};

@@ -276,3 +276,17 @@ fn slippage_allowance_is_not_spent_twice_when_deriving_fill_distance() -> Result
     assert!(recovered.reservations.is_empty());
     Ok(())
 }
+#[test]
+fn registration_activation_document_is_accepted_by_runtime_binding() -> Result<()> {
+    init();
+    let p = profile();
+    let root = tempfile::tempdir()?;
+    let (path, bytes) = registration::activation_file(&p, root.path())?;
+    std::fs::write(&path, &bytes)?;
+    registration::validate_activation(&p, &bytes)?;
+    binding::check_at(root.path(), Some(&p), p.account_id, p.environment)?;
+    let mut wrong = p;
+    wrong.account_id += 1;
+    assert!(registration::validate_activation(&wrong, &bytes).is_err());
+    Ok(())
+}

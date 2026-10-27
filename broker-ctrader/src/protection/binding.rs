@@ -28,7 +28,7 @@ fn directory() -> Result<PathBuf> {
     );
     Ok(path)
 }
-fn path_in(directory: &Path, id: i64, environment: ctrader_api::Environment) -> PathBuf {
+pub(super) fn path_in(directory: &Path, id: i64, environment: ctrader_api::Environment) -> PathBuf {
     directory.join(format!("{environment:?}-{id}.json"))
 }
 pub(super) fn check(
@@ -85,5 +85,24 @@ pub(super) fn check_at(
         }
         Err(e) => return Err(e.into()),
     }
+    Ok(())
+}
+
+pub(super) fn document(p: &PropAccount) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&Binding {
+        account_id: p.account_id,
+        environment: p.environment,
+        state_directory: p.state_directory.clone(),
+    })?)
+}
+pub(super) fn validate_document(bytes: &[u8], p: &PropAccount) -> Result<()> {
+    let b: Binding =
+        serde_json::from_slice(bytes).map_err(|_| eyre!("invalid risk activation document"))?;
+    ensure!(
+        b.account_id == p.account_id
+            && b.environment == p.environment
+            && b.state_directory == p.state_directory,
+        "risk activation identity or state directory differs"
+    );
     Ok(())
 }

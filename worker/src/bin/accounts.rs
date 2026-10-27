@@ -7,8 +7,9 @@
 //! the same [`PgMetadataStore`] the worker uses, so list/add/remove behave
 //! byte-for-byte like the dispatch path reads them — no HTTP, no admin route.
 //!
-//! Metadata lives in Postgres. MT5 `add` and `credentials` also maintain the
-//! named local profile and its private credential file. TradeNation credentials
+//! Metadata lives in Postgres. MT5/cTrader `add` and `credentials` maintain
+//! named private broker profiles. cTrader `--prop-firm` also enrolls durable
+//! account risk state. TradeNation credentials
 //! remain in the enc store; OANDA uses OANDA_API_KEY and its sub-account id.
 //!
 //! DB connection: `--database-url` / `DATABASE_URL` env win; otherwise the URL
@@ -35,14 +36,22 @@ use trade_control_core::account::{
 use trade_control_core::intent::BrokerKind;
 use trade_control_worker::{Config, PgMetadataStore, PgStateStore};
 
+#[path = "accounts/ctrader.rs"]
+mod ctrader;
+#[path = "accounts/files.rs"]
+mod files;
 #[path = "accounts/mt5.rs"]
 mod mt5;
+#[path = "accounts/paths.rs"]
+mod paths;
 #[path = "accounts/registration.rs"]
 mod registration;
+#[path = "accounts/risk.rs"]
+mod risk;
 
 #[derive(Parser)]
 #[command(name = "trade-control-accounts")]
-#[command(about = "Manage the native account index and local MT5 credentials")]
+#[command(about = "Manage accounts, private MT5/cTrader credentials, and prop risk enrollment")]
 struct Cli {
     /// Path to the worker's `trade-control.toml` to read `database.url` from.
     /// When omitted, the CLI resolves the DB URL via (in order): `--database-url`,
@@ -125,14 +134,18 @@ enum Command {
         /// The account name.
         name: String,
     },
-    /// Add a new account. MT5 also writes its profile and prompts for a password.
-    Add(AddArgs),
-    /// Replace an existing MT5 account's credentials and pinned identity.
+    /// Add an account, securely save broker credentials, and optionally enroll prop risk.
+    Add(Box<AddArgs>),
+    /// Rotate an existing MT5/cTrader account's private credentials.
     Credentials {
         name: String,
         #[command(flatten)]
         mt5: mt5::Options,
+        #[command(flatten)]
+        ctrader: ctrader::Options,
     },
+    /// Show non-secret risk parameters for a registered prop account.
+    Risk { name: String },
     /// Remove an account by name. Fails if it doesn't exist.
     Remove {
         /// The account name to remove.
@@ -165,6 +178,10 @@ struct AddArgs {
     max_open_positions: Option<u32>,
     #[command(flatten)]
     mt5: mt5::Options,
+    #[command(flatten)]
+    ctrader: ctrader::Options,
+    #[command(flatten)]
+    risk: risk::Options,
 }
 
 /// CLI mirror of [`BrokerKind`] so clap can derive
@@ -218,6 +235,9 @@ async fn main() -> Result<()> {
         .ok();
     let cli = Cli::parse();
 
+    if let Command::Risk { name } = &cli.command {
+        return ctrader::risk_status(name, &paths::Paths::resolve()?);
+    }
     let db_url = resolve_db_url(&cli)?;
 
     let store = PgStateStore::connect(&db_url)
@@ -228,13 +248,40 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::List { json } => list(&accounts, json).await,
         Command::Get { name } => get(&accounts, &name).await,
-        Command::Add(args) => add(&accounts, args).await,
-        Command::Credentials { name, mt5 } => {
-            let path = mt5::config_path()?;
-            registration::credentials(&accounts, &name, &mt5, &path, || mt5.password()).await?;
-            println!("updated MT5 credentials: {name}");
-            print_mt5_restart();
+        Command::Add(args) => add(&accounts, *args).await,
+        Command::Credentials { name, mt5, ctrader } => {
+            let meta = accounts.get(&name).await.map_err(meta_err)?;
+            if meta.broker == BrokerKind::Ctrader {
+                if mt5.is_present() {
+                    return Err(eyre!("MT5 options cannot update cTrader credentials"));
+                }
+                ctrader::credentials(
+                    &accounts,
+                    &name,
+                    &ctrader,
+                    &paths::Paths::resolve()?,
+                    || ctrader.secrets(),
+                )
+                .await?;
+                println!("updated private cTrader credentials: {name}");
+                print_ctrader_restart();
+            } else {
+                if ctrader.is_present() {
+                    return Err(eyre!("cTrader options require a cTrader account"));
+                }
+                let path = mt5::config_path()?;
+                registration::credentials(&accounts, &name, &mt5, &path, || mt5.password()).await?;
+                println!("updated MT5 credentials: {name}");
+                print_mt5_restart();
+            }
             Ok(())
+        }
+        Command::Risk { name } => {
+            let meta = accounts.get(&name).await.map_err(meta_err)?;
+            if meta.broker != BrokerKind::Ctrader {
+                return Err(eyre!("prop risk currently supports cTrader accounts"));
+            }
+            ctrader::risk_status(&name, &paths::Paths::resolve()?)
         }
         Command::Remove { name } => remove(&accounts, &name).await,
     }
@@ -246,8 +293,19 @@ async fn list(accounts: &PgMetadataStore, json: bool) -> Result<()> {
     if json {
         let rows = rows
             .iter()
-            .map(trade_control_worker::account_capabilities::listing)
-            .collect::<Vec<_>>();
+            .map(|meta| -> Result<serde_json::Value> {
+                let mut value = serde_json::to_value(
+                    trade_control_worker::account_capabilities::listing(meta),
+                )?;
+                if meta.broker == BrokerKind::Ctrader {
+                    value["prop_risk"] = serde_json::to_value(risk::display_profile(
+                        &paths::Paths::resolve()?,
+                        &meta.name,
+                    )?)?;
+                }
+                Ok(value)
+            })
+            .collect::<Result<Vec<_>>>()?;
         println!("{}", serde_json::to_string(&rows)?);
         return Ok(());
     }
@@ -256,7 +314,12 @@ async fn list(accounts: &PgMetadataStore, json: bool) -> Result<()> {
         return Ok(());
     }
     for m in &rows {
-        println!("{}", render(m));
+        let suffix = if m.broker == BrokerKind::Ctrader {
+            risk::describe(&paths::Paths::resolve()?, &m.name)?
+        } else {
+            String::new()
+        };
+        println!("{}{suffix}", render(m));
     }
     Ok(())
 }
@@ -265,7 +328,12 @@ async fn list(accounts: &PgMetadataStore, json: bool) -> Result<()> {
 async fn get(accounts: &PgMetadataStore, name: &str) -> Result<()> {
     match accounts.get(name).await {
         Ok(m) => {
-            println!("{}", render(&m));
+            let suffix = if m.broker == BrokerKind::Ctrader {
+                risk::describe(&paths::Paths::resolve()?, &m.name)?
+            } else {
+                String::new()
+            };
+            println!("{}{suffix}", render(&m));
             Ok(())
         }
         Err(MetadataError::NotFound(_)) => Err(eyre!("no account named '{name}'")),
@@ -284,15 +352,18 @@ async fn add(accounts: &impl MetadataStore, args: AddArgs) -> Result<()> {
         max_risk_pct,
         max_open_positions,
         mt5,
+        ctrader,
+        risk,
     } = args;
     let broker: BrokerKind = broker.into();
     let kind: AccountKind = kind.into();
     if broker != BrokerKind::Mt5 && mt5.is_present() {
         return Err(eyre!("MT5 credential options require --broker mt5"));
     }
-    if broker == BrokerKind::Ctrader {
-        broker_ctrader::access::Profile::load(&name)?
-            .validate(kind.is_live(), oanda_account_id.as_deref())?;
+    if broker != BrokerKind::Ctrader && (ctrader.is_present() || risk.is_present()) {
+        return Err(eyre!(
+            "cTrader credentials and prop risk options require --broker ctrader"
+        ));
     }
     if broker == BrokerKind::Oanda && oanda_account_id.is_none() {
         return Err(eyre!(
@@ -309,6 +380,16 @@ async fn add(accounts: &impl MetadataStore, args: AddArgs) -> Result<()> {
         },
         oanda_account_id,
     };
+    if broker == BrokerKind::Ctrader {
+        let paths = paths::Paths::resolve()?;
+        ctrader::register(accounts, meta.clone(), &ctrader, &risk, &paths, || {
+            ctrader.secrets()
+        })
+        .await?;
+        println!("added: {}{}", render(&meta), risk::describe(&paths, &name)?);
+        print_ctrader_restart();
+        return Ok(());
+    }
     let path = if broker == BrokerKind::Mt5 {
         Some(mt5::config_path()?)
     } else {
@@ -330,6 +411,11 @@ async fn add(accounts: &impl MetadataStore, args: AddArgs) -> Result<()> {
     Ok(())
 }
 
+fn print_ctrader_restart() {
+    println!(
+        "Private cTrader profiles saved locally. Run this command on the worker host and restart consumers after credential changes. Connectivity and reconciliation are required before entries; no order was submitted. Open API-only profiles retain the existing market-entry restriction; hybrid market entries require FIX QUOTE/TRADE credentials and broker binding."
+    );
+}
 fn print_mt5_restart() {
     println!(
         "MT5 profile and private credentials saved locally. Restart local-chart and any workers using this account to load the changes. Log the desktop MT5 terminal into the same account for CandleBridge history."
@@ -357,7 +443,12 @@ fn render(m: &AccountMetadata) -> String {
     };
     let mut s = format!("{:<16} {:<12} {kind}", m.name, broker);
     if let Some(id) = &m.oanda_account_id {
-        s.push_str(&format!("  oanda_id={id}"));
+        let label = if m.broker == BrokerKind::Ctrader {
+            "broker_id"
+        } else {
+            "oanda_id"
+        };
+        s.push_str(&format!("  {label}={id}"));
     }
     if let Some(r) = m.caps.max_risk_pct {
         s.push_str(&format!("  max_risk_pct={r}"));

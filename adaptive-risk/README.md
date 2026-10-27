@@ -20,6 +20,13 @@ Daily lockouts latch until a verified new day successfully reconciles. Account l
 
 ## cTrader enrollment and configuration
 
+`trade-control-accounts add NAME --broker ctrader --kind demo --prop-firm`
+now offers interactive account/credential/policy enrollment. Add `--ctrader-fix`
+for the existing hybrid backend. It also supports scripted parameters, reusable
+verified program policies and private stdin credential bundles. See
+[the account CLI workflow](../add-account-process.md#ctrader-credentials-and-prop-risk-in-one-operation).
+The explicit admin enrollment below remains available for advanced use.
+
 Copy [prop-risk-accounts.example.toml](prop-risk-accounts.example.toml) to the worker host's `~/.config/trade-control/prop-risk-accounts.toml`, or explicitly set `PROP_RISK_ACCOUNTS_FILE`. An explicitly configured missing file is an error. Only `enabled = true` profiles initially activate protection. Policies resolve by physical account ID and environment, so a second account alias cannot bypass them. Activation is sticky in `~/.local/state/trade-control/prop-risk-registry` (or the explicitly shared `PROP_RISK_REGISTRY_DIR`): missing/disabled policy files and state-directory changes then block instead of reverting to ordinary sizing, including after a restart. Removing protection requires an explicit operator migration. Keep this registry and the account state durable and shared across all processes. Duplicate enabled physical accounts or state directories in the profile file reject.
 
 Before setting verification flags, check the current purchased program's rulebook: actual equity/balance references, intraday versus end-of-day peaks, reset zone and time, cash adjustments, thresholds, holding/financing rules, and whether fees are included. Verify cTrader fee signs and whether closing-detail commission includes opening charges against broker statements. Supply conservative account-currency cost estimates for each native instrument, including future swap exposure over the intended holding period; update them as broker costs change. Zero estimates mean a verified zero, not unavailable data. The loss/slippage estimates cannot bound failed stops, gaps or unlimited holding costs.

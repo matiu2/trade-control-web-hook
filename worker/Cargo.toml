@@ -55,6 +55,7 @@ ctrader-fix = { version = "0.1.0", path = "../../ctrader-fix" }
 rpassword = "7.5.4"
 tempfile = "3.27.0"
 toml_edit = "0.25.15"
+adaptive-risk = { version = "0.1.0", path = "../adaptive-risk" }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }

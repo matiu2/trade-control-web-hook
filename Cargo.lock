@@ -5113,6 +5113,7 @@ dependencies = [
 name = "trade-control-worker"
 version = "0.1.0"
 dependencies = [
+ "adaptive-risk",
  "axum",
  "broker-ctrader",
  "broker-ibkr",
