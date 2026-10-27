@@ -21,6 +21,7 @@ mod control;
 mod control_result;
 mod enter;
 mod entry_origin;
+mod entry_warning;
 mod invalidate;
 mod seen;
 mod shared;

@@ -954,6 +954,23 @@ where
         }
     };
     let outcome = result.describe();
+    if verified.intent.action == Action::Enter && !matches!(&result, ActionResult::Ok(_)) {
+        cron.record_cron_note(trade_control_core::recording::CronNote {
+            ts: now.to_rfc3339(),
+            trade_id: verified.intent.trade_id.clone().unwrap_or_default(),
+            account: verified.intent.account.clone(),
+            source: "entry-dispatch".into(),
+            severity: trade_control_core::recording::CronNoteSeverity::Warn,
+            message: format!(
+                "{} {:?}: {}",
+                verified.intent.instrument,
+                granularity,
+                result.entry_warning()
+            ),
+            broker_exit: None,
+            attempt_resolution: None,
+        });
+    }
     tracing::info!(
         "cron engine fired: rule={} action={:?} id={} outcome={outcome}",
         fired.rule_id,

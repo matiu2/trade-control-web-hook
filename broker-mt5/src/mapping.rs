@@ -3,6 +3,9 @@ use mt5_data_source::web::trading::{
 };
 use trade_control_core::{broker::*, intent::Direction};
 
+#[cfg(test)]
+mod rejection_tests;
+
 pub(crate) fn direction(side: Side) -> Direction {
     match side {
         Side::Buy => Direction::Long,
@@ -64,7 +67,9 @@ pub(crate) fn placement(
         )));
     }
     if outcome.state == OutcomeState::Rejected {
-        return Err(EntryError::OrderRejected);
+        return Err(EntryError::OrderRejectedWithDetail(rejection_detail(
+            &outcome,
+        )));
     }
     let result = outcome.result.ok_or_else(|| {
         EntryError::AmbiguousSuccess("MT5 accepted entry without order identity".into())
@@ -84,6 +89,34 @@ pub(crate) fn placement(
         size: Some(size),
         price: Some(price),
     })
+}
+
+fn rejection_detail(outcome: &TradeOutcome) -> String {
+    let request_id = outcome.request_id;
+    let submission_code = outcome
+        .submission_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unavailable".into());
+    let context = format!("MT5 request_id={request_id} submission_code={submission_code}");
+    match &outcome.result {
+        Some(result) => {
+            let code = result.code;
+            let comment = &result.comment;
+            let bid = result.bid;
+            let ask = result.ask;
+            let detail =
+                format!("{context} result_code={code} comment={comment:?} bid={bid} ask={ask}");
+            if code == 10040 {
+                format!(
+                    "{detail}; account position limit reached \
+                     (pending orders also count on hedging accounts)"
+                )
+            } else {
+                detail
+            }
+        }
+        None => format!("{context}; final result unavailable"),
+    }
 }
 
 /// Core watchers amend using the originating order, which differs from the position ticket.
