@@ -87,6 +87,15 @@ async fn select_stocks(
     data: &ChartData,
     only: &[String],
 ) -> Result<(Vec<String>, Vec<crate::mt5::Failure>)> {
+    stock_selection(only, data.verify_stock_account()).await
+}
+
+async fn stock_selection(
+    only: &[String],
+    account: impl std::future::Future<Output = Result<()>>,
+) -> Result<(Vec<String>, Vec<crate::mt5::Failure>)> {
+    account.await?;
+    validate_scope(only, true)?;
     let mut requested = if only.is_empty() {
         broker_ctrader::catalogue::stock_symbols()?
             .into_iter()
@@ -100,9 +109,8 @@ async fn select_stocks(
         requested.windows(2).all(|pair| pair[0] != pair[1]),
         "duplicate native stock selection"
     );
-    for symbol in &requested {
-        data.verified_stock_metadata(symbol).await?;
-    }
+    // Preserve the full scope; measurement records missing/changed native metadata
+    // as this instrument's failure instead of aborting all remaining stocks here.
     Ok((requested, vec![]))
 }
 
@@ -128,6 +136,59 @@ mod tests {
                 .unwrap()
                 .len(),
             93
+        );
+    }
+    #[tokio::test]
+    async fn stock_selection_checks_account_once_and_retains_every_requested_instrument() {
+        crate::ctrader::test_logging();
+        let calls = std::cell::Cell::new(0);
+        let account = async {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        let (selected, excluded) = stock_selection(&[], account).await.unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(selected.len(), 350);
+        assert!(
+            selected.contains(&"AARONS".into()),
+            "missing history must fail later as a measured instrument, not disappear at discovery"
+        );
+        assert!(excluded.is_empty());
+        let requested = ["AIA".into(), "REDES ENERGETICAS NACIONAIS".into()];
+        assert_eq!(
+            stock_selection(&requested, async { Ok(()) })
+                .await
+                .unwrap()
+                .0,
+            requested
+        );
+        assert!(
+            stock_selection(&["AIA".into(), "AIA".into()], async { Ok(()) })
+                .await
+                .is_err()
+        );
+        assert!(
+            stock_selection(&["EURUSD".into()], async { Ok(()) })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stock_account_failure_aborts_before_any_collection_can_be_scheduled() {
+        crate::ctrader::test_logging();
+        let failure = async {
+            Err(color_eyre::eyre::eyre!(
+                "wrong authenticated broker account"
+            ))
+        };
+        let Err(error) = stock_selection(&[], failure).await else {
+            panic!("unverified stock account must not produce a collection scope");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("wrong authenticated broker account")
         );
     }
 }

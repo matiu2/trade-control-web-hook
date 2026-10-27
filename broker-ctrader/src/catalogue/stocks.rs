@@ -127,6 +127,21 @@ pub fn verify_stock_metadata(
     identity: &crate::market_data::AccountIdentity,
     current: &StockMetadata,
 ) -> Result<&'static Asset> {
+    verify_stock_account(profile, identity)?;
+    ensure!(
+        current == stock_metadata(&current.name)?,
+        "native cTrader stock identity/precision/session evidence changed for {:?}; re-audit before reading history",
+        current.name
+    );
+    stock_asset(&current.name)
+}
+
+/// Verify the authenticated account before scheduling stock history work.
+/// Individual native symbols must still pass fresh verify_stock_metadata checks.
+pub fn verify_stock_account(
+    profile: &str,
+    identity: &crate::market_data::AccountIdentity,
+) -> Result<()> {
     let expected = &catalogue()?.snapshot;
     ensure!(
         profile == expected.source_profile
@@ -137,12 +152,7 @@ pub fn verify_stock_metadata(
             && identity.trader_login == expected.source_trader_login,
         "stock metadata belongs to another cTrader broker/account; audit that account separately"
     );
-    ensure!(
-        current == stock_metadata(&current.name)?,
-        "native cTrader stock identity/precision/session evidence changed for {:?}; re-audit before reading history",
-        current.name
-    );
-    stock_asset(&current.name)
+    Ok(())
 }
 
 fn asset(row: &StockMetadata) -> Result<(String, Asset)> {

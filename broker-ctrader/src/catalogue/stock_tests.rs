@@ -231,3 +231,25 @@ fn stock_inventory_keeps_all_native_classes_and_six_declared_session_groups() {
     );
     assert_eq!(schedules.len(), 6);
 }
+
+#[test]
+fn account_verification_is_available_before_any_stock_metadata_or_history() {
+    let valid = identity();
+    verify_stock_account("ctrader-demo", &valid).unwrap();
+    assert!(verify_stock_account("other-profile", &valid).is_err());
+    for field in ["account", "environment", "broker", "endpoint", "login"] {
+        let mut wrong = valid.clone();
+        match field {
+            "account" => wrong.account_id += 1,
+            "environment" => wrong.environment = ctrader_api::Environment::Live,
+            "broker" => wrong.broker_name.push('!'),
+            "endpoint" => wrong.endpoint.push('!'),
+            "login" => wrong.trader_login += 1,
+            _ => unreachable!(),
+        }
+        assert!(
+            verify_stock_account("ctrader-demo", &wrong).is_err(),
+            "{field}"
+        );
+    }
+}

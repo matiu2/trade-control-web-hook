@@ -13,7 +13,8 @@ mod facts;
 mod stocks;
 pub use stocks::{
     NativeStockMetadata, StockAssetIdentity, StockCategory, StockClass, StockMetadata,
-    StockWeeklyInterval, stock_asset, stock_metadata, stock_symbols, verify_stock_metadata,
+    StockWeeklyInterval, stock_asset, stock_metadata, stock_symbols, verify_stock_account,
+    verify_stock_metadata,
 };
 
 static ASSETS: LazyLock<Result<BTreeMap<String, Asset>>> = LazyLock::new(|| {

@@ -3,10 +3,20 @@ use super::*;
 use crate::catalogue::{NativeStockMetadata, StockMetadata};
 
 impl ChartData {
+    /// One fresh account check permits planning the audited stock universe.
+    /// Every symbol still requires verified_stock_metadata before reading candles.
+    pub async fn verify_stock_account(&self) -> Result<()> {
+        crate::catalogue::verify_stock_account(
+            &self.broker.account_name,
+            &self.account_identity().await?,
+        )
+    }
+
     /// Verify the exact account, native identity, precision and declared sessions.
     /// An enabled or close-only stock can supply history; this never permits orders.
     pub async fn verified_stock_metadata(&self, symbol: &str) -> Result<InstrumentMetadata> {
         let identity = self.account_identity().await?;
+        crate::catalogue::verify_stock_account(&self.broker.account_name, &identity)?;
         let lights = metadata::symbols(&self.broker).await?;
         let light = exact_symbol(&lights, symbol)?;
         let metadata = metadata::instrument(&self.broker, symbol).await?;
