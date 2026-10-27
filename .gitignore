@@ -24,3 +24,4 @@ TODO-track-D-candle-cache-wasm-kv.md
 
 # Local MT5 login material
 .mt5-creds.toml
+/.local-calibration/

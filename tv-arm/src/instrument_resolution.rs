@@ -120,7 +120,14 @@ pub fn resolve_for_account(
         )
     })?;
 
-    require_spread_coverage(broker_symbol)?;
+    if broker == ConvBroker::Oanda {
+        require_spread_coverage(&trade_control_core::spread_blackout::spread_lookup_key(
+            broker_symbol,
+            account,
+        ))?;
+    } else {
+        require_spread_coverage(broker_symbol)?;
+    }
 
     Ok(finish_resolution(asset, il_broker, broker_symbol))
 }

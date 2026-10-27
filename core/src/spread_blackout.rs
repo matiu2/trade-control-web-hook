@@ -65,6 +65,9 @@ mod baseline_mt5 {
 mod baseline_ctrader {
     pub use candle_cache::spread_profiles::SPREAD_BASELINE_CTRADER;
 }
+mod baseline_oanda {
+    pub use candle_cache::spread_profiles::SPREAD_BASELINE_OANDA;
+}
 mod account_scope;
 pub use account_scope::{ctrader_spread_key, mt5_spread_key, spread_lookup_key};
 
@@ -120,6 +123,7 @@ fn baked_candle_row(instrument: &str) -> Option<(&'static str, u32, &'static [f6
         .iter()
         .chain(baseline_mt5::SPREAD_BASELINE_MT5.iter())
         .chain(baseline_ctrader::SPREAD_BASELINE_CTRADER.iter())
+        .chain(baseline_oanda::SPREAD_BASELINE_OANDA.iter())
         .find(|(_broker, symbol, ..)| *symbol == instrument)
         .map(|(_broker, _symbol, schedule, _reviewed, mask, widen, ..)| (*schedule, *mask, widen))
 }
@@ -334,6 +338,7 @@ pub fn baked_baseline(instrument: &str) -> Option<(f64, f64, f64)> {
         .iter()
         .chain(baseline_mt5::SPREAD_BASELINE_MT5.iter())
         .chain(baseline_ctrader::SPREAD_BASELINE_CTRADER.iter())
+        .chain(baseline_oanda::SPREAD_BASELINE_OANDA.iter())
         .find(|(_broker, symbol, ..)| *symbol == instrument)
         .map(
             |(
@@ -1564,6 +1569,7 @@ fn baked_forecast_row(
         .iter()
         .chain(baseline_mt5::SPREAD_BASELINE_MT5.iter())
         .chain(baseline_ctrader::SPREAD_BASELINE_CTRADER.iter())
+        .chain(baseline_oanda::SPREAD_BASELINE_OANDA.iter())
         .find(|(_broker, symbol, ..)| *symbol == instrument)
         .map(
             |(_broker, _symbol, schedule, _reviewed, mask, widen, _m, _l, _h, forecast)| {
