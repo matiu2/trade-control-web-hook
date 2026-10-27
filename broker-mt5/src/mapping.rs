@@ -104,7 +104,16 @@ fn rejection_detail(outcome: &TradeOutcome) -> String {
             let comment = &result.comment;
             let bid = result.bid;
             let ask = result.ask;
-            format!("{context} result_code={code} comment={comment:?} bid={bid} ask={ask}")
+            let detail =
+                format!("{context} result_code={code} comment={comment:?} bid={bid} ask={ask}");
+            if code == 10040 {
+                format!(
+                    "{detail}; account position limit reached \
+                     (pending orders also count on hedging accounts)"
+                )
+            } else {
+                detail
+            }
         }
         None => format!("{context}; final result unavailable"),
     }

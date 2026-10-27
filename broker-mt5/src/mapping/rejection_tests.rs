@@ -57,3 +57,52 @@ fn acknowledgment_rejection_does_not_invent_a_final_result() {
     assert!(timeline.contains("final result unavailable"));
     assert!(!timeline.contains("result_code=0"));
 }
+
+#[test]
+fn position_limit_rejection_explains_the_code_even_without_a_comment() {
+    logging();
+    let outcome = rejected(Some(TradeResult {
+        code: 10040,
+        deal: 0,
+        order: 0,
+        volume_raw: 0,
+        price: 0.0,
+        bid: 0.0,
+        ask: 0.0,
+        comment: String::new(),
+    }));
+    let error =
+        mapping::placement(outcome, Lots::from_raw(1_000_000).unwrap(), 0.83734).unwrap_err();
+    let timeline = outcome_for_entry_error(&error);
+    assert!(timeline.contains("result_code=10040"), "{timeline}");
+    assert!(
+        timeline.contains("account position limit reached"),
+        "{timeline}"
+    );
+    assert!(
+        timeline.contains("pending orders also count on hedging accounts"),
+        "{timeline}"
+    );
+    assert!(timeline.contains("comment=\"\" bid=0 ask=0"), "{timeline}");
+}
+
+#[test]
+fn unfamiliar_broker_code_is_preserved_without_an_invented_explanation() {
+    logging();
+    let outcome = rejected(Some(TradeResult {
+        code: 19999,
+        deal: 0,
+        order: 0,
+        volume_raw: 0,
+        price: 0.0,
+        bid: 0.0,
+        ask: 0.0,
+        comment: "new broker diagnostic".into(),
+    }));
+    let error =
+        mapping::placement(outcome, Lots::from_raw(1_000_000).unwrap(), 0.83734).unwrap_err();
+    let timeline = outcome_for_entry_error(&error);
+    assert!(timeline.contains("result_code=19999"), "{timeline}");
+    assert!(timeline.contains("new broker diagnostic"), "{timeline}");
+    assert!(!timeline.contains("position limit"), "{timeline}");
+}
