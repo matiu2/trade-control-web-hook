@@ -19,6 +19,10 @@ use trade_control_core::screenshot::ScreenshotUrl;
 pub struct PlanRow {
     pub trade_id: String,
     #[serde(default)]
+    pub positions: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub position_sync: Vec<serde_json::Value>,
+    #[serde(default)]
     pub account: String,
     #[serde(default)]
     pub instrument: String,

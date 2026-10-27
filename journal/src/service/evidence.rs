@@ -58,11 +58,13 @@ pub struct RecordedTimeline {
     pub entry_ts: Option<String>,
     pub outcome: String,
     pub outcome_good: bool,
+    pub positions: Vec<trade_control_core::position_tracking::PositionObservation>,
+    pub position_sync: Vec<trade_control_core::position_tracking::PositionSync>,
 }
 
 impl RecordedTimeline {
     pub fn from_value(raw: Value) -> Result<Self> {
-        validate_timeline(&raw)?;
+        let recorded = validate_timeline(&raw)?;
         let json = serde_json::to_string(&raw).wrap_err("encode journal timeline evidence")?;
         let events = timeline::parse_events(&json);
         let fires = divergence::live_fires(&json);
@@ -75,6 +77,8 @@ impl RecordedTimeline {
             entry_ts,
             outcome,
             outcome_good,
+            positions: recorded.positions,
+            position_sync: recorded.position_sync,
         })
     }
 }
@@ -86,6 +90,9 @@ pub struct ReplayComparison {
     pub replay_fires: Vec<FireFact>,
     pub outcome: ReplayOutcome,
     pub divergences: Divergences,
+    pub replay_open_at_end: Option<usize>,
+    pub replay_position_warnings: Vec<String>,
+    pub replay_open_positions: Vec<trade_control_core::position_tracking::TrackedPosition>,
 }
 
 /// Compare available recorded fires with the explicitly selected replay report.
@@ -106,6 +113,9 @@ pub fn compare_timeline_with_replay(timeline: &Value, report: &str) -> Result<Re
         replay_fires,
         outcome,
         divergences,
+        replay_open_at_end: None,
+        replay_position_warnings: Vec::new(),
+        replay_open_positions: Vec::new(),
     })
 }
 

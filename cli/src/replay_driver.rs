@@ -29,6 +29,8 @@ pub struct ReplayResult {
     pub report: String,
     pub positions: crate::replay_candles::positions_out::PositionsFile,
     pub outcome: crate::replay_candles::fixture::ReplayOutcome,
+    pub open_positions: Vec<trade_control_core::position_tracking::TrackedPosition>,
+    pub position_warnings: Vec<String>,
     /// False when replay completed but a requested artifact could not be saved.
     pub success: bool,
     pub error: Option<String>,
@@ -45,6 +47,8 @@ impl ReplayResult {
             report,
             positions,
             outcome,
+            open_positions: Vec::new(),
+            position_warnings: Vec::new(),
             success: true,
             error: None,
             exit_code: outcome::EXIT_OK,
@@ -475,6 +479,8 @@ fn run_live(
         );
         let outcome = ReplayOutcome::compute(&replay, simulate, Some(&rendered.economics));
         let mut completed = ReplayResult::completed(report_text, positions, outcome);
+        completed.open_positions = replay.open_positions.clone();
+        completed.position_warnings = replay.position_warnings.clone();
         let artifacts = (|| -> Result<()> {
             if let Some(path) = &args.positions {
                 completed.positions.write(path)?;
@@ -2177,6 +2183,8 @@ mod tests {
     fn result_serializes_report_positions_and_outcome_without_files() {
         let result = ReplayResult {
             report: "No trades filled".into(),
+            open_positions: Vec::new(),
+            position_warnings: Vec::new(),
             positions: positions_out::PositionsFile::new("EUR_USD", "1h", "oanda", &[]),
             outcome: ReplayOutcome {
                 fires: Vec::new(),

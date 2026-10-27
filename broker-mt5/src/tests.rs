@@ -155,6 +155,11 @@ fn closed_before_first_poll_is_correlated_by_deal_order_and_includes_both_fees()
     assert_eq!(s.trades[0].broker_trade_id, "200");
     assert_eq!(s.ledger.len(), 2);
     assert!((s.total_realized_pl().unwrap() + 0.01).abs() < 1e-12);
+    let exit = history::exit("EURCAD", "100", None, &live, &h, "USD").unwrap();
+    assert_eq!(exit.broker_trade_id, "200");
+    assert_eq!(exit.account_currency.as_deref(), Some("USD"));
+    assert!(exit.closed_at.is_some());
+    assert!((exit.realized_pl.unwrap() + 0.01).abs() < 1e-12);
 }
 #[test]
 fn partial_close_missing_history_and_foreign_symbol_remain_unknown() {

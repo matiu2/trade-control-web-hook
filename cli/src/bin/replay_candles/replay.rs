@@ -145,6 +145,8 @@ pub struct Replay {
     /// silent state moves the fire report can't show. One entry per evaluated
     /// live bar, in order; quiet bars are kept here and skipped at render time.
     pub traces: Vec<BarTrace>,
+    pub open_positions: Vec<trade_control_core::position_tracking::TrackedPosition>,
+    pub position_warnings: Vec<String>,
 }
 
 /// Minimum number of leading candles used to seed the FSM without firing. A
@@ -432,6 +434,8 @@ pub async fn run_with_upkeep(
             done: false,
             warnings: Vec::new(),
             traces: Vec::new(),
+            open_positions: Vec::new(),
+            position_warnings: Vec::new(),
         };
     }
 
@@ -1019,12 +1023,62 @@ pub async fn run_with_upkeep(
         }
     }
 
+    let mut position_warnings = Vec::new();
+    let mut links = store
+        .list_all_entry_attempts()
+        .await
+        .unwrap_or_else(|error| {
+            position_warnings.push(format!("replay position attempts unavailable: {error}"));
+            Vec::new()
+        })
+        .iter()
+        .map(trade_control_core::position_tracking::PositionLink::from)
+        .collect::<Vec<_>>();
+    match store.list_position_links().await {
+        Ok(placements) => links.extend(placements),
+        Err(error) => {
+            position_warnings.push(format!("replay placement links unavailable: {error}"))
+        }
+    }
+    // Single-shot engine-latched placements do not use the retry ledger.
+    // Successful broker order IDs on fires are equally strong identity evidence.
+    links.extend(fires.iter().filter_map(|fire| {
+        Some(trade_control_core::position_tracking::PositionLink {
+            account: None,
+            trade_id: plan.trade_id.clone(),
+            instrument: fire.fired.intent.instrument.clone(),
+            direction: fire.fired.intent.direction?,
+            broker_order_id: fire.order_id()?.into(),
+            broker_position_id: None,
+        })
+    }));
+    links.iter_mut().for_each(|link| link.account = None);
+    let observed_at = candles.last().map(|bar| bar.time).unwrap_or(live_start);
+    let open_positions = match trade_control_core::position_tracking::observe(
+        &replay_broker,
+        "",
+        &mut links,
+        observed_at,
+    )
+    .await
+    {
+        Ok(check) => {
+            position_warnings.extend(check.warnings);
+            check.positions
+        }
+        Err(error) => {
+            position_warnings.push(format!("replay position tracking unavailable: {error:?}"));
+            Vec::new()
+        }
+    };
     Replay {
         fires,
         final_state: state,
         done,
         warnings,
         traces,
+        open_positions,
+        position_warnings,
     }
 }
 
@@ -1852,6 +1906,48 @@ mod tests {
             level + 0.0200,
         ))
         .expect("parse plain-enter plan")
+    }
+
+    #[tokio::test]
+    async fn single_shot_open_position_is_tracked_without_a_retry_attempt() {
+        let mut candles: Vec<_> = (0..10)
+            .map(|h| {
+                ohlc_at(
+                    &format!("2026-07-14T{h:02}:00:00Z"),
+                    1.104,
+                    1.1042,
+                    1.1038,
+                    1.104,
+                )
+            })
+            .collect();
+        candles.push(ohlc_at(
+            "2026-07-14T10:00:00Z",
+            1.104,
+            1.1065,
+            1.1038,
+            1.106,
+        ));
+        candles.push(ohlc_at("2026-07-14T11:00:00Z", 1.106, 1.112, 1.105, 1.111));
+        candles.push(ohlc_at("2026-07-14T12:00:00Z", 1.111, 1.113, 1.110, 1.112));
+        let plan = plain_enter_plan("EUR/USD", 1.105);
+        let result = run(
+            &plan,
+            &candles,
+            Granularity::H1,
+            "2026-07-14T10:00:00Z".parse().unwrap(),
+            "2026-07-15T00:00:00Z".parse().unwrap(),
+            no_marks(),
+            None,
+        )
+        .await;
+        assert_eq!(result.fires.len(), 1);
+        assert_eq!(
+            result.open_positions.len(),
+            1,
+            "single-shot accepted placement must be linked: {:?}",
+            result.position_warnings
+        );
     }
 
     /// An `ohlc_at` candle carrying an explicit `spread_price` (ask−bid) on the

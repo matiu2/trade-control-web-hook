@@ -18,6 +18,8 @@ mod paper_entries;
 mod pg;
 mod pg_accounts;
 mod plan_admin;
+mod position_links;
+mod position_tracking;
 pub mod recording_pg;
 mod scheduler;
 mod secrets;

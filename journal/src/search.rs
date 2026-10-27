@@ -117,6 +117,8 @@ mod tests {
 
     fn row(trade_id: &str, instrument: &str, granularity: &str, phase: &str) -> PlanRow {
         PlanRow {
+            positions: Vec::new(),
+            position_sync: Vec::new(),
             trade_id: trade_id.to_string(),
             account: "demo".into(),
             instrument: instrument.to_string(),

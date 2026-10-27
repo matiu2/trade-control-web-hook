@@ -430,6 +430,9 @@ pub fn render(
         out.push_str(&caveats.render());
     }
 
+    if simulate {
+        out.push_str(&format!("\nPositions: {} open at window end; Net R is realized only. Setup phase describes rule readiness.\n",tally.open_at_end));
+    }
     out.push_str(&format!(
         "\nDone: {}  |  final phase: {:?}  |  fires: {}",
         replay.done,
@@ -1608,6 +1611,8 @@ mod tests {
             done: true,
             warnings: Vec::new(),
             traces: Vec::new(),
+            open_positions: Vec::new(),
+            position_warnings: Vec::new(),
         };
         let out = render(
             &plan_for(0.0001),

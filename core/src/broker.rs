@@ -120,7 +120,7 @@ fn trim_float(v: f64) -> String {
 /// `position_id` is the distinct position / trade id. On OANDA the two are
 /// the same trade id (there is no separate originating-order concept once a
 /// trade is open), so both are set to the trade id.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OpenPosition {
     /// TradeNation `market_name` / OANDA `instrument`.
     pub instrument: String,
@@ -592,6 +592,27 @@ pub trait Broker {
         &self,
         account_id: &str,
     ) -> impl Future<Output = Result<Vec<OpenPosition>, LookupError>>;
+
+    /// Reporting snapshot. Adapters can include broker P/L; the default never
+    /// invents money values from prices or assumes an account currency.
+    fn position_snapshots(
+        &self,
+        account_id: &str,
+    ) -> impl Future<Output = Result<Vec<crate::position_tracking::PositionSnapshot>, LookupError>>
+    {
+        async move {
+            Ok(self
+                .list_open_positions(account_id)
+                .await?
+                .into_iter()
+                .map(|position| crate::position_tracking::PositionSnapshot {
+                    position,
+                    unrealized_pl: None,
+                    currency: None,
+                })
+                .collect())
+        }
+    }
 
     /// Move the stop-loss on an open position (or a pending order's SL) to
     /// `new_stop`. Take-profit, entry trigger, and stake are left untouched.
