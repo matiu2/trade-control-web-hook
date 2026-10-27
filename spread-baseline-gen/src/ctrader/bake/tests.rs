@@ -32,10 +32,13 @@ fn report() -> Report {
         to_utc: to,
         requested_symbols: vec!["EURUSD".into()],
         complete: true,
+        quarantine_policy: None,
+        quarantine_audit: None,
         excluded: vec![],
         failures: vec![],
         instruments: vec![super::super::InstrumentReport {
             symbol_id: 1,
+            quarantined_minutes: Vec::new(),
             measurement: crate::mt5::InstrumentReport {
                 symbol: "EURUSD".into(),
                 pip_size: 0.0001,
@@ -293,4 +296,140 @@ fn gold_cross_uses_native_identity_without_a_class_specific_exemption() {
     verify_broker_metadata(&r.instruments[0], 22312, "XAUEUR", 0.01).unwrap();
     assert!(verify_broker_metadata(&r.instruments[0], 22312, "XAU_EUR", 0.01).is_err());
     assert!(verify_broker_metadata(&r.instruments[0], 22312, "XAUEUR", 0.1).is_err());
+}
+
+#[test]
+fn stock_bake_retains_all_exact_native_names_and_short_session_quality_rules() {
+    crate::ctrader::test_logging();
+    let mut r = report();
+    r.identity.profile = "ctrader-demo".into();
+    r.identity.account_id = 49247794;
+    r.identity.broker = "Spotware".into();
+    r.identity.login = 5944473;
+    let template = r.instruments[0].clone();
+    r.instruments = broker_ctrader::catalogue::stock_symbols()
+        .unwrap()
+        .into_iter()
+        .map(|symbol| {
+            let native = broker_ctrader::catalogue::stock_metadata(symbol).unwrap();
+            let mut row = template.clone();
+            row.symbol_id = native.id;
+            row.measurement.symbol = symbol.into();
+            row.measurement.pip_size = 10_f64.powi(-native.pip_position);
+            row.measurement.schedule = "utc".into();
+            row.measurement.timezone = "UTC".into();
+            row.measurement.profile.review = ReviewStatus::MaskNotComputable;
+            row
+        })
+        .collect();
+    r.requested_symbols = r
+        .instruments
+        .iter()
+        .map(|row| row.measurement.symbol.clone())
+        .collect();
+    let output = render(&r, &r.identity).unwrap();
+    let info = super::super::output::table_info(&output).unwrap();
+    assert_eq!(info.keys.len(), 350);
+    for symbol in &r.requested_symbols {
+        assert!(
+            info.keys
+                .contains(&format!("ctrader:ctrader-demo:{symbol}"))
+        );
+    }
+    r.instruments[0].measurement.profile.n_bars = MIN_INSTRUMENT_BARS - 1;
+    assert!(render(&r, &r.identity).is_err());
+}
+
+#[test]
+fn qualified_complete_profile_requires_durable_matching_bounded_exclusions() {
+    use crate::ctrader::quarantine::{Binding, Minute, Policy, audit::Audit};
+    crate::ctrader::test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = report();
+    r.quarantine_policy = Some(Policy::new(5).unwrap());
+    let mut audit = Audit::open(
+        &dir.path().join("audit.json"),
+        None,
+        Binding::from_report(&r).unwrap(),
+    )
+    .unwrap();
+    let crossed = ctrader_data_source::CrossedHistoricalQuote {
+        time_ms: (r.from_utc + chrono::Duration::minutes(1)).timestamp_millis() + 123,
+        bid: 2.0,
+        ask: 1.0,
+    };
+    let minute = Minute::from_error("EURUSD", 1, &crossed).unwrap();
+    audit.record(minute.clone()).unwrap();
+    r.instruments[0].quarantined_minutes.push(minute);
+    r.quarantine_audit = Some(audit.evidence().unwrap());
+    let output = render(&r, &r.identity).unwrap();
+    assert!(output.contains("calibration excludes 1 crossed M1 minutes, limit 5"));
+    crate::ctrader::output::table_info(&output).unwrap();
+    crate::ctrader::output::verify_present(&output, &output).unwrap();
+    for field in [
+        "digest",
+        "missing-row-evidence",
+        "duplicate",
+        "budget",
+        "window",
+        "policy",
+    ] {
+        let mut invalid = r.clone();
+        match field {
+            "digest" => invalid.quarantine_audit.as_mut().unwrap().sha256 = "0".repeat(64),
+            "missing-row-evidence" => invalid.instruments[0].quarantined_minutes.clear(),
+            "duplicate" => {
+                let minute = invalid.instruments[0].quarantined_minutes[0].clone();
+                invalid.instruments[0].quarantined_minutes.push(minute);
+            }
+            "budget" => {
+                invalid
+                    .quarantine_policy
+                    .as_mut()
+                    .unwrap()
+                    .max_minutes_per_instrument = 6
+            }
+            "window" => invalid.from_utc += chrono::Duration::minutes(1),
+            "policy" => invalid.quarantine_policy = None,
+            _ => unreachable!(),
+        }
+        assert!(
+            render(&invalid, &invalid.identity).is_err(),
+            "accepted {field}"
+        );
+    }
+    // A newer target audit can retain crash-durable evidence for pending symbols,
+    // but it cannot silently change an already completed profile's exclusions.
+    let mut pending = r.clone();
+    pending.complete = false;
+    pending.instruments.clear();
+    let next = ctrader_data_source::CrossedHistoricalQuote {
+        time_ms: (r.from_utc + chrono::Duration::minutes(2)).timestamp_millis(),
+        bid: 2.0,
+        ask: 1.0,
+    };
+    audit
+        .record(Minute::from_error("EURUSD", 1, &next).unwrap())
+        .unwrap();
+    pending.quarantine_audit = Some(audit.evidence().unwrap());
+    crate::ctrader::checkpoint::validate(&pending, &pending.identity, &pending.requested_symbols)
+        .unwrap();
+    let mut completed = r.clone();
+    completed.quarantine_audit = pending.quarantine_audit;
+    assert!(
+        crate::ctrader::checkpoint::validate(
+            &completed,
+            &completed.identity,
+            &completed.requested_symbols
+        )
+        .is_err()
+    );
+    let bytes = serde_json::to_vec(&report()).unwrap();
+    assert!(
+        !String::from_utf8(bytes.clone())
+            .unwrap()
+            .contains("quarantin")
+    );
+    let old: Report = serde_json::from_slice(&bytes).unwrap();
+    assert!(old.quarantine_policy.is_none());
 }

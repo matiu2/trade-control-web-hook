@@ -8,7 +8,7 @@ pub async fn verify_full_universe(account: &str, report: &Report) -> Result<()> 
     demo_config(&profile)?;
     let data = ChartData::connect_profile(account, profile).await?;
     let identity = identity(account, &data).await?;
-    let (requested, _) = super::universe::select(&data, &[], false).await?;
+    let (requested, _) = super::universe::select(&data, &[], false, false).await?;
     validate(report, &identity, &requested)
 }
 
@@ -41,6 +41,8 @@ mod tests {
             to_utc: "2026-10-01T00:00:00Z".parse().unwrap(),
             requested_symbols: vec!["EURUSD".into()],
             complete: false,
+            quarantine_policy: None,
+            quarantine_audit: None,
             excluded: vec![],
             instruments: vec![],
             failures: vec![],

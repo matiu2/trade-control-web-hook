@@ -5,7 +5,12 @@ pub(super) async fn select(
     data: &ChartData,
     only: &[String],
     all_instruments: bool,
+    stocks: bool,
 ) -> Result<(Vec<String>, Vec<crate::mt5::Failure>)> {
+    validate_scope(only, stocks)?;
+    if stocks {
+        return select_stocks(data, only).await;
+    }
     let catalogue = data.catalogue().await?;
     ensure!(
         only.iter().all(|s| catalogue
@@ -66,4 +71,63 @@ pub(super) async fn select(
         "account has no supported instruments for this calibration selection"
     );
     Ok((requested, excluded))
+}
+
+fn validate_scope(only: &[String], stocks: bool) -> Result<()> {
+    let native = broker_ctrader::catalogue::stock_symbols()?;
+    ensure!(
+        only.iter()
+            .all(|name| native.contains(&name.as_str()) == stocks),
+        "--stocks requires only audited native stocks; stock --only selection requires --stocks"
+    );
+    Ok(())
+}
+
+async fn select_stocks(
+    data: &ChartData,
+    only: &[String],
+) -> Result<(Vec<String>, Vec<crate::mt5::Failure>)> {
+    let mut requested = if only.is_empty() {
+        broker_ctrader::catalogue::stock_symbols()?
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+    } else {
+        only.to_vec()
+    };
+    requested.sort();
+    ensure!(
+        requested.windows(2).all(|pair| pair[0] != pair[1]),
+        "duplicate native stock selection"
+    );
+    for symbol in &requested {
+        data.verified_stock_metadata(symbol).await?;
+    }
+    Ok((requested, vec![]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stocks_are_a_separate_exact_scope_and_cannot_mix_with_nonstocks() {
+        crate::ctrader::test_logging();
+        validate_scope(&[], true).unwrap();
+        validate_scope(&["AIA".into(), "REDES ENERGETICAS NACIONAIS".into()], true).unwrap();
+        validate_scope(&["EURUSD".into()], false).unwrap();
+        assert!(validate_scope(&["AIA".into()], false).is_err());
+        assert!(validate_scope(&["EURUSD".into()], true).is_err());
+        assert!(validate_scope(&["AIA".into(), "EURUSD".into()], true).is_err());
+        assert!(validate_scope(&["aia".into()], true).is_err());
+        assert_eq!(
+            broker_ctrader::catalogue::stock_symbols().unwrap().len(),
+            350
+        );
+        assert_eq!(
+            broker_ctrader::catalogue::non_stock_symbols()
+                .unwrap()
+                .len(),
+            93
+        );
+    }
 }

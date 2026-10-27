@@ -18,7 +18,7 @@ struct Pinned {
 }
 impl Pinned {
     fn capture(args: &Args, status: &status::Status) -> Result<Self> {
-        let artifacts = [args.report.clone(), args.status.clone()];
+        let artifacts = artifacts(args);
         let cache_path = args.workspace.join("../candle-cache").canonicalize()?;
         let workspace = source::Source::pin(&args.workspace, false, &artifacts)?;
         let cache = source::Source::pin(&cache_path, true, &artifacts)?;
@@ -79,7 +79,7 @@ pub fn finish(args: &Args, status: &status::Status) -> Result<()> {
         commands::execute(&step, &args.workspace, status)?;
     }
     pinned.verify(&baked)?;
-    status.write("complete", &format!("strict non-stock row verification and release gates passed; {} symbols; verify_baked={}; workspace HEAD={}, SHA256={}; candle-cache HEAD={}, SHA256={}; staging_deployed={}; no Git writes", args.only.len(), args.verify_baked, pinned.workspace.head(), pinned.workspace.digest(), pinned.cache.head(), pinned.cache.digest(), args.deploy_staging))
+    status.write("complete", &format!("strict native row verification and release gates passed; {} symbols; verify_baked={}; workspace HEAD={}, SHA256={}; candle-cache HEAD={}, SHA256={}; staging_deployed={}; no Git writes", args.only.len(), args.verify_baked, pinned.workspace.head(), pinned.workspace.digest(), pinned.cache.head(), pinned.cache.digest(), args.deploy_staging))
 }
 
 fn collect(
@@ -111,7 +111,7 @@ fn collect(
     )?;
     // Hold the writer lock throughout verification, merge and release gates.
     let report_lock = Destination::acquire(&args.report, Some(&args.report))?;
-    status.write("verifying-complete-nonstocks", "reauthenticate selected native catalogue and require every requested profile to pass strict complete/quality gates")?;
+    status.write("verifying-complete-native", "reauthenticate selected native catalogue and require every requested profile to pass strict complete/quality gates")?;
     runtime.block_on(async {
         let fresh = scope::fresh(args).await?;
         ensure!(
@@ -145,7 +145,7 @@ fn verify_baked(
         "--verify-baked requires the existing complete batch report"
     );
     let report_lock = Destination::acquire(&args.report, Some(&args.report))?;
-    status.write("verifying-baked-nonstocks", "reauthenticate demo identity/native metadata, require complete exact-scope report and literal baked row equality; collection and baking are skipped")?;
+    status.write("verifying-baked-native", "reauthenticate demo identity/native metadata, require complete exact-scope report and literal baked row equality; collection and baking are skipped")?;
     runtime.block_on(async {
         let report = report_lock
             .read_resume()
@@ -168,6 +168,14 @@ async fn preflight_report(args: &Args, identity: &ctrader::Identity) -> Result<b
         scope::report(args, identity, &report, false)?;
     }
     Ok(resume)
+}
+
+fn artifacts(args: &Args) -> Vec<PathBuf> {
+    let mut paths = vec![args.report.clone(), args.status.clone()];
+    if args.quarantine_crossed_minutes {
+        paths.push(args.report.with_extension("quarantine.json"));
+    }
+    paths
 }
 
 fn require_staging(workspace: &Path) -> Result<()> {
@@ -224,5 +232,59 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read_to_string(&args.report).unwrap(), original);
+    }
+    #[test]
+    fn report_audit_and_lock_do_not_invalidate_the_requested_source_pin() {
+        crate::test_logging();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "// fixture").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+        )
+        .unwrap();
+        source::output(root, &["init", "--quiet"]).unwrap();
+        assert!(
+            std::process::Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        source::output(root, &["add", "--", "."]).unwrap();
+        source::output(
+            root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        )
+        .unwrap();
+        let mut args = super::super::args::tests::args();
+        args.report = root.join("r.json");
+        args.status = root.join("s.json");
+        args.quarantine_crossed_minutes = true;
+        let pinned = source::Source::pin(root, false, &artifacts(&args)).unwrap();
+        let audit = args.report.with_extension("quarantine.json");
+        for path in [
+            args.report.clone(),
+            args.status.clone(),
+            audit.clone(),
+            audit.with_extension("json.lock"),
+        ] {
+            std::fs::write(path, "generated artifact").unwrap();
+            pinned.verify(false).unwrap();
+        }
+        std::fs::write(root.join("unrelated.json"), "real build input").unwrap();
+        assert!(pinned.verify(false).is_err());
     }
 }

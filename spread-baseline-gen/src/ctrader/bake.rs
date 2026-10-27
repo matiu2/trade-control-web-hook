@@ -49,6 +49,7 @@ pub fn render_finished(report: &Report, identity: &Identity) -> Result<String> {
 
 pub fn render(report: &Report, identity: &Identity) -> Result<String> {
     identity.validate_demo()?;
+    super::quarantine::validate_report(report, true)?;
     ensure!(
         report.schema_version == 1 && report.identity == *identity,
         "cTrader calibration account identity mismatch"
@@ -94,7 +95,7 @@ pub fn render(report: &Report, identity: &Identity) -> Result<String> {
     rows.sort_by_key(|r| &r.measurement.symbol);
     let rows = rows
         .into_iter()
-        .map(|row| render_row(row, &identity.profile))
+        .map(|row| render_row(row, &identity.profile, &quality_annotation(report, row)?))
         .collect::<Result<Vec<_>>>()?;
     let evidence = serde_json::to_string(identity)?;
     Ok(format!(
@@ -183,7 +184,27 @@ fn validate_row(row: &crate::mt5::InstrumentReport) -> Result<()> {
     Ok(())
 }
 
-fn render_row(row: &InstrumentReport, account: &str) -> Result<String> {
+fn quality_annotation(report: &Report, row: &InstrumentReport) -> Result<String> {
+    if row.quarantined_minutes.is_empty() {
+        return Ok(String::new());
+    }
+    let policy = report
+        .quarantine_policy
+        .as_ref()
+        .ok_or_else(|| color_eyre::eyre::eyre!("missing quarantine policy"))?;
+    let audit = report
+        .quarantine_audit
+        .as_ref()
+        .ok_or_else(|| color_eyre::eyre::eyre!("missing quarantine evidence"))?;
+    Ok(format!(
+        " /* calibration excludes {} crossed M1 minutes, limit {}; audit sha256={} */",
+        row.quarantined_minutes.len(),
+        policy.max_minutes_per_instrument,
+        audit.sha256
+    ))
+}
+
+fn render_row(row: &InstrumentReport, account: &str, quality: &str) -> Result<String> {
     let row = &row.measurement;
     let profile = &row.profile;
     let key = format!("ctrader:{account}:{}", row.symbol);
@@ -191,7 +212,7 @@ fn render_row(row: &InstrumentReport, account: &str) -> Result<String> {
     let key = serde_json::to_string(&key)?;
     let schedule = serde_json::to_string(&row.schedule)?;
     Ok(format!(
-        "    (\"ctrader-{account}\", {key}, {schedule}, true, {}, {:?}, {:?}, {:?}, {:?}, {:?}),\n",
+        "    (\"ctrader-{account}\", {key}, {schedule}, true, {}, {:?}, {:?}, {:?}, {:?}, {:?}{quality}),\n",
         profile.elevated_hours,
         profile.hour_widen_frac,
         profile.baseline_median_pips,

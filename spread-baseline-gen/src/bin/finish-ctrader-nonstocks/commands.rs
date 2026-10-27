@@ -12,9 +12,19 @@ pub fn generate(args: &Args, binary: &Path, resume: bool) -> Step {
         "--window-hours".into(),
         args.window_hours.to_string(),
     ];
+    if args.quarantine_crossed_minutes {
+        flags.extend([
+            "--quarantine-crossed-minutes".into(),
+            "--max-quarantined-minutes".into(),
+            args.max_quarantined_minutes.to_string(),
+        ]);
+    }
     if resume {
         flags.extend(["--resume".into(), args.report.to_string_lossy().into()]);
     } else {
+        if args.stocks {
+            flags.push("--stocks".into());
+        }
         // Separate process arguments preserve spaces in exact native names.
         for name in &args.only {
             flags.extend(["--only".into(), name.clone()]);
@@ -27,7 +37,11 @@ pub fn generate(args: &Args, binary: &Path, resume: bool) -> Step {
         ]);
     }
     Step {
-        state: "calibrating-nonstocks",
+        state: if args.stocks {
+            "calibrating-stocks"
+        } else {
+            "calibrating-nonstocks"
+        },
         program: binary.to_string_lossy().into(),
         args: flags,
     }
@@ -35,7 +49,11 @@ pub fn generate(args: &Args, binary: &Path, resume: bool) -> Step {
 
 pub fn bake(args: &Args, binary: &Path, table: &Path) -> Step {
     Step {
-        state: "baking-nonstocks",
+        state: if args.stocks {
+            "baking-stocks"
+        } else {
+            "baking-nonstocks"
+        },
         program: binary.to_string_lossy().into(),
         args: vec![
             "--account".into(),
@@ -90,6 +108,53 @@ mod tests {
         let bake = bake(&a, Path::new("bake-ctrader"), Path::new("ctrader.rs"));
         assert!(bake.args.contains(&"--merge".into()));
         assert!(!bake.args.contains(&"--allow-partial".into()));
+    }
+    #[test]
+    fn stock_scope_and_native_names_survive_child_arguments_and_resume() {
+        crate::test_logging();
+        let mut a = super::super::args::tests::args();
+        a.stocks = true;
+        a.quarantine_crossed_minutes = true;
+        a.max_quarantined_minutes = 2;
+        a.only = vec!["AIA".into(), "REDES ENERGETICAS NACIONAIS".into()];
+        let parse = |resume| {
+            spread_baseline_gen::ctrader::generate::Args::try_parse_from(
+                std::iter::once("generate-ctrader".to_string())
+                    .chain(generate(&a, Path::new("generate-ctrader"), resume).args),
+            )
+            .unwrap()
+        };
+        let fresh = parse(false);
+        assert!(fresh.stocks);
+        assert!(fresh.quarantine_crossed_minutes);
+        assert_eq!(fresh.max_quarantined_minutes, 2);
+        assert_eq!(fresh.only, a.only);
+        let resume = parse(true);
+        assert!(!resume.stocks);
+        assert!(resume.quarantine_crossed_minutes);
+        assert_eq!(resume.max_quarantined_minutes, 2);
+        assert_eq!(resume.resume, Some(a.report.clone()));
+        assert_eq!(
+            bake(&a, Path::new("bake-ctrader"), Path::new("ctrader.rs")).state,
+            "baking-stocks"
+        );
+    }
+
+    #[test]
+    fn explicit_quality_policy_is_forwarded_for_fresh_and_resume() {
+        crate::test_logging();
+        let mut a = super::super::args::tests::args();
+        a.quarantine_crossed_minutes = true;
+        a.max_quarantined_minutes = 2;
+        for resume in [false, true] {
+            let command = generate(&a, Path::new("generate-ctrader"), resume);
+            let parsed = spread_baseline_gen::ctrader::generate::Args::try_parse_from(
+                std::iter::once("generate-ctrader".to_string()).chain(command.args),
+            )
+            .unwrap();
+            assert!(parsed.quarantine_crossed_minutes);
+            assert_eq!(parsed.max_quarantined_minutes, 2);
+        }
     }
     #[test]
     fn failed_step_stops_following_commands() {

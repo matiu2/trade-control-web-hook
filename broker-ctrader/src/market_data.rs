@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 mod forex;
 mod identity;
+mod stocks;
 pub use identity::AccountIdentity;
 
 pub use ctrader_data_source::{InstrumentSummary, NativeBar, NativePeriod};

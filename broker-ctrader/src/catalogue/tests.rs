@@ -2,7 +2,7 @@ use super::*;
 use instrument_lookup::AssetClass;
 use tracing_subscriber::prelude::*;
 
-fn logging() {
+pub(super) fn logging() {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .with(tracing_error::ErrorLayer::default())
