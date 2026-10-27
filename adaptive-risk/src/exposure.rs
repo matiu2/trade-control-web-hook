@@ -40,8 +40,8 @@ impl LossEstimate {
             Side::Sell => sub(stop, self.price)?,
         };
         ensure!(
-            self.is_open_position || distance > Decimal::ZERO,
-            "stop on wrong side of entry"
+            distance > Decimal::ZERO,
+            "protective stop crossed or on wrong side of entry/mark"
         );
         let price_risk = mul(
             mul(distance.max(Decimal::ZERO), self.contract_size)?,

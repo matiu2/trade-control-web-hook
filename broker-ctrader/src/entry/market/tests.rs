@@ -230,6 +230,7 @@ async fn short_fill_normalizes_both_absolute_levels_after_slippage() {
 fn market_protection_rejects_off_grid_prices_before_submission() {
     init();
     let mut req = EntryRequest {
+        setup_id: None,
         instrument: "EURUSD",
         direction: Direction::Long,
         entry: ResolvedEntry::Market {

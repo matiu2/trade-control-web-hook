@@ -5,6 +5,7 @@ pub mod decision;
 pub mod exposure;
 pub mod ledger;
 pub mod manager;
+pub mod metrics;
 pub mod policy;
 pub mod simulation;
 pub mod store;

@@ -30,6 +30,7 @@ fn money_digits_not_hardcoded_cents() {
 fn market_order_protects_with_relative_distances() {
     init();
     let req = EntryRequest {
+        setup_id: None,
         instrument: "EURUSD",
         direction: trade_control_core::intent::Direction::Long,
         entry: trade_control_core::intent::ResolvedEntry::Market {
@@ -70,6 +71,7 @@ fn request(
         (1.11, 1.08)
     };
     EntryRequest {
+        setup_id: None,
         instrument: "EURUSD",
         direction,
         entry,

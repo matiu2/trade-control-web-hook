@@ -75,6 +75,7 @@ pub struct ResolvedRecoverEntry {
 /// Fully-resolved trade intent, with all prices computed.
 #[derive(Debug, Clone)]
 pub struct Resolved {
+    pub setup_id: String,
     // `id` and `not_after` aren't read by current dispatch (it uses the raw
     // `Intent` for those) but carrying them keeps `Resolved` self-contained.
     #[allow(dead_code)]
@@ -567,6 +568,7 @@ impl Resolved {
         // size_units scripts all evaluate against this snapshot.
         let geometry_snapshot = Self {
             id: intent.id.clone(),
+            setup_id: intent.trade_id.clone().unwrap_or_else(|| intent.id.clone()),
             not_after: intent.not_after,
             instrument: intent.instrument.clone(),
             direction,
@@ -862,6 +864,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn setup_identity_prefers_trade_id_and_survives_resolution() {
+        let mut intent = long_market_intent();
+        intent.trade_id = Some("shared-setup".into());
+        let resolved = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
+        assert_eq!(resolved.setup_id, "shared-setup");
+        intent.trade_id = None;
+        assert_eq!(
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0)
+                .unwrap()
+                .setup_id,
+            intent.id
+        );
+    }
     #[test]
     fn long_market_resolves_r_multiple_tp() {
         let r = Resolved::from_intent(&long_market_intent(), &shell(), 0.0001, 0.0).unwrap();

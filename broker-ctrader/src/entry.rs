@@ -1,7 +1,7 @@
 use super::*;
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 use wire::{array, integer, is_enum};
-mod geometry;
+pub(crate) mod geometry;
 pub(crate) mod market;
 mod sizing;
 mod validate;
@@ -9,6 +9,25 @@ pub(crate) use geometry::payload;
 #[cfg(test)]
 pub(crate) use sizing::volume;
 
+#[derive(Default)]
+pub(crate) struct SubmissionEvidence {
+    pub attempted: bool,
+    pub absent: bool,
+}
+impl SubmissionEvidence {
+    pub(crate) fn observe(
+        &mut self,
+        result: &std::result::Result<Value, ctrader_api::RequestError>,
+    ) {
+        self.absent = matches!(
+            result,
+            Err(ctrader_api::RequestError::NotSent(_) | ctrader_api::RequestError::Rejected { .. })
+        );
+    }
+    fn no_risk_added(&self) -> bool {
+        !self.attempted || self.absent
+    }
+}
 fn reject(detail: impl Into<String>) -> EntryError {
     EntryError::OrderRejectedWithDetail(detail.into())
 }
@@ -73,19 +92,39 @@ where
     let quote = metadata::quote(broker, &symbol.name)
         .await
         .map_err(|_| EntryError::AccountFetch)?;
-    let price = geometry::price(req, quote)?;
+    let mut price = geometry::price(req, quote)?;
     let sizing::SizedEntry {
-        cents,
+        mut cents,
         implied_pct: implied,
-        max_stop_distance,
+        mut max_stop_distance,
     } = sizing::size(broker, req, &symbol, &trader, price, cap).await?;
-    let payload = with_client_id(
+    let mut protection = crate::protection::prepare(broker, req, &symbol, cents, cap, client_id)
+        .await
+        .map_err(|error| reject(format!("prop risk: {error}")))?;
+    if let Some(guard) = &protection {
+        price = guard.price().map_err(|error| reject(error.to_string()))?;
+        cents = guard.cents().map_err(|error| reject(error.to_string()))?;
+        max_stop_distance = guard
+            .max_stop_distance()
+            .map_err(|error| reject(error.to_string()))?;
+    }
+    let protected_id = protection.as_ref().map(|guard| guard.id().to_owned());
+    let client_id = protected_id.as_deref().or(client_id);
+    let mut payload = with_client_id(
         payload(broker.account_id(), symbol.id, cents, req, price)?,
         client_id,
     )?;
+    if let Some(guard) = &mut protection {
+        payload["label"] = json!(format!("risk:{}", guard.setup_id()));
+        guard
+            .before_submit(broker, req, &symbol)
+            .await
+            .map_err(|error| reject(format!("prop risk revalidation: {error}")))?;
+    }
     if req.dry_run {
         tracing::info!(account=%broker.account_name,instrument=%symbol.name,units=cents as f64/100.0,price,implied_risk_pct=implied,"cTrader dry run; no order submitted");
     }
+    let mut submission = SubmissionEvidence::default();
     if matches!(req.entry, ResolvedEntry::Market { .. }) && !req.dry_run {
         let terms = market::Terms {
             account: broker.account_id(),
@@ -101,17 +140,45 @@ where
             max_stop_distance,
             before: market::before(&snapshot).map_err(|error| reject(error.to_string()))?,
         };
-        return market::execute(
+        if let Some(guard) = &mut protection {
+            guard.mark_transport();
+        }
+        let result = market::execute(
             &mut market::Api {
                 broker,
                 audit: &mut audit,
+                submission: &mut submission,
             },
             terms,
             payload,
         )
         .await;
+        if matches!(result, Err(EntryError::OrderRejectedWithDetail(_))) {
+            submission.absent = true;
+        }
+        if let Some(guard) = &mut protection {
+            guard.outcome(submission.no_risk_added()).map_err(|error| {
+                EntryError::AmbiguousSuccess(format!("prop risk outcome persistence: {error}"))
+            })?;
+        }
+        return result;
     }
-    submit(req.dry_run, cents, price, || broker.mutate(2106, payload)).await
+    if let Some(guard) = &mut protection {
+        guard.mark_transport();
+    }
+    let result = submit(req.dry_run, cents, price, || async {
+        submission.attempted = true;
+        let response = broker.mutate(2106, payload).await;
+        submission.observe(&response);
+        response
+    })
+    .await;
+    if let Some(guard) = &mut protection {
+        guard.outcome(submission.no_risk_added()).map_err(|error| {
+            EntryError::AmbiguousSuccess(format!("prop risk outcome persistence: {error}"))
+        })?;
+    }
+    result
 }
 
 pub(crate) async fn submit<F, Fut>(

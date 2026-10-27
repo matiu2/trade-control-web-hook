@@ -574,6 +574,7 @@ mod tests {
 
     fn request<'a>(risk: RiskBudget, multiplier: Option<f64>) -> EntryRequest<'a> {
         EntryRequest {
+            setup_id: None,
             instrument: "ES",
             direction: trade_control_core::intent::Direction::Long,
             entry: ResolvedEntry::Market {

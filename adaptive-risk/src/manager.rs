@@ -61,6 +61,25 @@ impl RiskSession {
     pub fn state(&self) -> &RiskState {
         &self.state
     }
+    pub fn latch_stops(&mut self, account: bool, daily: bool) -> Result<()> {
+        if account && !self.state.account_locked {
+            self.state.metrics.circuit_breaker_activations = self
+                .state
+                .metrics
+                .circuit_breaker_activations
+                .saturating_add(1);
+        }
+        if daily && !self.state.daily_locked {
+            self.state.metrics.circuit_breaker_activations = self
+                .state
+                .metrics
+                .circuit_breaker_activations
+                .saturating_add(1);
+        }
+        self.state.account_locked |= account;
+        self.state.daily_locked |= daily;
+        self.persist()
+    }
     pub fn on_execution(&mut self, execution: ledger::Execution) -> Result<()> {
         let result = self.state.on_execution(execution);
         self.persist()?;
@@ -94,6 +113,7 @@ impl RiskSession {
         self.persist()?;
         self.apply_reconciliation(snapshot, rule, now)?;
         self.state.needs_reconciliation = false;
+        self.track_reduced(snapshot, rule, now);
         self.persist()
     }
     fn apply_reconciliation(
@@ -157,9 +177,11 @@ impl RiskSession {
         now: DateTime<Utc>,
     ) -> Result<Authorization> {
         let decision = evaluate_trade(&self.state.policy, a, &trade, &self.state, rule, now);
-        self.observe(a, &trade, &decision, now);
         if !decision.approved {
             self.state.metrics.blocked_trades = self.state.metrics.blocked_trades.saturating_add(1);
+        }
+        self.observe(a, &trade, &decision, rule, now);
+        if !decision.approved {
             self.persist()?;
             return Err(eyre!("risk blocked: {:?}", decision.reasons));
         }
@@ -262,24 +284,56 @@ impl RiskSession {
         self.state.needs_reconciliation = true;
         self.persist()
     }
+    fn track_reduced(&mut self, a: &AccountSnapshot, rule: &dyn LossRule, now: DateTime<Utc>) {
+        if let Ok(metrics) = crate::metrics::snapshot(&self.state, a, rule, now) {
+            if metrics.risk_multiplier < Decimal::ONE {
+                self.state.metrics.reduced_since.get_or_insert(now);
+            } else if let Some(start) = self.state.metrics.reduced_since.take() {
+                self.state.metrics.reduced_risk_seconds = self
+                    .state
+                    .metrics
+                    .reduced_risk_seconds
+                    .saturating_add((now - start).num_seconds().max(0));
+            }
+        }
+    }
     fn observe(
         &mut self,
         a: &AccountSnapshot,
         t: &ProposedTrade,
         d: &RiskDecision,
+        rule: &dyn LossRule,
         now: DateTime<Utc>,
     ) {
+        self.track_reduced(a, rule, now);
         let p = &self.state.policy;
         let multiplier = p.streak_multiplier(self.state.consecutive_losses);
-        if multiplier < Decimal::ONE || d.allowed_risk_pct < p.base_risk_pct {
-            self.state.metrics.reduced_since.get_or_insert(now);
-        } else if let Some(start) = self.state.metrics.reduced_since.take() {
-            self.state.metrics.reduced_risk_seconds = self
-                .state
-                .metrics
-                .reduced_risk_seconds
-                .saturating_add((now - start).num_seconds().max(0));
+        let telemetry = crate::metrics::snapshot(&self.state, a, rule, now);
+        let drawdown = telemetry
+            .as_ref()
+            .map_or(d.drawdown_pct, |m| m.account_drawdown_pct);
+        let daily_loss = telemetry
+            .as_ref()
+            .map_or(d.daily_loss_pct, |m| m.daily_loss_pct);
+        let reserved = telemetry
+            .as_ref()
+            .map_or(d.reserved_exposure, |m| m.total_reserved_exposure);
+        let daily_remaining = telemetry
+            .as_ref()
+            .map_or(d.daily_remaining, |m| m.daily_budget_remaining);
+        let reduced_seconds = telemetry
+            .as_ref()
+            .map_or(self.state.metrics.reduced_risk_seconds, |m| {
+                m.reduced_risk_seconds
+            });
+        match telemetry {
+            Ok(metrics) => {
+                tracing::info!(account_id=%a.account_id,metrics=?metrics,"account risk metrics")
+            }
+            Err(error) => {
+                tracing::warn!(account_id=%a.account_id,%error,"account risk telemetry unavailable")
+            }
         }
-        tracing::info!(timestamp=%now,account_id=%a.account_id,strategy_id=%t.strategy_id,setup_id=%t.setup_id,account_equity=%a.equity,account_drawdown_pct=%d.drawdown_pct,daily_loss_pct=%d.daily_loss_pct,consecutive_losses=self.state.consecutive_losses,base_risk_pct=%p.base_risk_pct,streak_risk_pct=%(p.base_risk_pct*multiplier),drawdown_risk_pct=%p.drawdown_risk_pct(d.drawdown_pct),allowed_risk_pct=%d.allowed_risk_pct,reserved_exposure=%d.reserved_exposure,decision=d.approved,limiting_policy=?d.limiting_policy,risk_multiplier=%multiplier,daily_budget_remaining=%d.daily_remaining,blocked_trades=self.state.metrics.blocked_trades,circuit_breaker_activations=self.state.metrics.circuit_breaker_activations,reduced_risk_seconds=self.state.metrics.reduced_risk_seconds,"account risk decision");
+        tracing::info!(timestamp=%now,account_id=%a.account_id,strategy_id=%t.strategy_id,setup_id=%t.setup_id,account_equity=%a.equity,account_drawdown_pct=%drawdown,daily_loss_pct=%daily_loss,consecutive_losses=self.state.consecutive_losses,base_risk_pct=%p.base_risk_pct,streak_risk_pct=%(p.base_risk_pct*multiplier),drawdown_risk_pct=%p.drawdown_risk_pct(drawdown),allowed_risk_pct=%d.allowed_risk_pct,reserved_exposure=%reserved,decision=d.approved,limiting_policy=?d.limiting_policy,risk_multiplier=%multiplier,daily_budget_remaining=%daily_remaining,blocked_trades=self.state.metrics.blocked_trades,circuit_breaker_activations=self.state.metrics.circuit_breaker_activations,reduced_risk_seconds=reduced_seconds,"account risk decision");
     }
 }

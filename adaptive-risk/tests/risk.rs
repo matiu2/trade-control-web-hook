@@ -493,3 +493,55 @@ fn corrupt_missing_or_changed_policy_state_never_enrolls_implicitly() -> Result<
     assert!(mgr.begin().is_err());
     Ok(())
 }
+
+#[test]
+fn charge_only_events_cannot_complete_a_setup() {
+    let (_, mut s, _, _) = fixture();
+    s.on_execution(Execution {
+        event_id: "fee-only".into(),
+        setup_id: "lost-opening".into(),
+        position_id: "p".into(),
+        occurred_at: now(),
+        volume_delta: Decimal::ZERO,
+        net_pnl: d("-1"),
+    })
+    .unwrap();
+    assert!(s.on_setup_closed("lost-opening", now(), true).is_err());
+}
+#[test]
+fn telemetry_and_numeric_toml_configuration_are_available() -> Result<()> {
+    let (p, mut s, a, _) = fixture();
+    let q: RiskPolicy = toml::from_str("base_risk_pct=1.0\ninternal_daily_stop_pct=2.0\n")?;
+    assert_eq!(p, q);
+    s.consecutive_losses = 2;
+    let metrics = adaptive_risk::metrics::snapshot(&s, &a, &StandardLossRule, now())?;
+    assert_eq!(metrics.risk_multiplier, d("0.5"));
+    assert_eq!(metrics.daily_budget_remaining, d("200"));
+    Ok(())
+}
+#[test]
+fn crossed_open_position_stops_block_new_risk_in_both_directions() {
+    let (p, s, mut a, t) = fixture();
+    for (side, mark, stop) in [
+        (Side::Buy, "99", "99.5"),
+        (Side::Sell, "101", "100.5"),
+        (Side::Buy, "99", "99"),
+    ] {
+        let mut estimate = t.estimate.clone();
+        estimate.side = side;
+        estimate.price = d(mark);
+        estimate.stop = Some(d(stop));
+        estimate.is_open_position = true;
+        a.exposures = vec![Exposure {
+            broker_id: "crossed".into(),
+            request_id: None,
+            volume: Decimal::ONE,
+            estimate,
+            overlapping: false,
+        }];
+        assert_eq!(
+            eval(&p, &s, &a, &t).limiting_policy,
+            RiskLimitReason::InvalidExposure
+        );
+    }
+}

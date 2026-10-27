@@ -91,7 +91,11 @@ impl RiskState {
         );
         let mut volumes = std::collections::BTreeMap::<&str, Decimal>::new();
         let mut net = Decimal::ZERO;
+        let mut opened = std::collections::BTreeSet::new();
         for e in events {
+            if e.volume_delta > Decimal::ZERO {
+                opened.insert(e.position_id.as_str());
+            }
             let previous = volumes
                 .get(e.position_id.as_str())
                 .copied()
@@ -100,7 +104,7 @@ impl RiskState {
             net = add(net, e.net_pnl)?;
         }
         ensure!(
-            volumes.values().all(Decimal::is_zero),
+            volumes.values().all(Decimal::is_zero) && volumes.keys().all(|id| opened.contains(id)),
             "setup positions not fully closed"
         );
         let outcome = SetupOutcome {
