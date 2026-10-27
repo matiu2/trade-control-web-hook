@@ -26,7 +26,7 @@ pub(crate) fn observation(
                 stored.plan.instrument, stored.plan.granularity
             ),
             None => format!(
-                "{} {:?}: plan evaluation resumed; this does not confirm an entry or recover missed signals",
+                "{} {:?}: plan evaluation resumed; this does not confirm an entry; closed-candle catch-up is reported separately",
                 stored.plan.instrument, stored.plan.granularity
             ),
         },
