@@ -46,6 +46,7 @@
 //! anchor math) are unit-tested here. End-to-end behaviour is exercised on the
 //! demo deploy, run in parallel with the live TV alerts (Stage F gate).
 
+mod catchup;
 mod detector_history;
 
 use chrono::{DateTime, Utc};
@@ -200,6 +201,21 @@ where
     // the failed transition first, so a replay can see "wanted to advance,
     // couldn't" rather than a silent gap.
     let put_failed = !kv.success && !eval.done;
+
+    if !put_failed
+        && let Some(note) =
+            catchup::observation(stored, since, &fresh, eval.new_state.watermark, now)
+    {
+        tracing::warn!(
+            trade_id = plan.trade_id,
+            message = note.message,
+            "candle backlog recovered"
+        );
+        // This is a one-shot event after consuming the backlog. The journal
+        // event sink is best-effort; unlike recurring health observations,
+        // there is no promise that a failed insert can retry next tick.
+        cron.record_cron_note(note);
+    }
 
     // Shadow plans observe only: the state above advanced exactly as a live
     // plan would, but we never touch the broker or the seen-id index — each

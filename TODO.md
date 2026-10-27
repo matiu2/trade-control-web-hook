@@ -362,3 +362,19 @@ should accept either and normalise internally.
       operator's own pasted URL armed `TRADENATION:GBPJPY` h4, H&S short,
       8 alerts, `source=…/arm-setup?instrument=GBP_JPY&tf=h4&broker=tradenation`
 - [ ] committed + pushed, parent pointer bumped
+
+# TODO — EURGBP candle catch-up investigation (2026-10-27)
+
+- [x] Verify Brisbane timestamps and genuine MT5 H1 closes: the 18:00/19:00
+      breaches preceded the 23:21 registration; later closes stayed below 0.8395.
+- [x] Confirm the engine already fetches all candles after its durable watermark.
+- [x] Add genuine-price regression coverage for pre-arming breaches and a veto
+      inside a catch-up batch that the newest candle alone would miss.
+- [x] Prove general catch-up evaluates every missed candle, entry heartbeat and
+      intermediate pause/resume in order, with the same state/fires as one-bar ticks.
+- [x] Journal a warning after a successfully persisted catch-up, including the
+      backlog size, time span, and actual evaluated range (terminal vetoes stop early).
+- [x] All 1,675 core/engine/cron tests pass; clippy with warnings as errors,
+      formatting and both independent reviews pass.
+- [x] Backport to main: all 1,622 applicable tests, clippy, formatting and
+      both integration reviews pass; preserve main's persistence failure paths.
