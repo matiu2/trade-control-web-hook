@@ -1,0 +1,33 @@
+{
+  "sampling_window": {
+    "from_utc": "2026-07-24T16:26:00Z",
+    "to_utc": "2026-10-22T16:26:00Z"
+  },
+  "source": "genuine paired M1 through candle-cache; no native-bid fallback",
+  "aarons": {
+    "native_symbol_id": 21877,
+    "retained_m1_candles": 0,
+    "failure": {
+      "symbol": "AARONS",
+      "error": "cTrader paired spread calculation: no minute candles for AARONS"
+    },
+    "elapsed_seconds": 108,
+    "report_sha256": "f8aece8625ecd6f7afe3474d83a25d6d0f62a8c09bcea56ca7df99bc27efc3b4"
+  },
+  "abbott": {
+    "native_symbol_id": 21706,
+    "retained_m1_candles": 24533,
+    "quarantined_minutes": 0,
+    "elapsed_seconds": 273,
+    "pip_size": 1.0,
+    "schedule": "utc",
+    "timezone": "UTC",
+    "review": "MaskNotComputable",
+    "baseline_median_native_pips": 0.3500000000000085,
+    "report_sha256": "f641c41f8c3b629619d7de53c4470d439d7cd70f91ce140c3dc36c542ca9e914",
+    "strict_native_bake_passed": true,
+    "temporary_table_sha256": "162224c5daa2414d17ce3ba8f35931c657b19560ea41dccbcd855dcee427d889"
+  },
+  "runtime_profiles_unchanged": 93,
+  "broker_order_mutations": 0
+}
