@@ -914,6 +914,7 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     }
 
     let entry_request = EntryRequest {
+        setup_id: Some(&resolved.setup_id),
         instrument: &resolved.instrument,
         direction: resolved.direction,
         entry: resolved.entry.clone(),
@@ -1843,6 +1844,7 @@ async fn place_entry_too_close_fallback<B: Broker>(
             // reference (TN re-fetches live bid/ask; OANDA uses it
             // directly), so the position size reflects the worse fill.
             let market_request = EntryRequest {
+                setup_id: Some(&resolved.setup_id),
                 instrument: &resolved.instrument,
                 direction: resolved.direction,
                 entry: ResolvedEntry::Market { reference_price },
@@ -1887,6 +1889,7 @@ async fn place_entry_too_close_fallback<B: Broker>(
             // sizes from the limit trigger just as it would have from the
             // stop trigger.
             let limit_request = EntryRequest {
+                setup_id: Some(&resolved.setup_id),
                 instrument: &resolved.instrument,
                 direction: resolved.direction,
                 entry: ResolvedEntry::Limit { trigger_price },
@@ -1929,6 +1932,7 @@ async fn place_entry_too_close_fallback<B: Broker>(
             // catches the continuation through it (used when a *limit* was
             // wrong-side).
             let stop_request = EntryRequest {
+                setup_id: Some(&resolved.setup_id),
                 instrument: &resolved.instrument,
                 direction: resolved.direction,
                 entry: ResolvedEntry::Stop { trigger_price },

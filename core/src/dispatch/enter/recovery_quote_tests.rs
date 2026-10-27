@@ -63,6 +63,7 @@ impl Broker for QuoteBroker {
 
 fn resolved(direction: Direction, action: RecoverEntryAction) -> Resolved {
     Resolved {
+        setup_id: "test-setup".into(),
         id: "audjpy-enter".into(),
         not_after: "2026-10-22T12:00:00Z".parse().unwrap(),
         instrument: "AUDJPY".into(),

@@ -52,6 +52,7 @@ pub async fn check(
                 1.0
             };
         let req = EntryRequest {
+            setup_id: None,
             instrument: symbol,
             direction: Direction::Short,
             entry: ResolvedEntry::Market {

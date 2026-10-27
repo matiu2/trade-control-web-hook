@@ -21,6 +21,7 @@ fn symbol() -> SymbolInfo {
 
 fn request(entry: ResolvedEntry, direction: Direction) -> EntryRequest<'static> {
     EntryRequest {
+        setup_id: None,
         instrument: "AUDJPY",
         direction,
         entry,

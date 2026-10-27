@@ -219,6 +219,7 @@ mod tests {
     fn market_request() -> EntryRequest<'static> {
         logging();
         EntryRequest {
+            setup_id: None,
             instrument: "AUDJPY",
             direction: Direction::Long,
             entry: ResolvedEntry::Market {
@@ -256,18 +257,22 @@ mod tests {
         let req = market_request();
         [
             EntryRequest {
+                setup_id: None,
                 stop_loss: 110.134,
                 ..market_request()
             },
             EntryRequest {
+                setup_id: None,
                 take_profit: 110.134,
                 ..market_request()
             },
             EntryRequest {
+                setup_id: None,
                 stop_loss: f64::NAN,
                 ..market_request()
             },
             EntryRequest {
+                setup_id: None,
                 take_profit: f64::INFINITY,
                 ..market_request()
             },
@@ -286,6 +291,7 @@ mod tests {
             band()
                 .check(
                     &EntryRequest {
+                        setup_id: None,
                         entry: ResolvedEntry::Stop {
                             trigger_price: 110.138
                         },
