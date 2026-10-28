@@ -162,3 +162,48 @@ fn sparse_stock_quotes_can_measure_a_forecast_without_ranking_volatility() {
     assert!(profile.hour_p90_frac[9] > 0.0);
     assert_eq!(profile.elevated_hours, 0);
 }
+
+#[test]
+fn legacy_fixed_spread_aliases_receive_the_same_current_measured_profile() {
+    init();
+    let to = Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+    let from = to - Duration::days(60);
+    let bars = (0..100)
+        .map(|_| crate::MinuteBar {
+            utc_minute_of_day: 540,
+            local_hour: 9,
+            spread_frac: 0.001,
+            mid_close: 100.0,
+        })
+        .collect::<Vec<_>>();
+    let row = Measurement {
+        schedule: "ny".into(),
+        pip_size: 0.01,
+        first_utc: from + Duration::days(2),
+        last_utc: to - Duration::days(1),
+        observed_days: 42,
+        profile: crate::compute::profile_from_sparse_minutes(&bars, 0.01),
+    };
+    let symbol = "Spot Gold (Fixed Spreads)".to_string();
+    let report = Report {
+        source: "test".into(),
+        from_utc: from,
+        to_utc: to,
+        catalogue: vec![symbol.clone()],
+        measurements: BTreeMap::from([(symbol, row)]),
+        failures: BTreeMap::new(),
+        complete: true,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("candle.rs");
+    std::fs::write(&out, crate::render_table(&[])).unwrap();
+    promote(&out, &report).unwrap();
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("\"tradenation\", \"Spot Gold\", \"ny\", true"));
+    assert!(text.contains("\"tradenation\", \"Spot Gold (Fixed Spreads)\", \"ny\", true"));
+    assert!(!text.contains("Variable Spreads"));
+}
