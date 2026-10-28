@@ -2416,6 +2416,27 @@ instrument: EUR/USD
 # ...
 ```
 
+### cTrader orders above the symbol maximum
+
+cTrader entries default to `on_oversize: cap_volume`: if risk sizing exceeds
+the symbol's maximum order volume, use the largest permitted volume step,
+preserve the strategy's stop-loss and take-profit prices, and accept lower
+cash risk and reward. The price-based reward-to-risk ratio is unchanged.
+Account risk caps, minimum volume and other entry checks still apply.
+
+Set `on_oversize: reject` on an entry intent or trade-design YAML to refuse
+instead. In `tv-arm`, use `--on-oversize reject` (default: `cap-volume`);
+the trade panel exposes the same choice under Risk and order lifetime.
+The setting survives stop/limit/market recovery and manual position entries.
+Other broker adapters retain their existing sizing behaviour. Replay has no
+broker equity or volume limits and does not simulate volume capping.
+
+Every oversized entry that passes the risk cap emits a warning containing
+account, instrument, setup, policy, requested and capped units, requested and
+capped risk percentages, and the original SL/TP. A capped sizing warning does
+not confirm an order submission or fill. Existing plans that omit the setting
+use `cap_volume` after upgrading the worker; no plans need to be re-registered.
+
 ### Futures contracts and the close-out guard
 
 **Not yet tradable — the guard lands ahead of the broker.** IBKR futures are

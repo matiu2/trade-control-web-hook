@@ -88,6 +88,7 @@ mod tests {
 
     fn enter_intent(needs_golden: bool, needs_confirmed: bool) -> Intent {
         Intent {
+            on_oversize: Default::default(),
             entry_level_vetos: Vec::new(),
             v: 1,
             id: "msg-1".into(),

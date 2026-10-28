@@ -30,6 +30,7 @@ fn money_digits_not_hardcoded_cents() {
 fn market_order_protects_with_relative_distances() {
     init();
     let req = EntryRequest {
+        on_oversize: Default::default(),
         setup_id: None,
         instrument: "EURUSD",
         direction: trade_control_core::intent::Direction::Long,
@@ -49,17 +50,29 @@ fn market_order_protects_with_relative_distances() {
 }
 
 #[test]
-fn volume_invalid_limits_nonfinite_and_oversize_are_refused() {
+fn volume_invalid_limits_and_nonfinite_are_refused() {
     init();
     for (units, min, max, step) in [
         (f64::NAN, 100, 1000, 100),
         (10.0, 0, 1000, 100),
         (10.0, 100, 1000, 0),
-        (20.0, 100, 1000, 100),
+        (10.0, 1001, 1000, 100),
         (f64::INFINITY, 100, 1000, 100),
     ] {
         assert!(entry::volume(units, min, max, step).is_err());
     }
+}
+
+#[test]
+fn volume_caps_at_the_largest_valid_broker_step() {
+    init();
+    assert_eq!(
+        entry::volume(11_544_530.24, 100_000, 1_000_000_000, 100_000).unwrap(),
+        1_000_000_000
+    );
+    assert_eq!(entry::volume(20.0, 100, 1050, 100).unwrap(), 1000);
+    assert_eq!(entry::volume(10.0, 100, 1000, 100).unwrap(), 1000);
+    assert!(entry::volume(20.0, 1050, 1050, 100).is_err());
 }
 fn request(
     direction: trade_control_core::intent::Direction,
@@ -71,6 +84,7 @@ fn request(
         (1.11, 1.08)
     };
     EntryRequest {
+        on_oversize: Default::default(),
         setup_id: None,
         instrument: "EURUSD",
         direction,

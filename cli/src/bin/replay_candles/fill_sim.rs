@@ -1868,6 +1868,7 @@ mod tests {
 
     fn base_enter() -> Intent {
         Intent {
+            on_oversize: Default::default(),
             entry_level_vetos: Vec::new(),
             v: 1,
             id: "sim-test".into(),

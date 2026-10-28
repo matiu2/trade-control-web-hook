@@ -40,6 +40,7 @@ fn candle(time: &str) -> Candle {
 /// A minimal intent — only `instrument` is read (and nothing gates expiry on it).
 fn intent() -> Intent {
     Intent {
+        on_oversize: Default::default(),
         entry_level_vetos: Vec::new(),
         v: 1,
         id: "x".into(),

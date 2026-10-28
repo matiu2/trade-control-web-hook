@@ -191,6 +191,7 @@ mod tests {
     fn pending_read_must_match_probe_client_and_absolute_protection() {
         crate::test_logging();
         let req = EntryRequest {
+            on_oversize: Default::default(),
             setup_id: None,
             instrument: "EURUSD",
             direction: trade_control_core::intent::Direction::Long,

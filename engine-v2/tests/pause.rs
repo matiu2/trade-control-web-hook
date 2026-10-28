@@ -39,6 +39,7 @@ fn candle(time: &str) -> Candle {
 
 fn intent() -> Intent {
     Intent {
+        on_oversize: Default::default(),
         entry_level_vetos: Vec::new(),
         v: 1,
         id: "x".into(),

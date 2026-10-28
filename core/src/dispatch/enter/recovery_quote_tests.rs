@@ -19,6 +19,7 @@ impl Broker for QuoteBroker {
         req: &EntryRequest<'_>,
     ) -> Result<Placement, EntryError> {
         self.placed.borrow_mut().push(req.entry.clone());
+        assert_eq!(req.on_oversize, crate::intent::OversizePolicy::Reject);
         Ok(Placement::id_only("recovered-order"))
     }
     async fn get_quote(&self, _: &str) -> Result<Quote, LookupError> {
@@ -63,6 +64,7 @@ impl Broker for QuoteBroker {
 
 fn resolved(direction: Direction, action: RecoverEntryAction) -> Resolved {
     Resolved {
+        on_oversize: crate::intent::OversizePolicy::Reject,
         setup_id: "test-setup".into(),
         id: "audjpy-enter".into(),
         not_after: "2026-10-22T12:00:00Z".parse().unwrap(),
