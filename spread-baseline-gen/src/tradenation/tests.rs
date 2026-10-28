@@ -152,4 +152,8 @@ fn sparse_stock_quotes_can_measure_a_forecast_without_ranking_volatility() {
     let profile = crate::compute::profile_from_sparse_minutes(&same_hour, 0.01);
     assert_eq!(profile.review, ReviewStatus::MaskNotComputable);
     assert!(profile.hour_p90_frac[9] > 0.0);
+    let one_hour = same_hour.into_iter().take(20).collect::<Vec<_>>();
+    let profile = crate::compute::profile_from_sparse_minutes(&one_hour, 0.01);
+    assert!(profile.hour_p90_frac[9] > 0.0);
+    assert_eq!(profile.elevated_hours, 0);
 }

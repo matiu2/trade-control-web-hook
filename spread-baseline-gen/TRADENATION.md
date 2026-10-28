@@ -21,12 +21,12 @@ DATABASE_URL=postgresql://candle_cache:candle_cache@localhost:5432/candle_cache 
 The checkpoint fixes the requested 60-day window. Many stocks and newly named
 markets expose only about a month of M1 history. Each accepted profile must pass
 the existing minute-profile sufficiency check, contain a positive finite spread
-forecast, include ten observed dates across at least two weeks, and have data
+forecast, include ten observed dates across more than a week, and have data
 within the last seven days of the requested window. The report records actual
 first/last observations and date counts. Short sessions retain their measured
 forecasts even when their hours cannot be ranked for a blackout mask.
-Sparse stock histories use the existing 48-observation floor while retaining
-20 samples per learned hour and the same date/span/recency checks. When their
+Sparse stock histories require 20 samples per learned hour and the same
+date/span/recency checks. When their
 hourly volatility cannot be ranked, only the measured forecast is retained.
 
 Rerun the same command to resume missing or failed instruments. `--limit N`

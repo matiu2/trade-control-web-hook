@@ -278,7 +278,7 @@ fn validate_measurement(row: &Measurement, from: DateTime<Utc>, to: DateTime<Utc
     ensure!(
         row.first_utc >= from
             && row.last_utc < to
-            && row.first_utc <= row.last_utc - Duration::days(14)
+            && row.first_utc <= row.last_utc - Duration::days(7)
             && row.last_utc >= to - Duration::days(7)
             && row.observed_days >= 10,
         "Incomplete history: {} observed days, {} through {}",

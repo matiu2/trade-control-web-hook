@@ -360,7 +360,7 @@ pub fn profile_from_minutes(bars: &[MinuteBar], pip_size: f64) -> SpreadProfile 
 /// Per-hour sample requirements remain unchanged; a zero volatility baseline
 /// disables ranking while retaining the independently observed spread cost.
 pub fn profile_from_sparse_minutes(bars: &[MinuteBar], pip_size: f64) -> SpreadProfile {
-    minute_profile(bars, pip_size, MIN_INSTRUMENT_BARS, true)
+    minute_profile(bars, pip_size, MIN_HOUR_MINUTES, true)
 }
 
 fn minute_profile(
