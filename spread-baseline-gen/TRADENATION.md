@@ -25,6 +25,9 @@ forecast, include ten observed dates across at least two weeks, and have data
 within the last seven days of the requested window. The report records actual
 first/last observations and date counts. Short sessions retain their measured
 forecasts even when their hours cannot be ranked for a blackout mask.
+Sparse stock histories use the existing 48-observation floor while retaining
+20 samples per learned hour and the same date/span/recency checks. When their
+hourly volatility cannot be ranked, only the measured forecast is retained.
 
 Rerun the same command to resume missing or failed instruments. `--limit N`
 bounds one invocation. Catalogue additions/removals are reconciled on resume;

@@ -234,6 +234,12 @@ async fn measure(
         .ok_or_else(|| eyre!("Missing spread clock"))?
         .parse::<chrono_tz::Tz>()?;
     let evidence = source.evidence(&item.symbol, from, to, tz).await?;
+    let mut profile = crate::profile_from_minutes(&evidence.bars, item.pip_size);
+    if item.class == instrument_lookup::AssetClass::Stock
+        && profile.review == ReviewStatus::InsufficientData
+    {
+        profile = crate::compute::profile_from_sparse_minutes(&evidence.bars, item.pip_size);
+    }
     let row = Measurement {
         schedule: item.spread_schedule.clone(),
         pip_size: item.pip_size,
@@ -244,7 +250,7 @@ async fn measure(
             .last_utc
             .ok_or_else(|| eyre!("No paired candles"))?,
         observed_days: evidence.observed_days,
-        profile: crate::profile_from_minutes(&evidence.bars, item.pip_size),
+        profile,
     };
     validate_measurement(&row, from, to)?;
     Ok(row)

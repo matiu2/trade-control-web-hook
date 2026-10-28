@@ -120,3 +120,36 @@ fn distinct_reports_share_one_output_lock() {
     drop(output_guard);
     assert!(output::lock(&path).is_ok());
 }
+
+#[test]
+fn sparse_stock_quotes_can_measure_a_forecast_without_ranking_volatility() {
+    init();
+    let bars = (0..300)
+        .map(|index| crate::MinuteBar {
+            utc_minute_of_day: ((index % 120) + 9 * 60) as u16,
+            local_hour: (9 + (index % 120) / 60) as u8,
+            spread_frac: 0.001,
+            mid_close: 100.0,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        crate::profile_from_minutes(&bars, 0.01).review,
+        ReviewStatus::InsufficientData
+    );
+    let profile = crate::compute::profile_from_sparse_minutes(&bars, 0.01);
+    assert_eq!(profile.review, ReviewStatus::MaskNotComputable);
+    assert_eq!(profile.elevated_hours, 0);
+    assert!(profile.hour_p90_frac[9] > 0.0);
+    assert!(profile.baseline_median_pips > 0.0);
+    assert_eq!(profile.n_bars, 300);
+    let same_hour = bars
+        .into_iter()
+        .map(|mut bar| {
+            bar.local_hour = 9;
+            bar
+        })
+        .collect::<Vec<_>>();
+    let profile = crate::compute::profile_from_sparse_minutes(&same_hour, 0.01);
+    assert_eq!(profile.review, ReviewStatus::MaskNotComputable);
+    assert!(profile.hour_p90_frac[9] > 0.0);
+}
