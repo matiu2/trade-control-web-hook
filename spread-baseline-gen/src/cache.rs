@@ -122,6 +122,13 @@ pub enum CachedSource {
     TradeNation(Box<CacheClient<tradenation_api::TradeNationClient>>),
 }
 
+pub struct MinuteEvidence {
+    pub bars: Vec<MinuteBar>,
+    pub first_utc: Option<DateTime<Utc>>,
+    pub last_utc: Option<DateTime<Utc>>,
+    pub observed_days: usize,
+}
+
 impl CachedSource {
     /// Build the cache-backed source for `broker`, using `cache_dir` (or the
     /// per-broker default).
@@ -153,6 +160,16 @@ impl CachedSource {
         to: DateTime<Utc>,
         tz: chrono_tz::Tz,
     ) -> Result<Vec<MinuteBar>> {
+        Ok(self.evidence(symbol, from, to, tz).await?.bars)
+    }
+
+    pub async fn evidence(
+        &self,
+        symbol: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        tz: chrono_tz::Tz,
+    ) -> Result<MinuteEvidence> {
         use candle_model::Granularity;
 
         let (from_fx, to_fx) = (from.fixed_offset(), to.fixed_offset());
@@ -166,7 +183,48 @@ impl CachedSource {
                 .await
                 .wrap_err_with(|| format!("cached TradeNation M1 fetch for {symbol}"))?,
         };
-        Ok(minutes_from_cache(&candles.candles, tz))
+        let usable = candles
+            .candles
+            .iter()
+            .filter(|c| {
+                let stamp = c.timestamp.with_timezone(&Utc);
+                stamp >= from
+                    && stamp < to
+                    && crate::fetch::minute_bar_from_closes(
+                        stamp,
+                        tz,
+                        c.close,
+                        c.bid_close,
+                        c.ask_close,
+                    )
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        let stamps = usable
+            .iter()
+            .map(|c| c.timestamp.with_timezone(&Utc))
+            .collect::<Vec<_>>();
+        Ok(MinuteEvidence {
+            bars: usable
+                .iter()
+                .filter_map(|c| {
+                    crate::fetch::minute_bar_from_closes(
+                        c.timestamp.with_timezone(&Utc),
+                        tz,
+                        c.close,
+                        c.bid_close,
+                        c.ask_close,
+                    )
+                })
+                .collect(),
+            first_utc: stamps.iter().min().copied(),
+            last_utc: stamps.iter().max().copied(),
+            observed_days: stamps
+                .iter()
+                .map(|stamp| stamp.date_naive())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+        })
     }
 }
 
