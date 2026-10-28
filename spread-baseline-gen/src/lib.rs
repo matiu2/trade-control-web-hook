@@ -21,6 +21,7 @@ pub mod mt5;
 pub mod oanda;
 pub mod render;
 pub mod shrink_guard;
+pub mod tradenation;
 pub mod universe;
 
 pub use compute::{

@@ -29,6 +29,7 @@ ctrader-api = { version = "0.1.0", path = "../../ctrader-api" }
 sha2 = "0.10"
 libc = "0.2.191"
 ctrader-data-source = { version = "0.1.0", path = "../../ctrader-data-source" }
+tempfile = "3.27.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
