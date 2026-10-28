@@ -266,7 +266,7 @@ fn validate_measurement(row: &Measurement, from: DateTime<Utc>, to: DateTime<Utc
             row.profile.review,
             ReviewStatus::Reviewed | ReviewStatus::MaskNotComputable
         ) && row.profile.baseline_median_pips.is_finite()
-            && row.profile.baseline_median_pips > 0.0
+            && row.profile.baseline_median_pips >= 0.0
             && row
                 .profile
                 .hour_p90_frac

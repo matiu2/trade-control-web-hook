@@ -59,6 +59,11 @@ fn insufficient_stale_and_unreviewed_measurements_never_become_defaults() {
         profile,
     };
     assert!(validate_measurement(&row, from, to).is_ok());
+    row.profile.baseline_median_pips = 0.0;
+    assert!(
+        validate_measurement(&row, from, to).is_ok(),
+        "a measured zero median can coexist with positive hourly costs"
+    );
     row.observed_days = 9;
     assert!(validate_measurement(&row, from, to).is_err());
     row.observed_days = 42;
