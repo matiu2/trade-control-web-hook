@@ -15,6 +15,21 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 mod new_tv;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Oversize {
+    CapVolume,
+    Reject,
+}
+
+impl Oversize {
+    pub fn into_core(self) -> trade_control_core::intent::OversizePolicy {
+        match self {
+            Self::CapVolume => trade_control_core::intent::OversizePolicy::CapVolume,
+            Self::Reject => trade_control_core::intent::OversizePolicy::Reject,
+        }
+    }
+}
+
 /// CLI broker selection. Mirrors `conventions::Broker` but kept
 /// crate-local so the value-enum can be used in `clap` derive
 /// without owning the conventions crate.
@@ -131,6 +146,10 @@ pub enum PositionEntry {
         .multiple(false)
 ))]
 pub struct Args {
+    /// cTrader entries above maximum volume: cap size and preserve SL/TP,
+    /// or reject the entry. Other brokers retain their sizing rules.
+    #[arg(long, value_enum, default_value = "cap-volume")]
+    pub on_oversize: Oversize,
     /// Explicit caller routing and result collection for the shared library.
     #[arg(skip)]
     pub(crate) execution: Option<crate::api::Execution>,

@@ -1914,6 +1914,7 @@ mod tests {
     /// An `EntryRequest` for a plain stop entry at the given risk budget.
     fn entry_req(risk: RiskBudget) -> EntryRequest<'static> {
         EntryRequest {
+            on_oversize: Default::default(),
             setup_id: None,
             instrument: "EUR/USD",
             direction: Direction::Short,

@@ -156,6 +156,7 @@ async fn place_market<B: Broker>(
 
 fn request(resolved: &Resolved, entry: ResolvedEntry) -> EntryRequest<'_> {
     EntryRequest {
+        on_oversize: resolved.on_oversize,
         setup_id: Some(&resolved.setup_id),
         instrument: &resolved.instrument,
         direction: resolved.direction,

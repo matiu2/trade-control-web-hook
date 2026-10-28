@@ -679,6 +679,7 @@ mod tests {
     fn resolved_long_market() -> Resolved {
         // entry=1.1000, SL=1.0978, TP=1.1044 → sl=0.0022, tp=0.0044, R=2.0
         Resolved {
+            on_oversize: Default::default(),
             setup_id: "test-setup".into(),
             id: "t1".into(),
             not_after: "2026-05-13T20:00:00Z".parse().unwrap(),
@@ -771,6 +772,7 @@ mod tests {
         let engine = build_engine();
         let mut scope = Scope::new();
         let r = Resolved {
+            on_oversize: Default::default(),
             setup_id: "test-setup".into(),
             id: "t1".into(),
             not_after: "2026-05-13T20:00:00Z".parse().unwrap(),

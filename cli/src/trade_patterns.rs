@@ -331,6 +331,12 @@ pub enum EntryMode {
 /// take-profit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeSpec {
+    /// cTrader maximum-volume policy; preserves the stop and target.
+    #[serde(
+        default,
+        skip_serializing_if = "trade_control_core::intent::OversizePolicy::is_default"
+    )]
+    pub on_oversize: trade_control_core::intent::OversizePolicy,
     pub pattern: TradePattern,
     pub instrument: String,
     pub account: String,
@@ -1062,6 +1068,7 @@ fn build_pattern(
         .map_err(|e| eyre!("entry deadline prompt: {e}"))?;
 
     let spec = TradeSpec {
+        on_oversize: Default::default(),
         pattern,
         instrument,
         account,
@@ -1405,6 +1412,11 @@ fn assemble_trade(
         ));
     }
 
+    alerts
+        .iter_mut()
+        .filter(|alert| alert.intent.action == Action::Enter)
+        .for_each(|alert| alert.intent.on_oversize = spec.on_oversize);
+
     Ok(BuiltTrade {
         trade_id,
         instrument: spec.instrument.clone(),
@@ -1603,7 +1615,7 @@ fn build_mw_pattern(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
     let entry_deadline = derive_entry_deadline(now, spec.trade_expiry, spec.entry_deadline_pct);
     let veto_expiry = spec.trade_expiry + DEFAULT_POST_EXPIRY_GRACE;
 
-    let alerts = vec![
+    let mut alerts = vec![
         build_mw_cancel_alert(
             &spec.instrument,
             &trade_id,
@@ -1673,6 +1685,11 @@ fn build_mw_pattern(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
             script_errors.join("\n  - ")
         ));
     }
+
+    alerts
+        .iter_mut()
+        .filter(|alert| alert.intent.action == Action::Enter)
+        .for_each(|alert| alert.intent.on_oversize = spec.on_oversize);
 
     Ok(BuiltTrade {
         trade_id,
@@ -2000,6 +2017,7 @@ fn skeleton(
     trade_id: &str,
 ) -> Intent {
     Intent {
+        on_oversize: Default::default(),
         entry_level_vetos: Vec::new(),
         v: 1,
         id,
@@ -2569,6 +2587,7 @@ pub enum PositionEntryKind {
 /// signed shell's reference `close` for the worker's geometry/R checks.
 #[derive(Debug, Clone)]
 pub struct PositionEnterSpec {
+    pub on_oversize: trade_control_core::intent::OversizePolicy,
     pub instrument: String,
     pub account: String,
     pub broker: BrokerKind,
@@ -2673,6 +2692,7 @@ pub fn build_position_enter(
     intent.pip_size = spec.pip_size;
     intent.tick_size = spec.tick_size;
     intent.contract_multiplier = spec.contract_multiplier;
+    intent.on_oversize = spec.on_oversize;
     intent.entry = Some(entry);
     intent.stop_loss = Some(PriceRef::Absolute {
         absolute: spec.stop_loss,
@@ -3051,6 +3071,7 @@ mod tests {
             trade_expiry,
             alerts,
             spec: TradeSpec {
+                on_oversize: Default::default(),
                 pattern: TradePattern::Hs,
                 instrument: "EUR_USD".into(),
                 account: "demo".into(),
@@ -3596,6 +3617,7 @@ mod tests {
 
     fn position_spec(kind: PositionEntryKind) -> PositionEnterSpec {
         PositionEnterSpec {
+            on_oversize: Default::default(),
             instrument: "EUR_USD".into(),
             account: "demo".into(),
             broker: BrokerKind::Oanda,
@@ -3624,6 +3646,18 @@ mod tests {
         assert!(body.contains(r#""type":"market""#), "{body}");
         // Market carries no `at` trigger.
         assert!(!body.contains(r#""at":"#), "{body}");
+    }
+
+    #[test]
+    fn manual_entry_preserves_the_explicit_oversize_policy_in_the_signed_intent() {
+        use trade_control_core::intent::OversizePolicy;
+        let key = [9u8; KEY_LEN];
+        let now = ts("2026-05-24T00:00:00Z");
+        let mut spec = position_spec(PositionEntryKind::Stop);
+        spec.on_oversize = OversizePolicy::Reject;
+        let (_, body) = build_position_enter(&spec, &key, now).unwrap();
+        let verified = trade_control_core::incoming::parse_and_verify(&body, &key, now).unwrap();
+        assert_eq!(verified.intent.on_oversize, OversizePolicy::Reject);
     }
 
     #[test]
@@ -3786,6 +3820,7 @@ mod tests {
     /// at 1.2640 with its stop at 1.2720.
     fn gbp_usd_sell_stop(kind: PositionEntryKind) -> PositionEnterSpec {
         PositionEnterSpec {
+            on_oversize: Default::default(),
             instrument: "GBP_USD".into(),
             account: "demo".into(),
             broker: BrokerKind::Oanda,
@@ -4224,6 +4259,7 @@ mod tests {
 
     fn sample_spec(pattern: TradePattern, trade_expiry: DateTime<Utc>) -> TradeSpec {
         TradeSpec {
+            on_oversize: Default::default(),
             pattern,
             instrument: "EUR_USD".into(),
             account: "demo".into(),
@@ -5470,6 +5506,34 @@ tp_price: 1.05
             trade_control_core::tunable::Tunable::Static(p) if (p - 1.0).abs() < 1e-9
         ));
         enter.intent.validate().unwrap();
+    }
+
+    #[test]
+    fn oversize_policy_is_applied_to_hs_and_mw_entries_only() {
+        use trade_control_core::intent::OversizePolicy;
+        let now = ts("2026-05-20T00:00:00Z");
+        let expiry = ts("2026-05-25T00:00:00Z");
+        for mut spec in [
+            sample_spec(TradePattern::Hs, expiry),
+            mw_spec(TradePattern::M, expiry),
+        ] {
+            spec.on_oversize = OversizePolicy::Reject;
+            let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+            assert!(
+                trade
+                    .alerts
+                    .iter()
+                    .any(|alert| alert.intent.action == Action::Enter)
+            );
+            for alert in trade.alerts {
+                let expected = if alert.intent.action == Action::Enter {
+                    OversizePolicy::Reject
+                } else {
+                    OversizePolicy::CapVolume
+                };
+                assert_eq!(alert.intent.on_oversize, expected);
+            }
+        }
     }
 
     #[test]

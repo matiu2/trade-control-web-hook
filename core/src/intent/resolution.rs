@@ -88,6 +88,7 @@ pub struct Resolved {
     pub stop_loss: f64,
     pub take_profit: f64,
     pub risk: RiskBudget,
+    pub on_oversize: super::OversizePolicy,
     /// The effective R-floor this trade was held to at resolve time — the
     /// intent's `min_r` override, or [`MIN_R_FLOOR`] (1.0) when omitted. The
     /// resolve already enforced `implicit_R >= min_r`; carrying it forward lets
@@ -567,6 +568,7 @@ impl Resolved {
         // we're about to store. min_r / risk_pct / risk_amount /
         // size_units scripts all evaluate against this snapshot.
         let geometry_snapshot = Self {
+            on_oversize: intent.on_oversize,
             id: intent.id.clone(),
             setup_id: intent.trade_id.clone().unwrap_or_else(|| intent.id.clone()),
             not_after: intent.not_after,
@@ -802,6 +804,7 @@ mod tests {
 
     fn long_market_intent() -> Intent {
         Intent {
+            on_oversize: Default::default(),
             entry_level_vetos: Vec::new(),
             v: 1,
             id: "t1".into(),
@@ -862,6 +865,29 @@ mod tests {
             include_archived: false,
             plan_admin: None,
         }
+    }
+
+    #[test]
+    fn oversize_policy_defaults_without_changing_old_intents_and_survives_resolution() {
+        crate::test_logging::init_tracing();
+        use super::super::OversizePolicy;
+        let mut intent = long_market_intent();
+        let old_yaml = serde_yaml::to_string(&intent).unwrap();
+        assert!(!old_yaml.contains("on_oversize"));
+        let parsed: Intent = serde_yaml::from_str(&old_yaml).unwrap();
+        assert_eq!(parsed.on_oversize, OversizePolicy::CapVolume);
+        intent.on_oversize = OversizePolicy::Reject;
+        let yaml = serde_yaml::to_string(&intent).unwrap();
+        assert!(yaml.contains("on_oversize: reject"));
+        let parsed: Intent = serde_yaml::from_str(&yaml).unwrap();
+        let resolved = Resolved::from_intent(&parsed, &shell(), 0.0001, 0.0).unwrap();
+        assert_eq!(resolved.on_oversize, OversizePolicy::Reject);
+        assert!(
+            serde_yaml::from_str::<Intent>(
+                &yaml.replace("on_oversize: reject", "on_oversize: widen_stop")
+            )
+            .is_err()
+        );
     }
 
     #[test]

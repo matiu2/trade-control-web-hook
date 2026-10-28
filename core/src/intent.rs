@@ -39,6 +39,8 @@ pub use prep_req::{PrepReq, PrepReqSliceExt, SlotOutcome, resolve_slot};
 // re-export exists to prevent.
 pub use resolution::MIN_R_FLOOR;
 pub use resolution::{ResolveError, Resolved, ResolvedEntry, ResolvedRecoverEntry, RiskBudget};
+mod oversize;
+pub use oversize::OversizePolicy;
 pub use sl_spread_floor::{
     DEFAULT_SPREAD_WINDOW, SL_MIN_SPREAD_MULTIPLE, SL_WIDEN_SPREAD_MULTIPLE, SlWiden, mean_spread,
     sl_spread_floor_violation, widen_sl_to_spread_floor,
@@ -438,6 +440,10 @@ pub struct Intent {
     /// non-finite or non-positive value are rejected at resolve time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_units: Option<crate::tunable::Tunable<f64>>,
+    /// cTrader maximum-volume handling. Defaults to capping volume while
+    /// preserving SL/TP. `reject` retains strict refusal. Other brokers are unchanged.
+    #[serde(default, skip_serializing_if = "OversizePolicy::is_default")]
+    pub on_oversize: OversizePolicy,
     /// When true, the worker resolves the intent, logs the sizing
     /// inputs / calculations / output, then returns success **without
     /// placing the order**. Useful for verifying new sizing modes

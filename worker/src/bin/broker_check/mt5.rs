@@ -52,6 +52,7 @@ pub async fn check(
                 1.0
             };
         let req = EntryRequest {
+            on_oversize: Default::default(),
             setup_id: None,
             instrument: symbol,
             direction: Direction::Short,

@@ -21,6 +21,7 @@ fn symbol() -> SymbolInfo {
 
 fn request(entry: ResolvedEntry, direction: Direction) -> EntryRequest<'static> {
     EntryRequest {
+        on_oversize: Default::default(),
         setup_id: None,
         instrument: "AUDJPY",
         direction,

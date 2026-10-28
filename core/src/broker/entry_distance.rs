@@ -219,6 +219,7 @@ mod tests {
     fn market_request() -> EntryRequest<'static> {
         logging();
         EntryRequest {
+            on_oversize: Default::default(),
             setup_id: None,
             instrument: "AUDJPY",
             direction: Direction::Long,

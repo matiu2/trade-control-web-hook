@@ -41,6 +41,7 @@ fn candle(time: &str, o: f64, h: f64, l: f64, c: f64) -> Candle {
 /// rest is copied verbatim into any fired result (an invalidate emits none).
 fn intent() -> Intent {
     Intent {
+        on_oversize: Default::default(),
         entry_level_vetos: Vec::new(),
         v: 1,
         id: "x".into(),

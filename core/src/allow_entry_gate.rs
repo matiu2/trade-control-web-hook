@@ -132,6 +132,7 @@ mod tests {
 
     fn resolved_long_market() -> Resolved {
         Resolved {
+            on_oversize: Default::default(),
             setup_id: "test-setup".into(),
             id: "t1".into(),
             not_after: ts("2026-05-13T20:00:00Z"),
@@ -153,6 +154,7 @@ mod tests {
 
     fn intent_with_gate(gate: Option<Tunable<bool>>) -> Intent {
         Intent {
+            on_oversize: Default::default(),
             entry_level_vetos: Vec::new(),
             v: 1,
             id: "msg-1".into(),
