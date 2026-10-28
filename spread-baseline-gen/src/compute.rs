@@ -347,10 +347,32 @@ pub const MIN_HOUR_MINUTES: usize = 20;
 ///
 /// Bars must be in timestamp order. Same empty-profile guards as the H1 path.
 pub fn profile_from_minutes(bars: &[MinuteBar], pip_size: f64) -> SpreadProfile {
+    minute_profile(
+        bars,
+        pip_size,
+        MIN_INSTRUMENT_BARS * MIN_HOUR_MINUTES,
+        false,
+    )
+}
+
+/// Sparse stock quotes measured across multiple weeks. The caller must verify
+/// distinct observation dates and recency before promoting this profile.
+/// Per-hour sample requirements remain unchanged; a zero volatility baseline
+/// disables ranking while retaining the independently observed spread cost.
+pub fn profile_from_sparse_minutes(bars: &[MinuteBar], pip_size: f64) -> SpreadProfile {
+    minute_profile(bars, pip_size, MIN_INSTRUMENT_BARS, true)
+}
+
+fn minute_profile(
+    bars: &[MinuteBar],
+    pip_size: f64,
+    minimum_bars: usize,
+    sparse: bool,
+) -> SpreadProfile {
     let n = bars.len();
     // Minute bars are ~60× denser; require the equivalent of MIN_INSTRUMENT_BARS
     // *hours* of coverage so a thin sample still can't compute a mask.
-    if n < MIN_INSTRUMENT_BARS * MIN_HOUR_MINUTES {
+    if n < minimum_bars {
         return SpreadProfile::empty(n);
     }
 
@@ -374,8 +396,12 @@ pub fn profile_from_minutes(bars: &[MinuteBar], pip_size: f64) -> SpreadProfile 
         .filter(|w| w[0] > 0.0)
         .map(|w| (w[1] - w[0]).abs() / w[0])
         .collect();
-    let vol = median(&rets);
-    if !(vol.is_finite() && vol > 0.0) {
+    let vol = if sparse && rets.is_empty() {
+        0.0
+    } else {
+        median(&rets)
+    };
+    if !vol.is_finite() || (!sparse && vol <= 0.0) {
         return SpreadProfile::empty(n);
     }
 
@@ -406,7 +432,8 @@ pub fn profile_from_minutes(bars: &[MinuteBar], pip_size: f64) -> SpreadProfile 
     // non-positive pip_size leaves the baselines at 0.0 (gate falls back to flat).
     let (low_pips, median_pips, high_pips) = baseline_pips(bars, pip_size);
 
-    let flag_ratio: [Option<f64>; 24] = std::array::from_fn(|h| hour_flag[h].map(|m| m / vol));
+    let flag_ratio: [Option<f64>; 24] =
+        std::array::from_fn(|h| hour_flag[h].map(|m| if vol > 0.0 { m / vol } else { 0.0 }));
     apply_gates(
         flag_ratio,
         hour_p90,
