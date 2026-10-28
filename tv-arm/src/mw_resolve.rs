@@ -263,6 +263,7 @@ pub fn build_mw_trade_spec(
     anchors: MwSpecAnchors,
 ) -> cli::TradeSpec {
     cli::TradeSpec {
+        on_oversize: args.on_oversize.into_core(),
         pattern,
         instrument: instrument.to_string(),
         account: account.to_string(),

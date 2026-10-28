@@ -298,6 +298,7 @@ pub fn build_trade_spec(
     // Borrow `skip_preps` before it's moved into the struct literal below.
     let prep_expiries = prep_expiry_steps(geom, &skip_preps);
     let mut spec = cli::TradeSpec {
+        on_oversize: args.on_oversize.into_core(),
         pattern,
         instrument: instrument.to_string(),
         account: account.to_string(),
@@ -1129,6 +1130,18 @@ mod tests {
         )
         .expect("valid H&S resolves");
         spec
+    }
+
+    #[test]
+    fn oversize_policy_flag_reaches_the_trade_spec() {
+        assert_eq!(
+            resolve_with_sr(&[]).on_oversize,
+            trade_control_core::intent::OversizePolicy::CapVolume
+        );
+        assert_eq!(
+            resolve_with_sr(&["--on-oversize", "reject"]).on_oversize,
+            trade_control_core::intent::OversizePolicy::Reject
+        );
     }
 
     /// `--skip-reversals` drops **every** S/R band — the drawn ones and the

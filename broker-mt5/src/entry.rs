@@ -65,6 +65,7 @@ pub(crate) async fn place(
             .map_err(|_| EntryError::AccountFetch)?;
         let (_, price) = entry_price(req, &symbol, fresh.bid, fresh.ask)?;
         let aligned_request = EntryRequest {
+            on_oversize: req.on_oversize,
             setup_id: req.setup_id,
             stop_loss: stop,
             take_profit: take,

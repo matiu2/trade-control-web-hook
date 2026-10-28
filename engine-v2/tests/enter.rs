@@ -48,6 +48,7 @@ fn candle(time: &str, o: f64, h: f64, l: f64, c: f64) -> Candle {
 /// assertions; the rest is copied verbatim into the fired result.
 fn enter_intent(instrument: &str) -> Intent {
     Intent {
+        on_oversize: Default::default(),
         entry_level_vetos: Vec::new(),
         v: 1,
         id: "05-enter".into(),

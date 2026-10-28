@@ -211,6 +211,7 @@ pub(crate) fn run_position_entry(
     );
 
     let spec = cli::PositionEnterSpec {
+        on_oversize: args.on_oversize.into_core(),
         instrument: instrument.to_string(),
         account: account.to_string(),
         broker: broker_to_kind(broker),

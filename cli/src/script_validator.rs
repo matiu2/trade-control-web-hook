@@ -168,6 +168,7 @@ fn fixture_shell() -> Shell {
 /// scripts that reference `r_multiple` get a representative number.
 fn fixture_resolved() -> Resolved {
     Resolved {
+        on_oversize: Default::default(),
         setup_id: "test-setup".into(),
         id: "validator-fixture".into(),
         not_after: "2026-06-01T00:00:00Z".parse().unwrap_or_default(),
@@ -203,6 +204,7 @@ mod tests {
 
     fn intent_with_allow_entry(gate: Option<Tunable<bool>>) -> Intent {
         Intent {
+            on_oversize: Default::default(),
             entry_level_vetos: Vec::new(),
             v: 1,
             id: "msg-1".into(),

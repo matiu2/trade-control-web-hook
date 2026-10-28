@@ -38,6 +38,7 @@ async fn audjpy_minimum_lot_preview_uses_the_listed_inverse_conversion_pair() ->
     let lots =
         contract.rules.min_volume_raw as f64 / mt5_data_source::web::trading::Lots::SCALE as f64;
     let request = EntryRequest {
+        on_oversize: Default::default(),
         setup_id: None,
         instrument: "AUDJPY",
         direction: Direction::Long,

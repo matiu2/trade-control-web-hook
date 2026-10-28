@@ -346,6 +346,7 @@ mod tests {
 
     fn mw_intent(direction: Direction, mw: MwParams) -> Intent {
         Intent {
+            on_oversize: Default::default(),
             entry_level_vetos: Vec::new(),
             v: 1,
             id: "mw-test".into(),

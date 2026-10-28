@@ -92,6 +92,7 @@ fn veto_intent(id: &str, name: &str, level: VetoLevel) -> Intent {
 
 fn base_intent(action: Action, id: &str) -> Intent {
     Intent {
+        on_oversize: Default::default(),
         entry_level_vetos: Vec::new(),
         v: 1,
         id: id.into(),

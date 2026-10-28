@@ -162,8 +162,8 @@ fn kind(arg: &clap::Arg) -> &'static str {
 
 fn group(long: &str) -> &'static str {
     match long {
-        "account-id" | "risk-pct" | "risk-amount" | "broker-dry-run" | "max-retries"
-        | "expiry-bars" | "blackout-close" => "Risk and order lifetime",
+        "account-id" | "risk-pct" | "risk-amount" | "on-oversize" | "broker-dry-run"
+        | "max-retries" | "expiry-bars" | "blackout-close" => "Risk and order lifetime",
         "entry-market" | "entry-stop" | "entry-limit" | "market-entry" | "stop-entry"
         | "limit-entry" | "recover-entry" | "strategy-v2" | "qm-entry" | "quasimodo" | "trend" => {
             "Entry strategy"
@@ -269,6 +269,10 @@ mod tests {
         let schema = options();
         let option = |long: &str| schema.arm.iter().find(|d| d.long == long).unwrap();
         assert_eq!(option("risk-pct").kind, "number");
+        assert_eq!(option("on-oversize").kind, "select");
+        assert_eq!(option("on-oversize").choices, ["cap-volume", "reject"]);
+        assert_eq!(option("on-oversize").defaults, ["cap-volume"]);
+        assert_eq!(option("on-oversize").group, option("risk-pct").group);
         assert_eq!(option("max-retries").kind, "integer");
         assert_eq!(option("skip-golden").kind, "boolean");
         assert!(!option("skip-golden").takes_value);
