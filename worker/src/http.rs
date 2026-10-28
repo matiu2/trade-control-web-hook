@@ -43,6 +43,7 @@
 
 use std::sync::Arc;
 
+mod control_recording;
 mod reconciliation;
 mod registration;
 
@@ -317,7 +318,7 @@ async fn dispatch_inner(
 
     // --- Control actions (no broker). ---
     if let Some(result) = dispatch_control(state, &verified, now).await {
-        return control_to_parts(result).into();
+        return DispatchOutcome::from_control(result, verified.intent.action);
     }
 
     // --- Broker actions (Enter / Close / Invalidate / escalated Veto). ---
