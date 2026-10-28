@@ -317,7 +317,7 @@ fn promote(path: &Path, report: &Report) -> Result<()> {
     if report.measurements.is_empty() {
         return Ok(());
     }
-    let rows = report
+    let mut rows = report
         .measurements
         .iter()
         .map(|(symbol, row)| {
@@ -331,6 +331,23 @@ fn promote(path: &Path, report: &Report) -> Result<()> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    for asset in instrument_lookup::all()? {
+        let Some(alias) = asset.symbols.tradenation.as_deref() else {
+            continue;
+        };
+        if report.catalogue.iter().any(|symbol| symbol == alias) {
+            continue;
+        }
+        if let Some(row) = report.measurements.get(&format!("{alias} (Fixed Spreads)")) {
+            rows.push(BaselineRow {
+                broker: Broker::TradeNation,
+                symbol: alias.to_string(),
+                display_name: asset.display_name.clone(),
+                spread_schedule: row.schedule.clone(),
+                profile: row.profile.clone(),
+            });
+        }
+    }
     let incoming = crate::render_table(&rows);
     let _output_lock = output::lock(path)?;
     let existing =
