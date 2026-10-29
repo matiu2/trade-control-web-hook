@@ -9,6 +9,7 @@ mod blackout;
 mod breakeven;
 mod entry_dedup;
 mod entry_level_veto;
+mod entry_sl_spread_floor;
 mod expiry;
 mod mw_resolution;
 mod mw_state;
@@ -25,6 +26,7 @@ pub use breakeven::{Breakeven, BreakevenTrigger, DEFAULT_BREAKEVEN_THRESHOLD};
 pub use entry_dedup::EntryDedup;
 use entry_dedup::effective_entry_dedup;
 pub use entry_level_veto::{EntryLevelVeto, VetoSide};
+pub use entry_sl_spread_floor::{SlWidenVeto, widen_entry_sl_to_spread_floor};
 // `OffsetError` / `resolve_offset` are defined in this file (below) but
 // re-stated here in the doc-facing surface; no re-export needed since they're
 // already `pub` at module root.

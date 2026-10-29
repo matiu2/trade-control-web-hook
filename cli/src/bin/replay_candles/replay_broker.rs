@@ -837,7 +837,7 @@ impl ReplayBroker {
             None => {
                 // Legacy/test path: no captured request → floor from the intent as
                 // the pre-"orders-are-state" code did (fire-bar spread).
-                super::fill_sim::apply_entry_spread_floor(
+                if super::fill_sim::apply_entry_spread_floor(
                     &mut resolved,
                     self.pip_size,
                     // The same tick `Resolved::from_intent` snapped the drawn
@@ -846,7 +846,11 @@ impl ReplayBroker {
                     tick,
                     forward,
                     None,
-                );
+                    &attempt.intent.entry_level_vetos,
+                ) == super::fill_sim::EntryFloor::Rejected
+                {
+                    return None;
+                }
             }
         }
         Some(resolved)

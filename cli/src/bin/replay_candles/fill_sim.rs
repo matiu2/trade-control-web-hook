@@ -60,7 +60,8 @@ use ma_cross::CrossHistory;
 
 use trade_control_core::broker::BidAskCandle;
 use trade_control_core::intent::{
-    Direction, Intent, Resolved, ResolvedEntry, Shell, SlWiden, widen_sl_to_spread_floor,
+    Direction, EntryLevelVeto, Intent, Resolved, ResolvedEntry, Shell, SlWiden,
+    widen_entry_sl_to_spread_floor,
 };
 use trade_control_core::sweep_gate::{
     SweepReason, bar_adverse_extreme, bar_expiry_due, breach_detected, market_blackout_due_symbol,
@@ -238,6 +239,7 @@ fn resolve_effective_bracket(
         replay_tick(intent, pip_size),
         candles,
         entry_spread_price,
+        &intent.entry_level_vetos,
     ) {
         return Err(BracketReject::FloorRejected);
     }
@@ -1110,8 +1112,8 @@ pub enum EntryFloor {
     /// to `10 × spread`. `spread_pips` is the fire-bar spread the floor used —
     /// surfaced so the journal can show *which* spread sized the placed stop.
     Applied { spread_pips: f64 },
-    /// Widening to `10 × spread` would drop R below `min_r` — the live worker
-    /// declines the entry, so the sim/replay must too.
+    /// Widening to `10 × spread` would drop R below `min_r` or put the stop
+    /// at or beyond a setup boundary. Live and replay both decline the entry.
     Rejected,
 }
 
@@ -1120,7 +1122,8 @@ pub enum EntryFloor {
 ///
 /// This is the mirror of `run_enter`'s widen-then-reject: when the signed stop
 /// sits closer than `10 × spread` to entry, the worker widens it to `10 × spread`
-/// (entering with the wider stop if R still clears `min_r`, declining otherwise).
+/// (entering only if R still clears `min_r` and the rounded stop stays inside
+/// the setup boundaries).
 /// Both `simulate_fill` (the exit sim) and `widened_stop_at` (the System-2
 /// baseline) call this so the placed stop, the simulated exit, and the System-2
 /// "from" level are all the **same** floored number — they can't drift into the
@@ -1140,6 +1143,7 @@ pub fn apply_entry_spread_floor(
     tick_size: f64,
     candles: &[BidAskCandle],
     entry_spread_price: Option<f64>,
+    entry_level_vetos: &[EntryLevelVeto],
 ) -> EntryFloor {
     // The spread the floor sizes off. Prefer a caller-supplied
     // `entry_spread_price` — the MEAN over the trailing spread window, computed
@@ -1156,19 +1160,12 @@ pub fn apply_entry_spread_floor(
             fire.close_spread()
         }
     };
-    match widen_sl_to_spread_floor(
-        resolved.entry.reference_price(),
-        resolved.stop_loss,
-        resolved.take_profit,
-        spread_price,
-        resolved.min_r,
-        tick_size,
-    ) {
-        SlWiden::Unchanged => {}
-        SlWiden::Widened { new_stop_loss, .. } => {
+    match widen_entry_sl_to_spread_floor(resolved, spread_price, tick_size, entry_level_vetos) {
+        Ok(SlWiden::Unchanged) => {}
+        Ok(SlWiden::Widened { new_stop_loss, .. }) => {
             resolved.stop_loss = new_stop_loss;
         }
-        SlWiden::Reject { .. } => return EntryFloor::Rejected,
+        Ok(SlWiden::Reject { .. }) | Err(_) => return EntryFloor::Rejected,
     }
     let spread_pips = if pip_size > 0.0 && pip_size.is_finite() {
         spread_price / pip_size
@@ -1284,6 +1281,7 @@ fn widened_stop_at(
         replay_tick(intent, pip_size),
         candles,
         entry_spread_price,
+        &intent.entry_level_vetos,
     ) {
         return None;
     }
@@ -1730,6 +1728,7 @@ fn book_reaches(c: &BidAskCandle, book: Book, level: f64, approach: Approach) ->
 
 #[cfg(test)]
 mod tests {
+    mod entry_sl_veto_tests;
     mod ma_cross_tests;
     mod sma_break_tests;
     use super::*;
@@ -1842,7 +1841,7 @@ mod tests {
         // Fire-bar path (entry_spread_price = None) → floor off 0.0020 → widen to
         // 10× = 0.0200 above entry → SL 1.1200.
         let mut r_fire = Resolved::from_intent(&intent, &shell, 0.0001, 0.0).expect("resolves");
-        let out_fire = apply_entry_spread_floor(&mut r_fire, 0.0001, 0.00001, &fire, None);
+        let out_fire = apply_entry_spread_floor(&mut r_fire, 0.0001, 0.00001, &fire, None, &[]);
         assert!(
             matches!(out_fire, EntryFloor::Applied { .. }),
             "{out_fire:?}"
@@ -1857,7 +1856,8 @@ mod tests {
         // 10× = 0.0010 above entry → SL 1.1010, far tighter. The SAME fire slice,
         // only the supplied spread differs — proving the window wins.
         let mut r_win = Resolved::from_intent(&intent, &shell, 0.0001, 0.0).expect("resolves");
-        let out_win = apply_entry_spread_floor(&mut r_win, 0.0001, 0.00001, &fire, Some(0.0001));
+        let out_win =
+            apply_entry_spread_floor(&mut r_win, 0.0001, 0.00001, &fire, Some(0.0001), &[]);
         assert!(matches!(out_win, EntryFloor::Applied { .. }), "{out_win:?}");
         assert!(
             (r_win.stop_loss - 1.1010).abs() < 1e-9,

@@ -388,6 +388,7 @@ fn fixtures_root() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    mod fixture_entry_sl_veto_tests;
     use super::super::brisbane::bne;
     use super::super::cadence::CronCadence;
     use super::*;
@@ -765,7 +766,16 @@ mod tests {
     #[tokio::test]
     async fn an_invalidation_close_is_labelled_and_ends_the_journal() {
         let dir = require_fixture(GBP_NZD_INVALIDATION);
-        let inputs = load(&dir).expect("load gbp-nzd fixture");
+        let mut inputs = load(&dir).expect("load gbp-nzd fixture");
+        // Exercise close reporting for a legacy position that is already open.
+        // New entries in this historical setup are now blocked by the spread
+        // widening boundary check (covered separately). Keep the too-low exit
+        // rule, but omit its entry-only boundary in this reporting test.
+        inputs.plan.rules.iter_mut().for_each(|rule| {
+            rule.intent
+                .entry_level_vetos
+                .retain(|veto| veto.name != "too-low");
+        });
         let expires_at = inputs
             .candles
             .last()

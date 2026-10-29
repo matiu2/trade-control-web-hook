@@ -194,10 +194,10 @@ pub enum SlWiden {
 /// tighter stop sizes bigger.
 ///
 /// The widen is **direction-agnostic**: the stop's side relative to entry is
-/// preserved (above for a short, below for a long). It deliberately does not
-/// clamp the widened stop to any pattern-invalidation level — pushing the stop
-/// past `too-high` / `too-low` is acceptable (the continuous entry-level vetos
-/// abort the trade independently if price actually reaches invalidation).
+/// preserved (above for a short, below for a long). This low-level calculation
+/// has no setup boundaries. Entry paths must use
+/// [`super::widen_entry_sl_to_spread_floor`] to reject a rounded widened stop
+/// at or beyond `too-high` / `too-low` before placing an unopened trade.
 pub fn widen_sl_to_spread_floor(
     entry_price: f64,
     stop_loss: f64,

@@ -798,33 +798,43 @@ pub async fn run_enter<B: Broker, S: StateStore>(
 
         // SALVAGE-BY-WIDENING: rather than reject a too-tight stop outright,
         // try widening the SL to `SL_WIDEN_SPREAD_MULTIPLE`× the spread and
-        // re-check the trade still clears its R-floor. A wider stop is
-        // strictly *safer* against spread noise; we only reject if even the
-        // widened stop can't hold an `>= min_r` trade against the fixed TP.
-        // Pure decision in `crate::intent::widen_sl_to_spread_floor`; this
-        // is the live-quote wrapper. The widened SL may sit past the
-        // pattern's invalidation level — that's fine, the continuous
-        // entry-level vetos abort the trade independently if price reaches
-        // invalidation. Mutating `resolved.stop_loss` here flows into the
-        // `EntryRequest` built just below.
+        // re-check the trade still clears its R-floor and setup boundaries.
+        // The shared entry decision rejects a widened stop at or beyond a
+        // setup boundary, even when the widened bracket still clears min_r.
+        // Mutating `resolved.stop_loss` only after that decision flows into
+        // the `EntryRequest` built just below.
         // `tick_size` is the same resolved tick `Resolved::from_intent` snapped
         // the drawn geometry with (baked `Intent::tick_size` → `cfg.tick_size`
         // → `pip_size`), NOT a second derivation: the widened stop must land on
         // the same grid as the entry and TP beside it.
-        match crate::intent::widen_sl_to_spread_floor(
-            entry_price,
-            resolved.stop_loss,
-            resolved.take_profit,
+        match crate::intent::widen_entry_sl_to_spread_floor(
+            &resolved,
             spread_price,
-            resolved.min_r,
             tick_size,
+            &verified.intent.entry_level_vetos,
         ) {
-            crate::intent::SlWiden::Unchanged => {}
-            crate::intent::SlWiden::Widened {
+            Err(rejection) => {
+                let name = &rejection.veto.name;
+                let level = fmt_price_trim(rejection.veto.level);
+                let widened_sl_lvl = fmt_price_trim(rejection.widened_stop_loss);
+                let message = format!(
+                    "entry blocked: widening SL to {widened_sl_lvl} would reach or pass {name} at {level}"
+                );
+                tracing::info!("{message} (id={})", verified.intent.id);
+                return ActionResult::Rejected {
+                    status: 422,
+                    body: message,
+                    outcome: format!(
+                        "rejected: sl-widen-past-veto ({name} level={level} widened_sl_lvl={widened_sl_lvl})"
+                    ),
+                };
+            }
+            Ok(crate::intent::SlWiden::Unchanged) => {}
+            Ok(crate::intent::SlWiden::Widened {
                 new_stop_loss,
                 new_sl_distance,
                 new_r,
-            } => {
+            }) => {
                 tracing::info!(
                     "sl-spread-floor: widened SL {old_sl} -> {new_stop_loss} for {} (sl_distance {sl_distance} -> {new_sl_distance}, spread {spread_price}, {mult:.0}x floor; R now {new_r:.2} >= min_r {min_r:.2}) (id={})",
                     resolved.instrument,
@@ -835,12 +845,12 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 );
                 resolved.stop_loss = new_stop_loss;
             }
-            crate::intent::SlWiden::Reject {
+            Ok(crate::intent::SlWiden::Reject {
                 widened_stop_loss,
                 widened_sl_distance,
                 r_at_widen,
                 min_r,
-            } => {
+            }) => {
                 let spread_str = fmt_price_trim(spread_price);
                 let widened_lvl_str = fmt_price_trim(widened_stop_loss);
                 let widened_dist_str = fmt_price_trim(widened_sl_distance);
@@ -4431,6 +4441,8 @@ mod mw_everybar_dedup_tests {
 /// WAS ASKED FOR, which is the number that cost the setup.
 #[cfg(test)]
 mod widen_rounding_tests {
+    mod entry_sl_veto_tests;
+
     use super::gate_order_tests::{describe, store_at_incident};
     use super::*;
     use crate::broker::{
