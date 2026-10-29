@@ -292,5 +292,116 @@ async fn exercise(pool: &sqlx::PgPool) -> Result<()> {
     let mut conflict = tracked().link;
     conflict.broker_position_id = Some("conflicting-position".into());
     assert!(append_link(&mut links, conflict).is_err());
+    delayed_cash_history(pool, now).await?;
+    Ok(())
+}
+
+async fn delayed_cash_history(pool: &sqlx::PgPool, now: DateTime<Utc>) -> Result<()> {
+    let mut link = tracked().link;
+    link.broker_order_id = "cash-order".into();
+    link.broker_position_id = Some("cash-position".into());
+    let mut opening = tracked();
+    opening.link = link.clone();
+    opening.snapshot.position.position_id = "cash-position".into();
+    opening.snapshot.position.order_id = "cash-order".into();
+    record(
+        pool,
+        Some("demo"),
+        now + Duration::seconds(95),
+        &[opening],
+        &[],
+        &[],
+    )
+    .await?;
+    let partial: trade_control_core::broker_exit::BrokerTradeExit = serde_json::from_value(
+        json!({
+            "broker_trade_id":"cash-position","closed_at":now,"reason":"unknown","broker_reason":"activity-close-position","exit_price":0.98407
+        }),
+    )?;
+    record(
+        pool,
+        Some("demo"),
+        now + Duration::seconds(100),
+        &[],
+        &[(link.clone(), partial.clone())],
+        &[],
+    )
+    .await?;
+    let first_close = for_trade(pool, &link.trade_id)
+        .await?
+        .into_iter()
+        .find(|position| position.link.broker_order_id == "cash-order")
+        .unwrap();
+    assert_eq!(
+        first_close.exit.unwrap().reason,
+        trade_control_core::broker_exit::ExitReason::Unknown
+    );
+    let proof = json!({"broker_order_id":"cash-order","attempt_no":3,"direction":"short","execution":partial});
+    sqlx::query("INSERT INTO cron_notes(ts,correlation_id,account,source,severity,message,body) VALUES ($1,$2,'demo','broker-exit','info','closed',$3)")
+        .bind(now).bind(&link.trade_id).bind(json!({"broker_exit":proof})).execute(pool).await?;
+    assert!(
+        candidate_links(pool)
+            .await?
+            .iter()
+            .any(|p| p.broker_order_id == "cash-order"),
+        "already closed activity records must retry missing settlement"
+    );
+    let mut complete = partial.clone();
+    complete.realized_pl = Some(12.55);
+    complete.account_currency = Some("CAD".into());
+    complete.reason = trade_control_core::broker_exit::ExitReason::TakeProfit;
+    complete.transaction_id = Some("188187546".into());
+    record(
+        pool,
+        Some("demo"),
+        now + Duration::seconds(115),
+        &[],
+        &[(link.clone(), complete)],
+        &[],
+    )
+    .await?;
+    let observation = for_trade(pool, &link.trade_id)
+        .await?
+        .into_iter()
+        .find(|p| p.link.broker_order_id == "cash-order")
+        .unwrap();
+    assert_eq!(
+        observation.exit.as_ref().unwrap().realized_pl,
+        Some(12.55),
+        "old cron proof must not hide new settlement"
+    );
+    let proof: Value=sqlx::query_scalar("SELECT body->'broker_exit'->'execution' FROM cron_notes WHERE body->'broker_exit'->>'broker_order_id'='cash-order'").fetch_one(pool).await?;
+    assert_eq!(
+        proof["realized_pl"],
+        json!(12.55),
+        "timeline evidence must also be enriched"
+    );
+    assert_eq!(proof["reason"], json!("take_profit"));
+    assert!(
+        !candidate_links(pool)
+            .await?
+            .iter()
+            .any(|p| p.broker_order_id == "cash-order")
+    );
+    // A late activity-only observation cannot erase completed settlement.
+    record(
+        pool,
+        Some("demo"),
+        now + Duration::seconds(130),
+        &[],
+        &[(link.clone(), partial)],
+        &[],
+    )
+    .await?;
+    let observation = for_trade(pool, &link.trade_id)
+        .await?
+        .into_iter()
+        .find(|p| p.link.broker_order_id == "cash-order")
+        .unwrap();
+    assert_eq!(observation.exit.as_ref().unwrap().realized_pl, Some(12.55));
+    assert_eq!(
+        observation.exit.unwrap().reason,
+        trade_control_core::broker_exit::ExitReason::TakeProfit
+    );
     Ok(())
 }

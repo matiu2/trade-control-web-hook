@@ -1,0 +1,15 @@
+[
+  {
+    "Description": "AUD/CAD",
+    "RefID": "188187546",
+    "Action": "Trade Receivable",
+    "TransactionType": "2",
+    "TransactionDate": "29/10/26 08:52:38",
+    "OpenPeriod": "29/10/26 07:11:38",
+    "OpenPrice": "0.98564",
+    "ClosePrice": "0.98407",
+    "ProfitLoss": "12.55",
+    "Amount": "-0.08",
+    "Currency": "CAD"
+  }
+]

@@ -13,6 +13,8 @@ pub(super) struct History {
     fetched: Instant,
     events: Vec<Event>,
     complete: bool,
+    activity: Vec<ActivityRecord>,
+    transactions: Vec<tradenation_api::TransactionRecord>,
 }
 
 impl TradeNationAdapter {
@@ -64,15 +66,18 @@ impl TradeNationAdapter {
         };
         evidence.events = history
             .events
-            .into_iter()
+            .iter()
             .filter(|e| same_instrument(&e.instrument, instrument))
+            .cloned()
             .collect();
         evidence.history_complete = history.complete;
-        Ok(attempt_resolution::resolve(
-            order_id,
-            position_id,
-            &evidence,
-        ))
+        let mut observation = attempt_resolution::resolve(order_id, position_id, &evidence);
+        if history.complete
+            && let AttemptState::ClosedConfirmed { exit } = &mut observation.state
+        {
+            crate::exit_history::enrich(exit, &history.activity, &history.transactions);
+        }
+        Ok(observation)
     }
 
     async fn activity_history(&self) -> Result<History, LookupError> {
@@ -84,6 +89,7 @@ impl TradeNationAdapter {
             return Ok(history);
         }
         let mut events = Vec::new();
+        let mut activity = Vec::new();
         let mut total = None;
         let mut complete = false;
         let mut malformed = false;
@@ -109,6 +115,7 @@ impl TradeNationAdapter {
                 .iter()
                 .any(|row| recognized_event(row) && activity_event(row).is_none());
             events.extend(result.records.iter().filter_map(activity_event));
+            activity.extend(result.records);
             if !stable || (result.total_pages > 0 && result.current_page != page + 1) {
                 break;
             }
@@ -127,9 +134,20 @@ impl TradeNationAdapter {
         if malformed {
             tracing::warn!("tn activity has malformed lifecycle rows; fallback disabled");
         }
+        let transactions = if events.iter().any(|event| event.kind == EventKind::Close) {
+            tradenation_api::get_all_transactions(self.0.client(), self.0.session(), CLOSED_TRADE_HISTORY_DAYS)
+                .await.unwrap_or_else(|error| {
+                    tracing::warn!(?error, "tn cash history unavailable; retaining activity closure and retrying enrichment");
+                    Vec::new()
+                })
+        } else {
+            Vec::new()
+        };
         let history = History {
             fetched: Instant::now(),
             events,
+            activity,
+            transactions,
             complete: complete && !malformed,
         };
         if let Ok(mut cache) = self.2.lock() {
@@ -139,7 +157,7 @@ impl TradeNationAdapter {
     }
 }
 
-fn same_instrument(a: &str, b: &str) -> bool {
+pub(super) fn same_instrument(a: &str, b: &str) -> bool {
     let canonical = |s: &str| {
         s.chars()
             .filter(char::is_ascii_alphanumeric)

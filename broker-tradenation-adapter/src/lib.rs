@@ -20,6 +20,7 @@ use tradenation_api::{OpeningOrder, Position};
 
 mod attempts;
 mod candles;
+mod exit_history;
 mod session_anchor;
 mod settlement;
 

@@ -1,3 +1,5 @@
+mod settlement;
+
 use chrono::{DateTime, Utc};
 use color_eyre::Result;
 use serde_json::Value;
@@ -38,6 +40,9 @@ pub(super) async fn candidate_links(pool: &sqlx::PgPool) -> Result<Vec<PositionL
     for body in attempts {
         let attempt = serde_json::from_value::<trade_control_core::state::EntryAttempt>(body)?;
         let link = PositionLink::from(&attempt);
+        append_link(&mut links, link)?;
+    }
+    for link in settlement::pending(pool).await? {
         append_link(&mut links, link)?;
     }
     Ok(links)
@@ -139,13 +144,15 @@ pub(super) async fn record(
             link.broker_position_id.as_deref() == Some(&exit.broker_trade_id),
             "exit position mismatch"
         );
+        let patch = settlement::patch(exit)?;
         let rows = sqlx::query("INSERT INTO position_observations (account,position_id,trade_id,order_id,observed_at,body,closed_exit)
-            VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (account,position_id) DO UPDATE SET closed_exit=EXCLUDED.closed_exit
+            VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (account,position_id) DO UPDATE SET closed_exit=COALESCE(position_observations.closed_exit,EXCLUDED.closed_exit) || $8
             WHERE position_observations.trade_id=EXCLUDED.trade_id AND position_observations.order_id=EXCLUDED.order_id")
             .bind(account_key).bind(&exit.broker_trade_id).bind(&link.trade_id).bind(&link.broker_order_id).bind(now)
-            .bind(serde_json::json!({"link":link,"snapshot":null})).bind(serde_json::to_value(exit)?)
+            .bind(serde_json::json!({"link":link,"snapshot":null})).bind(serde_json::to_value(exit)?).bind(&patch)
             .execute(&mut *tx).await?.rows_affected();
         color_eyre::eyre::ensure!(rows == 1, "closed position ownership conflict");
+        settlement::enrich_note(&mut tx, account_key, link, &patch).await?;
     }
     let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
     write_sync(&mut tx, account_key, now, warning.as_deref()).await?;
