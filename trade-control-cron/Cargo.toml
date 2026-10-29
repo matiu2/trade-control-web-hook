@@ -6,9 +6,9 @@ edition = "2024"
 [dependencies]
 broker-mt5 = { path = "../broker-mt5" }
 broker-oanda = { version = "0.1.0", path = "../broker-oanda" }
-broker-tradenation = { git = "https://github.com/matiu2/tradenation-api.git", rev = "99d8264" }
+broker-tradenation = { git = "https://github.com/matiu2/tradenation-api.git", rev = "92734fd" }
 broker-tradenation-adapter = { version = "0.1.0", path = "../broker-tradenation-adapter" }
-tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", rev = "99d8264" }
+tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", rev = "92734fd" }
 chrono = { version = "0.4.45", default-features = false, features = ["serde", "alloc"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 trade-control-core = { version = "0.1.0", path = "../core" }

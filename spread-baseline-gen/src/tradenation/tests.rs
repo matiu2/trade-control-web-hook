@@ -1,6 +1,6 @@
 use super::*;
 
-fn init() {
+pub(super) fn init() {
     use tracing_subscriber::prelude::*;
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_default_env())
