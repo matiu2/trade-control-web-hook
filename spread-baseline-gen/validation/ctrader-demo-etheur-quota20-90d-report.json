@@ -1,0 +1,210 @@
+{
+  "schema_version": 1,
+  "identity": {
+    "profile": "ctrader-demo",
+    "environment": "demo",
+    "endpoint": "wss://demo.ctraderapi.com:5036",
+    "account_id": 49247794,
+    "broker": "Spotware",
+    "login": 5944473
+  },
+  "source": "paired-ticks-m1",
+  "from_utc": "2026-07-24T16:26:00Z",
+  "to_utc": "2026-10-22T16:26:00Z",
+  "requested_symbols": [
+    "ETHEUR"
+  ],
+  "complete": true,
+  "quarantine_policy": {
+    "max_minutes_per_instrument": 20
+  },
+  "quarantine_audit": {
+    "path": "/home/matiu/projects/trading-libraries/trade-control-web-hook/spread-baseline-gen/validation/ctrader-demo-etheur-quota20-90d-report.quarantine.json",
+    "sha256": "24f9eb6167351d1662b36c7874450a4ccbc10a7b23e8c375a80b2d1c0b89a463",
+    "excluded_minutes": 8
+  },
+  "excluded": [],
+  "instruments": [
+    {
+      "symbol_id": 22398,
+      "quarantined_minutes": [
+        {
+          "symbol": "ETHEUR",
+          "symbol_id": 22398,
+          "from_utc": "2026-07-27T22:40:00Z",
+          "to_utc": "2026-07-27T22:41:00Z",
+          "observed_at_utc": "2026-07-27T22:40:54.252Z",
+          "bid": 1689.595,
+          "ask": 1683.94,
+          "reason": "crossed-historical-book"
+        },
+        {
+          "symbol": "ETHEUR",
+          "symbol_id": 22398,
+          "from_utc": "2026-08-19T15:27:00Z",
+          "to_utc": "2026-08-19T15:28:00Z",
+          "observed_at_utc": "2026-08-19T15:27:31.292Z",
+          "bid": 1771.429,
+          "ask": 1765.786,
+          "reason": "crossed-historical-book"
+        },
+        {
+          "symbol": "ETHEUR",
+          "symbol_id": 22398,
+          "from_utc": "2026-08-22T05:10:00Z",
+          "to_utc": "2026-08-22T05:11:00Z",
+          "observed_at_utc": "2026-08-22T05:10:54.724Z",
+          "bid": 2094.635,
+          "ask": 2094.2,
+          "reason": "crossed-historical-book"
+        },
+        {
+          "symbol": "ETHEUR",
+          "symbol_id": 22398,
+          "from_utc": "2026-08-22T05:11:00Z",
+          "to_utc": "2026-08-22T05:12:00Z",
+          "observed_at_utc": "2026-08-22T05:11:00Z",
+          "bid": 2094.635,
+          "ask": 2094.2,
+          "reason": "crossed-historical-book"
+        },
+        {
+          "symbol": "ETHEUR",
+          "symbol_id": 22398,
+          "from_utc": "2026-08-27T09:25:00Z",
+          "to_utc": "2026-08-27T09:26:00Z",
+          "observed_at_utc": "2026-08-27T09:25:41.255Z",
+          "bid": 2195.898,
+          "ask": 2189.981,
+          "reason": "crossed-historical-book"
+        },
+        {
+          "symbol": "ETHEUR",
+          "symbol_id": 22398,
+          "from_utc": "2026-09-04T12:30:00Z",
+          "to_utc": "2026-09-04T12:31:00Z",
+          "observed_at_utc": "2026-09-04T12:30:02.231Z",
+          "bid": 2171.188,
+          "ask": 2163.813,
+          "reason": "crossed-historical-book"
+        },
+        {
+          "symbol": "ETHEUR",
+          "symbol_id": 22398,
+          "from_utc": "2026-10-07T02:01:00Z",
+          "to_utc": "2026-10-07T02:02:00Z",
+          "observed_at_utc": "2026-10-07T02:01:19.947Z",
+          "bid": 2321.616,
+          "ask": 2309.277,
+          "reason": "crossed-historical-book"
+        },
+        {
+          "symbol": "ETHEUR",
+          "symbol_id": 22398,
+          "from_utc": "2026-10-15T12:30:00Z",
+          "to_utc": "2026-10-15T12:31:00Z",
+          "observed_at_utc": "2026-10-15T12:30:02.260Z",
+          "bid": 2110.483,
+          "ask": 2101.398,
+          "reason": "crossed-historical-book"
+        }
+      ],
+      "symbol": "ETHEUR",
+      "pip_size": 0.1,
+      "schedule": "ny",
+      "timezone": "America/New_York",
+      "first_minute_utc": "2026-07-24T16:26:00Z",
+      "last_minute_utc": "2026-10-22T16:25:00Z",
+      "elevated_local_hours": [],
+      "profile": {
+        "elevated_hours": 0,
+        "hour_widen_frac": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "vol": 0.0019846819312842887,
+        "median_ratio": 0.3939333450155736,
+        "hour_p90_frac": [
+          0.0007972999679021893,
+          0.0007980379921124263,
+          0.0007992090226531921,
+          0.0007990760490948746,
+          0.0007994163117285123,
+          0.0007989452048328812,
+          0.0007972656912128166,
+          0.0007975510849166225,
+          0.0007974521190594042,
+          0.0007962343884742488,
+          0.0007986049312472504,
+          0.00079901776488895,
+          0.0007992749303262418,
+          0.0007987883156377997,
+          0.0007990369338619869,
+          0.0007988409796796962,
+          0.0007984419170581796,
+          0.0007994464360077275,
+          0.0007990617626835276,
+          0.0007992963734613708,
+          0.000798910912768613,
+          0.0007993796469466404,
+          0.0007984843048265384,
+          0.0007973093284595147
+        ],
+        "hour_ratio": [
+          0.3955151685340901,
+          0.39504005024827266,
+          0.3948979267164427,
+          0.392961546942133,
+          0.3936529128947392,
+          0.3947208769127662,
+          0.3944037031912691,
+          0.39447317870780935,
+          0.3942137771364081,
+          0.39294331825867934,
+          0.3936046571708931,
+          0.393023097938891,
+          0.3923792245415914,
+          0.39332983932231774,
+          0.3920684130362781,
+          0.3920890114477777,
+          0.3919262891364539,
+          0.3920006879148601,
+          0.39208911430469984,
+          0.3945568483922171,
+          0.39457938162166895,
+          0.3951491391178006,
+          0.3953388607817325,
+          0.3952479727804316
+        ],
+        "review": "Reviewed",
+        "n_bars": 123524,
+        "baseline_low_pips": 12.970000000000256,
+        "baseline_high_pips": 13.160000000002585,
+        "baseline_median_pips": 13.029999999998836
+      }
+    }
+  ],
+  "failures": []
+}

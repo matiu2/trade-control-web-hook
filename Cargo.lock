@@ -4332,6 +4332,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "ctrader-api",
+ "ctrader-data-source",
  "instrument-lookup",
  "libc",
  "mt5-data-source",

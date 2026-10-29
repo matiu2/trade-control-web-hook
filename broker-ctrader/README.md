@@ -96,6 +96,11 @@ needs equity and conversion to check that cap. An old equity screenshot is not
 a current account-data source, and the demo test's 1,000-unit EURUSD minimum is
 not a universal default for other symbols or brokers.
 
+Risk conversion prefers a unique direct currency pair. If none exists, it uses
+two unique pairs through USD, resolved from the account's asset catalogue. Each
+leg uses ask in the forward direction or inverse bid in the reverse direction.
+Missing or ambiguous pairs, unavailable quotes and invalid rates stop sizing.
+
 cTrader FIX supplies prices and trading operations, but not balance, leverage,
 margin or historical candles. Its documented requests also cannot attach or
 amend native stop-loss/take-profit protection. Reports may include native

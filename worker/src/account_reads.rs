@@ -1,4 +1,4 @@
-//! Authenticated, read-only account discovery and account-scoped OANDA quotes.
+//! Authenticated, read-only account discovery and account-scoped broker quotes.
 
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ use trade_control_core::broker::Broker;
 use trade_control_core::intent::BrokerKind;
 use trade_control_core::sig::parse_key_hex;
 
-use crate::{PgMetadataStore, Secrets, acquire_oanda};
+use crate::{PgMetadataStore, Secrets, acquire_oanda, acquire_tn};
 
 struct Reads {
     accounts: PgMetadataStore,
@@ -78,27 +78,50 @@ async fn quote(
     if let Err(error) = validate_quote_account(&meta) {
         return failure(StatusCode::BAD_REQUEST, error);
     }
-    let broker = match acquire_oanda(&meta, &reads.secrets) {
-        Ok(broker) => broker,
-        Err(error) => return failure(StatusCode::SERVICE_UNAVAILABLE, &error.to_string()),
+    let result = match meta.broker {
+        BrokerKind::Oanda => match acquire_oanda(&meta, &reads.secrets) {
+            Ok(broker) => broker.get_quote(&query.instrument).await,
+            Err(error) => {
+                tracing::warn!(account = name, %error, "Account broker unavailable");
+                return failure(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Selected account broker unavailable",
+                );
+            }
+        },
+        BrokerKind::TradeNation => match acquire_tn(&meta).await {
+            Ok(broker) => broker.get_quote(&query.instrument).await,
+            Err(error) => {
+                tracing::warn!(account = name, %error, "Account broker unavailable");
+                return failure(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Selected account broker unavailable",
+                );
+            }
+        },
+        _ => return failure(StatusCode::BAD_REQUEST, "Unsupported quote account broker"),
     };
-    match broker.get_quote(&query.instrument).await {
+    match result {
         Ok(quote) => Json(json!({"account":meta.name, "instrument":query.instrument,
-            "kind":meta.kind, "bid":quote.bid, "ask":quote.ask}))
+            "kind":meta.kind, "bid":quote.bid, "ask":quote.ask,
+            "source": if meta.broker == BrokerKind::TradeNation { "chart-minute" } else { "broker-quote" }}))
         .into_response(),
         Err(error) => {
             tracing::warn!(account = name, ?error, "Account quote read failed");
             failure(
                 StatusCode::BAD_GATEWAY,
-                "OANDA quote unavailable for the selected account and instrument",
+                "Quote unavailable for the selected account and instrument",
             )
         }
     }
 }
 
 fn validate_quote_account(meta: &AccountMetadata) -> Result<(), &'static str> {
+    if meta.broker == BrokerKind::TradeNation {
+        return Ok(());
+    }
     if meta.broker != BrokerKind::Oanda {
-        return Err("This quote endpoint supports OANDA accounts only");
+        return Err("This quote endpoint supports OANDA and TradeNation accounts only");
     }
     if meta.oanda_account_id.as_deref().is_none_or(str::is_empty) {
         return Err("The selected OANDA account has no broker account ID");

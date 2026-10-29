@@ -18,6 +18,11 @@ async fn fresh_data(args: &Args) -> Result<(Identity, ChartData)> {
     let data = ChartData::connect_profile(&args.account, profile).await?;
     let identity = ctrader::generate::identity(&args.account, &data).await?;
     catalogue(&data.catalogue().await?, &args.only)?;
+    if args.stocks {
+        for symbol in &args.only {
+            data.verified_stock_metadata(symbol).await?;
+        }
+    }
     Ok((identity, data))
 }
 
@@ -88,6 +93,14 @@ pub fn table(args: &Args, identity: &Identity, info: &TableInfo) -> Result<()> {
 
 pub fn report(args: &Args, identity: &Identity, report: &Report, finished: bool) -> Result<()> {
     ctrader::checkpoint::validate(report, identity, &args.only)?;
+    let policy = args
+        .quarantine_crossed_minutes
+        .then(|| ctrader::quarantine::Policy::new(args.max_quarantined_minutes))
+        .transpose()?;
+    ensure!(
+        report.quarantine_policy == policy,
+        "completion must explicitly retain the report's crossed-minute quarantine policy"
+    );
     ensure!(
         report.from_utc == args.from && report.to_utc == args.to,
         "existing report sampling window differs from explicit completion bounds"
@@ -112,11 +125,13 @@ pub fn report(args: &Args, identity: &Identity, report: &Report, finished: bool)
 mod tests {
     use super::*;
     fn evidence() -> Report {
-        serde_json::from_str(include_str!(concat!(
+        let mut report: Report = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/validation/ctrader-demo-xpdusd-90d-report.json"
         )))
-        .unwrap()
+        .unwrap();
+        report.identity.endpoint = ctrader_api::Environment::Demo.endpoint().into();
+        report
     }
     #[test]
     fn table_preflight_requires_same_identity_window_and_only_missing_keys() {

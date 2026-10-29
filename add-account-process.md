@@ -18,6 +18,41 @@ directory. Inspect the selected database before writing account metadata.
 
 ## Persistent locations
 
+### TradeNation live and practice accounts
+
+Named TradeNation credentials live in `~/.config/tradenation/accounts.enc`.
+Register the same name in each worker environment that will use it, with broker
+`tradenation` and the matching `demo` or `live` kind. Existing registrations
+should be inspected with `get` rather than added again.
+
+The native broker factory checks the stored credential kind against the account
+metadata before authentication. Practice accounts use the demo platform; live
+accounts use TradeNation's current OAuth/PKCE and portal login flow. Worker,
+arming and CLI dependencies pin the shared OAuth fix at `00e1e65`.
+
+Local Chart exposes `tradenation` (practice, `reversals`) and `tradenation-live`
+(live, `tradenation-live`). Setup exports and execution options carry that exact
+account, and conflicting overrides are rejected. The chart uses its configured
+worker for account discovery; registering an account only in dev does not make
+it available on a chart connected to staging.
+
+Read-only checks after rebuilding and installing the worker:
+
+```sh
+trade-control-accounts --config ~/.config/trade-control/staging-worker.toml \
+  get tradenation-live
+trade-control-broker-check tradenation-live \
+  --config ~/.config/trade-control/staging-worker.toml --instrument EUR/USD
+```
+
+The authenticated `/accounts/{name}/quote` endpoint supports OANDA and
+TradeNation. TradeNation replies include `source: chart-minute`: they read
+the shared chart feed's latest bid/ask minute closes, after authenticating the
+selected account. They do not represent an account-specific executable tick.
+Arming spread and pullback reads use this endpoint with the selected account.
+
+### MT5 locations
+
 | Location | Purpose | What we changed for MT5 |
 |---|---|---|
 | `~/.config/trade-control/mt5-accounts.toml` | Named MT5 profiles | `trade-control-accounts add` / `credentials` maintain the pinned login/server/clock and absolute credential/mailbox paths. `MT5_ACCOUNTS_FILE` can override this file. |

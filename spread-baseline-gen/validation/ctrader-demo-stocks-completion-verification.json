@@ -1,0 +1,40 @@
+{
+  "requested_stocks": 350,
+  "measured_stocks": 129,
+  "baked_stocks": 128,
+  "unavailable_stocks": 222,
+  "confirmed_no_native_m1_history": 221,
+  "quality_exclusions": [
+    {
+      "symbol": "AES",
+      "review": "InsufficientData",
+      "retained_m1_candles": 652
+    }
+  ],
+  "previous_nonstock_profiles": 93,
+  "total_baked_profiles": 221,
+  "previous93_rows_byte_identical": true,
+  "checkpoint_lock_fix": "10c9f36b",
+  "table_sha256": "a2ca191920cf384679183bb731d7dc0e57b8434fd11899694e583fbc931b796a",
+  "evidence_sha256": {
+    "ctrader-demo-stocks-90d-report.json": "1ad80a4a5df263202d12be46ffa9395cc457f0de5c3f10556f385ff0cf778974",
+    "ctrader-demo-stocks-90d-report.quarantine.json": "e4e39d91b92973b57dfd73f1b4a09df9fa57498a53c48def1160fd02568c0139",
+    "ctrader-demo-stocks-ready-90d-report.json": "ec24cb1bfa75d1cc9982f43770919f019aeef6c7464e1a40ead79e254b96386c",
+    "ctrader-demo-stocks-ready-90d-report.quarantine.json": "2cedd9bb786c9a72383afe4d2c9f469814c426e6875f488f695d8268f24ff0d2",
+    "ctrader-demo-stocks-ready-provenance.json": "c0c1fda4ded0949aa38cba46b4d94a7dec19f6cfd56e55f135a9fa7457733285",
+    "ctrader-demo-stocks-timeout-retry4-90d-report.json": "01cc870d0d29ba64d75b50ead4cec1a5085a5422fdfbc602852b1790862bff90",
+    "ctrader-demo-stocks-timeout-retry4-90d-report.quarantine.json": "d5a5c2c3dab46162e3373790a8da1cf314979bb8f26653353c758060123e9691",
+    "ctrader-demo-stocks-ready-provenance.sha256": "698a5f6ee1a2fa11c0a87853effdb85296751331110d11d8a48657a28d518523",
+    "ctrader-demo-stocks-ready-preparation.json": "13a177c457d07976986b99fec6c042473fcbcbe06a23bf7e85ac8261cbacf88b",
+    "ctrader-demo-stocks-finish-complete.json": "dcfedf32a3520a4752d1be187fda5c0eaf044645450f44b8f13ba487b5dbffea",
+    "ctrader-demo-stocks-complete.json": "54213ab3940851317591ee68334e859829e8330e53c31dd229137ad65be4e496"
+  },
+  "validation_state": "passed",
+  "isolated_source_manifest_sha256": "7987ccb130fb1e46fe2fbe5d94f08257f7beb81dba1d137f05615bcf6b54ac5c",
+  "utc_reader_fix": "aea5af05",
+  "final_release_tests_passed": 3584,
+  "final_release_tests_failed": 0,
+  "final_receipt": "ctrader-demo-stocks-finish-complete.json",
+  "final_job_receipt": "ctrader-demo-stocks-complete.json",
+  "staging_deployed": false
+}

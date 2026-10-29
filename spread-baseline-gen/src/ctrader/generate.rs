@@ -24,6 +24,7 @@ pub async fn run(args: Args) -> Result<()> {
     );
     let destination = super::checkpoint::Destination::acquire(&args.out, args.resume.as_deref())?;
     let previous = destination.read_resume().await?;
+    let policy = args.quarantine_policy()?;
     let profile = Profile::load(&args.account)?;
     demo_config(&profile)?;
     let data = ChartData::connect_profile(&args.account, profile).await?;
@@ -32,7 +33,15 @@ pub async fn run(args: Args) -> Result<()> {
         .as_ref()
         .map(|r| r.requested_symbols.as_slice())
         .unwrap_or(&args.only);
-    let (requested, excluded) = universe::select(&data, only, args.all_instruments).await?;
+    let native_stocks = broker_ctrader::catalogue::stock_symbols()?;
+    let stocks = args.stocks
+        || previous.as_ref().is_some_and(|report| {
+            report
+                .requested_symbols
+                .iter()
+                .any(|name| native_stocks.contains(&name.as_str()))
+        });
+    let (requested, excluded) = universe::select(&data, only, args.all_instruments, stocks).await?;
     let end = closed_minute(args.to.unwrap_or_else(Utc::now));
     let start = args
         .from
@@ -47,6 +56,10 @@ pub async fn run(args: Args) -> Result<()> {
     );
     let mut report = if let Some(mut report) = previous {
         super::checkpoint::validate(&report, &identity, &requested)?;
+        ensure!(
+            report.quarantine_policy == policy,
+            "resume must explicitly retain the original crossed-minute quarantine policy"
+        );
         report.complete = false;
         report.failures.clear();
         report
@@ -59,16 +72,38 @@ pub async fn run(args: Args) -> Result<()> {
             to_utc: end,
             requested_symbols: requested,
             complete: false,
+            quarantine_policy: policy,
+            quarantine_audit: None,
             excluded,
             instruments: vec![],
             failures: vec![],
         }
     };
+    if report.quarantine_policy.is_some() {
+        super::quarantine::Binding::from_report(&report)?;
+    }
     let remaining = super::checkpoint::remaining(&report);
     let workload = workload::estimate(report.from_utc, report.to_utc, args.window_hours);
     tracing::info!(account=args.account, instruments=remaining.len(), from=%report.from_utc, to=%report.to_utc, window_hours=args.window_hours, windows_per_symbol=workload.windows, nominal_unpaginated_history_requests=workload.requests * remaining.len() as i64, "calibration plan: sequential bounded windows, native M1 plus two quote seeds and two historical quote sides; pagination/seed search increase calls, closed sessions and warm cache reduce calls");
     if args.plan {
         return Ok(());
+    }
+    let mut audit = report
+        .quarantine_policy
+        .as_ref()
+        .map(|_| {
+            let path = super::quarantine::audit::path(&args.out);
+            let resume = report.quarantine_audit.as_ref().map(|e| e.path.as_path());
+            super::quarantine::audit::Audit::open(
+                &path,
+                resume,
+                super::quarantine::Binding::from_report(&report)?,
+            )
+        })
+        .transpose()?;
+    if let Some(audit) = &audit {
+        report.quarantine_audit = Some(audit.evidence()?);
+        super::quarantine::validate_report(&report, false)?;
     }
     destination.save(&report).await?;
     let feed = data.cached_feed().await?;
@@ -80,6 +115,7 @@ pub async fn run(args: Args) -> Result<()> {
             report.from_utc,
             report.to_utc,
             args.window_hours,
+            audit.as_mut(),
         )
         .await;
         match measured {
@@ -94,6 +130,9 @@ pub async fn run(args: Args) -> Result<()> {
                     error: format!("{error:#}"),
                 });
             }
+        }
+        if let Some(audit) = &audit {
+            report.quarantine_audit = Some(audit.evidence()?);
         }
         destination.save(&report).await?;
         ensure!(

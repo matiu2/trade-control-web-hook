@@ -31,8 +31,9 @@ pub fn read_spread_blocking(
     pip_size: f64,
     account: &str,
 ) -> std::result::Result<f64, ResolveError> {
-    if broker == Broker::Oanda {
-        return read_oanda_spread(args, instrument, pip_size, account).map_err(ResolveError::Fatal);
+    if matches!(broker, Broker::Oanda | Broker::TradeNation) {
+        return read_worker_spread(args, instrument, pip_size, account)
+            .map_err(ResolveError::Fatal);
     }
     trade_control_cli::blocking::run_blocking(crate::spread::read_spread_pips(
         broker,
@@ -53,7 +54,7 @@ pub fn read_mid_blocking(
     key: &[u8; trade_control_core::sig::KEY_LEN],
     execution: Option<&crate::api::Execution>,
 ) -> Result<f64> {
-    if broker == Broker::Oanda {
+    if matches!(broker, Broker::Oanda | Broker::TradeNation) {
         let client = crate::account_reads::AccountReads::new(
             crate::register_post::worker_url(execution),
             key,
@@ -71,24 +72,24 @@ pub fn read_mid_blocking(
     .context("reading live broker mid")
 }
 
-fn read_oanda_spread(args: &Args, instrument: &str, pip_size: f64, account: &str) -> Result<f64> {
+fn read_worker_spread(args: &Args, instrument: &str, pip_size: f64, account: &str) -> Result<f64> {
     if !pip_size.is_finite() || pip_size <= 0.0 {
         return Err(color_eyre::eyre::eyre!(
             "pip_size must be finite and positive; got {pip_size}"
         ));
     }
-    let (bid, ask) = read_oanda_quote(args, instrument, account)?;
+    let (bid, ask) = read_worker_quote(args, instrument, account)?;
     Ok(crate::spread::spread_from_bid_ask(bid, ask)? / pip_size)
 }
 
-fn read_oanda_quote(args: &Args, instrument: &str, account: &str) -> Result<(f64, f64)> {
+fn read_worker_quote(args: &Args, instrument: &str, account: &str) -> Result<(f64, f64)> {
     let key = crate::pipeline::read_key(args)?;
     let client = crate::account_reads::AccountReads::new(
         crate::register_post::worker_url(args.execution.as_ref()),
         &key,
     )?;
     trade_control_cli::blocking::run_blocking(client.quote(account, instrument))
-        .context("Read selected OANDA account quote from worker")
+        .context("Read selected account quote from worker")
 }
 
 #[cfg(test)]

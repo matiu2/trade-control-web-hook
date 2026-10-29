@@ -6,7 +6,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 #[derive(Parser)]
 #[command(
-    about = "Complete an explicit missing-only cTrader DEMO non-stock calibration; strict additive bake, release gates, optional staging deployment; no Git writes"
+    about = "Complete an explicit missing-only cTrader DEMO calibration (non-stocks, or --stocks); strict additive bake, release gates, optional staging deployment; no Git writes"
 )]
 pub struct Args {
     #[arg(long)]
@@ -19,12 +19,20 @@ pub struct Args {
     pub workspace: PathBuf,
     #[arg(long, value_delimiter = ',', required = true)]
     pub only: Vec<String>,
+    /// Select the separately audited native demo stock/ETF catalogue, read-only.
+    #[arg(long)]
+    pub stocks: bool,
     #[arg(long)]
     pub from: DateTime<Utc>,
     #[arg(long)]
     pub to: DateTime<Utc>,
     #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u32).range(1..=24))]
     pub window_hours: u32,
+    /// Explicit bounded whole-minute quality exclusions, forwarded to the generator.
+    #[arg(long)]
+    pub quarantine_crossed_minutes: bool,
+    #[arg(long, default_value_t=5, value_parser=clap::value_parser!(u32).range(1..=100), requires="quarantine_crossed_minutes")]
+    pub max_quarantined_minutes: u32,
     #[arg(long)]
     pub deploy_staging: bool,
     /// Recover after a successful merge: verify identical baked rows and rerun gates only.
@@ -39,12 +47,16 @@ impl Args {
             .iter()
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
-        let audited = broker_ctrader::catalogue::non_stock_symbols()?;
+        let audited = if self.stocks {
+            broker_ctrader::catalogue::stock_symbols()?
+        } else {
+            broker_ctrader::catalogue::non_stock_symbols()?
+        };
         ensure!(
             !names.is_empty()
                 && names.len() == self.only.len()
                 && names.iter().all(|name| audited.contains(name)),
-            "--only must contain unique exact audited native non-stock symbols"
+            "--only must contain unique exact audited native symbols matching the selected stock/non-stock scope"
         );
         ensure!(
             self.to <= Utc::now()
@@ -86,6 +98,48 @@ pub(super) mod tests {
         ])
         .unwrap()
     }
+    #[test]
+    fn explicit_quarantine_budget_twenty_is_forwardable_but_one_hundred_one_is_refused() {
+        crate::test_logging();
+        let parse = |budget| {
+            Args::try_parse_from([
+                "finish-ctrader-nonstocks",
+                "--account",
+                "ctrader-demo",
+                "--report",
+                "r.json",
+                "--status",
+                "s.json",
+                "--only",
+                "ETHEUR",
+                "--from",
+                "2026-07-24T16:26:00Z",
+                "--to",
+                "2026-10-22T16:26:00Z",
+                "--quarantine-crossed-minutes",
+                "--max-quarantined-minutes",
+                budget,
+            ])
+        };
+        assert_eq!(parse("20").unwrap().max_quarantined_minutes, 20);
+        assert!(parse("101").is_err());
+    }
+    #[test]
+    fn stock_scope_is_explicit_native_only_and_rejects_mixed_batches() {
+        crate::test_logging();
+        let mut a = args();
+        a.only = vec![
+            "AIA".into(),
+            "AMP".into(),
+            "REDES ENERGETICAS NACIONAIS".into(),
+        ];
+        assert!(a.validate().is_err());
+        a.stocks = true;
+        a.validate().unwrap();
+        a.only.push("EURUSD".into());
+        assert!(a.validate().is_err());
+    }
+
     #[test]
     fn explicit_scope_has_no_stocks_aliases_duplicates_or_rolling_bounds() {
         crate::test_logging();

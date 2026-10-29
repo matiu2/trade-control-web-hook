@@ -2,6 +2,34 @@ use super::Args;
 use clap::Parser;
 
 #[test]
+fn offside_is_independent_of_touch_and_rejects_direct_entry() {
+    for flags in [
+        vec![],
+        vec!["--trend"],
+        vec!["--enable-on-ma-touch", "200 sma"],
+    ] {
+        let args = Args::try_parse_from(
+            ["tv-arm", "--be-offside", "9 ema|20 sma|200 sma"]
+                .into_iter()
+                .chain(flags),
+        )
+        .unwrap()
+        .apply_aliases();
+        assert_eq!(args.be_offside.len(), 3);
+        assert!(args.must_touch.is_empty());
+        assert!(args.validate().is_ok());
+        assert!(!args.ma_requirements().is_empty());
+    }
+    for value in ["", "9 ema|", "0 ema", "9 ema|20 wma"] {
+        assert!(Args::try_parse_from(["tv-arm", "--be-offside", value]).is_err());
+    }
+    let direct = Args::try_parse_from(["tv-arm", "--market-entry", "--be-offside", "9 ema"])
+        .unwrap()
+        .apply_aliases();
+    assert!(direct.validate().is_err());
+}
+
+#[test]
 fn alignment_is_independent_of_veto_and_rejects_direct_entry() {
     for flags in [vec![], vec!["--trend"], vec!["--ma-cross-veto"]] {
         let args = Args::try_parse_from(["tv-arm", "--ma-cross-pause"].into_iter().chain(flags))

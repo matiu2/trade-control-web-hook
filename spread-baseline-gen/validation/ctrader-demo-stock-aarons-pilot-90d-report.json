@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "identity": {
+    "profile": "ctrader-demo",
+    "environment": "demo",
+    "endpoint": "wss://demo.ctraderapi.com:5036",
+    "account_id": 49247794,
+    "broker": "Spotware",
+    "login": 5944473
+  },
+  "source": "paired-ticks-m1",
+  "from_utc": "2026-07-24T16:26:00Z",
+  "to_utc": "2026-10-22T16:26:00Z",
+  "requested_symbols": [
+    "AARONS"
+  ],
+  "complete": false,
+  "quarantine_policy": {
+    "max_minutes_per_instrument": 20
+  },
+  "quarantine_audit": {
+    "path": "/home/matiu/projects/trading-libraries/trade-control-web-hook/spread-baseline-gen/validation/ctrader-demo-stock-aarons-pilot-90d-report.quarantine.json",
+    "sha256": "44a9aac84d7b61a754359f29aef21f5a953ff3847acdc42fbadc19285857ac1f",
+    "excluded_minutes": 0
+  },
+  "excluded": [],
+  "instruments": [],
+  "failures": [
+    {
+      "symbol": "AARONS",
+      "error": "cTrader paired spread calculation: no minute candles for AARONS"
+    }
+  ]
+}

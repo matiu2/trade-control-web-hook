@@ -22,7 +22,7 @@
 //! since the worker's real `run_close` (which the offline replay doesn't run)
 //! is what flattens the broker position live.
 
-use super::fill_sim::{breakeven_armed_at_resolved, sweep_reason, widened_stop_at_resolved};
+use super::fill_sim::{breakeven_armed_at_resolved, sweep_reason, widen_episodes_at_resolved};
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::{Action, Direction, Intent, Resolved, ResolvedEntry, Shell};
 use trade_control_core::plan_sentiment::PlanSentiment;
@@ -854,18 +854,16 @@ fn render_fire(
     // Spread-widen (System 2): a spread-hour bar moves the broker SL *away* from
     // price (`blackout_apply`), transiently — the recovery watcher
     // (`blackout_watch`) restores the original once the spread recovers (≤4p) or
-    // the 3h backstop fires. We surface BOTH so the journal shows the shield
-    // snapping back, not a permanent risk change. `simulate_fill_resolved` ALSO
-    // applies this same widen (via `widened_stop_at_resolved`) when scoring the
-    // exit — so a spread-hour spike that clears the widened stop no longer books a
-    // false stop-out. These journal lines and the scored outcome read the same
-    // reconstruction off the SAME placed bracket, so they can't disagree.
+    // safety backstop fires. Report EVERY widen and restore, matching the full
+    // episode list `simulate_fill_resolved` uses when scoring the exit. Reporting
+    // only the first episode hid the stop protecting later spread-hour spikes
+    // (AUD/NZD 2025-11-13), making a valid TP look like a missed stop-out.
     let widen_trigger =
         elevated_threshold_pips(&trade_control_core::spread_blackout::spread_lookup_key(
             &intent.instrument,
             intent.account.as_deref(),
         ));
-    if let Some(widen) = widened_stop_at_resolved(
+    for widen in widen_episodes_at_resolved(
         placed,
         intent,
         &shell,
@@ -1253,6 +1251,8 @@ fn describe_control_action(action: Action, rule_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod stop_management;
+
     use super::super::replay::EnterGateOutcome;
     use super::*;
     use crate::replay_args::{DirectionFilter, GoldenFilter};

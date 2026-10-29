@@ -1,0 +1,71 @@
+{
+  "workspace": "/home/matiu/projects/trading-libraries/target/ctrader-stock-validation-snapshot-20261029/trade-control-web-hook",
+  "local_packages": 37,
+  "repositories": {
+    "/home/matiu/projects/trading-libraries/target/ctrader-stock-validation-snapshot-20261029/trade-control-web-hook": {
+      "head": "bf557f3d6f1fbe0af968fb23e6aa697ad2bf3e14",
+      "original_source": "/home/matiu/projects/trading-libraries/trade-control-web-hook"
+    },
+    "/home/matiu/projects/trading-libraries/target/ctrader-stock-validation-snapshot-20261029/candle-cache": {
+      "head": "1d59b3425029af737eaf414237ee44f9296579e9",
+      "original_source": "/home/matiu/projects/trading-libraries/candle-cache"
+    },
+    "/home/matiu/projects/trading-libraries/target/ctrader-stock-validation-snapshot-20261029/candle-model": {
+      "head": "20fa15818d7ea863eaa8904cc74e07aacdc1f5f9",
+      "original_source": "/home/matiu/projects/trading-libraries/candle-model"
+    },
+    "/home/matiu/projects/trading-libraries/target/ctrader-stock-validation-snapshot-20261029": {
+      "head": "f8709e4ff02e1d94f7922fd449227547ffe9bc31",
+      "original_source": "/home/matiu/projects/trading-libraries"
+    },
+    "/home/matiu/projects/trading-libraries/target/ctrader-stock-validation-snapshot-20261029/ibkr-client": {
+      "head": "16d1e56d767f0120a61356587001e9d7ba1dc74e",
+      "original_source": "/home/matiu/projects/trading-libraries/ibkr-client"
+    },
+    "/home/matiu/projects/trading-libraries/target/ctrader-stock-validation-snapshot-20261029/instrument-lookup": {
+      "head": "49f91495d02450f011bbcfbb08bf80680d6d5bb3",
+      "original_source": "/home/matiu/projects/trading-libraries/instrument-lookup"
+    },
+    "/home/matiu/projects/trading-libraries/target/ctrader-stock-validation-snapshot-20261029/local-chart-client": {
+      "head": "faf56da4d1488831a0c2e0c9c78525cf49cc33cd",
+      "original_source": "/home/matiu/projects/trading-libraries/local-chart-client"
+    },
+    "/home/matiu/projects/trading-libraries/target/ctrader-stock-validation-snapshot-20261029/oanda-client": {
+      "head": "ed8052af916ab02193d83888245241ecef43d32a",
+      "original_source": "/home/matiu/projects/trading-libraries/oanda-client"
+    },
+    "/home/matiu/projects/trading-libraries/target/ctrader-stock-validation-snapshot-20261029/strategy-common": {
+      "head": "0c45063fe51d4a610028776c308f388cd3fea720",
+      "original_source": "/home/matiu/projects/trading-libraries/strategy-common"
+    },
+    "/home/matiu/projects/trading-libraries/target/ctrader-stock-validation-snapshot-20261029/trade-calendar-maker": {
+      "head": "f22b10a83b8d8ef61b7dd4e1a458278350867f1e",
+      "original_source": "/home/matiu/projects/trade-calendar-maker"
+    },
+    "/home/matiu/projects/trading-libraries/target/ctrader-stock-validation-snapshot-20261029/trading-base": {
+      "head": "6d7937d9431a0ee4c3d27c948499184bdd42653c",
+      "original_source": "/home/matiu/projects/trading-libraries/trading-base"
+    }
+  },
+  "table_sha256": "a2ca191920cf384679183bb731d7dc0e57b8434fd11899694e583fbc931b796a",
+  "policy": "Committed trading workspace and frozen working dependencies; shared source checkouts untouched; no broker mutation",
+  "metadata_graphs": {
+    "trade-control-web-hook": 37,
+    "candle-cache": 6
+  },
+  "optional_manifest_dependency": {
+    "path": "/home/matiu/projects/trading-libraries/target/ctrader-stock-validation-snapshot-20261029/tradenation-api",
+    "head": "92734fd8296b10cb125b2ee438c29fdf9e3cbc8f",
+    "absolute_path_mapping": {
+      "/home/matiu/projects/trading-libraries/candle-model": "/home/matiu/projects/trading-libraries/target/ctrader-stock-validation-snapshot-20261029/candle-model"
+    }
+  },
+  "reviewed_workspace_patch": {
+    "commit": "aea5af05",
+    "purpose": "Resolve the UTC learning clock in shared spread readers",
+    "files": {
+      "core/src/spread_blackout.rs": "6c7f161206fc3bda696995dc15cf2cc7eb3b663f6eff93f10b23071cdac9f504",
+      "core/src/spread_blackout/utc_tests.rs": "e8516c3dfcac859b22080280cf5e0b3604b1485164dfa37fdc7a296bb46cabab"
+    }
+  }
+}

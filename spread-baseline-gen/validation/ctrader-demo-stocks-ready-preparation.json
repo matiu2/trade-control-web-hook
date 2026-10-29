@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "source_report": {
+    "path": "/home/matiu/projects/trading-libraries/trade-control-web-hook/spread-baseline-gen/validation/ctrader-demo-stocks-90d-report.json",
+    "sha256": "1ad80a4a5df263202d12be46ffa9395cc457f0de5c3f10556f385ff0cf778974"
+  },
+  "source_audit": {
+    "path": "/home/matiu/projects/trading-libraries/trade-control-web-hook/spread-baseline-gen/validation/ctrader-demo-stocks-90d-report.quarantine.json",
+    "sha256": "e4e39d91b92973b57dfd73f1b4a09df9fa57498a53c48def1160fd02568c0139"
+  },
+  "catalogue": {
+    "path": "/home/matiu/projects/trading-libraries/trade-control-web-hook/broker-ctrader/src/catalogue/stocks.json",
+    "sha256": "c550b432b68e91a8e7215fba22cdf7e50aa4be8bbca07d907b94ebf590f6ced7"
+  }
+}

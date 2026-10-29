@@ -1,0 +1,18 @@
+{
+  "pid": 1488288,
+  "state": "failed",
+  "detail": "checking-consumers failed with exit status: 101; later validation/deployment steps were not run",
+  "updated_at": "2026-10-29T02:22:49.143937162Z",
+  "sources": [
+    {
+      "name": "workspace",
+      "head": "4f29a849075421ef3406ed172c7544ee1e61280b",
+      "sha256": "7cc362fe53bff5a8f904b604640992173c3c9f75060777ff4742ccd0ce59c65f"
+    },
+    {
+      "name": "candle-cache",
+      "head": "6615f0e95ff6ec63113a5a6ae23a33510b8c8bd0",
+      "sha256": "23d36b85c9d15f3e621d9f577622d95f063dffcfa32ed9ac06754b1fa34f3b79"
+    }
+  ]
+}

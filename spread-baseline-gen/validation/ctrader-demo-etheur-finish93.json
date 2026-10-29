@@ -1,0 +1,18 @@
+{
+  "pid": 2668500,
+  "state": "complete",
+  "detail": "strict native row verification and release gates passed; 1 symbols; verify_baked=false; workspace HEAD=36373bad3f7484fae32ecf8dc436a37b184f4f98, SHA256=947955b272769dda828a89cabe3a4432e0ac9bdbc1bd250656d31a2776e3f5a7; candle-cache HEAD=48a36961256d21f0ff81113a93fdabff11a9e0af, SHA256=02e336cb0912f2f5387abde434b13f5140e3400b2d1885246545816f4c80026b; staging_deployed=true; no Git writes",
+  "updated_at": "2026-10-27T21:04:12.251173336Z",
+  "sources": [
+    {
+      "name": "workspace",
+      "head": "36373bad3f7484fae32ecf8dc436a37b184f4f98",
+      "sha256": "947955b272769dda828a89cabe3a4432e0ac9bdbc1bd250656d31a2776e3f5a7"
+    },
+    {
+      "name": "candle-cache",
+      "head": "48a36961256d21f0ff81113a93fdabff11a9e0af",
+      "sha256": "02e336cb0912f2f5387abde434b13f5140e3400b2d1885246545816f4c80026b"
+    }
+  ]
+}

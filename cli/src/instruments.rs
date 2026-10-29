@@ -15,8 +15,10 @@ use std::time::Duration;
 use crate::blocking::run_blocking;
 use color_eyre::eyre::{Result, eyre};
 use trade_control_core::intent::BrokerKind;
-use tradenation_api::{login_demo, login_demo_named};
+use tradenation_api::login_demo;
 use tradenation_instrument_cache::{InstrumentCache, ResolveError};
+
+mod login;
 
 /// How old the cached catalog can be before we re-walk the TN tree.
 /// Per-instrument additions are rare; a week is conservative and still
@@ -28,7 +30,8 @@ const CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 ///
 /// `account = Some(name)` logs in via the named entry in the local TN
 /// store (so `tv-arm --account-id=X` walks the catalog under the same
-/// identity that arms the trade). Errors when the name is missing
+/// identity that arms the trade), using demo or live login according to the
+/// stored account kind. Errors when the name is missing
 /// locally — the operator should `tradenation account create <name>`
 /// first.
 ///
@@ -51,7 +54,7 @@ pub fn load_cache(
     let account = account.map(str::to_owned);
     run_blocking(async move {
         let session = match account.as_deref() {
-            Some(name) => login_demo_named(name).await.map_err(|e| {
+            Some(name) => login::login_named_account(name).await.map_err(|e| {
                 eyre!("logging in to TradeNation as '{name}' for catalog walk: {e}")
             })?,
             None => login_demo()

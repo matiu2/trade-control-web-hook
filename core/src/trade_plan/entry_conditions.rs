@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use super::LinePoint;
 use crate::moving_average::MovingAverage;
 
+mod offside;
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntryConditions {
@@ -20,6 +22,10 @@ pub struct EntryConditions {
     /// Evaluated at each constituent candle, never at its later confirmation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub must_touch: Vec<MovingAverage>,
+    /// The signal must touch or lie above any selected MA for shorts, below
+    /// for longs. Uses each constituent's own MA, excluding confirmation bars.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub be_offside: Vec<MovingAverage>,
     /// Under `--trend`, the optional neckline is a minimum retracement line.
     /// Short: close above it; long: close below it. No retest follows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,6 +37,7 @@ impl EntryConditions {
         !self.require_ma_alignment
             && self.retrace.is_none()
             && self.must_touch.is_empty()
+            && self.be_offside.is_empty()
             && self.enable_on_ma_touch.is_empty()
     }
 
@@ -38,6 +45,7 @@ impl EntryConditions {
         self.must_touch
             .iter()
             .chain(self.enable_on_ma_touch.iter())
+            .chain(self.be_offside.iter())
             .map(|ma| ma.history_bars())
             .max()
             .unwrap_or(0)
@@ -106,5 +114,7 @@ pub struct RetraceLine {
     pub b: LinePoint,
 }
 
+#[cfg(test)]
+mod offside_tests;
 #[cfg(test)]
 mod tests;

@@ -69,6 +69,8 @@ mod baseline_oanda {
     pub use candle_cache::spread_profiles::SPREAD_BASELINE_OANDA;
 }
 mod account_scope;
+#[cfg(test)]
+mod utc_tests;
 pub use account_scope::{ctrader_spread_key, mt5_spread_key, spread_lookup_key};
 
 mod coverage;
@@ -89,6 +91,7 @@ pub use sample_mask::*;
 /// absent masks.
 fn schedule_tz(schedule: &str) -> Option<chrono_tz::Tz> {
     match schedule {
+        "utc" => Some(chrono_tz::UTC),
         "ny" => Some(chrono_tz::America::New_York),
         "london" => Some(chrono_tz::Europe::London),
         "frankfurt" => Some(chrono_tz::Europe::Berlin),

@@ -1,0 +1,73 @@
+{
+  "binding": {
+    "version": 1,
+    "identity": {
+      "profile": "ctrader-demo",
+      "environment": "demo",
+      "endpoint": "wss://demo.ctraderapi.com:5036",
+      "account_id": 49247794,
+      "broker": "Spotware",
+      "login": 5944473
+    },
+    "from_utc": "2026-07-24T16:26:00Z",
+    "to_utc": "2026-10-22T16:26:00Z",
+    "requested_symbols": [
+      "ETHEUR"
+    ],
+    "policy": {
+      "max_minutes_per_instrument": 5
+    }
+  },
+  "records": [
+    {
+      "symbol": "ETHEUR",
+      "symbol_id": 22398,
+      "from_utc": "2026-07-27T22:40:00Z",
+      "to_utc": "2026-07-27T22:41:00Z",
+      "observed_at_utc": "2026-07-27T22:40:54.252Z",
+      "bid": 1689.595,
+      "ask": 1683.94,
+      "reason": "crossed-historical-book"
+    },
+    {
+      "symbol": "ETHEUR",
+      "symbol_id": 22398,
+      "from_utc": "2026-08-19T15:27:00Z",
+      "to_utc": "2026-08-19T15:28:00Z",
+      "observed_at_utc": "2026-08-19T15:27:31.292Z",
+      "bid": 1771.429,
+      "ask": 1765.786,
+      "reason": "crossed-historical-book"
+    },
+    {
+      "symbol": "ETHEUR",
+      "symbol_id": 22398,
+      "from_utc": "2026-08-22T05:10:00Z",
+      "to_utc": "2026-08-22T05:11:00Z",
+      "observed_at_utc": "2026-08-22T05:10:54.724Z",
+      "bid": 2094.635,
+      "ask": 2094.2,
+      "reason": "crossed-historical-book"
+    },
+    {
+      "symbol": "ETHEUR",
+      "symbol_id": 22398,
+      "from_utc": "2026-08-22T05:11:00Z",
+      "to_utc": "2026-08-22T05:12:00Z",
+      "observed_at_utc": "2026-08-22T05:11:00Z",
+      "bid": 2094.635,
+      "ask": 2094.2,
+      "reason": "crossed-historical-book"
+    },
+    {
+      "symbol": "ETHEUR",
+      "symbol_id": 22398,
+      "from_utc": "2026-08-27T09:25:00Z",
+      "to_utc": "2026-08-27T09:26:00Z",
+      "observed_at_utc": "2026-08-27T09:25:41.255Z",
+      "bid": 2195.898,
+      "ask": 2189.981,
+      "reason": "crossed-historical-book"
+    }
+  ]
+}

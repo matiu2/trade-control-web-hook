@@ -5,16 +5,20 @@ use color_eyre::{
     eyre::{Context, ensure, eyre},
 };
 use std::{
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     path::{Path, PathBuf},
 };
 
-/// Locks are released by the OS, including on process exit or interruption.
+mod guard;
+use guard::AdvisoryLock;
+
+/// Advisory ownership ends on Drop, even if another process inherited its FD.
+/// The OS also releases locks when all descriptors close after process exit.
 /// Sidecars remain to keep every process locking the same inode.
 pub struct Destination {
     output: PathBuf,
     resume: Option<PathBuf>,
-    _locks: Vec<File>,
+    _locks: Vec<AdvisoryLock>,
 }
 impl Destination {
     pub fn acquire(output: &Path, resume: Option<&Path>) -> Result<Self> {
@@ -27,6 +31,13 @@ impl Destination {
             .iter()
             .map(|path| lock(path))
             .collect::<Result<Vec<_>>>()?;
+        Self::finish_acquisition(output, resume, locks)
+    }
+    fn finish_acquisition(
+        output: PathBuf,
+        resume: Option<PathBuf>,
+        locks: Vec<AdvisoryLock>,
+    ) -> Result<Self> {
         // A concurrent fresh run could have created the report before we won its lock.
         validate_paths(&output, resume.as_deref())?;
         Ok(Self {
@@ -92,7 +103,7 @@ fn regular_file(path: &Path, required: bool) -> Result<bool> {
         Err(error) => Err(error).wrap_err("inspect checkpoint path"),
     }
 }
-fn lock(path: &Path) -> Result<File> {
+fn lock(path: &Path) -> Result<AdvisoryLock> {
     let path = path.with_extension("json.lock");
     // Never truncate/remove a lock sidecar: replacing its inode permits two owners.
     regular_file(&path, false)?;
@@ -104,7 +115,7 @@ fn lock(path: &Path) -> Result<File> {
         .open(&path)?;
     file.try_lock()
         .wrap_err("another calibration owns this checkpoint or its resume source")?;
-    Ok(file)
+    Ok(AdvisoryLock::acquired(file, path))
 }
 
 #[cfg(test)]

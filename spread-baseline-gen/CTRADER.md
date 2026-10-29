@@ -32,10 +32,12 @@ target/release/bake-ctrader --account ctrader-demo \
 ```
 
 `--only EURUSD,AUDUSD` restricts a fresh run to exact native broker names.
-Explicit selection uses the 93 audited native non-stock mappings in
-`broker_ctrader::catalogue`, each with a verified spread schedule. Stocks, ETFs
-and unverified aliases are refused, even if a generic catalogue recognises the
-name. This does not enable broker order sizing or live trading.
+Without `--stocks`, explicit selection uses the 93 audited native non-stock
+mappings in `broker_ctrader::catalogue`, each with a verified spread schedule.
+`--stocks` selects the separate audited 350 stock/ETF catalogue for `ctrader-demo`;
+combine it with repeated `--only 'EXACT NATIVE NAME'` for a subset. Unverified
+aliases are refused, even if a generic catalogue recognises the name. These
+read-only selections do not enable broker order sizing or live trading.
 `--all-instruments` explicitly discovers enabled, recognized **non-stock**
 markets for this rollout. Stocks, missing mappings and missing/unknown schedule
 timezones remain explicit exclusions; no class-derived calendar is guessed.
@@ -171,8 +173,8 @@ target/release/finish-ctrader-nonstocks --account ctrader-demo \
 
 Select exact native names from the current audited inventory and subtract the
 latest table's account-qualified keys **after any ongoing bake finishes**. Quote
-`--only` values containing spaces. The runner accepts only audited non-stock
-names and explicit closed-minute bounds of 90–366 days. Before collection, it
+`--only` values containing spaces. The runner accepts audited non-stock names by default, or audited stock/ETF
+names with `--stocks`, and explicit closed-minute bounds of 90–366 days. Before collection, it
 reauthenticates the demo account and verifies selected symbols are enabled and
 unambiguous, the existing table has the same identity and exact UTC window, and
 every selected key is missing. Existing reports must match that identity, subset
@@ -180,7 +182,10 @@ and window before resume; unrelated reports are never selected for overwrite.
 
 On completion it rechecks account/catalogue identity, requires every selected
 profile to pass the strict quality gates, and invokes `bake-ctrader --merge`
-without partial promotion. A report lock spans verification, merge and checks.
+without partial promotion. A report lock spans verification, merge and checks. An already complete checkpoint
+must pass every strict report/audit/quality gate, then retains that lock and skips
+the no-op generator; its report and audit bytes stay unchanged. Incomplete
+checkpoints still use the real generator, and invalid complete reports fail.
 The original table bytes must remain unchanged during collection. Source and
 dependency snapshots include existing drafts; any later source change stops
 activation while retaining the report and cached windows. The runner reuses the
@@ -204,3 +209,136 @@ metadata, then reruns the release/deployment gates under source and table guards
 It never invokes collection or baking, and accepts neither mixed present/missing
 coverage nor an incomplete, stale or different report. Ordinary missing-only
 mode continues to refuse already measured keys.
+
+
+## Native stock and ETF collection
+
+Stock history uses the exact demo broker name and ID, including spaces and
+punctuation. Fresh native light/full symbol, asset, category and asset-class reads
+must match the account-scoped audit before collection and again before baking.
+This prevents aliases such as `AIA` from being mapped to a different company's
+prices or currency. Native precision and pip units are retained. Close-only
+instruments may supply history; no stock order permission or sizing is added.
+
+```sh
+# Inspect all 350 audited native stocks/ETFs, without downloading history.
+target/release/generate-ctrader --account ctrader-demo --stocks \
+  --out spread-baseline-gen/validation/ctrader-demo-stocks-90d-report.json --plan
+
+# A fresh stock subset using the existing table's fixed 90-day bounds.
+target/release/generate-ctrader --account ctrader-demo --stocks --only AIA \
+  --only 'REDES ENERGETICAS NACIONAIS' \
+  --from 2026-07-24T16:26:00Z --to 2026-10-22T16:26:00Z \
+  --out spread-baseline-gen/validation/ctrader-demo-stock-subset-90d-report.json
+```
+
+Omit `--only` with `--stocks` for all 350. Resume with the original report and
+`--resume`, without `--stocks`; the report's exact native list determines stock
+scope. Stock and non-stock symbols cannot be mixed. The durable missing-only
+runner keeps its historical `finish-ctrader-nonstocks` name and accepts `--stocks`
+with an explicit missing stock list, forwarding stock selection to the generator
+and retaining strict additive baking and all release gates.
+
+All stock observations pass through the same paired candle-cache path. The
+broker explicitly declares UTC sessions; `utc` is the spread learning clock,
+not an inferred exchange timezone or historical holiday calendar. Current weekly
+sessions do not filter historical candles. Sparse daily sessions retain the
+existing minimum observation and hour-bucket thresholds; a measured baseline
+with `MaskNotComputable` remains eligible, while insufficient history fails.
+
+## Audited crossed-minute exclusions
+
+Normal historical feeds remain strict. A calibration can explicitly exclude
+whole M1 candles containing a finite, positive crossed book (`bid > ask`):
+
+```sh
+target/release/generate-ctrader --account ctrader-demo --only ETHEUR \
+  --from 2026-07-24T16:26:00Z --to 2026-10-22T16:26:00Z \
+  --quarantine-crossed-minutes --max-quarantined-minutes 5 \
+  --out spread-baseline-gen/validation/ctrader-demo-etheur-quarantine-90d-report.json
+```
+
+The absolute limit defaults to five and accepts one through 100 distinct minutes
+per instrument over the entire sampling window. Every completed profile must also
+keep `excluded_minutes / (retained_M1_observations + excluded_minutes) <= 0.001`
+(0.1%); collection, resume validation and strict baking enforce the same quota.
+A larger explicit allowance cannot bypass this fraction for sparse stock sessions.
+Existing reports retain their original policy; changing the allowance requires a
+fresh report and leaves the original report and audit intact. Every exclusion
+is durably recorded before collection continues, including native identity, minute bounds, observation timestamp and
+bid/ask. Other data errors remain fatal. Valid segments use candle-cache;
+excluded minutes remain uncovered gaps rather than cached empty results.
+
+Keep the report's `.quarantine.json` sidecar: resume and baking validate its
+identity, exclusions and digest. Resume requires the same explicit policy and
+retains the original cumulative budget, including exclusions for unfinished
+symbols. Start a fresh report when opting in for an earlier strict failure;
+existing strict reports cannot silently acquire a different policy. The
+missing-only finisher accepts and forwards both flags, and baked rows retain
+an exclusion-count and audit-digest comment.
+
+### Fixed demo stock batch, 28 October 2026
+
+`validation/ctrader-demo-stocks-run-2026-10-28.py` scans all 350 stocks/ETFs
+over the existing 24 July–22 October window with an explicit 20-minute allowance
+and the 0.1% quota. It uses pinned Rust binaries and up to three total collection
+attempts (initial plus two checkpoint resumes). It never places orders or deploys
+servers. Start it after all 93 non-stock profiles are baked.
+
+```sh
+python3 spread-baseline-gen/validation/ctrader-demo-stocks-run-2026-10-28.py \
+  target/APPROVED-STOCK-CALIBRATION-BINARIES
+```
+
+The complete scan must account for each requested native symbol exactly once as
+a measured row or a failure. An interrupted scan with unattempted symbols cannot
+produce a subset or bake. The original `ctrader-demo-stocks-90d-report.json` and
+its full audit retain all measurements, failures and exclusions verbatim after
+collection, including audit records for failed symbols.
+
+When some measured rows pass every quality gate, the runner creates a separate
+`ctrader-demo-stocks-ready-90d-report.json` marked complete only for those exact
+native symbols, plus a matching `.quarantine.json` with the selected audit records.
+`Reviewed` and `MaskNotComputable` rows must retain verified native metadata,
+statistical thresholds, the 0.1% quota and exact per-row exclusion evidence.
+Failed or unqualified rows remain uncovered and appear explicitly in
+`ctrader-demo-stocks-ready-provenance.json`. That manifest binds the original and
+selected report/audit SHA256 hashes, catalogue hash, source failures and quality
+exclusions; its `.sha256` seal detects manifest changes. If all 350 rows qualify,
+the original complete report can be used directly without rewriting it.
+
+Only the strict additive finisher receives the selected complete scope, original
+window, stock mode and policy20. It uses `bake-ctrader --merge` and the existing
+release checks, never `--allow-partial` or an overwrite bake. Source guards are
+captured after collection; the original 93 non-stock rows remain intact. No
+eligible rows means `failed` with no bake. Success with excluded rows ends as
+`complete-with-failures`, with explicit ready/failed counts and symbol lists;
+only all350 qualified rows can end as `complete`.
+
+Evidence files are published from synced complete temporary files with atomic
+no-replacement links. A `ctrader-demo-stocks-ready-preparation.json` marker freezes
+the source hashes before subset publication. A normal restart after interrupted
+preparation validates every existing byte, completes missing artifacts or the
+manifest seal, and never recollects into the frozen full report. Orphaned publish
+temps are not trusted or promoted; truncated legacy final files are refused
+rather than silently replaced. `--verify-baked` cannot create a missing seal.
+
+Progress is recorded in `ctrader-demo-stocks-job.json`, and initial finishing
+checks use `ctrader-demo-stocks-finish.json`. If baking succeeded but a later
+check failed, rerun with `--verify-baked`. Recovery verifies every sealed hash and
+recomputes the subset relationship in memory, skips collection and derivation,
+and asks the finisher to verify each baked row literally before rerunning gates.
+It writes a separate recovery finishing status and archives the previous job
+status, preserving original gate-failure evidence. Changed or mixed rows fail;
+report, audit and provenance files are never regenerated during recovery.
+
+
+For recovery while other agents continue editing the main sources, an independently
+captured complete source/dependency snapshot can be selected with
+`--verify-baked --verification-workspace /absolute/path/to/frozen/workspace`.
+This routes only the finisher's working directory and source guards to that
+workspace. The original catalogue, reports, audits and sealed provenance keep
+their original paths. The option is refused for collection or baking. Original
+and snapshot account spread-table bytes must match before verification, and both
+must remain identical to those captured bytes afterward; a changed main table
+prevents completion. Job status records the selected verification workspace.

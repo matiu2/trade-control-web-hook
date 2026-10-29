@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "identity": {
+    "profile": "ctrader-demo",
+    "environment": "demo",
+    "endpoint": "wss://demo.ctraderapi.com:5036",
+    "account_id": 49247794,
+    "broker": "Spotware",
+    "login": 5944473
+  },
+  "source": "paired-ticks-m1",
+  "from_utc": "2026-07-24T16:26:00Z",
+  "to_utc": "2026-10-22T16:26:00Z",
+  "requested_symbols": [
+    "ETHEUR"
+  ],
+  "complete": false,
+  "quarantine_policy": {
+    "max_minutes_per_instrument": 5
+  },
+  "quarantine_audit": {
+    "path": "/home/matiu/projects/trading-libraries/trade-control-ctrader-quality-quarantine/spread-baseline-gen/validation/ctrader-demo-etheur-quarantine-90d-report.quarantine.json",
+    "sha256": "f664586ed3d48c32aaa1d64ebcdeb3152e3c13ef6a162c670257a91960392a5c",
+    "excluded_minutes": 5
+  },
+  "excluded": [],
+  "instruments": [],
+  "failures": [
+    {
+      "symbol": "ETHEUR",
+      "error": "refused calibration exclusion for ETHEUR [2026-09-04 12:30:00 UTC,2026-09-04 12:31:00 UTC), observation=2026-09-04 12:30:02.231 UTC bid=2171.188 ask=2163.813: crossed-minute quarantine budget exhausted for ETHEUR (maximum 5)"
+    }
+  ]
+}

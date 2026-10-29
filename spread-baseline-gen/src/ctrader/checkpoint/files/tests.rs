@@ -88,3 +88,58 @@ async fn bad_resume_at_the_output_path_is_not_replaced() {
         "invalid existing report"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn dropping_owner_unlocks_despite_an_inherited_descriptor_without_unlocking_the_next_owner() {
+    crate::ctrader::test_logging();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("report.json");
+    let first = Destination::acquire(&path, None).unwrap();
+    let inherited = first._locks[0].file.try_clone().unwrap();
+    drop(first);
+    let second = Destination::acquire(&path, None).unwrap();
+    assert!(Destination::acquire(&path, None).is_err());
+    drop(inherited);
+    assert!(Destination::acquire(&path, None).is_err());
+    drop(second);
+    assert!(Destination::acquire(&path, None).is_ok());
+    assert!(!path.exists());
+}
+
+#[test]
+fn failed_partial_acquisition_releases_earlier_locks_without_changing_checkpoints() {
+    crate::ctrader::test_logging();
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("a.json");
+    let target = directory.path().join("z.json");
+    std::fs::write(&source, b"original checkpoint").unwrap();
+    let owner = Destination::acquire(&target, None).unwrap();
+    assert!(Destination::acquire(&target, Some(&source)).is_err());
+    let source_owner = Destination::acquire(&source, Some(&source)).unwrap();
+    assert!(Destination::acquire(&target, None).is_err());
+    assert_eq!(std::fs::read(&source).unwrap(), b"original checkpoint");
+    assert!(!target.exists());
+    drop(source_owner);
+    drop(owner);
+    assert!(Destination::acquire(&target, Some(&source)).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_post_lock_validation_unlocks_inherited_descriptors_without_replacing_the_racing_report() {
+    crate::ctrader::test_logging();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("report.json");
+    let (output, resume) = validate_paths(&path, None).unwrap();
+    let owned = lock(&output).unwrap();
+    let inherited = owned.file.try_clone().unwrap();
+    std::fs::write(&path, b"concurrent report").unwrap();
+    assert!(Destination::finish_acquisition(output, resume, vec![owned]).is_err());
+    let next = Destination::acquire(&path, Some(&path)).unwrap();
+    drop(inherited);
+    assert!(Destination::acquire(&path, Some(&path)).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"concurrent report");
+    drop(next);
+    assert!(Destination::acquire(&path, Some(&path)).is_ok());
+}

@@ -151,6 +151,52 @@ fn ma_filter_is_any_of_and_fails_closed_without_history() {
 }
 
 #[test]
+fn offside_short_enters_fully_above_average_while_legacy_touch_does_not() {
+    init();
+    let mut p = plan(vec![pine_enter_rule(None, Direction::Short, false)]);
+    p.entry_conditions.be_offside = vec!["9 ema".parse().unwrap()];
+    let signal = bearish_pinbar_window();
+    let mut window: Vec<_> = (0..90)
+        .map(|i| Candle {
+            time: signal[0].time - chrono::Duration::hours(90 - i),
+            o: 0.5,
+            h: 0.5,
+            l: 0.5,
+            c: 0.5,
+        })
+        .collect();
+    window.extend(signal);
+    let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+    let eval = run_window(&p, &prior, &window[93..], &window);
+    assert_eq!(eval.fired.len(), 1);
+    p.entry_conditions.must_touch = std::mem::take(&mut p.entry_conditions.be_offside);
+    let strict = run_window(&p, &prior, &window[93..], &window);
+    assert!(strict.fired.is_empty());
+}
+
+#[test]
+fn offside_is_enforced_during_confirmation_and_blocks_non_pattern_entries() {
+    init();
+    let mut enter = pine_enter_rule(None, Direction::Short, false);
+    enter.intent.needs_confirmed = true;
+    let mut p = plan(vec![enter]);
+    p.entry_conditions.be_offside = vec!["200 sma".parse().unwrap()];
+    let window = two_short_engulfers_window();
+    let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+    let eval = run_window(&p, &prior, &window[3..], &window);
+    assert!(
+        eval.fired.is_empty(),
+        "a confirmed signal still needs MA history"
+    );
+    p.rules[0].trigger = Trigger::MwEveryBar;
+    let eval = run_window(&p, &prior, &window[3..], &window);
+    assert!(
+        eval.fired.is_empty(),
+        "non-pattern entry cannot bypass the filter"
+    );
+}
+
+#[test]
 fn ma_confirmation_touch_cannot_qualify_an_earlier_pattern() {
     init();
     let mut enter = pine_enter_rule(None, Direction::Short, false);
