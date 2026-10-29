@@ -147,7 +147,7 @@ pub fn verify_stock_account(
         profile == expected.source_profile
             && identity.account_id == expected.source_account_id
             && identity.environment == ctrader_api::Environment::Demo
-            && identity.endpoint == expected.source_endpoint
+            && identity.environment.matches_endpoint(&identity.endpoint)
             && identity.broker_name == expected.source_broker_name
             && identity.trader_login == expected.source_trader_login,
         "stock metadata belongs to another cTrader broker/account; audit that account separately"
@@ -188,7 +188,7 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
             && snapshot.source_environment == "demo"
             && snapshot.source_broker_name == "Spotware"
             && snapshot.source_trader_login == 5944473
-            && snapshot.source_endpoint == ctrader_api::Environment::Demo.endpoint()
+            && ctrader_api::Environment::Demo.matches_endpoint(&snapshot.source_endpoint)
             && chrono::DateTime::parse_from_rfc3339(&snapshot.verified_at).is_ok()
             && snapshot.learning_clock == "utc"
             && snapshot.records.len() == 350,
