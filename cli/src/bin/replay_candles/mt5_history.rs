@@ -67,7 +67,7 @@ impl EstimatedSpread {
     }
     pub fn notice(&self) -> String {
         format!(
-            "Price data: ESTIMATED ask/mid from native BID candles; baked 90-day median {:.3} pips ({}, pip size {}). This is a replay approximation, not the measured historical spread.\n",
+            "Price data: ESTIMATED ask/mid from native BID candles; baked median {:.3} pips ({}, pip size {}). This is a replay approximation, not the measured historical spread.\n",
             self.median_pips, self.profile, self.pip_size
         )
     }
@@ -226,6 +226,20 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&estimate).unwrap()).unwrap();
         assert_eq!(saved, estimate);
         assert!(estimate.notice().contains("ESTIMATED"));
+    }
+
+    #[test]
+    fn short_history_estimates_do_not_claim_ninety_days_of_measurements() {
+        init();
+        let estimate = EstimatedSpread {
+            profile: "mt5:the5ers-real:XAUUSD".into(),
+            median_pips: 52.0,
+            pip_size: 0.01,
+        };
+        let notice = estimate.notice();
+        assert!(notice.contains("baked median 52.000 pips"));
+        assert!(!notice.contains("90-day"));
+        assert!(notice.contains("not the measured historical spread"));
     }
 
     #[test]

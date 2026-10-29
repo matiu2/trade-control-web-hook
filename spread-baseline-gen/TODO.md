@@ -2,6 +2,13 @@
 
 - [x] Read the account catalogue through the pinned desktop bridge.
 - [x] Resolve pip units and local spread schedules for all 64 native instruments.
-- [ ] Measure genuine M1 bid/ask spreads over 90 days with resumable progress (running).
+- [x] Measure 62 instruments over 90 days; explicitly use five-day provisional gold/NAS100 profiles where older ticks are unavailable.
 - [x] Add validated multi-account bake merging while preserving competition profiles.
-- [ ] Validate tests, Clippy and formatting; commit and push each completed change.
+- [x] Validate 204 generator tests, 763 CLI library tests, Clippy and formatting; commit and push each completed change.
+
+## Explicit shorter history for gold and NAS100
+
+- [x] Measure XAUUSD and NAS100 over October 23–28: 4,095 validated M1 observations each.
+- [x] Add opt-in supplemental report baking; preserve strict 90-day validation by default.
+- [x] Test identity, catalogue, sample-quality and provenance checks; run Clippy and formatting.
+- [ ] Publish all 64 profiles with both source reports and their actual measurement dates.

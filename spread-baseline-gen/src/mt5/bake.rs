@@ -6,6 +6,9 @@ use color_eyre::{Result, eyre::ensure};
 use super::{InstrumentReport, Report};
 use crate::compute::{MIN_INSTRUMENT_BARS, ReviewStatus};
 
+mod short_history;
+pub use short_history::render as render_with_short_history;
+
 /// A finished run may contain unavailable instruments. Keep those absent from
 /// the runtime table, with their reasons retained in the committed evidence.
 /// A checkpoint with unattempted symbols is always refused.
@@ -58,7 +61,7 @@ pub fn render_finished(report: &Report, account: &str, login: u64, server: &str)
 }
 
 pub fn render(report: &Report, account: &str, login: u64, server: &str) -> Result<String> {
-    validate_report(report, account, login, server)?;
+    validate_report(report, account, login, server, 90)?;
     let mut rows = report.instruments.iter().collect::<Vec<_>>();
     rows.sort_by_key(|row| &row.symbol);
     let rendered = rows
@@ -76,7 +79,13 @@ pub fn render(report: &Report, account: &str, login: u64, server: &str) -> Resul
     ))
 }
 
-fn validate_report(report: &Report, account: &str, login: u64, server: &str) -> Result<()> {
+fn validate_report(
+    report: &Report,
+    account: &str,
+    login: u64,
+    server: &str,
+    minimum_days: i64,
+) -> Result<()> {
     ensure!(
         account
             .bytes()
@@ -95,8 +104,8 @@ fn validate_report(report: &Report, account: &str, login: u64, server: &str) -> 
         "calibration is incomplete; failed instruments must be resolved before baking"
     );
     ensure!(
-        report.to_utc - report.from_utc >= chrono::Duration::days(90),
-        "baking requires at least 90 calendar days"
+        report.to_utc - report.from_utc >= chrono::Duration::days(minimum_days),
+        "baking requires at least {minimum_days} calendar days"
     );
     let wanted = report.requested_symbols.iter().collect::<BTreeSet<_>>();
     let got = report
