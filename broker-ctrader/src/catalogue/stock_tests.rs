@@ -253,3 +253,16 @@ fn account_verification_is_available_before_any_stock_metadata_or_history() {
         );
     }
 }
+
+#[test]
+fn stock_audit_remains_bound_to_its_server_across_json_and_protobuf_ports() {
+    tests::logging();
+    let mut current = identity();
+    assert!(verify_stock_account("ctrader-demo", &current).is_ok());
+    current.endpoint = "wss://demo.ctraderapi.com:5036".into();
+    assert!(verify_stock_account("ctrader-demo", &current).is_ok());
+    current.endpoint = "wss://live.ctraderapi.com:5035".into();
+    assert!(verify_stock_account("ctrader-demo", &current).is_err());
+    current.endpoint = "wss://demo.ctraderapi.com:5037".into();
+    assert!(verify_stock_account("ctrader-demo", &current).is_err());
+}

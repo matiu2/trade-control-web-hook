@@ -1,5 +1,6 @@
 //! One persistent account session per environment, shared across worker ticks.
 use super::*;
+use ctrader_api::{proto, protocol::Payload};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
@@ -56,7 +57,7 @@ pub(crate) async fn acquire(config: Config) -> Result<Arc<Shared>> {
         old.session.client.close().await;
     }
     let client = Client::connect(config.clone()).await?;
-    let mut events = client.events();
+    let mut events = client.proto_events();
     let shared = Arc::new(Shared {
         client,
         risk_revision: std::sync::atomic::AtomicU64::new(0),
@@ -91,30 +92,40 @@ pub(crate) async fn acquire(config: Config) -> Result<Arc<Shared>> {
                     .risk_revision
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            if event.payload_type != 2131
-                || wire::integer(&event.payload, "ctidTraderAccountId").ok()
-                    != Some(shared.client.account_id())
-            {
+            if event.payload_type != proto::ProtoOaSpotEvent::TYPE {
                 continue;
             }
-            let (Ok(symbol), Ok(time)) = (
-                wire::integer(&event.payload, "symbolId"),
-                wire::integer(&event.payload, "timestamp"),
-            ) else {
+            let event = match event.decode_payload::<proto::ProtoOaSpotEvent>() {
+                Ok(event) => event,
+                Err(_) => {
+                    tracing::warn!("Malformed cTrader Protobuf quote; retiring session");
+                    shared
+                        .risk_healthy
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    shared.quotes.write().await.clear();
+                    shared.client.close().await;
+                    break;
+                }
+            };
+            if event.ctid_trader_account_id != shared.client.account_id() {
+                continue;
+            }
+            let Some(time) = event.timestamp else {
                 continue;
             };
+            let symbol = event.symbol_id;
             let mut quotes = shared.quotes.write().await;
             let book = quotes.entry(symbol).or_default();
             let received = Instant::now();
-            if let Ok(bid) = wire::number(&event.payload, "bid")
+            if let Some(bid) = event.bid
                 && book.bid.is_none_or(|(_, _, previous)| time >= previous)
             {
-                book.bid = Some((bid / 100000.0, received, time));
+                book.bid = Some((bid as f64 / 100000.0, received, time));
             }
-            if let Ok(ask) = wire::number(&event.payload, "ask")
+            if let Some(ask) = event.ask
                 && book.ask.is_none_or(|(_, _, previous)| time >= previous)
             {
-                book.ask = Some((ask / 100000.0, received, time));
+                book.ask = Some((ask as f64 / 100000.0, received, time));
             }
             drop(quotes);
             shared.changed.notify_waiters();
@@ -178,7 +189,16 @@ impl Shared {
     pub async fn quote(&self, symbol: i64) -> Result<Quote> {
         let mut subscribed = self.subscriptions.lock().await;
         if !subscribed.contains(&symbol) {
-            self.client.request(2127,2128,json!({"ctidTraderAccountId":self.client.account_id(),"symbolId":[symbol],"subscribeToSpotTimestamp":true})).await?;
+            self.client
+                .request_proto::<_, proto::ProtoOaSubscribeSpotsRes>(
+                    &proto::ProtoOaSubscribeSpotsReq {
+                        ctid_trader_account_id: self.client.account_id(),
+                        symbol_id: vec![symbol],
+                        subscribe_to_spot_timestamp: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await?;
             subscribed.insert(symbol);
         }
         drop(subscribed);
