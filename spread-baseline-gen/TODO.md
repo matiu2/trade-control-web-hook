@@ -11,4 +11,4 @@
 - [x] Measure XAUUSD and NAS100 over October 23–28: 4,095 validated M1 observations each.
 - [x] Add opt-in supplemental report baking; preserve strict 90-day validation by default.
 - [x] Test identity, catalogue, sample-quality and provenance checks; run Clippy and formatting.
-- [ ] Publish all 64 profiles with both source reports and their actual measurement dates.
+- [x] Publish all 64 profiles with both source reports, their actual measurement dates and a comparison to the competition bake.

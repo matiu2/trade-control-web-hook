@@ -1,0 +1,641 @@
+{
+  "schema_version": 1,
+  "account": "the5ers-real",
+  "login": 26790640,
+  "server": "FivePercentOnline-Real",
+  "complete": true,
+  "instruments": 64,
+  "validated_m1_minutes": 5611560,
+  "long_history_instruments": 62,
+  "short_history_instruments": [
+    "XAUUSD",
+    "NAS100"
+  ],
+  "short_history_classification": "provisional; five calendar days including a weekend",
+  "limitations": "Short sample may miss unusual spread widening, news and longer-term variation. Spreads exclude commissions and slippage. No competition account quotes substituted.",
+  "sources": [
+    {
+      "file": "the5ers-real-primary-finished-report.json",
+      "sha256": "e26a24a15946903e8c3ce3c49dce37fa9521e89c6e9b6706c2ff44e9c3b90725",
+      "from_utc": "2026-07-29T09:40:00Z",
+      "to_utc": "2026-10-27T09:40:00Z",
+      "measured_symbols": [
+        "EURUSD",
+        "GBPUSD",
+        "USDCHF",
+        "USDJPY",
+        "USDCAD",
+        "AUDUSD",
+        "AUDNZD",
+        "AUDCAD",
+        "AUDCHF",
+        "AUDJPY",
+        "CADCHF",
+        "CADJPY",
+        "CHFJPY",
+        "EURAUD",
+        "EURCAD",
+        "EURCHF",
+        "EURGBP",
+        "EURJPY",
+        "EURNZD",
+        "GBPCHF",
+        "GBPAUD",
+        "GBPCAD",
+        "GBPNZD",
+        "NZDCAD",
+        "NZDCHF",
+        "NZDJPY",
+        "NZDUSD",
+        "USDDKK",
+        "USDHKD",
+        "USDMXN",
+        "USDNOK",
+        "USDPLN",
+        "USDZAR",
+        "USDBRL",
+        "XAGUSD",
+        "XPDUSD",
+        "XPTUSD",
+        "CUCUSD",
+        "XAGEUR",
+        "XAUEUR",
+        "SP500",
+        "UK100",
+        "JPN225",
+        "DAX40",
+        "IBXEUR",
+        "ESXEUR",
+        "ASXAUD",
+        "HSIHKD",
+        "F40EUR",
+        "XBRUSD",
+        "NGCUSD",
+        "GBPJPY",
+        "US30",
+        "XTIUSD",
+        "XRPUSD",
+        "BTCUSD",
+        "ETHUSD",
+        "LTCUSD",
+        "SOLUSD",
+        "DOGUSD",
+        "BTCEUR",
+        "ETHEUR"
+      ],
+      "failures": [
+        {
+          "symbol": "XAUUSD",
+          "error": "Read-only five-minute tick probe at 2026-07-29T09:40:00Z after MT5 restart: tick history unavailable or incomplete (MT5 error 0); retry; copied 0"
+        },
+        {
+          "symbol": "NAS100",
+          "error": "Read-only five-minute tick probe at 2026-07-29T09:40:00Z after MT5 restart: tick history unavailable or incomplete (MT5 error 0); retry; copied 0"
+        }
+      ]
+    },
+    {
+      "file": "the5ers-real-short-history-report.json",
+      "sha256": "a0e94622a2d1999d76dc43f90476f6082a00bd9abf7b145c51ca3ac559369b77",
+      "from_utc": "2026-10-23T00:00:00Z",
+      "to_utc": "2026-10-28T00:00:00Z",
+      "measured_symbols": [
+        "XAUUSD",
+        "NAS100"
+      ],
+      "failures": []
+    }
+  ],
+  "coverage": [
+    {
+      "symbol": "EURUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "GBPUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "USDCHF",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91518,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "USDJPY",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "USDCAD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "AUDUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "AUDNZD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91519,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "AUDCAD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "AUDCHF",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "AUDJPY",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "CADCHF",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "CADJPY",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91519,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "CHFJPY",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "EURAUD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "EURCAD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "EURCHF",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "EURGBP",
+      "first_minute_utc": "2026-08-12T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 77219,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "EURJPY",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "EURNZD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "GBPCHF",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91518,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "GBPAUD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91512,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "GBPCAD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "GBPNZD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 90959,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "NZDCAD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "NZDCHF",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "NZDJPY",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "NZDUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91519,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "USDDKK",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91508,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "USDHKD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91071,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "USDMXN",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 90998,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "USDNOK",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 90630,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "USDPLN",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 87382,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "USDZAR",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 79253,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "USDBRL",
+      "first_minute_utc": "2026-07-29T12:30:00Z",
+      "last_minute_utc": "2026-10-26T17:02:00Z",
+      "m1_observations": 27384,
+      "review": "MaskNotComputable",
+      "provisional": false
+    },
+    {
+      "symbol": "XAGUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 87221,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "XPDUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 84832,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "XPTUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 87201,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "CUCUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 87127,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "XAGEUR",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 87078,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "XAUEUR",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 87204,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "SP500",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 87122,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "UK100",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 85601,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "JPN225",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 86758,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "DAX40",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 87110,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "IBXEUR",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 41333,
+      "review": "MaskNotComputable",
+      "provisional": false
+    },
+    {
+      "symbol": "ESXEUR",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 49942,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "ASXAUD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 77432,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "HSIHKD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 59485,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "F40EUR",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 53371,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "XBRUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 86775,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "NGCUSD",
+      "first_minute_utc": "2026-07-29T09:41:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 74011,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "GBPJPY",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 91520,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "US30",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 87126,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "XTIUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 87112,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "XRPUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 126124,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "BTCUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 127772,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "ETHUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 127772,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "LTCUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 127479,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "SOLUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 126721,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "DOGUSD",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 127123,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "BTCEUR",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 125509,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "ETHEUR",
+      "first_minute_utc": "2026-07-29T09:40:00Z",
+      "last_minute_utc": "2026-10-27T09:39:00Z",
+      "m1_observations": 125120,
+      "review": "Reviewed",
+      "provisional": false
+    },
+    {
+      "symbol": "XAUUSD",
+      "first_minute_utc": "2026-10-23T00:00:00Z",
+      "last_minute_utc": "2026-10-27T23:59:00Z",
+      "m1_observations": 4095,
+      "review": "Reviewed",
+      "provisional": true
+    },
+    {
+      "symbol": "NAS100",
+      "first_minute_utc": "2026-10-23T00:00:00Z",
+      "last_minute_utc": "2026-10-27T23:59:00Z",
+      "m1_observations": 4095,
+      "review": "Reviewed",
+      "provisional": true
+    }
+  ],
+  "preserved_other_account_rows": 40,
+  "maximum_serialization_difference_ulps": 1.0,
+  "table_sha256": "8e8eddbfa432d35fd30ac02b971b5491b6b883cdb54eaf8945aa08b4ed927d38",
+  "verified_at_utc": "2026-10-29T06:45:02.957744+00:00",
+  "checks": {
+    "spread_baseline_gen_all_target_tests": 204,
+    "cli_library_tests": 763,
+    "cache_library_tests": 230,
+    "generator_clippy_all_targets": "passed",
+    "cli_clippy_lib_and_replay_binary": "passed",
+    "cache_clippy_all_targets": "passed",
+    "formatting": "passed",
+    "reviewers": "both approved; no actionable findings at confidence >=80",
+    "source_commit": "95c9ba06adf5d7dc2b605fd9d624f4897e497910",
+    "final_mt5_replay_tests": "5"
+  },
+  "cache_commit": "fef03dabe1bfec52912b2d6a387cde041a9935f3",
+  "evidence_note": "The original 90-day evidence retains explicit unavailable-history failures for XAUUSD and NAS100. Exactly those symbols are supplied by the separately completed five-day report; its dates and sample counts are retained."
+}
