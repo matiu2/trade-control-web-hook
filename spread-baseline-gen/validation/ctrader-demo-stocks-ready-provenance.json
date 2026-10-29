@@ -1,0 +1,1270 @@
+{
+  "schema_version": 1,
+  "source_report": {
+    "path": "/home/matiu/projects/trading-libraries/trade-control-web-hook/spread-baseline-gen/validation/ctrader-demo-stocks-90d-report.json",
+    "sha256": "1ad80a4a5df263202d12be46ffa9395cc457f0de5c3f10556f385ff0cf778974"
+  },
+  "source_audit": {
+    "path": "/home/matiu/projects/trading-libraries/trade-control-web-hook/spread-baseline-gen/validation/ctrader-demo-stocks-90d-report.quarantine.json",
+    "sha256": "e4e39d91b92973b57dfd73f1b4a09df9fa57498a53c48def1160fd02568c0139"
+  },
+  "catalogue": {
+    "path": "/home/matiu/projects/trading-libraries/trade-control-web-hook/broker-ctrader/src/catalogue/stocks.json",
+    "sha256": "c550b432b68e91a8e7215fba22cdf7e50aa4be8bbca07d907b94ebf590f6ced7"
+  },
+  "selected_report": {
+    "path": "/home/matiu/projects/trading-libraries/trade-control-web-hook/spread-baseline-gen/validation/ctrader-demo-stocks-ready-90d-report.json",
+    "sha256": "ec24cb1bfa75d1cc9982f43770919f019aeef6c7464e1a40ead79e254b96386c"
+  },
+  "selected_audit": {
+    "path": "/home/matiu/projects/trading-libraries/trade-control-web-hook/spread-baseline-gen/validation/ctrader-demo-stocks-ready-90d-report.quarantine.json",
+    "sha256": "2cedd9bb786c9a72383afe4d2c9f469814c426e6875f488f695d8268f24ff0d2"
+  },
+  "selected_symbols": [
+    "ABBOTT",
+    "ABBVIE",
+    "ABERCROMBIE",
+    "ACUITY BRANDS",
+    "AECOM",
+    "AGCO",
+    "AIG",
+    "ALASKA AIR",
+    "ALCOA",
+    "ALIBABA",
+    "ALLEGHENY TECHNOLOGIES",
+    "ALLISON TRANSMISSION",
+    "ALLY FINANCIAL",
+    "AMERICAN TOWER",
+    "AMPHENOL",
+    "APPLE",
+    "BANCORP",
+    "BANK OF AMERICA",
+    "BANK OF EAST ASIA",
+    "BECHTLE",
+    "BEST BUY",
+    "BOEING",
+    "CANCOM",
+    "CARLISLE",
+    "CATERPILLAR",
+    "CHEUNG KONG PROPERTY",
+    "CHEVRON",
+    "CHINA MERCHANTS HLDGS INTL",
+    "CHINA OVERSEAS LAND & INVEST",
+    "CHINA OVERSEAS PROPERTY HOLD",
+    "CHINA RESOURCES BEER",
+    "CHINA RESOURCES POWER",
+    "CHRISTIAN DIOR",
+    "CITIC",
+    "CITIGROUP",
+    "CITIZENS FINANCIAL",
+    "CK HUTCHISON",
+    "CLP",
+    "COCA-COLA",
+    "COLGATE-PALMOLIVE",
+    "COTY",
+    "CROWN HOLDINGS",
+    "DELTA AIR LINES",
+    "DEVON ENERGY",
+    "EAGLE MATERIALS",
+    "ECOLAB",
+    "EDISON",
+    "EUTELSAT COMMUNICATIONS",
+    "EXXON",
+    "FEDEX",
+    "FORD MOTOR",
+    "FRANKLIN RESOURCES",
+    "GALAXY ENTERTAINMENT",
+    "GENERAC HOLDINGS",
+    "GENERAL MOTORS",
+    "GLOBAL PAYMENTS",
+    "GOLDMAN SACHS",
+    "GRACO",
+    "GRIFOLS",
+    "HANG LUNG PROPERTIES",
+    "HILTON",
+    "HOME DEPOT",
+    "HONG KONG & CHINA GAS",
+    "HP",
+    "HYATT",
+    "IBM",
+    "IBOXX USD HIGH YIELD",
+    "INFINEON",
+    "INVESCO",
+    "IRON MOUNTAIN",
+    "KIMCO REALTY",
+    "KINDER MORGAN",
+    "KIRBY",
+    "KUNLUN ENERGY",
+    "LAGARDERE",
+    "LENNOX",
+    "LINDT",
+    "LINK REIT",
+    "LOEWS",
+    "LOUISIANA-PACIFIC",
+    "MASTERCARD",
+    "MC DONALDS",
+    "MEDIASET",
+    "METLIFE",
+    "MGM",
+    "MOHAWK INDUSTRIES",
+    "MOODYS",
+    "MOSAIC",
+    "MOTOROLA",
+    "MSCI BRAZIL",
+    "MSCI MALAYSIA",
+    "MSCI SOUTH KOREA",
+    "MSCI TAIWAN",
+    "MTR",
+    "NEW WORLD DEV",
+    "NEW YORK TIMES",
+    "NIKE",
+    "NIPPON YUSEN",
+    "OCCIDENTAL PETROLEUM",
+    "ORACLE",
+    "PACKAGING",
+    "PARKER HANNIFIN",
+    "PAYCOM",
+    "PFIZER",
+    "PHILIP MORRIS",
+    "PHILIPS 66",
+    "RALPH LAUREN",
+    "ROCKWELL AUTOMATION",
+    "ROLLINS",
+    "ROYAL CARIBBEAN CRUISES",
+    "SINO LAND CO",
+    "SM ENERGY",
+    "SUN HUNG KAI",
+    "SWIRE PACIFIC",
+    "TAG IMMOBILIEN",
+    "TARGA RESOURCES",
+    "TELEDYNE TECHNOLOGIES",
+    "TELEFONICA",
+    "TOTAL",
+    "TRAVELERS COMPANIES",
+    "UNION PACIFIC",
+    "VENTAS",
+    "VERIZON",
+    "VISA",
+    "WALT DISNEY",
+    "WHARF",
+    "XCEL ENERGY",
+    "YUM!"
+  ],
+  "failed_symbols": [
+    "AARONS",
+    "ABACUS",
+    "ACADIA REALTY TRUST",
+    "ADELAIDE BRIGHTON",
+    "ADIDAS",
+    "ADVANCE AUTO PARTS",
+    "AES",
+    "AFFILIATED MANAGERS",
+    "AIA",
+    "AIMS AMP CAPITAL",
+    "AIR LEASE",
+    "ALLIANCE DATA SYSTEMS",
+    "ALS",
+    "ALUMINA",
+    "AMP",
+    "APA",
+    "ARB",
+    "ASALEO CARE",
+    "ASCENDAS REAL ESTATE",
+    "ASTELLAS PHARMA",
+    "ASX",
+    "AURIZON",
+    "AUSNET SERVICES",
+    "BANK OF NEW YORK",
+    "BANK OF QUEENSLAND",
+    "BENDIGO AND ADELAIDE BANK",
+    "BLACK HILLS",
+    "BLACKROCK",
+    "BLUESCOPE STEEL",
+    "BOC",
+    "BREVILLE",
+    "BRIDGESTONE",
+    "CALTEX",
+    "CANON",
+    "CAPITALAND MALL",
+    "CARDNO",
+    "CARSALES",
+    "CATHAY PACIFIC",
+    "CHALLENGER",
+    "CHARTER HALL",
+    "CHIMERA INVESTMENT",
+    "CITY DEVELOPMENTS",
+    "COCA-COLA AMATIL",
+    "COCHLEAR",
+    "COMFORTDELGRO",
+    "COMPUTERSHARE",
+    "CORPORATE TRAVEL MANAGEMENT",
+    "CROWN",
+    "DAIKIN INDUSTRIES LTD",
+    "DAIWA SECURITIES",
+    "DBS GROUP",
+    "DEXUS PROPERTY",
+    "DISCOVER FINANCIAL",
+    "DOWNER EDI",
+    "ENERGIZER",
+    "ESTIA HEALTH",
+    "EVOLUTION MINING",
+    "FANUC",
+    "FEDERAL REALTY",
+    "FIAT CHRYSLER",
+    "FLEXIGROUP",
+    "FLIGHT CENTRE TRAVEL",
+    "FOOT LOCKER",
+    "FORTESCUE METALS",
+    "FUJITSU",
+    "G.U.D.",
+    "G8 EDUCATION",
+    "GAMESTOP",
+    "GAP",
+    "GENERAL ELECTRIC",
+    "GENTING",
+    "GOLDEN AGRI-RESOURCES",
+    "GRAINCORP",
+    "GUESS",
+    "GWA",
+    "HANG SENG BANK",
+    "HARLEY-DAVIDSON",
+    "HARVEY NORMAN",
+    "HENDERSON LAND",
+    "HERBALIFE",
+    "HITACHI CAPITAL",
+    "HONDA MOTOR",
+    "HUNTSMAN",
+    "IHI",
+    "ILUKA RESOURCES",
+    "INCITEC PIVOT",
+    "INDEPENDENCE",
+    "INVOCARE",
+    "IOOF",
+    "IRESS",
+    "ISUZU MOTORS",
+    "JARDINE CYCLE & CARRIAGE",
+    "JB HI-FI",
+    "JUNIPER NETWORKS",
+    "KAROON GAS",
+    "KAWASAKI",
+    "KELLOGG",
+    "KEPPEL CORP",
+    "KOBE STEEL",
+    "KONICA MINOLTA",
+    "KOSMOS ENERGY",
+    "KYOCERA",
+    "LATIN AMERICA 40",
+    "MARUBENI",
+    "MAZDA MOTOR",
+    "MCMILLAN SHAKESPEARE",
+    "MEDIBANK PRIVATE",
+    "METCASH",
+    "MINERAL RESOURCES",
+    "MIRVAC",
+    "MITSUBISHI",
+    "MITSUBISHI ELECTRIC",
+    "MITSUBISHI HEAVY INDUSTRIES",
+    "MITSUBISHI UFJ FINANCIAL",
+    "MITSUI CHEMICALS",
+    "MITSUI CO",
+    "MIZUHO FINANCIAL",
+    "MONADELPHOUS",
+    "MSC",
+    "MSCI AUSTRALIA",
+    "MSCI CANADA",
+    "MSCI GERMANY",
+    "MSCI INDONESIA",
+    "MSCI ITALY",
+    "MSCI MEXICO",
+    "MSCI PACIFIC",
+    "MSCI THAILAND",
+    "MSCI UNITED KINGDOM",
+    "NIKON",
+    "NIPPON STEEL & SUMIKIN BUSSA",
+    "NIPPON TELEGRAPH & TELEPHONE",
+    "NISSAN MOTOR",
+    "NUFARM",
+    "OIL SEARCH",
+    "OIL STATES INTERNATIONAL",
+    "OLAM INTERNATIONAL",
+    "OLYMPUS",
+    "ORICA",
+    "OVERSEA-CHINESE BANKING",
+    "OZ MINERALS",
+    "PACT GROUP",
+    "PANASONIC",
+    "PARSLEY ENERGY",
+    "PERPETUAL",
+    "PIONEER NATURAL RESOURCES",
+    "PLATINUM ASSET MANAGEMENT",
+    "POLARIS",
+    "PREMIER INVESTMENTS",
+    "QANTAS AIRWAYS",
+    "QBE INSURANCE",
+    "QUBE",
+    "RAMSAY HEALTH CARE",
+    "REDES ENERGETICAS NACIONAIS",
+    "REGIS RESOURCES",
+    "RESONA",
+    "RICOH",
+    "RPC",
+    "SANDFIRE",
+    "SANTOS",
+    "SATS",
+    "SCP",
+    "SEEK",
+    "SEMBCORP INDUSTRIES",
+    "SEMBCORP MARINE",
+    "SEVEN WEST MEDIA",
+    "SHARP",
+    "SHINSEI BANK",
+    "SHISEIDO",
+    "SIA ENGINEERING",
+    "SINGAPORE AIRLINES",
+    "SINGAPORE EXCHANGE",
+    "SINGAPORE PRESS",
+    "SINGAPORE TECH ENGINEERING",
+    "SINGAPORE TELECOMMUNICATIONS",
+    "SOJITZ",
+    "SONIC HEALTHCARE",
+    "SOUTH32",
+    "SOUTHERN CROSS MEDIA",
+    "SOUTHWESTERN ENERGY",
+    "SPARK INFRASTRUCTURE",
+    "SPDR S&P CHINA",
+    "SPIRIT AIRLINES",
+    "STARHUB",
+    "STEADFAST",
+    "STOCKLAND",
+    "SUMITOMO CHEMICAL",
+    "SUMITOMO MITSUI TRUST",
+    "SUNSTONE HOTEL",
+    "SUPER RETAIL",
+    "SUZUKI MOTOR",
+    "SYRAH",
+    "TABCORP",
+    "TAIHEIYO CEMENT",
+    "TAISEI",
+    "TASSAL",
+    "TDK",
+    "TELEPHONE AND DATA SYSTEMS",
+    "THE GARDEN",
+    "THOMSON REUTERS",
+    "TOKYO ELECTRIC POWER",
+    "TOKYO GAS",
+    "TOYOTA MOTOR",
+    "TPG TELECOM",
+    "TREASURY WINE",
+    "TRIUMPH",
+    "UNITED OVERSEAS BANK",
+    "UOL GROUP",
+    "US STEEL",
+    "VALEANT PHARMACEUTICALS",
+    "VALMONT",
+    "VILLAGE ROADSHOW",
+    "VOCUS COMMUNICATIONS",
+    "WAL-MART",
+    "WESTERN AREAS",
+    "WESTERN UNION",
+    "WESTROCK",
+    "WHIRLPOOL",
+    "WILMAR INTERNATIONAL",
+    "WORLEYPARSONS",
+    "WORTHINGTON INDUSTRIES",
+    "YAHOO JAPAN",
+    "YELP"
+  ],
+  "source_failures": [
+    {
+      "symbol": "AARONS",
+      "error": "cTrader request outcome unknown: response deadline elapsed; reconcile before retrying"
+    },
+    {
+      "symbol": "ABACUS",
+      "error": "cTrader paired spread calculation: no minute candles for ABACUS"
+    },
+    {
+      "symbol": "ACADIA REALTY TRUST",
+      "error": "cTrader request outcome unknown: response deadline elapsed; reconcile before retrying"
+    },
+    {
+      "symbol": "ADELAIDE BRIGHTON",
+      "error": "cTrader paired spread calculation: no minute candles for ADELAIDE BRIGHTON"
+    },
+    {
+      "symbol": "ADIDAS",
+      "error": "cTrader paired spread calculation: no minute candles for ADIDAS"
+    },
+    {
+      "symbol": "ADVANCE AUTO PARTS",
+      "error": "cTrader paired spread calculation: no minute candles for ADVANCE AUTO PARTS"
+    },
+    {
+      "symbol": "AFFILIATED MANAGERS",
+      "error": "cTrader paired spread calculation: no minute candles for AFFILIATED MANAGERS"
+    },
+    {
+      "symbol": "AIA",
+      "error": "cTrader paired spread calculation: no minute candles for AIA"
+    },
+    {
+      "symbol": "AIMS AMP CAPITAL",
+      "error": "cTrader paired spread calculation: no minute candles for AIMS AMP CAPITAL"
+    },
+    {
+      "symbol": "AIR LEASE",
+      "error": "cTrader paired spread calculation: no minute candles for AIR LEASE"
+    },
+    {
+      "symbol": "ALLIANCE DATA SYSTEMS",
+      "error": "cTrader paired spread calculation: no minute candles for ALLIANCE DATA SYSTEMS"
+    },
+    {
+      "symbol": "ALS",
+      "error": "cTrader paired spread calculation: no minute candles for ALS"
+    },
+    {
+      "symbol": "ALUMINA",
+      "error": "cTrader paired spread calculation: no minute candles for ALUMINA"
+    },
+    {
+      "symbol": "AMP",
+      "error": "cTrader paired spread calculation: no minute candles for AMP"
+    },
+    {
+      "symbol": "APA",
+      "error": "cTrader paired spread calculation: no minute candles for APA"
+    },
+    {
+      "symbol": "ARB",
+      "error": "cTrader paired spread calculation: no minute candles for ARB"
+    },
+    {
+      "symbol": "ASALEO CARE",
+      "error": "cTrader paired spread calculation: no minute candles for ASALEO CARE"
+    },
+    {
+      "symbol": "ASCENDAS REAL ESTATE",
+      "error": "cTrader paired spread calculation: no minute candles for ASCENDAS REAL ESTATE"
+    },
+    {
+      "symbol": "ASTELLAS PHARMA",
+      "error": "cTrader paired spread calculation: no minute candles for ASTELLAS PHARMA"
+    },
+    {
+      "symbol": "ASX",
+      "error": "cTrader paired spread calculation: no minute candles for ASX"
+    },
+    {
+      "symbol": "AURIZON",
+      "error": "cTrader paired spread calculation: no minute candles for AURIZON"
+    },
+    {
+      "symbol": "AUSNET SERVICES",
+      "error": "cTrader paired spread calculation: no minute candles for AUSNET SERVICES"
+    },
+    {
+      "symbol": "BANK OF NEW YORK",
+      "error": "cTrader paired spread calculation: no minute candles for BANK OF NEW YORK"
+    },
+    {
+      "symbol": "BANK OF QUEENSLAND",
+      "error": "cTrader paired spread calculation: no minute candles for BANK OF QUEENSLAND"
+    },
+    {
+      "symbol": "BENDIGO AND ADELAIDE BANK",
+      "error": "cTrader paired spread calculation: no minute candles for BENDIGO AND ADELAIDE BANK"
+    },
+    {
+      "symbol": "BLACK HILLS",
+      "error": "cTrader paired spread calculation: no minute candles for BLACK HILLS"
+    },
+    {
+      "symbol": "BLACKROCK",
+      "error": "cTrader paired spread calculation: no minute candles for BLACKROCK"
+    },
+    {
+      "symbol": "BLUESCOPE STEEL",
+      "error": "cTrader paired spread calculation: no minute candles for BLUESCOPE STEEL"
+    },
+    {
+      "symbol": "BOC",
+      "error": "cTrader paired spread calculation: no minute candles for BOC"
+    },
+    {
+      "symbol": "BREVILLE",
+      "error": "cTrader paired spread calculation: no minute candles for BREVILLE"
+    },
+    {
+      "symbol": "BRIDGESTONE",
+      "error": "cTrader paired spread calculation: no minute candles for BRIDGESTONE"
+    },
+    {
+      "symbol": "CALTEX",
+      "error": "cTrader paired spread calculation: no minute candles for CALTEX"
+    },
+    {
+      "symbol": "CANON",
+      "error": "cTrader paired spread calculation: no minute candles for CANON"
+    },
+    {
+      "symbol": "CAPITALAND MALL",
+      "error": "cTrader paired spread calculation: no minute candles for CAPITALAND MALL"
+    },
+    {
+      "symbol": "CARDNO",
+      "error": "cTrader paired spread calculation: no minute candles for CARDNO"
+    },
+    {
+      "symbol": "CARSALES",
+      "error": "cTrader paired spread calculation: no minute candles for CARSALES"
+    },
+    {
+      "symbol": "CATHAY PACIFIC",
+      "error": "cTrader paired spread calculation: no minute candles for CATHAY PACIFIC"
+    },
+    {
+      "symbol": "CHALLENGER",
+      "error": "cTrader paired spread calculation: no minute candles for CHALLENGER"
+    },
+    {
+      "symbol": "CHARTER HALL",
+      "error": "cTrader paired spread calculation: no minute candles for CHARTER HALL"
+    },
+    {
+      "symbol": "CHIMERA INVESTMENT",
+      "error": "cTrader paired spread calculation: no minute candles for CHIMERA INVESTMENT"
+    },
+    {
+      "symbol": "CITY DEVELOPMENTS",
+      "error": "cTrader paired spread calculation: no minute candles for CITY DEVELOPMENTS"
+    },
+    {
+      "symbol": "COCA-COLA AMATIL",
+      "error": "cTrader paired spread calculation: no minute candles for COCA-COLA AMATIL"
+    },
+    {
+      "symbol": "COCHLEAR",
+      "error": "cTrader paired spread calculation: no minute candles for COCHLEAR"
+    },
+    {
+      "symbol": "COMFORTDELGRO",
+      "error": "cTrader paired spread calculation: no minute candles for COMFORTDELGRO"
+    },
+    {
+      "symbol": "COMPUTERSHARE",
+      "error": "cTrader paired spread calculation: no minute candles for COMPUTERSHARE"
+    },
+    {
+      "symbol": "CORPORATE TRAVEL MANAGEMENT",
+      "error": "cTrader paired spread calculation: no minute candles for CORPORATE TRAVEL MANAGEMENT"
+    },
+    {
+      "symbol": "CROWN",
+      "error": "cTrader paired spread calculation: no minute candles for CROWN"
+    },
+    {
+      "symbol": "DAIKIN INDUSTRIES LTD",
+      "error": "cTrader paired spread calculation: no minute candles for DAIKIN INDUSTRIES LTD"
+    },
+    {
+      "symbol": "DAIWA SECURITIES",
+      "error": "cTrader paired spread calculation: no minute candles for DAIWA SECURITIES"
+    },
+    {
+      "symbol": "DBS GROUP",
+      "error": "cTrader paired spread calculation: no minute candles for DBS GROUP"
+    },
+    {
+      "symbol": "DEXUS PROPERTY",
+      "error": "cTrader paired spread calculation: no minute candles for DEXUS PROPERTY"
+    },
+    {
+      "symbol": "DISCOVER FINANCIAL",
+      "error": "cTrader paired spread calculation: no minute candles for DISCOVER FINANCIAL"
+    },
+    {
+      "symbol": "DOWNER EDI",
+      "error": "cTrader paired spread calculation: no minute candles for DOWNER EDI"
+    },
+    {
+      "symbol": "ENERGIZER",
+      "error": "cTrader paired spread calculation: no minute candles for ENERGIZER"
+    },
+    {
+      "symbol": "ESTIA HEALTH",
+      "error": "cTrader paired spread calculation: no minute candles for ESTIA HEALTH"
+    },
+    {
+      "symbol": "EVOLUTION MINING",
+      "error": "cTrader paired spread calculation: no minute candles for EVOLUTION MINING"
+    },
+    {
+      "symbol": "FANUC",
+      "error": "cTrader request outcome unknown: response deadline elapsed; reconcile before retrying"
+    },
+    {
+      "symbol": "FEDERAL REALTY",
+      "error": "cTrader paired spread calculation: no minute candles for FEDERAL REALTY"
+    },
+    {
+      "symbol": "FIAT CHRYSLER",
+      "error": "cTrader request outcome unknown: response deadline elapsed; reconcile before retrying"
+    },
+    {
+      "symbol": "FLEXIGROUP",
+      "error": "cTrader paired spread calculation: no minute candles for FLEXIGROUP"
+    },
+    {
+      "symbol": "FLIGHT CENTRE TRAVEL",
+      "error": "cTrader paired spread calculation: no minute candles for FLIGHT CENTRE TRAVEL"
+    },
+    {
+      "symbol": "FOOT LOCKER",
+      "error": "cTrader paired spread calculation: no minute candles for FOOT LOCKER"
+    },
+    {
+      "symbol": "FORTESCUE METALS",
+      "error": "cTrader paired spread calculation: no minute candles for FORTESCUE METALS"
+    },
+    {
+      "symbol": "FUJITSU",
+      "error": "cTrader paired spread calculation: no minute candles for FUJITSU"
+    },
+    {
+      "symbol": "G.U.D.",
+      "error": "cTrader paired spread calculation: no minute candles for G.U.D."
+    },
+    {
+      "symbol": "G8 EDUCATION",
+      "error": "cTrader paired spread calculation: no minute candles for G8 EDUCATION"
+    },
+    {
+      "symbol": "GAMESTOP",
+      "error": "cTrader paired spread calculation: no minute candles for GAMESTOP"
+    },
+    {
+      "symbol": "GAP",
+      "error": "cTrader paired spread calculation: no minute candles for GAP"
+    },
+    {
+      "symbol": "GENERAL ELECTRIC",
+      "error": "cTrader paired spread calculation: no minute candles for GENERAL ELECTRIC"
+    },
+    {
+      "symbol": "GENTING",
+      "error": "cTrader paired spread calculation: no minute candles for GENTING"
+    },
+    {
+      "symbol": "GOLDEN AGRI-RESOURCES",
+      "error": "cTrader paired spread calculation: no minute candles for GOLDEN AGRI-RESOURCES"
+    },
+    {
+      "symbol": "GRAINCORP",
+      "error": "cTrader paired spread calculation: no minute candles for GRAINCORP"
+    },
+    {
+      "symbol": "GUESS",
+      "error": "cTrader paired spread calculation: no minute candles for GUESS"
+    },
+    {
+      "symbol": "GWA",
+      "error": "cTrader paired spread calculation: no minute candles for GWA"
+    },
+    {
+      "symbol": "HANG SENG BANK",
+      "error": "cTrader paired spread calculation: no minute candles for HANG SENG BANK"
+    },
+    {
+      "symbol": "HARLEY-DAVIDSON",
+      "error": "cTrader paired spread calculation: no minute candles for HARLEY-DAVIDSON"
+    },
+    {
+      "symbol": "HARVEY NORMAN",
+      "error": "cTrader paired spread calculation: no minute candles for HARVEY NORMAN"
+    },
+    {
+      "symbol": "HENDERSON LAND",
+      "error": "cTrader paired spread calculation: no minute candles for HENDERSON LAND"
+    },
+    {
+      "symbol": "HERBALIFE",
+      "error": "cTrader paired spread calculation: no minute candles for HERBALIFE"
+    },
+    {
+      "symbol": "HITACHI CAPITAL",
+      "error": "cTrader paired spread calculation: no minute candles for HITACHI CAPITAL"
+    },
+    {
+      "symbol": "HONDA MOTOR",
+      "error": "cTrader paired spread calculation: no minute candles for HONDA MOTOR"
+    },
+    {
+      "symbol": "HUNTSMAN",
+      "error": "cTrader paired spread calculation: no minute candles for HUNTSMAN"
+    },
+    {
+      "symbol": "IHI",
+      "error": "cTrader paired spread calculation: no minute candles for IHI"
+    },
+    {
+      "symbol": "ILUKA RESOURCES",
+      "error": "cTrader paired spread calculation: no minute candles for ILUKA RESOURCES"
+    },
+    {
+      "symbol": "INCITEC PIVOT",
+      "error": "cTrader paired spread calculation: no minute candles for INCITEC PIVOT"
+    },
+    {
+      "symbol": "INDEPENDENCE",
+      "error": "cTrader paired spread calculation: no minute candles for INDEPENDENCE"
+    },
+    {
+      "symbol": "INVOCARE",
+      "error": "cTrader paired spread calculation: no minute candles for INVOCARE"
+    },
+    {
+      "symbol": "IOOF",
+      "error": "cTrader paired spread calculation: no minute candles for IOOF"
+    },
+    {
+      "symbol": "IRESS",
+      "error": "cTrader paired spread calculation: no minute candles for IRESS"
+    },
+    {
+      "symbol": "ISUZU MOTORS",
+      "error": "cTrader paired spread calculation: no minute candles for ISUZU MOTORS"
+    },
+    {
+      "symbol": "JARDINE CYCLE & CARRIAGE",
+      "error": "cTrader paired spread calculation: no minute candles for JARDINE CYCLE & CARRIAGE"
+    },
+    {
+      "symbol": "JB HI-FI",
+      "error": "cTrader paired spread calculation: no minute candles for JB HI-FI"
+    },
+    {
+      "symbol": "JUNIPER NETWORKS",
+      "error": "cTrader paired spread calculation: no minute candles for JUNIPER NETWORKS"
+    },
+    {
+      "symbol": "KAROON GAS",
+      "error": "cTrader paired spread calculation: no minute candles for KAROON GAS"
+    },
+    {
+      "symbol": "KAWASAKI",
+      "error": "cTrader paired spread calculation: no minute candles for KAWASAKI"
+    },
+    {
+      "symbol": "KELLOGG",
+      "error": "cTrader paired spread calculation: no minute candles for KELLOGG"
+    },
+    {
+      "symbol": "KEPPEL CORP",
+      "error": "cTrader paired spread calculation: no minute candles for KEPPEL CORP"
+    },
+    {
+      "symbol": "KOBE STEEL",
+      "error": "cTrader paired spread calculation: no minute candles for KOBE STEEL"
+    },
+    {
+      "symbol": "KONICA MINOLTA",
+      "error": "cTrader paired spread calculation: no minute candles for KONICA MINOLTA"
+    },
+    {
+      "symbol": "KOSMOS ENERGY",
+      "error": "cTrader paired spread calculation: no minute candles for KOSMOS ENERGY"
+    },
+    {
+      "symbol": "KYOCERA",
+      "error": "cTrader paired spread calculation: no minute candles for KYOCERA"
+    },
+    {
+      "symbol": "LATIN AMERICA 40",
+      "error": "cTrader paired spread calculation: no minute candles for LATIN AMERICA 40"
+    },
+    {
+      "symbol": "MARUBENI",
+      "error": "cTrader paired spread calculation: no minute candles for MARUBENI"
+    },
+    {
+      "symbol": "MAZDA MOTOR",
+      "error": "cTrader paired spread calculation: no minute candles for MAZDA MOTOR"
+    },
+    {
+      "symbol": "MCMILLAN SHAKESPEARE",
+      "error": "cTrader paired spread calculation: no minute candles for MCMILLAN SHAKESPEARE"
+    },
+    {
+      "symbol": "MEDIBANK PRIVATE",
+      "error": "cTrader paired spread calculation: no minute candles for MEDIBANK PRIVATE"
+    },
+    {
+      "symbol": "METCASH",
+      "error": "cTrader paired spread calculation: no minute candles for METCASH"
+    },
+    {
+      "symbol": "MINERAL RESOURCES",
+      "error": "cTrader paired spread calculation: no minute candles for MINERAL RESOURCES"
+    },
+    {
+      "symbol": "MIRVAC",
+      "error": "cTrader paired spread calculation: no minute candles for MIRVAC"
+    },
+    {
+      "symbol": "MITSUBISHI",
+      "error": "cTrader paired spread calculation: no minute candles for MITSUBISHI"
+    },
+    {
+      "symbol": "MITSUBISHI ELECTRIC",
+      "error": "cTrader paired spread calculation: no minute candles for MITSUBISHI ELECTRIC"
+    },
+    {
+      "symbol": "MITSUBISHI HEAVY INDUSTRIES",
+      "error": "cTrader paired spread calculation: no minute candles for MITSUBISHI HEAVY INDUSTRIES"
+    },
+    {
+      "symbol": "MITSUBISHI UFJ FINANCIAL",
+      "error": "cTrader paired spread calculation: no minute candles for MITSUBISHI UFJ FINANCIAL"
+    },
+    {
+      "symbol": "MITSUI CHEMICALS",
+      "error": "cTrader paired spread calculation: no minute candles for MITSUI CHEMICALS"
+    },
+    {
+      "symbol": "MITSUI CO",
+      "error": "cTrader paired spread calculation: no minute candles for MITSUI CO"
+    },
+    {
+      "symbol": "MIZUHO FINANCIAL",
+      "error": "cTrader paired spread calculation: no minute candles for MIZUHO FINANCIAL"
+    },
+    {
+      "symbol": "MONADELPHOUS",
+      "error": "cTrader paired spread calculation: no minute candles for MONADELPHOUS"
+    },
+    {
+      "symbol": "MSC",
+      "error": "cTrader paired spread calculation: no minute candles for MSC"
+    },
+    {
+      "symbol": "MSCI AUSTRALIA",
+      "error": "cTrader paired spread calculation: no minute candles for MSCI AUSTRALIA"
+    },
+    {
+      "symbol": "MSCI CANADA",
+      "error": "cTrader paired spread calculation: no minute candles for MSCI CANADA"
+    },
+    {
+      "symbol": "MSCI GERMANY",
+      "error": "cTrader paired spread calculation: no minute candles for MSCI GERMANY"
+    },
+    {
+      "symbol": "MSCI INDONESIA",
+      "error": "cTrader paired spread calculation: no minute candles for MSCI INDONESIA"
+    },
+    {
+      "symbol": "MSCI ITALY",
+      "error": "cTrader paired spread calculation: no minute candles for MSCI ITALY"
+    },
+    {
+      "symbol": "MSCI MEXICO",
+      "error": "cTrader paired spread calculation: no minute candles for MSCI MEXICO"
+    },
+    {
+      "symbol": "MSCI PACIFIC",
+      "error": "cTrader paired spread calculation: no minute candles for MSCI PACIFIC"
+    },
+    {
+      "symbol": "MSCI THAILAND",
+      "error": "cTrader paired spread calculation: no minute candles for MSCI THAILAND"
+    },
+    {
+      "symbol": "MSCI UNITED KINGDOM",
+      "error": "cTrader paired spread calculation: no minute candles for MSCI UNITED KINGDOM"
+    },
+    {
+      "symbol": "NIKON",
+      "error": "cTrader paired spread calculation: no minute candles for NIKON"
+    },
+    {
+      "symbol": "NIPPON STEEL & SUMIKIN BUSSA",
+      "error": "cTrader paired spread calculation: no minute candles for NIPPON STEEL & SUMIKIN BUSSA"
+    },
+    {
+      "symbol": "NIPPON TELEGRAPH & TELEPHONE",
+      "error": "cTrader paired spread calculation: no minute candles for NIPPON TELEGRAPH & TELEPHONE"
+    },
+    {
+      "symbol": "NISSAN MOTOR",
+      "error": "cTrader paired spread calculation: no minute candles for NISSAN MOTOR"
+    },
+    {
+      "symbol": "NUFARM",
+      "error": "cTrader paired spread calculation: no minute candles for NUFARM"
+    },
+    {
+      "symbol": "OIL SEARCH",
+      "error": "cTrader paired spread calculation: no minute candles for OIL SEARCH"
+    },
+    {
+      "symbol": "OIL STATES INTERNATIONAL",
+      "error": "cTrader paired spread calculation: no minute candles for OIL STATES INTERNATIONAL"
+    },
+    {
+      "symbol": "OLAM INTERNATIONAL",
+      "error": "cTrader paired spread calculation: no minute candles for OLAM INTERNATIONAL"
+    },
+    {
+      "symbol": "OLYMPUS",
+      "error": "cTrader paired spread calculation: no minute candles for OLYMPUS"
+    },
+    {
+      "symbol": "ORICA",
+      "error": "cTrader paired spread calculation: no minute candles for ORICA"
+    },
+    {
+      "symbol": "OVERSEA-CHINESE BANKING",
+      "error": "cTrader paired spread calculation: no minute candles for OVERSEA-CHINESE BANKING"
+    },
+    {
+      "symbol": "OZ MINERALS",
+      "error": "cTrader paired spread calculation: no minute candles for OZ MINERALS"
+    },
+    {
+      "symbol": "PACT GROUP",
+      "error": "cTrader paired spread calculation: no minute candles for PACT GROUP"
+    },
+    {
+      "symbol": "PANASONIC",
+      "error": "cTrader paired spread calculation: no minute candles for PANASONIC"
+    },
+    {
+      "symbol": "PARSLEY ENERGY",
+      "error": "cTrader paired spread calculation: no minute candles for PARSLEY ENERGY"
+    },
+    {
+      "symbol": "PERPETUAL",
+      "error": "cTrader paired spread calculation: no minute candles for PERPETUAL"
+    },
+    {
+      "symbol": "PIONEER NATURAL RESOURCES",
+      "error": "cTrader paired spread calculation: no minute candles for PIONEER NATURAL RESOURCES"
+    },
+    {
+      "symbol": "PLATINUM ASSET MANAGEMENT",
+      "error": "cTrader paired spread calculation: no minute candles for PLATINUM ASSET MANAGEMENT"
+    },
+    {
+      "symbol": "POLARIS",
+      "error": "cTrader paired spread calculation: no minute candles for POLARIS"
+    },
+    {
+      "symbol": "PREMIER INVESTMENTS",
+      "error": "cTrader paired spread calculation: no minute candles for PREMIER INVESTMENTS"
+    },
+    {
+      "symbol": "QANTAS AIRWAYS",
+      "error": "cTrader paired spread calculation: no minute candles for QANTAS AIRWAYS"
+    },
+    {
+      "symbol": "QBE INSURANCE",
+      "error": "cTrader paired spread calculation: no minute candles for QBE INSURANCE"
+    },
+    {
+      "symbol": "QUBE",
+      "error": "cTrader paired spread calculation: no minute candles for QUBE"
+    },
+    {
+      "symbol": "RAMSAY HEALTH CARE",
+      "error": "cTrader paired spread calculation: no minute candles for RAMSAY HEALTH CARE"
+    },
+    {
+      "symbol": "REDES ENERGETICAS NACIONAIS",
+      "error": "cTrader paired spread calculation: no minute candles for REDES ENERGETICAS NACIONAIS"
+    },
+    {
+      "symbol": "REGIS RESOURCES",
+      "error": "cTrader paired spread calculation: no minute candles for REGIS RESOURCES"
+    },
+    {
+      "symbol": "RESONA",
+      "error": "cTrader paired spread calculation: no minute candles for RESONA"
+    },
+    {
+      "symbol": "RICOH",
+      "error": "cTrader paired spread calculation: no minute candles for RICOH"
+    },
+    {
+      "symbol": "RPC",
+      "error": "cTrader paired spread calculation: no minute candles for RPC"
+    },
+    {
+      "symbol": "SANDFIRE",
+      "error": "cTrader paired spread calculation: no minute candles for SANDFIRE"
+    },
+    {
+      "symbol": "SANTOS",
+      "error": "cTrader paired spread calculation: no minute candles for SANTOS"
+    },
+    {
+      "symbol": "SATS",
+      "error": "cTrader paired spread calculation: no minute candles for SATS"
+    },
+    {
+      "symbol": "SCP",
+      "error": "cTrader paired spread calculation: no minute candles for SCP"
+    },
+    {
+      "symbol": "SEEK",
+      "error": "cTrader paired spread calculation: no minute candles for SEEK"
+    },
+    {
+      "symbol": "SEMBCORP INDUSTRIES",
+      "error": "cTrader paired spread calculation: no minute candles for SEMBCORP INDUSTRIES"
+    },
+    {
+      "symbol": "SEMBCORP MARINE",
+      "error": "cTrader paired spread calculation: no minute candles for SEMBCORP MARINE"
+    },
+    {
+      "symbol": "SEVEN WEST MEDIA",
+      "error": "cTrader paired spread calculation: no minute candles for SEVEN WEST MEDIA"
+    },
+    {
+      "symbol": "SHARP",
+      "error": "cTrader paired spread calculation: no minute candles for SHARP"
+    },
+    {
+      "symbol": "SHINSEI BANK",
+      "error": "cTrader paired spread calculation: no minute candles for SHINSEI BANK"
+    },
+    {
+      "symbol": "SHISEIDO",
+      "error": "cTrader paired spread calculation: no minute candles for SHISEIDO"
+    },
+    {
+      "symbol": "SIA ENGINEERING",
+      "error": "cTrader paired spread calculation: no minute candles for SIA ENGINEERING"
+    },
+    {
+      "symbol": "SINGAPORE AIRLINES",
+      "error": "cTrader paired spread calculation: no minute candles for SINGAPORE AIRLINES"
+    },
+    {
+      "symbol": "SINGAPORE EXCHANGE",
+      "error": "cTrader paired spread calculation: no minute candles for SINGAPORE EXCHANGE"
+    },
+    {
+      "symbol": "SINGAPORE PRESS",
+      "error": "cTrader paired spread calculation: no minute candles for SINGAPORE PRESS"
+    },
+    {
+      "symbol": "SINGAPORE TECH ENGINEERING",
+      "error": "cTrader paired spread calculation: no minute candles for SINGAPORE TECH ENGINEERING"
+    },
+    {
+      "symbol": "SINGAPORE TELECOMMUNICATIONS",
+      "error": "cTrader paired spread calculation: no minute candles for SINGAPORE TELECOMMUNICATIONS"
+    },
+    {
+      "symbol": "SOJITZ",
+      "error": "cTrader paired spread calculation: no minute candles for SOJITZ"
+    },
+    {
+      "symbol": "SONIC HEALTHCARE",
+      "error": "cTrader paired spread calculation: no minute candles for SONIC HEALTHCARE"
+    },
+    {
+      "symbol": "SOUTH32",
+      "error": "cTrader paired spread calculation: no minute candles for SOUTH32"
+    },
+    {
+      "symbol": "SOUTHERN CROSS MEDIA",
+      "error": "cTrader paired spread calculation: no minute candles for SOUTHERN CROSS MEDIA"
+    },
+    {
+      "symbol": "SOUTHWESTERN ENERGY",
+      "error": "cTrader paired spread calculation: no minute candles for SOUTHWESTERN ENERGY"
+    },
+    {
+      "symbol": "SPARK INFRASTRUCTURE",
+      "error": "cTrader paired spread calculation: no minute candles for SPARK INFRASTRUCTURE"
+    },
+    {
+      "symbol": "SPDR S&P CHINA",
+      "error": "cTrader paired spread calculation: no minute candles for SPDR S&P CHINA"
+    },
+    {
+      "symbol": "SPIRIT AIRLINES",
+      "error": "cTrader paired spread calculation: no minute candles for SPIRIT AIRLINES"
+    },
+    {
+      "symbol": "STARHUB",
+      "error": "cTrader paired spread calculation: no minute candles for STARHUB"
+    },
+    {
+      "symbol": "STEADFAST",
+      "error": "cTrader paired spread calculation: no minute candles for STEADFAST"
+    },
+    {
+      "symbol": "STOCKLAND",
+      "error": "cTrader paired spread calculation: no minute candles for STOCKLAND"
+    },
+    {
+      "symbol": "SUMITOMO CHEMICAL",
+      "error": "cTrader paired spread calculation: no minute candles for SUMITOMO CHEMICAL"
+    },
+    {
+      "symbol": "SUMITOMO MITSUI TRUST",
+      "error": "cTrader paired spread calculation: no minute candles for SUMITOMO MITSUI TRUST"
+    },
+    {
+      "symbol": "SUNSTONE HOTEL",
+      "error": "cTrader paired spread calculation: no minute candles for SUNSTONE HOTEL"
+    },
+    {
+      "symbol": "SUPER RETAIL",
+      "error": "cTrader paired spread calculation: no minute candles for SUPER RETAIL"
+    },
+    {
+      "symbol": "SUZUKI MOTOR",
+      "error": "cTrader paired spread calculation: no minute candles for SUZUKI MOTOR"
+    },
+    {
+      "symbol": "SYRAH",
+      "error": "cTrader paired spread calculation: no minute candles for SYRAH"
+    },
+    {
+      "symbol": "TABCORP",
+      "error": "cTrader paired spread calculation: no minute candles for TABCORP"
+    },
+    {
+      "symbol": "TAIHEIYO CEMENT",
+      "error": "cTrader paired spread calculation: no minute candles for TAIHEIYO CEMENT"
+    },
+    {
+      "symbol": "TAISEI",
+      "error": "cTrader paired spread calculation: no minute candles for TAISEI"
+    },
+    {
+      "symbol": "TASSAL",
+      "error": "cTrader paired spread calculation: no minute candles for TASSAL"
+    },
+    {
+      "symbol": "TDK",
+      "error": "cTrader paired spread calculation: no minute candles for TDK"
+    },
+    {
+      "symbol": "TELEPHONE AND DATA SYSTEMS",
+      "error": "cTrader paired spread calculation: no minute candles for TELEPHONE AND DATA SYSTEMS"
+    },
+    {
+      "symbol": "THE GARDEN",
+      "error": "cTrader paired spread calculation: no minute candles for THE GARDEN"
+    },
+    {
+      "symbol": "THOMSON REUTERS",
+      "error": "cTrader paired spread calculation: no minute candles for THOMSON REUTERS"
+    },
+    {
+      "symbol": "TOKYO ELECTRIC POWER",
+      "error": "cTrader paired spread calculation: no minute candles for TOKYO ELECTRIC POWER"
+    },
+    {
+      "symbol": "TOKYO GAS",
+      "error": "cTrader paired spread calculation: no minute candles for TOKYO GAS"
+    },
+    {
+      "symbol": "TOYOTA MOTOR",
+      "error": "cTrader paired spread calculation: no minute candles for TOYOTA MOTOR"
+    },
+    {
+      "symbol": "TPG TELECOM",
+      "error": "cTrader paired spread calculation: no minute candles for TPG TELECOM"
+    },
+    {
+      "symbol": "TREASURY WINE",
+      "error": "cTrader paired spread calculation: no minute candles for TREASURY WINE"
+    },
+    {
+      "symbol": "TRIUMPH",
+      "error": "cTrader paired spread calculation: no minute candles for TRIUMPH"
+    },
+    {
+      "symbol": "UNITED OVERSEAS BANK",
+      "error": "cTrader paired spread calculation: no minute candles for UNITED OVERSEAS BANK"
+    },
+    {
+      "symbol": "UOL GROUP",
+      "error": "cTrader paired spread calculation: no minute candles for UOL GROUP"
+    },
+    {
+      "symbol": "US STEEL",
+      "error": "cTrader paired spread calculation: no minute candles for US STEEL"
+    },
+    {
+      "symbol": "VALEANT PHARMACEUTICALS",
+      "error": "cTrader paired spread calculation: no minute candles for VALEANT PHARMACEUTICALS"
+    },
+    {
+      "symbol": "VALMONT",
+      "error": "cTrader paired spread calculation: no minute candles for VALMONT"
+    },
+    {
+      "symbol": "VILLAGE ROADSHOW",
+      "error": "cTrader paired spread calculation: no minute candles for VILLAGE ROADSHOW"
+    },
+    {
+      "symbol": "VOCUS COMMUNICATIONS",
+      "error": "cTrader paired spread calculation: no minute candles for VOCUS COMMUNICATIONS"
+    },
+    {
+      "symbol": "WAL-MART",
+      "error": "cTrader paired spread calculation: no minute candles for WAL-MART"
+    },
+    {
+      "symbol": "WESTERN AREAS",
+      "error": "cTrader paired spread calculation: no minute candles for WESTERN AREAS"
+    },
+    {
+      "symbol": "WESTERN UNION",
+      "error": "cTrader paired spread calculation: no minute candles for WESTERN UNION"
+    },
+    {
+      "symbol": "WESTROCK",
+      "error": "cTrader paired spread calculation: no minute candles for WESTROCK"
+    },
+    {
+      "symbol": "WHIRLPOOL",
+      "error": "cTrader paired spread calculation: no minute candles for WHIRLPOOL"
+    },
+    {
+      "symbol": "WILMAR INTERNATIONAL",
+      "error": "cTrader paired spread calculation: no minute candles for WILMAR INTERNATIONAL"
+    },
+    {
+      "symbol": "WORLEYPARSONS",
+      "error": "cTrader paired spread calculation: no minute candles for WORLEYPARSONS"
+    },
+    {
+      "symbol": "WORTHINGTON INDUSTRIES",
+      "error": "cTrader paired spread calculation: no minute candles for WORTHINGTON INDUSTRIES"
+    },
+    {
+      "symbol": "YAHOO JAPAN",
+      "error": "cTrader paired spread calculation: no minute candles for YAHOO JAPAN"
+    },
+    {
+      "symbol": "YELP",
+      "error": "cTrader paired spread calculation: no minute candles for YELP"
+    }
+  ],
+  "quality_exclusions": [
+    {
+      "symbol": "AES",
+      "error": "profile review is InsufficientData",
+      "review": "InsufficientData"
+    }
+  ]
+}

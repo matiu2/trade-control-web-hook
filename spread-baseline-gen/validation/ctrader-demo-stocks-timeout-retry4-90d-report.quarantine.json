@@ -1,0 +1,25 @@
+{
+  "binding": {
+    "version": 1,
+    "identity": {
+      "profile": "ctrader-demo",
+      "environment": "demo",
+      "endpoint": "wss://demo.ctraderapi.com:5036",
+      "account_id": 49247794,
+      "broker": "Spotware",
+      "login": 5944473
+    },
+    "from_utc": "2026-07-24T16:26:00Z",
+    "to_utc": "2026-10-22T16:26:00Z",
+    "requested_symbols": [
+      "AARONS",
+      "ACADIA REALTY TRUST",
+      "FANUC",
+      "FIAT CHRYSLER"
+    ],
+    "policy": {
+      "max_minutes_per_instrument": 20
+    }
+  },
+  "records": []
+}
