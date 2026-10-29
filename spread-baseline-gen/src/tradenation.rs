@@ -18,6 +18,7 @@ use crate::{
 };
 
 mod output;
+mod selection;
 use output::merge_tables;
 
 #[derive(Parser)]
@@ -38,6 +39,9 @@ pub struct Args {
     /// Bound this invocation; subsequent runs resume the same fixed window.
     #[arg(long)]
     pub limit: Option<usize>,
+    /// Measure only these exact broker symbols, merging into the full checkpoint.
+    #[arg(long, value_delimiter = ',')]
+    pub only: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -78,11 +82,13 @@ pub async fn run(args: Args) -> Result<()> {
     );
     let _report_lock = output::lock(&args.report)?;
     let items = universe()?;
+    let selected = selection::requested(&items, &args.only)?;
     let mut report = load_report(&args.report, &items, args.days)?;
     report.complete = false;
     save_report(&args.report, &report)?;
     let remaining = items
         .into_iter()
+        .filter(|item| selected.contains(&item.symbol))
         .filter(|item| !report.measurements.contains_key(&item.symbol))
         .take(args.limit.unwrap_or(usize::MAX))
         .collect::<Vec<_>>();
@@ -108,8 +114,10 @@ pub async fn run(args: Args) -> Result<()> {
         "TradeNation spread coverage"
     );
     ensure!(
-        report.complete,
-        "TradeNation bake incomplete: {} of {} measured; {} failures. Resume with the same report.",
+        selected
+            .iter()
+            .all(|symbol| report.measurements.contains_key(symbol)),
+        "Requested TradeNation bake incomplete: {} of {} total markets measured; {} failures. Resume with the same report.",
         report.measurements.len(),
         report.catalogue.len(),
         report.failures.len()
