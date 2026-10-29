@@ -21,6 +21,21 @@ class Config:
     verify_baked: bool = False
     retry_delay: float = 30
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    verification_workspace: Path | None = None
+
+    def __post_init__(self):
+        evidence.require(
+            self.verification_workspace is None or self.verify_baked,
+            "--verification-workspace requires --verify-baked",
+        )
+
+    @property
+    def finishing_workspace(self):
+        return (
+            self.verification_workspace
+            if self.verification_workspace is not None
+            else self.workspace
+        )
 
     @property
     def report(self):
@@ -62,6 +77,9 @@ def record(config, state, **details):
         provenance=str(config.provenance),
         binaries=str(config.binaries),
         verify_baked=config.verify_baked,
+        verification_workspace=str(config.verification_workspace)
+        if config.verification_workspace is not None
+        else None,
         **details,
     )
     temporary = config.status.with_suffix("." + config.run_id + ".tmp")
@@ -133,7 +151,7 @@ def finish(config, manifest):
             "ctrader-demo",
             "--stocks",
             "--workspace",
-            str(config.workspace),
+            str(config.finishing_workspace),
             "--report",
             manifest["selected_report"]["path"],
             "--status",
@@ -146,8 +164,40 @@ def finish(config, manifest):
             *selection,
             *recovery,
         ],
-        cwd=config.workspace,
+        cwd=config.finishing_workspace,
         check=False,
+    )
+
+
+def capture_verification_tables(config):
+    if config.verification_workspace is None:
+        return None
+    paths = tuple(
+        workspace.parent / "candle-cache/src/spread_profiles/ctrader.rs"
+        for workspace in [config.workspace, config.verification_workspace]
+    )
+    evidence.require(
+        all(path.is_file() and not path.is_symlink() for path in paths),
+        "isolated verification requires regular original and snapshot spread tables",
+    )
+    original = paths[0].read_bytes()
+    evidence.require(
+        paths[1].read_bytes() == original,
+        "original and isolated verification tables differ",
+    )
+    return paths, original
+
+
+def verify_tables_unchanged(captured):
+    if captured is None:
+        return
+    paths, original = captured
+    evidence.require(
+        all(
+            path.is_file() and not path.is_symlink() and path.read_bytes() == original
+            for path in paths
+        ),
+        "original or isolated spread table changed during verification",
     )
 
 
@@ -177,12 +227,14 @@ def run_locked(config):
                 collect(config)
             manifest = evidence.prepare(config)
         details = summary(manifest)
+        captured_tables = capture_verification_tables(config)
         record(
             config,
             "verifying-and-baking" if not config.verify_baked else "verifying-baked",
             **details,
         )
         result = finish(config, manifest)
+        verify_tables_unchanged(captured_tables)
         # Complete-checkpoint finisher optimization retains report/audit bytes. A
         # mutation is fatal even if the subprocess reports success.
         evidence.verify(config)

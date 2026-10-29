@@ -331,3 +331,14 @@ and asks the finisher to verify each baked row literally before rerunning gates.
 It writes a separate recovery finishing status and archives the previous job
 status, preserving original gate-failure evidence. Changed or mixed rows fail;
 report, audit and provenance files are never regenerated during recovery.
+
+
+For recovery while other agents continue editing the main sources, an independently
+captured complete source/dependency snapshot can be selected with
+`--verify-baked --verification-workspace /absolute/path/to/frozen/workspace`.
+This routes only the finisher's working directory and source guards to that
+workspace. The original catalogue, reports, audits and sealed provenance keep
+their original paths. The option is refused for collection or baking. Original
+and snapshot account spread-table bytes must match before verification, and both
+must remain identical to those captured bytes afterward; a changed main table
+prevents completion. Job status records the selected verification workspace.

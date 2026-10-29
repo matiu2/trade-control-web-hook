@@ -19,13 +19,23 @@ def main():
         action="store_true",
         help="Verify sealed evidence and baked rows, then rerun gates without collection",
     )
+    parser.add_argument(
+        "--verification-workspace",
+        type=Path,
+        help="Frozen source workspace for --verify-baked only; sealed evidence stays at original paths",
+    )
     options = parser.parse_args()
+    if options.verification_workspace is not None and not options.verify_baked:
+        parser.error("--verification-workspace requires --verify-baked")
     run(
         Config(
             workspace=Path(__file__).resolve().parents[2],
             artifacts=Path(__file__).resolve().parent,
             binaries=options.binaries.resolve(),
             verify_baked=options.verify_baked,
+            verification_workspace=options.verification_workspace.resolve()
+            if options.verification_workspace is not None
+            else None,
         )
     )
 

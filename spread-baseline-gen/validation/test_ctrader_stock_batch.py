@@ -3,6 +3,8 @@
 import copy
 import hashlib
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,7 +34,8 @@ class StockBatchTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name) / "trade-control-web-hook"
+        self.root.mkdir()
         self.artifacts = self.root / "validation"
         self.artifacts.mkdir()
         self.binaries = self.root / "bin"
@@ -138,7 +141,7 @@ status.write_text(json.dumps({"state":"complete"}))
         path = self.binaries / name
         path.write_text(
             "#!/usr/bin/env python3\nimport sys,json,hashlib\nfrom pathlib import Path\n"
-            + "with Path('calls.jsonl').open('a') as log: log.write(json.dumps([Path(sys.argv[0]).name,sys.argv[1:]])+'\\n')\n"
+            + f"with Path({str(self.root / 'calls.jsonl')!r}).open('a') as log: log.write(json.dumps([Path(sys.argv[0]).name,sys.argv[1:],str(Path.cwd())])+'\\n')\n"
             + body
         )
         path.chmod(0o700)
@@ -416,6 +419,122 @@ status.write_text(json.dumps({"state":"complete"}))
         self.assertEqual(partial.read_bytes(), b'{"partial')
         self.assertEqual(len(self.calls("generate-ctrader")), 3)
         self.assertEqual(self.calls("finish-ctrader-nonstocks"), [])
+
+    def isolated_workspace(self):
+        isolated = self.root.parent / "isolated" / "trade-control-web-hook"
+        isolated.mkdir(parents=True, exist_ok=True)
+        (isolated / "baked").write_text("existing baked selected rows")
+        for workspace in [self.root, isolated]:
+            table = workspace.parent / "candle-cache/src/spread_profiles/ctrader.rs"
+            table.parent.mkdir(parents=True, exist_ok=True)
+            table.write_bytes(b"all 221 measured profile rows")
+        return isolated
+
+    def test_isolated_recovery_keeps_original_seals_but_routes_finisher_and_cwd(self):
+        run(self.config)
+        isolated = self.isolated_workspace()
+        paths = [self.artifacts / name for name in [REPORT, READY, PROVENANCE]]
+        paths.extend(Path(read(path)["quarantine_audit"]["path"]) for path in paths[:2])
+        before = {path: path.read_bytes() for path in paths}
+        run(
+            Config(
+                self.root,
+                self.artifacts,
+                self.binaries,
+                verify_baked=True,
+                retry_delay=0,
+                verification_workspace=isolated,
+            )
+        )
+        calls = self.calls("finish-ctrader-nonstocks")
+        self.assertEqual(calls[-1][calls[-1].index("--workspace") + 1], str(isolated))
+        self.assertEqual(
+            calls[-1][calls[-1].index("--report") + 1], str(self.artifacts / READY)
+        )
+        recorded = list(
+            map(json.loads, (self.root / "calls.jsonl").read_text().splitlines())
+        )
+        self.assertEqual(recorded[-1][2], str(isolated))
+        self.assertEqual(len(self.calls("generate-ctrader")), 3)
+        self.assertTrue(all(path.read_bytes() == raw for path, raw in before.items()))
+        self.assertEqual(
+            read(self.artifacts / STATUS)["verification_workspace"], str(isolated)
+        )
+
+    def test_verification_workspace_is_rejected_for_normal_collection_in_config_and_cli(
+        self,
+    ):
+        with self.assertRaises(ValueError):
+            Config(
+                self.root,
+                self.artifacts,
+                self.binaries,
+                verification_workspace=self.root,
+            )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(
+                    ROOT
+                    / "spread-baseline-gen/validation/ctrader-demo-stocks-run-2026-10-28.py"
+                ),
+                str(self.binaries),
+                "--verification-workspace",
+                str(self.root),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires --verify-baked", result.stderr)
+        self.assertEqual(self.calls("generate-ctrader"), [])
+
+    def test_isolated_recovery_rejects_table_mismatch_before_or_after_finisher(self):
+        run(self.config)
+        isolated = self.isolated_workspace()
+        original_table = (
+            self.root.parent / "candle-cache/src/spread_profiles/ctrader.rs"
+        )
+        snapshot_table = isolated.parent / "candle-cache/src/spread_profiles/ctrader.rs"
+        calls = len(self.calls("finish-ctrader-nonstocks"))
+        snapshot_table.write_bytes(b"different table")
+        with self.assertRaises(ValueError):
+            run(
+                Config(
+                    self.root,
+                    self.artifacts,
+                    self.binaries,
+                    verify_baked=True,
+                    retry_delay=0,
+                    verification_workspace=isolated,
+                )
+            )
+        self.assertEqual(len(self.calls("finish-ctrader-nonstocks")), calls)
+        snapshot_table.write_bytes(original_table.read_bytes())
+        original_finish = batch.finish
+
+        def changed_during_verification(config, manifest):
+            result = original_finish(config, manifest)
+            original_table.write_bytes(b"main table changed during verification")
+            return result
+
+        with (
+            mock.patch.object(batch, "finish", side_effect=changed_during_verification),
+            self.assertRaises(ValueError),
+        ):
+            run(
+                Config(
+                    self.root,
+                    self.artifacts,
+                    self.binaries,
+                    verify_baked=True,
+                    retry_delay=0,
+                    verification_workspace=isolated,
+                )
+            )
+        self.assertEqual(read(self.artifacts / STATUS)["state"], "failed")
+        self.assertEqual(len(self.calls("generate-ctrader")), 3)
 
     def test_zero_eligible_is_failed_and_never_bakes(self):
         for row in self.source["instruments"]:
