@@ -220,6 +220,15 @@ fn unchanged(table: &Path, expected: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn evidence() -> ctrader::Report {
+        let mut report: ctrader::Report = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/validation/ctrader-demo-xpdusd-90d-report.json"
+        )))
+        .unwrap();
+        report.identity.endpoint = ctrader_api::Environment::Demo.endpoint().into();
+        report
+    }
     #[test]
     fn concurrent_table_changes_block_merge_without_overwriting_rows() {
         crate::test_logging();
@@ -237,12 +246,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut args = super::super::args::tests::args();
         args.report = dir.path().join("report.json");
-        let original = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/validation/ctrader-demo-xpdusd-90d-report.json"
-        ));
-        std::fs::write(&args.report, original).unwrap();
-        let report: ctrader::Report = serde_json::from_str(original).unwrap();
+        let report = evidence();
+        let original = serde_json::to_string(&report).unwrap();
+        std::fs::write(&args.report, &original).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -267,12 +273,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut args = super::super::args::tests::args();
         args.report = dir.path().join("report.json");
-        let original = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/validation/ctrader-demo-xpdusd-90d-report.json"
-        ));
-        std::fs::write(&args.report, original).unwrap();
-        let mut report: ctrader::Report = serde_json::from_str(original).unwrap();
+        let mut report = evidence();
+        let original = serde_json::to_string(&report).unwrap();
+        std::fs::write(&args.report, &original).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

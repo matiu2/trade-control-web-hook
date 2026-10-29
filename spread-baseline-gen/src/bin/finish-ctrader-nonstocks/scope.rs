@@ -125,11 +125,13 @@ pub fn report(args: &Args, identity: &Identity, report: &Report, finished: bool)
 mod tests {
     use super::*;
     fn evidence() -> Report {
-        serde_json::from_str(include_str!(concat!(
+        let mut report: Report = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/validation/ctrader-demo-xpdusd-90d-report.json"
         )))
-        .unwrap()
+        .unwrap();
+        report.identity.endpoint = ctrader_api::Environment::Demo.endpoint().into();
+        report
     }
     #[test]
     fn table_preflight_requires_same_identity_window_and_only_missing_keys() {

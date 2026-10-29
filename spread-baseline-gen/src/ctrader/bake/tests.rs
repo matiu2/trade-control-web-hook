@@ -22,7 +22,7 @@ fn report() -> Report {
         identity: super::super::Identity {
             profile: "demo".into(),
             environment: "demo".into(),
-            endpoint: "wss://demo.ctraderapi.com:5036".into(),
+            endpoint: ctrader_api::Environment::Demo.endpoint().into(),
             account_id: 42,
             broker: "Example".into(),
             login: 123,
