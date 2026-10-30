@@ -119,7 +119,11 @@ fn descriptor(arg: &clap::Arg) -> Option<OptionDescriptor> {
     });
     Some(OptionDescriptor {
         id: arg.get_id().to_string(),
-        label: long.replace('-', " "),
+        label: if long == "ma-cross-close" {
+            "close on MA cross".into()
+        } else {
+            long.replace('-', " ")
+        },
         help: arg
             .get_long_help()
             .or_else(|| arg.get_help())
@@ -183,6 +187,7 @@ fn group(long: &str) -> &'static str {
         | "skip-tp-resistance"
         | "veto-on-reversal"
         | "ma-cross-veto"
+        | "ma-cross-close"
         | "sma-200-break-veto" => "Exit rules",
         "replace" | "shadow" => "Registration",
         "simulate"
@@ -247,6 +252,15 @@ mod tests {
         assert_eq!(cross.kind, "boolean");
         assert_eq!(cross.group, "Exit rules");
         assert!(cross.help.contains("actual fill"));
+        let close = schema
+            .arm
+            .iter()
+            .find(|d| d.long == "ma-cross-close")
+            .unwrap();
+        assert_eq!(close.label, "close on MA cross");
+        assert_eq!(close.kind, "boolean");
+        assert_eq!(close.group, "Exit rules");
+        assert!(close.help.contains("never veto entries"));
         let sma = schema
             .arm
             .iter()

@@ -65,6 +65,7 @@ pub enum ExitReason {
     TookProfit,
     /// Flattened by a `06-`/`07-close-on-…-reversal` fire before SL/TP.
     Reversal,
+    MaCross,
     /// Flattened by the trade-expiry `close-positions` veto at wall-clock expiry.
     Expiry,
     /// Flattened by the structure-invalidation `close-positions` veto (`too-low`
@@ -85,6 +86,7 @@ impl ExitReason {
             FillKind::StoppedOut => Some(Self::StoppedOut),
             FillKind::TookProfit => Some(Self::TookProfit),
             FillKind::ClosedOnReversal => Some(Self::Reversal),
+            FillKind::ClosedOnMaCross => Some(Self::MaCross),
             FillKind::ClosedAtExpiry => Some(Self::Expiry),
             FillKind::ClosedOnInvalidation => Some(Self::Invalidation),
             FillKind::Open => Some(Self::OpenAtWindowEnd),
@@ -143,6 +145,8 @@ pub struct ReplayEconomics {
     pub tp_hits: usize,
     pub sl_hits: usize,
     pub reversal_closes: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ma_cross_closes: usize,
     pub expiry_closes: usize,
     /// Positions flattened by the structure-invalidation `close-positions` veto.
     /// `#[serde(default)]` so fixtures blessed before the counter existed still
@@ -158,6 +162,10 @@ pub struct ReplayEconomics {
     pub legs: Vec<Leg>,
 }
 
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 impl Default for ReplayEconomics {
     fn default() -> Self {
         Self {
@@ -165,6 +173,7 @@ impl Default for ReplayEconomics {
             tp_hits: 0,
             sl_hits: 0,
             reversal_closes: 0,
+            ma_cross_closes: 0,
             expiry_closes: 0,
             invalidation_closes: 0,
             open_at_end: 0,
@@ -228,6 +237,7 @@ impl ReplayEconomics {
             ExitReason::TookProfit => self.tp_hits += 1,
             ExitReason::StoppedOut => self.sl_hits += 1,
             ExitReason::Reversal => self.reversal_closes += 1,
+            ExitReason::MaCross => self.ma_cross_closes += 1,
             ExitReason::Expiry => self.expiry_closes += 1,
             ExitReason::Invalidation => self.invalidation_closes += 1,
             ExitReason::OpenAtWindowEnd => self.open_at_end += 1,
@@ -439,6 +449,29 @@ mod tests {
         // +0.5R then −0.5R.
         assert!(e.net_r.abs() < 1e-9, "net_r was {}", e.net_r);
         assert_eq!(e.legs.len(), 2);
+    }
+
+    #[test]
+    fn ma_cross_closes_book_losses_separately_from_reversals() {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        let mut economics = ReplayEconomics::new();
+        assert!(
+            serde_json::to_value(&economics)
+                .unwrap()
+                .get("ma_cross_closes")
+                .is_none()
+        );
+        economics.book(&long_fire(FillKind::ClosedOnMaCross, Some(1.095)));
+        assert_eq!(economics.ma_cross_closes, 1);
+        assert_eq!(economics.reversal_closes, 0);
+        assert_eq!(economics.legs[0].exit_reason, ExitReason::MaCross);
+        assert!((economics.net_r + 0.5).abs() < 1e-9);
     }
 
     /// An invalidation close books its OWN counter, not the expiry one. Both come

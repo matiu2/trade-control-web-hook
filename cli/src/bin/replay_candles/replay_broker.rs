@@ -153,6 +153,8 @@ pub enum ExitReason {
     TookProfit,
     /// A gate-passing reversal-close (`06-/07-close-on-…`) flattened it.
     Reversal,
+    /// The independent adverse MA cross exit.
+    MaCross,
     /// The trade-expiry `close-positions` veto flattened it at wall-clock expiry.
     Expiry,
     /// The structure-invalidation veto (`too-low` for a long / `too-high` for a
@@ -689,6 +691,7 @@ impl ReplayBroker {
                 ExitReason::StoppedOut => FillKind::StoppedOut,
                 ExitReason::TookProfit => FillKind::TookProfit,
                 ExitReason::Reversal => FillKind::ClosedOnReversal,
+                ExitReason::MaCross => FillKind::ClosedOnMaCross,
                 ExitReason::Expiry => FillKind::ClosedAtExpiry,
                 ExitReason::Invalidation => FillKind::ClosedOnInvalidation,
             };

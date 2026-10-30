@@ -16,6 +16,23 @@ fn plan() -> TradePlan {
 }
 
 #[test]
+fn ma_close_requests_history_without_enabling_an_entry_veto() {
+    use tracing_subscriber::prelude::*;
+    tracing_subscriber::registry()
+        .with(tracing_error::ErrorLayer::default())
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer().with_test_writer())
+        .try_init()
+        .ok();
+    let mut p = plan();
+    p.rules[0].trigger = Trigger::AdverseMaCross { dir: p.direction };
+    p.rules[0].intent.action = Action::Close;
+    assert!(!p.has_ma_veto());
+    let now = ts("2026-06-17T20:00:00Z");
+    assert!(pine_lookback_since(&p, now).unwrap() <= now - chrono::Duration::hours(91));
+}
+
+#[test]
 fn alignment_requests_warm_history_even_for_a_non_pine_entry() {
     let mut p = plan();
     p.rules[0].trigger = Trigger::MwEveryBar;

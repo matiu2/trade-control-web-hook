@@ -542,6 +542,14 @@ pub struct Args {
     #[arg(long)]
     pub ma_cross_pause: bool,
 
+    /// Close open positions on an adverse closed 9 EMA / 20 SMA cross on the
+    /// setup timeframe: below for longs, above for shorts. Exit only, including
+    /// losing positions; never veto entries, pause, or cancel unfilled orders.
+    /// Remains active for later crosses after re-entry. Independent of
+    /// --ma-cross-veto, --ma-cross-pause, and --no-breakeven.
+    #[arg(long)]
+    pub ma_cross_close: bool,
+
     /// Require the entry signal pattern to touch ANY listed close-based MA on
     /// the setup timeframe, e.g. '9 ema|20 sma|200 sma'. A wick counts. For a
     /// multi-candle pattern, any constituent candle can touch at its own MA
@@ -1069,6 +1077,7 @@ impl Args {
             signal_offside: &self.be_offside,
             enabling_touch: &self.enable_on_ma_touch,
             cross_veto: self.ma_cross_veto,
+            cross_close: self.ma_cross_close,
             sma_200_break_veto: self.sma_200_break_veto,
 
             alignment: self.ma_cross_pause,

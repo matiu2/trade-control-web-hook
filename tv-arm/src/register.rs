@@ -240,6 +240,9 @@ pub(crate) fn register_trade_plan(
     if ma_requirements.cross_veto || ma_requirements.sma_200_break_veto {
         crate::ma_cross_veto::configure(&mut plan, ma_requirements)?;
     }
+    if ma_requirements.cross_close {
+        crate::ma_cross_close::configure(&mut plan)?;
+    }
     plan.entry_conditions.must_touch = ma_requirements.signal_touch.to_vec();
     plan.entry_conditions.be_offside = ma_requirements.signal_offside.to_vec();
     plan.entry_conditions.require_ma_alignment = ma_requirements.alignment;
@@ -545,6 +548,67 @@ mod tests {
                     plan.rules.iter().any(|r| r.rule_id == "01-veto-ma-cross"),
                     cross
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn ma_cross_close_is_an_independent_ungated_recurring_exit() {
+        use tracing_subscriber::prelude::*;
+        use trade_control_core::intent::Action;
+        use trade_control_core::trade_plan::{FireMode, TradePlan, Trigger};
+
+        tracing_subscriber::registry()
+            .with(tracing_error::ErrorLayer::default())
+            .with(tracing_subscriber::EnvFilter::from_default_env())
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init()
+            .ok();
+        for trend in [false, true] {
+            for extras in [vec![], vec!["--ma-cross-veto", "--ma-cross-pause"]] {
+                let mut flags = vec!["--ma-cross-close", "--no-breakeven"];
+                flags.extend(extras);
+                let json = plan_json_with(trend, "ma-close-wire", false, &flags);
+                let plan: TradePlan = serde_json::from_value(json).unwrap();
+                let entry = plan
+                    .rules
+                    .iter()
+                    .find(|r| r.intent.action == Action::Enter)
+                    .unwrap();
+                let close = plan
+                    .rules
+                    .iter()
+                    .find(|r| r.rule_id == "08-close-on-ma-cross")
+                    .unwrap();
+                assert_eq!(close.intent.action, Action::Close);
+                assert_eq!(
+                    close.kind,
+                    trade_control_conventions::RuleKind::PerPositionClose
+                );
+                assert_eq!(close.fire_mode, FireMode::EveryBar);
+                assert_eq!(
+                    close.trigger,
+                    Trigger::AdverseMaCross {
+                        dir: plan.direction
+                    }
+                );
+                assert_eq!(close.intent.account, entry.intent.account);
+                assert_eq!(close.intent.broker, entry.intent.broker);
+                assert_eq!(close.intent.not_after, entry.intent.not_after);
+                assert_eq!(
+                    close.intent.trade_id.as_deref(),
+                    Some(plan.trade_id.as_str())
+                );
+                assert!(!close.intent.needs_golden && !close.intent.needs_confirmed);
+                assert!(close.intent.inside_window.is_empty());
+                assert!(close.intent.allow_close.is_none());
+                assert!(close.intent.level.is_none());
+                close.intent.validate().unwrap();
+                if !plan.entry_conditions.require_ma_alignment {
+                    assert!(!plan.has_ma_veto());
+                    assert!(entry.intent.breakeven.is_none());
+                    assert!(!entry.intent.vetos.iter().any(|v| v == "ma-cross"));
+                }
             }
         }
     }

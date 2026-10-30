@@ -97,12 +97,18 @@ pub struct BaselineEntry {
     pub tp_hits: usize,
     pub sl_hits: usize,
     pub reversal_closes: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ma_cross_closes: usize,
     pub expiry_closes: usize,
     /// Flattened by the structure-invalidation `close-positions` veto. Separate
     /// from `expiry_closes` so a setup-broke close and a clock-ran-out close are
     /// a detectable change of character, not the same number.
     #[serde(default)]
     pub invalidation_closes: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 impl BaselineEntry {
@@ -123,17 +129,19 @@ impl BaselineEntry {
             tp_hits: outcome.tp_hits,
             sl_hits: outcome.sl_hits,
             reversal_closes: outcome.reversal_closes,
+            ma_cross_closes: outcome.ma_cross_closes,
             expiry_closes: outcome.expiry_closes,
             invalidation_closes: outcome.invalidation_closes,
         })
     }
 
     /// The exit-shape counters, for detecting a same-R change of character.
-    fn shape(&self) -> (usize, usize, usize, usize, usize) {
+    fn shape(&self) -> (usize, usize, usize, usize, usize, usize) {
         (
             self.tp_hits,
             self.sl_hits,
             self.reversal_closes,
+            self.ma_cross_closes,
             self.expiry_closes,
             self.invalidation_closes,
         )

@@ -20,6 +20,7 @@ mod geometry;
 mod hs_resolve;
 mod instrument_recovery;
 mod instrument_resolution;
+mod ma_cross_close;
 mod ma_cross_veto;
 mod ma_requirements;
 mod mt5_instrument;

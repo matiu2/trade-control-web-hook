@@ -813,7 +813,18 @@ pub async fn run_with_upkeep(
                         gate,
                         trade_control_core::allow_close_gate::AllowCloseOutcome::Proceed
                     ) {
-                        replay_broker.set_close_reason(ExitReason::Reversal);
+                        let reason = if matches!(
+                            plan.rules
+                                .iter()
+                                .find(|r| r.rule_id == fired.rule_id)
+                                .map(|r| &r.trigger),
+                            Some(trade_control_core::trade_plan::Trigger::AdverseMaCross { .. })
+                        ) {
+                            ExitReason::MaCross
+                        } else {
+                            ExitReason::Reversal
+                        };
+                        replay_broker.set_close_reason(reason);
                         replay_broker
                             .close_positions(&fired.intent.instrument)
                             .await;
@@ -1550,6 +1561,7 @@ async fn inject_control_ticks(
 #[cfg(test)]
 mod tests {
     mod ma_alignment;
+    mod ma_cross_close;
     use super::*;
     use crate::replay_args::{DirectionFilter, GoldenFilter};
     use chrono::TimeZone;

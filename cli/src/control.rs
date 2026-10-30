@@ -82,6 +82,19 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
     }
 }
 
+/// Build an unconditional position close without entry gates or veto effects.
+pub fn build_close_intent(
+    instrument: &str,
+    trade_id: &str,
+    now: DateTime<Utc>,
+    suffix: &str,
+) -> Intent {
+    let id = format!("{trade_id}-close-{suffix}");
+    let mut intent = control_skeleton(Action::Close, instrument, id, now);
+    intent.trade_id = Some(trade_id.into());
+    intent
+}
+
 /// Build a status `Intent`. `suffix` is a short random tag appended to the
 /// id so two concurrent status calls don't collide on replay protection.
 pub fn build_status_intent(now: DateTime<Utc>, suffix: &str) -> Intent {

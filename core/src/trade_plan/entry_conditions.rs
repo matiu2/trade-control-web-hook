@@ -71,39 +71,11 @@ impl EntryConditions {
 }
 
 impl super::TradePlan {
-    /// Shared live/replay history floor. MA history must reach the first
-    /// constituent of a signal which may confirm several candles later.
-    pub fn ma_veto_history_bars(&self) -> usize {
-        self.rules
-            .iter()
-            .filter_map(|r| match r.trigger {
-                super::Trigger::AdverseMaCross { .. } => Some(crate::ma_cross::HISTORY_BARS),
-                super::Trigger::AdverseMaBreak { average, .. } => Some(average.history_bars() + 1),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
-    pub fn has_ma_veto(&self) -> bool {
-        self.ma_veto_history_bars() > 0
-    }
-
-    pub fn ma_veto_ready_at(&self, candles: &[crate::broker::Candle], index: usize) -> bool {
-        self.rules.iter().all(|r| match r.trigger {
-            super::Trigger::AdverseMaCross { .. } => crate::ma_cross::ready_at(candles, index),
-            super::Trigger::AdverseMaBreak { average, .. } => {
-                crate::ma_cross::average_ready_at(candles, index, average)
-            }
-            _ => true,
-        })
-    }
-
     pub fn detector_history_bars(&self) -> usize {
         let cfg = crate::signals::DetectorConfig::pine_defaults(self.granularity);
         crate::signals::detector_lookback_bars(&cfg, self.granularity)
             .max(self.entry_conditions.history_bars() + cfg.confirm_bars + 3)
-            .max(self.ma_veto_history_bars())
+            .max(self.ma_guard_history_bars())
     }
 }
 

@@ -144,6 +144,8 @@ pub enum FillKind {
     /// Filled, then flattened by a `06-close-on-reversal` fire (a confirming
     /// opposite-direction reversal candle inside the SR band) before SL/TP.
     ClosedOnReversal,
+    /// Filled, then closed at market by an adverse MA cross.
+    ClosedOnMaCross,
     /// Filled, then flattened by the trade-expiry `close-positions` veto at
     /// wall-clock expiry (the live worker's ClosePositions veto flattens any
     /// still-open position at market when the plan expires). Booked at the
@@ -197,6 +199,7 @@ impl FillKind {
                 | Self::StoppedOut
                 | Self::TookProfit
                 | Self::ClosedOnReversal
+                | Self::ClosedOnMaCross
                 | Self::ClosedAtExpiry
                 | Self::ClosedOnInvalidation
         )
@@ -446,6 +449,9 @@ pub fn render(
         ));
         if tally.reversal_closes > 0 {
             out.push_str(&format!("  REV: {}", tally.reversal_closes));
+        }
+        if tally.ma_cross_closes > 0 {
+            out.push_str(&format!("  MA: {}", tally.ma_cross_closes));
         }
         if tally.expiry_closes > 0 {
             out.push_str(&format!("  EXP: {}", tally.expiry_closes));
@@ -946,7 +952,10 @@ fn render_fire(
         // structure-invalidation veto) render identically apart from the reason,
         // so they share one arm — a new close reason gets a label, not a
         // copy-pasted block that can drift.
-        FillKind::ClosedOnReversal | FillKind::ClosedAtExpiry | FillKind::ClosedOnInvalidation => {
+        FillKind::ClosedOnReversal
+        | FillKind::ClosedOnMaCross
+        | FillKind::ClosedAtExpiry
+        | FillKind::ClosedOnInvalidation => {
             events.push(EntryEvent {
                 at: result.fill_at,
                 note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
@@ -1046,6 +1055,7 @@ fn render_fire(
 fn close_label(kind: FillKind) -> &'static str {
     match kind {
         FillKind::ClosedOnReversal => "CLOSED ON REVERSAL",
+        FillKind::ClosedOnMaCross => "CLOSED ON MA CROSS",
         FillKind::ClosedAtExpiry => "CLOSED AT TRADE EXPIRY",
         FillKind::ClosedOnInvalidation => "CLOSED ON INVALIDATION (setup broke)",
         _ => "CLOSED",

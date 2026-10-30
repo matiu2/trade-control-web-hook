@@ -108,6 +108,7 @@ fn economics_match(a: &ReplayEconomics, b: &ReplayEconomics) -> bool {
     a.tp_hits == b.tp_hits
         && a.sl_hits == b.sl_hits
         && a.reversal_closes == b.reversal_closes
+        && a.ma_cross_closes == b.ma_cross_closes
         && a.expiry_closes == b.expiry_closes
         && a.invalidation_closes == b.invalidation_closes
         && a.open_at_end == b.open_at_end

@@ -68,7 +68,7 @@ use trade_control_core::signals::{
     DetectorConfig, LatchedSignal, atr_length_for, latched_signal_at, wilder_atr,
 };
 use trade_control_core::trade_plan::{
-    BarEvent, ConditionRule, CrossDir, LinePoint, RuleKind, TradePlan, Trigger,
+    BarEvent, ConditionRule, CrossDir, FireMode, LinePoint, RuleKind, TradePlan, Trigger,
 };
 
 /// Substrings that identify a rule's role from its `rule_id` (the alert
@@ -667,7 +667,9 @@ fn evaluate_guards(
     // See `[[reversal_close_spine_retire_recurring]]` and the 3.3 parity map.
     let mut terminal_fired = false;
     for rule in &plan.rules {
-        if !is_guard(rule) || state.fired.contains(&rule.rule_id) {
+        if !is_guard(rule)
+            || (matches!(rule.fire_mode, FireMode::Once) && state.fired.contains(&rule.rule_id))
+        {
             continue;
         }
         if !armed_in_rule(rule, state.phase, state.entries_blocked) {
@@ -729,7 +731,9 @@ fn evaluate_guards(
             }
         };
         push_fire_signal(rule, candle, signal, fired);
-        state.fired.insert(rule.rule_id.clone());
+        if matches!(rule.fire_mode, FireMode::Once) {
+            state.fired.insert(rule.rule_id.clone());
+        }
         // Terminate decision, split three ways:
         //
         // 1. A **terminal** setup-invalidation (`too-high` = `ClosePositions`,
@@ -762,7 +766,7 @@ fn evaluate_guards(
             }
         }
         // Non-terminal guard fired (a reversal-close): keep scanning later rules
-        // this bar, but it has latched so it won't re-fire.
+        // this bar. Once guards latch; EveryBar guards can fire on later events.
     }
     if terminal_fired {
         state.phase = Phase::Done;
@@ -1098,7 +1102,7 @@ fn evaluate_one_entry(
         state.fired.insert(rule.rule_id.clone());
         // Consume the entry once while retaining guards for its resting order
         // and open position. Cross policy must survive --max-retries 0 too.
-        if !plan.has_ma_veto() && !plan.entry_conditions.require_ma_alignment {
+        if !plan.has_ma_guard() && !plan.entry_conditions.require_ma_alignment {
             state.phase = Phase::Done;
         }
     }
@@ -3132,6 +3136,7 @@ mod tests {
     mod entry_conditions;
     mod ma_alignment;
     mod ma_cross;
+    mod ma_cross_close;
     mod ma_enablement;
     mod sma_break;
     use super::*;

@@ -46,6 +46,7 @@ pub use trade_control_conventions::RuleKind;
 mod broker_check;
 pub use broker_check::*;
 mod entry_conditions;
+mod ma_protection;
 pub use entry_conditions::{EntryConditions, RetraceLine};
 
 use crate::broker::Granularity;

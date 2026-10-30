@@ -36,7 +36,7 @@ pub use calendar_bars::{
     plan_calendar_bars_within,
 };
 pub use control::{
-    build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
+    build_clear_prep_intent, build_clear_veto_intent, build_close_intent, build_market_info_intent,
     build_plan_admin_intent, build_plan_delete_intent, build_plan_list_intent,
     build_plan_purge_intent, build_plan_show_intent, build_plan_timeline_intent, build_prep_intent,
     build_purge_older_than_intent, build_register_intent, build_status_intent, build_unlock_intent,

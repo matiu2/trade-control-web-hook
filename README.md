@@ -3719,6 +3719,19 @@ both retains that option's permanent adverse-cross veto.
 In local-chart, select **ma cross pause** in the shared Entry settings
 for Reversal or Trend. In the CLI, add `--ma-cross-pause` to the arm.
 
+### Close on an adverse MA cross — `--ma-cross-close`
+
+Select **close on MA cross** under **Trend → Exit** in local-chart, or add
+`--ma-cross-close` to a CLI arm. On a closed setup-timeframe candle, a 9 EMA
+cross below the 20 SMA closes longs; a cross above closes shorts. The position
+closes at market even when losing. Replay labels this exit **CLOSED ON MA CROSS**.
+
+This option defaults off. It never vetoes or pauses entries, cancels pending
+orders, or changes break-even settings. It stays active for later crosses after
+re-entry. Combine it independently with `--ma-cross-pause` or `--ma-cross-veto`
+when their entry restrictions are also wanted. The CLI supports both trend
+and reversal setups. Existing signed plans retain their current rules.
+
 ### Veto an adverse MA cross — `--ma-cross-veto`
 
 ```sh
