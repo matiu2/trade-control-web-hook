@@ -1032,6 +1032,7 @@ fn sample_record(trade_id: &str, account: Option<&str>, instrument: &str) -> Hel
         // Stored orders through every backend. Losing one on a restart would
         // silently discard a setup the operator is still waiting on.
         stored_orders: vec![crate::order_control::StoredOrder {
+            spread_recovery: None,
             signed_intent: "{\"stored\":true}".into(),
             reason: crate::order_control::StoredReason::BelowMinRForecast,
             original_sl_distance: 0.0020,
@@ -1112,6 +1113,54 @@ pub async fn held_trade_record(store: &impl StateStore, tag: &str) {
     let got = store.get_held_trade_record(&tid).await.unwrap().unwrap();
     assert!(!got.applied);
     assert_eq!(got.pip_size, 0.01);
+
+    let original = got.stored_orders;
+    let mut newer = original.clone();
+    newer[0].shell_time += chrono::Duration::seconds(60);
+    assert!(
+        store
+            .compare_set_stored_orders(&tid, &original, &newer)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .compare_set_stored_orders(&tid, &original, &[])
+            .await
+            .unwrap(),
+        "an old poll cannot delete a newer signal"
+    );
+    assert!(
+        !store
+            .compare_set_stored_orders(&tid, &original, &original)
+            .await
+            .unwrap(),
+        "an old poll cannot overwrite a newer signal"
+    );
+    let kept = store.get_held_trade_record(&tid).await.unwrap().unwrap();
+    assert_eq!(kept.stored_orders, newer);
+    assert_eq!(kept.holders, rec.holders);
+    assert_eq!(kept.pip_size, 0.01);
+    assert!(!kept.applied);
+    assert!(
+        store
+            .compare_set_stored_orders(&tid, &newer, &[])
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .compare_set_stored_orders(&tid, &newer, &[])
+            .await
+            .unwrap(),
+        "only one promoter may claim a parked signal"
+    );
+    assert!(
+        store
+            .compare_set_stored_orders(&tid, &[], &original)
+            .await
+            .unwrap()
+    );
 
     // list_all recovers it.
     let all = store.list_all_held_trade_records().await.unwrap();

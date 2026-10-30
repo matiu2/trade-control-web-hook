@@ -1347,6 +1347,7 @@ mod tests {
             // These tests call `evaluate` directly, so this field does not
             // gate their entry — but the fixture models an intent that
             // REACHES the gate, and the only intents that do are gate-owned.
+            spread_retry: None,
             entry_dedup: Some(crate::intent::EntryDedup::GateOwned),
             expiry_bars: None,
             allow_entry: None,

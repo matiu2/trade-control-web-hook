@@ -56,6 +56,7 @@ pub enum EnterGateOutcome {
 /// One fired intent plus the forward candle path needed to simulate its fill.
 pub struct Fire {
     pub fired: FiredIntent,
+    pub recovery_quote: Option<QuoteSample>,
     /// Bid/ask candles at or after the firing bar (ascending) — the fill
     /// simulator's input (it fills each leg on the relevant book side).
     pub forward: Vec<EngineCandle>,
@@ -260,6 +261,18 @@ fn adopt_promotions(
 ) {
     use trade_control_core::order_control::PromoteOutcome;
     for (trade_id, outcome) in outcomes {
+        if let PromoteOutcome::Dropped(reason) = outcome {
+            if let Some(fire) = fires.iter_mut().rev().find(|f| {
+                f.fired.intent.trade_id.as_deref() == Some(trade_id)
+                    && f.fired.intent.spread_retry.is_some()
+                    && f.rejected_reason()
+                        .is_some_and(|r| r.contains("stored until"))
+            }) && let EnterGateOutcome::Rejected { reason: original } = &mut fire.gate_outcome
+            {
+                original.push_str(&format!("; recovery ended: {reason}"));
+            }
+            continue;
+        }
         if !matches!(outcome, PromoteOutcome::Promoted(_)) {
             continue;
         }
@@ -284,6 +297,7 @@ fn adopt_promotions(
                     .is_some_and(|r| r.contains("stored until"))
         });
         if let Some(fire) = fire {
+            fire.recovery_quote = replay_broker.recovery_quote(&order_id);
             fire.placed_bracket = replay_broker.placed_bracket(&order_id);
             fire.gate_outcome = EnterGateOutcome::Placed {
                 order_id: Some(order_id),
@@ -476,6 +490,22 @@ pub async fn run_with_upkeep(
         }
         None => ReplayBroker::new(candles.to_vec(), plan.pip_size),
     };
+    let replay_broker = if plan
+        .rules
+        .iter()
+        .any(|rule| rule.intent.spread_retry.is_some())
+    {
+        match upkeep {
+            Some(ticks) => {
+                let frozen = ticks.to_frozen();
+                replay_broker.with_recovery_bars(frozen.bars, frozen.bar_seconds)
+            }
+            None => replay_broker,
+        }
+    } else {
+        replay_broker
+    };
+
     let store = MemStateStore::default();
     // PR 4b-3: the SAME shared spread-hour resting-order lifecycle the live cron
     // runs, driven per bar below. Its two offline seams — a fixed dispatch config
@@ -905,6 +935,7 @@ pub async fn run_with_upkeep(
                 None
             };
             fires.push(Fire {
+                recovery_quote: None,
                 ma_warmup: if fired.intent.breakeven.is_some_and(|be| be.has_ma_veto()) {
                     candles[fire_index.saturating_sub(
                         fired
@@ -1544,6 +1575,7 @@ async fn inject_control_ticks(
                 _ => {}
             }
             fires.push(Fire {
+                recovery_quote: None,
                 fired,
                 forward: forward.to_vec(),
                 ma_warmup: Vec::new(),

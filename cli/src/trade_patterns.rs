@@ -646,6 +646,8 @@ pub struct TradeSpec {
     /// (5) — byte-identical wire form to pre-feature specs. Meaningful on enters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spread_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_retry: Option<trade_control_core::spread_retry::SpreadRetry>,
 }
 
 /// Default for [`TradeSpec::breakeven_pct`]: break-even is **on at 50%** unless
@@ -1123,6 +1125,7 @@ fn build_pattern(
         // Interactive builder: use the worker's default window (5); the flag
         // path (tv-arm) is where an override is set.
         spread_window: None,
+        spread_retry: None,
     };
     // The interactive prompt is explicitly pip-based, so thread the prompted
     // values through as the pips form (not the ATR-pct default).
@@ -1275,6 +1278,7 @@ fn assemble_trade(
         false, // BCR leg → 05-enter
         breakeven_from_pct(spec.breakeven_pct),
         spec.spread_window,
+        spec.spread_retry,
     ));
     // strategy-v2: a second enter — the Quasimodo entry — armed alongside the
     // BCR stop entry on the same setup. No preps (both skipped),
@@ -1354,6 +1358,7 @@ fn assemble_trade(
             true, // QM leg → 09-enter-qm
             breakeven_from_pct(spec.breakeven_pct),
             spec.spread_window,
+            spec.spread_retry,
         ));
     }
     // Reversal-close split (2026-07-09). The operator's rule: a golden opposite
@@ -1666,6 +1671,7 @@ fn build_mw_pattern(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
             &spec.account,
             breakeven_from_pct(spec.breakeven_pct),
             spec.spread_window,
+            spec.spread_retry,
         ),
     ];
 
@@ -1831,6 +1837,7 @@ fn build_mw_enter_alert(
     account: &str,
     breakeven: Option<trade_control_core::intent::Breakeven>,
     spread_window: Option<u32>,
+    spread_retry: Option<trade_control_core::spread_retry::SpreadRetry>,
 ) -> BuiltAlert {
     let id = format!("{trade_id}-enter");
     let mut intent = skeleton(
@@ -1844,6 +1851,7 @@ fn build_mw_enter_alert(
     );
     intent.direction = Some(direction);
     intent.spread_window = spread_window;
+    intent.spread_retry = spread_retry;
     // entry / stop_loss / take_profit deliberately left None — the worker
     // computes all three from `mw` + the shell OHLC (mid-correct).
     // Read the tick and multiplier before `to_params` consumes `mw`; both are
@@ -2049,6 +2057,7 @@ fn skeleton(
         // Default: the engine's `FireMode::Once` latch guarantees a single
         // fire. Any builder whose enter is `FireMode::EveryBar` (M/W) or
         // multi-shot MUST override this to `GateOwned` — see `EntryDedup`.
+        spread_retry: None,
         entry_dedup: None,
         expiry_bars: None,
         allow_entry: None,
@@ -2352,6 +2361,7 @@ fn build_enter_alert(
     qm: bool,
     breakeven: Option<trade_control_core::intent::Breakeven>,
     spread_window: Option<u32>,
+    spread_retry: Option<trade_control_core::spread_retry::SpreadRetry>,
 ) -> BuiltAlert {
     // The QM leg (strategy-v2's second enter) gets the `09-enter-qm`
     // basename; every other pattern enter gets `05-enter`. This is keyed
@@ -2556,6 +2566,7 @@ fn build_enter_alert(
     // over the last `spread_window` candles instead of a single spiky bar
     // (see `TradeSpec::spread_window`). `None` → the worker's default (5).
     intent.spread_window = spread_window;
+    intent.spread_retry = spread_retry;
     let purpose = if is_qm {
         "enter: quasimodo limit at signal level, confirmed-candle gated, no preps"
     } else {
@@ -3063,6 +3074,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
             ),
         ];
         let trade = BuiltTrade {
@@ -3113,6 +3125,7 @@ mod tests {
                 qm_entry_mode: EntryMode::Stop,
                 breakeven_pct: default_breakeven_pct(),
                 spread_window: None,
+                spread_retry: None,
             },
         };
         let manifest = render_manifest(&trade);
@@ -3163,6 +3176,7 @@ mod tests {
             &[],
             RecoverEntryAction::Skip,
             false,
+            None,
             None,
             None,
         );
@@ -3263,6 +3277,7 @@ mod tests {
                 qm,
                 None,
                 None,
+                None,
             )
         };
         let alert = build(true, RecoverEntryAction::Limit);
@@ -3361,6 +3376,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         assert_eq!(alert.intent.entry_level_vetos, levels);
     }
@@ -3405,6 +3421,7 @@ mod tests {
             &[],
             RecoverEntryAction::Skip,
             false,
+            None,
             None,
             None,
         );
@@ -3492,6 +3509,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         match &alert.intent.stop_loss {
             Some(PriceRef::Absolute { absolute }) => {
@@ -3549,6 +3567,7 @@ mod tests {
             &[],
             RecoverEntryAction::Skip,
             false,
+            None,
             None,
             None,
         )
@@ -4301,6 +4320,7 @@ mod tests {
             qm_entry_mode: EntryMode::Stop,
             breakeven_pct: default_breakeven_pct(),
             spread_window: None,
+            spread_retry: None,
         }
     }
 

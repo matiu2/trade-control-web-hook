@@ -65,6 +65,8 @@ pub enum PromoteScope<'a> {
     /// Every record regardless of account. What the offline replay passes: it
     /// has one broker and one plan, and its records carry the plan's account.
     Every,
+    /// Fast live pass: only retained spread recoveries for this exact account.
+    SpreadRecovery(Option<&'a str>),
 }
 
 impl PromoteScope<'_> {
@@ -74,6 +76,7 @@ impl PromoteScope<'_> {
             Self::Account(want) => account == Some(want),
             Self::Global => account.is_none(),
             Self::Every => true,
+            Self::SpreadRecovery(want) => account == want,
         }
     }
 }
@@ -125,13 +128,24 @@ where
         }
     };
     let mut outcomes = Vec::new();
-    for record in records
-        .iter()
-        .filter(|r| scope.covers(r.account.as_deref()) && !r.stored_orders.is_empty())
-    {
+    for record in records.iter().filter(|r| {
+        scope.covers(r.account.as_deref())
+            && !r.stored_orders.is_empty()
+            && (!matches!(scope, PromoteScope::SpreadRecovery(_))
+                || r.stored_orders[0].reason == super::StoredReason::SpreadRecovery)
+    }) {
         let Some(parked) = record.stored_orders.first() else {
             continue;
         };
+        if parked.reason == super::StoredReason::SpreadRecovery {
+            match super::spread_recovery::tick(broker, store, cfg, src, record, now).await {
+                Ok(outcome) => outcomes.push((record.trade_id.clone(), outcome)),
+                Err(error) => {
+                    tracing::error!(%error, trade_id = %record.trade_id, "spread-retry tick failed")
+                }
+            }
+            continue;
+        }
         // One measured spread per record. Not cached across records here (unlike
         // the re-price pass): a parked order is rare, so the extra round-trip is
         // noise, and the caller's broker may cache anyway.

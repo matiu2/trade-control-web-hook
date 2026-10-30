@@ -88,7 +88,31 @@ where
     C: CronEnv,
 {
     for account in affected_accounts(store).await {
-        tick_account(store, cron, account.as_deref(), now).await;
+        tick_account(store, cron, account.as_deref(), now, false).await;
+    }
+}
+
+/// Minute cadence for opt-in retained signals; does not reprice resting orders.
+pub async fn spread_retry_tick<S: StateStore, C: CronEnv>(store: &S, cron: &C, now: DateTime<Utc>) {
+    let records = match store.list_all_held_trade_records().await {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::error!(%error, "spread-retry: cannot list records");
+            return;
+        }
+    };
+    let mut accounts = Vec::new();
+    for record in records.iter().filter(|r| {
+        r.stored_orders.first().is_some_and(|o| {
+            o.reason == trade_control_core::order_control::StoredReason::SpreadRecovery
+        })
+    }) {
+        if !accounts.contains(&record.account) {
+            accounts.push(record.account.clone());
+        }
+    }
+    for account in accounts {
+        tick_account(store, cron, account.as_deref(), now, true).await;
     }
 }
 
@@ -114,8 +138,13 @@ async fn affected_accounts<S: StateStore>(store: &S) -> Vec<Option<String>> {
 }
 
 /// One account: match the broker enum once, then run both halves.
-async fn tick_account<S, C>(store: &S, cron: &C, account: Option<&str>, now: DateTime<Utc>)
-where
+async fn tick_account<S, C>(
+    store: &S,
+    cron: &C,
+    account: Option<&str>,
+    now: DateTime<Utc>,
+    recovery_only: bool,
+) where
     S: StateStore,
     C: CronEnv,
 {
@@ -135,11 +164,15 @@ where
     let cfg = CronEnterConfigProvider { cron };
 
     match &broker {
-        BrokerHandle::Oanda(b) => run_both(b, store, &cfg, &src, account, now).await,
-        BrokerHandle::TradeNation(b) => run_both(b, store, &cfg, &src, account, now).await,
-        BrokerHandle::Ibkr(b) => run_both(b, store, &cfg, &src, account, now).await,
-        BrokerHandle::Mt5(b) => run_both(b, store, &cfg, &src, account, now).await,
-        BrokerHandle::Ctrader(b) => run_both(b, store, &cfg, &src, account, now).await,
+        BrokerHandle::Oanda(b) => run_both(b, store, &cfg, &src, account, now, recovery_only).await,
+        BrokerHandle::TradeNation(b) => {
+            run_both(b, store, &cfg, &src, account, now, recovery_only).await
+        }
+        BrokerHandle::Ibkr(b) => run_both(b, store, &cfg, &src, account, now, recovery_only).await,
+        BrokerHandle::Mt5(b) => run_both(b, store, &cfg, &src, account, now, recovery_only).await,
+        BrokerHandle::Ctrader(b) => {
+            run_both(b, store, &cfg, &src, account, now, recovery_only).await
+        }
     }
 }
 
@@ -155,6 +188,7 @@ async fn run_both<B, S, P, V>(
     src: &V,
     account: Option<&str>,
     now: DateTime<Utc>,
+    recovery_only: bool,
 ) where
     B: Broker,
     S: StateStore,
@@ -164,9 +198,15 @@ async fn run_both<B, S, P, V>(
     let mut quotes = QuoteCache::new(broker);
     // Scope this pass to the account whose broker we just acquired — a `None`
     // fan-out entry means the worker-global rows, NOT every account's.
-    let scope = account.map_or(PromoteScope::Global, PromoteScope::Account);
+    let scope = if recovery_only {
+        PromoteScope::SpreadRecovery(account)
+    } else {
+        account.map_or(PromoteScope::Global, PromoteScope::Account)
+    };
     promote_due_orders(broker, store, cfg, src, scope, now).await;
-    reprice_due_orders(broker, store, cfg, src, &mut quotes, account, now).await;
+    if !recovery_only {
+        reprice_due_orders(broker, store, cfg, src, &mut quotes, account, now).await;
+    }
 }
 
 /// One live spread reading per instrument per tick, as a

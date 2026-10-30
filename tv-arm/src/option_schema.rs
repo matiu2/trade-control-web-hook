@@ -166,6 +166,11 @@ fn kind(arg: &clap::Arg) -> &'static str {
 
 fn group(long: &str) -> &'static str {
     match long {
+        "spread-retry"
+        | "spread-retry-max-age-secs"
+        | "spread-retry-max-chase-r"
+        | "spread-retry-lookahead-secs"
+        | "spread-retry-min-improvement-r" => "Spread recovery (experimental)",
         "account-id" | "risk-pct" | "risk-amount" | "on-oversize" | "broker-dry-run"
         | "max-retries" | "expiry-bars" | "blackout-close" => "Risk and order lifetime",
         "entry-market" | "entry-stop" | "entry-limit" | "market-entry" | "stop-entry"
@@ -228,6 +233,21 @@ mod tests {
     fn schema_covers_semantics_and_hides_transport() {
         init();
         let schema = options();
+        let retry = schema
+            .arm
+            .iter()
+            .find(|d| d.long == "spread-retry")
+            .unwrap();
+        assert_eq!(retry.choices, ["immediate", "adaptive"]);
+        assert!(retry.defaults.is_empty(), "recovery stays opt-in");
+        assert_eq!(retry.group, "Spread recovery (experimental)");
+        let chase = schema
+            .arm
+            .iter()
+            .find(|d| d.long == "spread-retry-max-chase-r")
+            .unwrap();
+        assert_eq!(chase.kind, "number");
+        assert_eq!(chase.defaults, ["0.25"]);
         let offside = schema.arm.iter().find(|d| d.long == "be-offside").unwrap();
         assert_eq!(offside.label, "be offside");
         assert!(offside.repeatable);

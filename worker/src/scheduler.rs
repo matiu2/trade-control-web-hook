@@ -105,6 +105,7 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
     // housekeeping, hourly by default.
     let sweep_period = intervals.upkeep_interval();
     let order_control_period = intervals.upkeep_interval();
+    let spread_retry_period = Duration::from_secs(trade_control_core::spread_retry::POLL_SECONDS);
     // Broker-truth reconciliation is purely observational (logs a mismatch,
     // touches nothing) — the frequent upkeep cadence is generous for it, not
     // load-bearing the way it is for the sweep/order-control passes.
@@ -135,6 +136,7 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
                     blackout_apply_loop(state.clone(), cron.clone(), blackout_apply_period),
                     sweep_loop(state.clone(), cron.clone(), sweep_period),
                     order_control_loop(state.clone(), cron.clone(), order_control_period),
+                    spread_retry_loop(state.clone(), cron.clone(), spread_retry_period),
                     reconcile_loop(state.clone(), cron.clone(), reconcile_period),
                     operator_alert_loop(state.clone()),
                     entry_notification_loop(state.clone(), cron.clone()),
@@ -360,6 +362,22 @@ async fn order_control_loop(state: Arc<AppState>, cron: NativeCronEnv, period: D
         let (state, cron) = (state.clone(), cron.clone());
         run_isolated("order_control", async move {
             order_control_tick(&state.store, &cron, now).await;
+        })
+        .await;
+    }
+}
+
+async fn spread_retry_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Duration) {
+    let mut interval = skip_interval(period);
+    tracing::info!(
+        seconds = period.as_secs(),
+        "scheduler: retained spread-signal polling"
+    );
+    loop {
+        interval.tick().await;
+        let (state, cron) = (state.clone(), cron.clone());
+        run_isolated("spread_retry", async move {
+            trade_control_cron::spread_retry_tick(&state.store, &cron, chrono::Utc::now()).await;
         })
         .await;
     }

@@ -155,6 +155,15 @@ fn run_live(
     emit: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ReplayResult>>>> {
     Box::pin(async move {
+        if args.upkeep.is_none()
+            && plan
+                .rules
+                .iter()
+                .any(|rule| rule.intent.spread_retry.is_some())
+        {
+            tracing::info!("spread-retry: enabling 1m historical quote samples for replay");
+            args.upkeep = Some("1m".into());
+        }
         // `--annotate-unfilled` is a superset of `--annotate` (it adds the
         // not-taken trades), so it implies annotation is on.
         let annotate = args.annotate || args.annotate_unfilled;
@@ -327,6 +336,16 @@ fn run_live(
         // default) is byte-identical. Pulled once and shared by both zoom passes.
         let upkeep =
             pull_upkeep(&args, &symbol, gran.engine(), start, pull_end, &mt5_history).await?;
+        if plan
+            .rules
+            .iter()
+            .any(|rule| rule.intent.spread_retry.is_some())
+            && upkeep.as_ref().is_none_or(|ticks| ticks.is_empty())
+        {
+            return Err(outcome::bad_input(eyre!(
+                "spread retry requires finer quote samples: pass --upkeep 1m (or another finer granularity)"
+            )));
+        }
 
         // Sub-bar zoom (PR-2), run LAZILY in two passes (see `lazy_zoom`).
         //

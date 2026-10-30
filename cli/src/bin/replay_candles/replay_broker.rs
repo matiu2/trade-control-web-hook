@@ -24,7 +24,7 @@
 
 use std::cell::RefCell;
 
-use super::fill_sim::{SimOutcome, simulate_fill_resolved_zoom};
+use super::fill_sim::SimOutcome;
 use super::report::FillKind;
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{
@@ -62,6 +62,7 @@ struct PlacedAttempt {
     /// `SpreadHour` delay), not by the fire's own dispatch. Read by
     /// `promoted_order_id` so the replay can re-point that fire.
     promoted_from_park: bool,
+    recovery_quote: Option<QuoteSample>,
 }
 
 /// The CONCRETE order levels the broker placed an attempt at — the floored stop,
@@ -319,6 +320,9 @@ pub struct ReplayBroker {
     /// upkeep tick differs from the per-bar pass by exactly the clock and the
     /// quote — the operator's "shared code" constraint. `None` between ticks.
     upkeep_sample: RefCell<Option<QuoteSample>>,
+    /// Fine candles used only to clip the first parent bar of a delayed retry.
+    recovery_bars: Vec<BidAskCandle>,
+    recovery_step_seconds: i64,
 
     // --- Stateful held model (S1). Mutated by `advance()` per bar and by
     // `place_entry`/`close_positions`; read by `list_open_positions` /
@@ -350,6 +354,8 @@ impl ReplayBroker {
             parked: RefCell::new(Vec::new()),
             finer: None,
             upkeep_sample: RefCell::new(None),
+            recovery_bars: Vec::new(),
+            recovery_step_seconds: 0,
             resting: RefCell::new(Vec::new()),
             open: RefCell::new(Vec::new()),
             closed: RefCell::new(Vec::new()),
@@ -418,6 +424,12 @@ impl ReplayBroker {
     /// tick (`Some`), or back at the plan bar `as_of` names (`None`). The held
     /// state is deliberately NOT moved: a sub-bar tick asks "what is the spread
     /// right now?" of the shared order-control passes, and nothing else.
+    pub fn with_recovery_bars(mut self, bars: Vec<BidAskCandle>, step_seconds: i64) -> Self {
+        self.recovery_bars = bars;
+        self.recovery_step_seconds = step_seconds;
+        self
+    }
+
     pub fn set_upkeep_sample(&self, sample: Option<QuoteSample>) {
         *self.upkeep_sample.borrow_mut() = sample;
     }
@@ -434,6 +446,9 @@ impl ReplayBroker {
     /// placement, or this reject wasn't a park).
     pub fn park_armed(&self) {
         if let Some(a) = self.armed.borrow_mut().take() {
+            self.parked
+                .borrow_mut()
+                .retain(|old| old.intent.trade_id != a.intent.trade_id);
             self.parked.borrow_mut().push(a);
         }
     }
@@ -441,6 +456,14 @@ impl ReplayBroker {
     /// The broker order id a PROMOTED park was placed under, so the replay can
     /// re-point the enter fire the gate rejected at the placement it later
     /// became. `None` while still parked (or never parked).
+    pub fn recovery_quote(&self, order_id: &str) -> Option<QuoteSample> {
+        self.placed
+            .borrow()
+            .iter()
+            .find(|attempt| attempt.order_id == order_id)
+            .and_then(|attempt| attempt.recovery_quote)
+    }
+
     pub fn promoted_order_id(&self, trade_id: &str) -> Option<String> {
         self.placed
             .borrow()
@@ -491,6 +514,7 @@ impl ReplayBroker {
             placed,
             cancelled: false,
             promoted_from_park: false,
+            recovery_quote: None,
         });
     }
 
@@ -778,6 +802,7 @@ impl ReplayBroker {
             placed: placed.clone(),
             cancelled: false,
             promoted_from_park: false,
+            recovery_quote: None,
         };
         self.resolved_for_sim(&probe, &[])
     }
@@ -867,6 +892,26 @@ impl ReplayBroker {
     /// System-2 widen) for free from `simulate_fill_resolved_zoom`. MA-cross
     /// trades additionally retain pre-fire warmup; `find_fill` excludes that
     /// history before searching for an entry, so it can only seed averages.
+    fn recovery_parent(&self, at: DateTime<Utc>) -> Result<Option<BidAskCandle>, String> {
+        let Some(parent) = self.candles.iter().rfind(|c| c.time < at) else {
+            return Ok(None);
+        };
+        let end = parent.time + super::fill_sim::infer_bar_len(&self.candles);
+        if at >= end || self.candles.iter().any(|c| c.time == at) {
+            return Ok(None);
+        }
+        super::recovery_path::clipped_parent(
+            &self.recovery_bars,
+            at,
+            end,
+            self.recovery_step_seconds,
+        )
+        .map(Some)
+        .ok_or_else(|| {
+            format!("spread-retry: incomplete post-entry minute path at {at}; refusing simulation")
+        })
+    }
+
     fn prefix_from_fire(
         &self,
         shell: &Shell,
@@ -882,11 +927,35 @@ impl ReplayBroker {
         // off bar N+1's open before the bar-N cancel could land). The re-sim
         // `resolve` avoids this because every dispatch-time lookup bounds at the
         // firing bar's OPEN (`fired.candle.time`); `advance` matches that.
-        self.candles
+        let mut prefix: Vec<_> = self
+            .candles
             .iter()
             .filter(|c| (ma_cross || c.time >= shell.time) && c.time <= up_to)
             .cloned()
-            .collect()
+            .collect();
+        if !self.recovery_bars.is_empty()
+            && let Some(parent) = self.candles.iter().rfind(|c| c.time < shell.time)
+            && parent.time <= up_to
+            && !self.candles.iter().any(|c| c.time == shell.time)
+        {
+            let end = parent.time + super::fill_sim::infer_bar_len(&self.candles);
+            if shell.time < end {
+                let clipped = match self.recovery_parent(shell.time) {
+                    Ok(Some(clipped)) => clipped,
+                    result => {
+                        tracing::error!(
+                            ?result,
+                            "spread-retry: unvalidated recovery path; refusing simulation"
+                        );
+                        return Vec::new();
+                    }
+                };
+                prefix.retain(|c| (ma_cross && c.time < parent.time) || c.time >= end);
+                prefix.push(clipped);
+                prefix.sort_by_key(|bar| bar.time);
+            }
+        }
+        prefix
     }
 
     /// Simulate one held order/position against the prefix up to `as_of` and read
@@ -917,15 +986,19 @@ impl ReplayBroker {
             placed: placed.clone(),
             cancelled: false,
             promoted_from_park: false,
+            recovery_quote: None,
         };
         let resolved = self.resolved_for_sim(&probe, &prefix)?;
-        let outcome = simulate_fill_resolved_zoom(
+        let parent_len =
+            (!self.recovery_bars.is_empty()).then(|| super::fill_sim::infer_bar_len(&self.candles));
+        let outcome = super::fill_sim::simulate_fill_with_parent_cadence(
             &resolved,
             intent,
             shell,
             self.pip_size,
             &prefix,
             self.zoom(),
+            parent_len,
         );
         Some((resolved, outcome))
     }
@@ -1301,10 +1374,25 @@ impl Broker for ReplayBroker {
                     // the bar being processed (an upkeep tick inside bar N
                     // still sees `as_of` = N−1, so it stays fillable from N).
                     let mut shell = a.shell;
-                    shell.time = *self.as_of.borrow();
+                    shell.time = if a.intent.spread_retry.is_some() {
+                        self.upkeep_sample
+                            .borrow()
+                            .as_ref()
+                            .map_or(*self.as_of.borrow(), |sample| sample.at)
+                    } else {
+                        *self.as_of.borrow()
+                    };
+                    if a.intent.spread_retry.is_some() {
+                        self.recovery_parent(shell.time)
+                            .map_err(EntryError::OrderRejectedWithDetail)?;
+                    }
                     self.record_attempt(a.order_id.clone(), a.intent, shell, Some(placed));
                     if let Some(rec) = self.placed.borrow_mut().last_mut() {
                         rec.promoted_from_park = true;
+                        rec.recovery_quote = rec
+                            .intent
+                            .spread_retry
+                            .and_then(|_| self.upkeep_sample.borrow().as_ref().copied());
                     }
                     Ok(replay_placement(a.order_id, req))
                 }
@@ -1727,6 +1815,28 @@ mod tests {
             }"#,
         )
         .expect("valid enter intent")
+    }
+
+    #[test]
+    fn an_incomplete_retry_path_cannot_reuse_pre_entry_extremes() {
+        let parent = candle(1_781_244_000, 1.1000);
+        let next = candle(1_781_247_600, 1.1000);
+        let retry_at = parent.time + chrono::Duration::minutes(11);
+        let broker = ReplayBroker::new(vec![parent, next], 0.0001)
+            .with_recovery_bars(vec![candle(retry_at.timestamp(), 1.1000)], 60);
+        assert!(broker.recovery_parent(retry_at).is_err());
+        let shell = Shell::from_candle(&trade_control_core::broker::Candle {
+            time: retry_at,
+            o: 1.1000,
+            h: 1.1000,
+            l: 1.1000,
+            c: 1.1000,
+        });
+        assert!(
+            broker
+                .prefix_from_fire(&shell, parent.time, false)
+                .is_empty()
+        );
     }
 
     /// A bar carrying an explicit bid/ask close spread, so `get_quote` has a

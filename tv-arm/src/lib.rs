@@ -48,6 +48,7 @@ pub mod sl_anchor;
 mod sl_note;
 mod spec_url;
 mod spread;
+mod spread_retry;
 mod start_note;
 #[cfg(test)]
 mod test_drawings;

@@ -391,6 +391,19 @@ pub fn simulate_fill_resolved_zoom(
     candles: &[BidAskCandle],
     sub_bars: &dyn SubBars,
 ) -> SimOutcome {
+    simulate_fill_with_parent_cadence(resolved, intent, shell, pip_size, candles, sub_bars, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_fill_with_parent_cadence(
+    resolved: &Resolved,
+    intent: &Intent,
+    shell: &Shell,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+    sub_bars: &dyn SubBars,
+    parent_bar_len: Option<chrono::Duration>,
+) -> SimOutcome {
     let dir = resolved.direction;
 
     // Phase 1 — find the fill (shared with `breakeven_armed_at`).
@@ -453,7 +466,7 @@ pub fn simulate_fill_resolved_zoom(
     // bar_len)` when we zoom. Inferred from the exit-window spacing (the smallest
     // positive gap between consecutive bars) so a session gap between two bars
     // doesn't inflate it; zero when `rest` has < 2 bars (⇒ no zoom, pessimistic).
-    let bar_len = infer_bar_len(rest);
+    let bar_len = parent_bar_len.unwrap_or_else(|| infer_bar_len(rest));
     // The bar cadence in minutes, for the shared break-even noise floor's ATR
     // length. Derived from the same inferred `bar_len` the zoom uses rather than
     // from a `Granularity` the fill sim does not carry; zero (a single-bar
@@ -598,7 +611,7 @@ pub fn simulate_fill_resolved_zoom(
 /// the true bar cadence rather than the gap width. `Duration::zero()` when the
 /// slice has fewer than two bars (⇒ the zoom window is empty ⇒ no sub-bars ⇒
 /// pessimistic stop, the safe fallback).
-fn infer_bar_len(candles: &[BidAskCandle]) -> chrono::Duration {
+pub(super) fn infer_bar_len(candles: &[BidAskCandle]) -> chrono::Duration {
     candles
         .windows(2)
         .map(|w| w[1].time - w[0].time)
@@ -1897,6 +1910,7 @@ mod tests {
             clears: Vec::new(),
             trade_id: Some("sim-test".into()),
             max_retries: Tunable::Static(0),
+            spread_retry: None,
             entry_dedup: None,
             expiry_bars: None,
             allow_entry: None,

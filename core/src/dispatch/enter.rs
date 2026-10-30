@@ -19,6 +19,7 @@ use crate::state::{StateStore, veto_ttl_seconds};
 mod near_market_tests;
 #[cfg(test)]
 mod recovery_quote_tests;
+mod spread_retry;
 
 /// Render a raw price for an operator-facing message: fixed generous precision
 /// (enough for 5dp FX and finer) with trailing zeros trimmed, so an index level
@@ -354,6 +355,11 @@ pub async fn run_enter<B: Broker, S: StateStore>(
             };
         }
     };
+    let retry_spread =
+        match spread_retry::prepare(broker, verified, &mut resolved, &origin, now).await {
+            Ok(spread) => spread,
+            Err(rejection) => return rejection,
+        };
 
     // Entry-level veto gate — Bug #12. The pcl-exhausted / invalidation level
     // is a *continuous* predicate: reject when the resolved entry price is
@@ -743,14 +749,18 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // the webhook / blackout-restore paths pass `enter_granularity: None` — or a
     // candle-fetch error / all-degenerate window). See
     // `crate::intent::mean_spread`.
-    let spread_source = windowed_entry_spread(
-        broker,
-        &resolved.instrument,
-        &verified.intent,
-        now,
-        enter_granularity,
-    )
-    .await;
+    let spread_source = if let Some(spread) = retry_spread {
+        Some((spread, 1))
+    } else {
+        windowed_entry_spread(
+            broker,
+            &resolved.instrument,
+            &verified.intent,
+            now,
+            enter_granularity,
+        )
+        .await
+    };
     let effective_spread = match spread_source {
         Some((mean, n)) => {
             tracing::info!(
@@ -821,11 +831,23 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                     "entry blocked: widening SL to {widened_sl_lvl} would reach or pass {name} at {level}"
                 );
                 tracing::info!("{message} (id={})", verified.intent.id);
+                let parked = spread_retry::park(
+                    broker,
+                    store,
+                    verified,
+                    &resolved,
+                    rejection.veto.level,
+                    raw_body,
+                    enter_granularity,
+                    &origin,
+                    now,
+                )
+                .await;
                 return ActionResult::Rejected {
                     status: 422,
                     body: message,
                     outcome: format!(
-                        "rejected: sl-widen-past-veto ({name} level={level} widened_sl_lvl={widened_sl_lvl})"
+                        "rejected: sl-widen-past-veto ({name} level={level} widened_sl_lvl={widened_sl_lvl}{parked})"
                     ),
                 };
             }
@@ -1140,6 +1162,13 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 ))
             } else {
                 tracing::info!("entry placed id={} order={}", verified.intent.id, order_id);
+                if verified.intent.spread_retry.is_some()
+                    && let Err(error) =
+                        crate::order_control::clear_stored_order(store, trade_id, now).await
+                {
+                    tracing::error!(%error, trade_id, "spread-retry: could not clear superseded park");
+                }
+
                 crate::position_tracking::record_placement(store, &verified.intent, &order_id)
                     .await;
                 if let Some(attempt_no) = retry_attempt_no {
@@ -1555,6 +1584,7 @@ async fn park_stored_entry<S: StateStore>(
     let bar_seconds = enter_granularity.map_or(3600, crate::broker::Granularity::seconds);
     let drop_at = crate::order_control::drop_at(verified.intent.not_after, bar_seconds, now);
     let order = crate::order_control::StoredOrder {
+        spread_recovery: None,
         signed_intent: body,
         reason,
         original_sl_distance,
@@ -4475,6 +4505,8 @@ mod widen_rounding_tests {
     struct SpyBroker {
         places: RefCell<Vec<PlacedGeometry>>,
         quote: Quote,
+        quote_steps: RefCell<std::collections::VecDeque<Quote>>,
+        ambiguous_placement: bool,
         /// The bid/ask window `get_bidask_candles` serves. Empty (the default)
         /// makes `windowed_entry_spread` fall through to `quote`.
         bidask: Vec<BidAskCandle>,
@@ -4496,6 +4528,8 @@ mod widen_rounding_tests {
                     ask: mid + spread / 2.0,
                 },
                 bidask: Vec::new(),
+                quote_steps: RefCell::new(std::collections::VecDeque::new()),
+                ambiguous_placement: false,
             }
         }
         /// The one placement this fire made. Panics if the count isn't exactly
@@ -4518,6 +4552,9 @@ mod widen_rounding_tests {
                 stop_loss: req.stop_loss,
                 take_profit: req.take_profit,
             });
+            if self.ambiguous_placement {
+                return Err(EntryError::AmbiguousSuccess("test response unknown".into()));
+            }
             Ok(Placement::id_only("order-1"))
         }
         async fn close_positions(&self, _instrument: &str) -> crate::broker::CloseOutcome {
@@ -4542,7 +4579,11 @@ mod widen_rounding_tests {
             unimplemented!("cancel_order unused by these tests")
         }
         async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
-            Ok(self.quote)
+            Ok(self
+                .quote_steps
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(self.quote))
         }
         async fn list_open_positions(
             &self,

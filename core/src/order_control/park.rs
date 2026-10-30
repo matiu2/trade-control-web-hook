@@ -126,6 +126,7 @@ mod tests {
 
     fn order(shell: &str, sl: f64) -> StoredOrder {
         StoredOrder {
+            spread_recovery: None,
             signed_intent: format!("{{\"shell\":\"{shell}\"}}"),
             reason: StoredReason::BelowMinR,
             original_sl_distance: sl,

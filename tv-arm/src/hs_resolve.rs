@@ -150,7 +150,7 @@ pub fn resolve_hs_trade(
         contract_multiplier,
         entry_level_vetos,
         anchored_sl,
-    );
+    )?;
     Ok((direction, spec))
 }
 
@@ -282,7 +282,7 @@ pub fn build_trade_spec(
     // present — the Note wins, and the caller passes `None` so the two can never
     // both be `Some` and race for the same field.
     anchored_sl: Option<f64>,
-) -> cli::TradeSpec {
+) -> color_eyre::eyre::Result<cli::TradeSpec> {
     use cli::TradePattern;
     let pattern = match direction {
         Direction::Short => TradePattern::Hs,
@@ -476,6 +476,7 @@ pub fn build_trade_spec(
         },
         // Entry SL-spread floor window baked onto the enter; `None` → worker default (5).
         spread_window: args.spread_window,
+        spread_retry: crate::spread_retry::policy(args)?,
     };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {
@@ -483,7 +484,7 @@ pub fn build_trade_spec(
             Direction::Long => cli::PriceAnchor::RecentLow,
         });
     }
-    spec
+    Ok(spec)
 }
 
 /// The continuous at-entry level vetos for an H&S/IH&S setup (Bug #12).

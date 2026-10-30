@@ -42,6 +42,7 @@ pub mod settlement;
 pub mod sig;
 pub mod signals;
 pub mod spread_blackout;
+pub mod spread_retry;
 pub mod state;
 pub mod sweep_gate;
 pub mod tick_bundle;

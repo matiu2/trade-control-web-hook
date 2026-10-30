@@ -54,6 +54,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         account: None,
         trade_id: None,
         max_retries: trade_control_core::tunable::Tunable::Static(0),
+        spread_retry: None,
         entry_dedup: None,
         expiry_bars: None,
         allow_entry: None,

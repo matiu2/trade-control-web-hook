@@ -840,6 +840,7 @@ mod tests {
             account: None,
             trade_id: None,
             max_retries: crate::tunable::Tunable::Static(0),
+            spread_retry: None,
             entry_dedup: None,
             expiry_bars: None,
             allow_entry: None,

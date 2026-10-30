@@ -470,6 +470,31 @@ pub struct Args {
     #[arg(long)]
     pub spread_window: Option<u32>,
 
+    /// Experimentally retain candle-pattern entries whose spread-floor SL crosses a setup
+    /// veto. Recheck observed quotes until valid, expired, superseded by a
+    /// better signal or beyond the chase cap. Adaptive timing compares spread
+    /// decay against price drift; immediate retries at the first valid sample.
+    #[arg(long, value_parser = ["immediate", "adaptive"])]
+    pub spread_retry: Option<String>,
+
+    /// Maximum age of a retained spread-blocked signal, in seconds.
+    #[arg(long, default_value_t = 3600, requires = "spread_retry")]
+    pub spread_retry_max_age_secs: u32,
+
+    /// Maximum adverse market-entry distance from the original entry, as a
+    /// multiple of its original signed stop distance. Zero never chases.
+    #[arg(long, default_value_t = 0.25, requires = "spread_retry")]
+    pub spread_retry_max_chase_r: f64,
+
+    /// Adaptive projection horizon and exponential smoothing time, in seconds.
+    #[arg(long, default_value_t = 60, requires = "spread_retry")]
+    pub spread_retry_lookahead_secs: u32,
+
+    /// Minimum predicted improvement in R needed to keep waiting once the
+    /// current spread and entry already pass the hard entry gates.
+    #[arg(long, default_value_t = 0.05, requires = "spread_retry")]
+    pub spread_retry_min_improvement_r: f64,
+
     /// Drop the break-and-close prep from the bundle (no alert
     /// emitted and the entry no longer requires it).
     #[arg(long)]

@@ -78,6 +78,7 @@ tick_size: 0.00001",
         None,
     );
     Fire {
+        recovery_quote: None,
         placed_bracket: broker.placed_bracket("spread-order"),
         realized: broker.held_realized_outcome("spread-order"),
         fired,

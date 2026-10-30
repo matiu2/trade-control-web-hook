@@ -312,6 +312,7 @@ async fn park_below_min_r<S: StateStore>(
         account,
         pip_size,
         StoredOrder {
+            spread_recovery: None,
             signed_intent,
             reason: StoredReason::BelowMinR,
             // The DRAWN geometry, so the promotion gate re-asks the very question

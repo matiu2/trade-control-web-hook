@@ -1996,6 +1996,27 @@ impl StateStore for PgStateStore {
     async fn clear_held_trade_record(&self, trade_id: &str) -> Result<(), StateError> {
         self.clear_held_trade_record_impl(trade_id).await
     }
+
+    async fn compare_set_stored_orders(
+        &self,
+        trade_id: &str,
+        expected: &[trade_control_core::order_control::StoredOrder],
+        replacement: &[trade_control_core::order_control::StoredOrder],
+    ) -> Result<bool, StateError> {
+        let changed = sqlx::query(
+            "UPDATE held_trade_record
+             SET body = jsonb_set(body, '{stored_orders}', $3::jsonb)
+             WHERE trade_id = $1 AND expires_at > now()
+             AND COALESCE(body->'stored_orders', '[]'::jsonb) = $2::jsonb",
+        )
+        .bind(trade_id)
+        .bind(to_jsonb(&expected)?)
+        .bind(to_jsonb(&replacement)?)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(changed.rows_affected() == 1)
+    }
     async fn get_mw_state(
         &self,
         account: Option<&str>,

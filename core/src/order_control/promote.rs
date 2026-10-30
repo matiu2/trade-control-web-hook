@@ -105,9 +105,9 @@ where
                 order.drop_at,
                 super::stored::DROP_BARS_BEFORE_EXPIRY,
             );
-            clear_stored_order(store, trade_id, now)
-                .await
-                .map_err(|e| format!("clear dropped order: {e}"))?;
+            if !claim_park(store, trade_id, &order, now).await? {
+                return Ok(PromoteOutcome::StillWaiting);
+            }
             return Ok(PromoteOutcome::Dropped("past-drop-at"));
         }
         StoredVerdict::Promote => {}
@@ -121,9 +121,9 @@ where
             tracing::info!(
                 "stored-order: DROPPED trade={trade_id} — signed window closed while parked",
             );
-            clear_stored_order(store, trade_id, now)
-                .await
-                .map_err(|e| format!("clear expired order: {e}"))?;
+            if !claim_park(store, trade_id, &order, now).await? {
+                return Ok(PromoteOutcome::StillWaiting);
+            }
             return Ok(PromoteOutcome::Dropped("window-closed"));
         }
         Recovered::Unrecoverable => {
@@ -138,9 +138,10 @@ where
     // next candle would promote the same order again and open a second position
     // — a duplicate entry on real money. Clearing first can at worst lose a
     // promotion (recoverable: the setup re-fires) rather than duplicate one.
-    clear_stored_order(store, trade_id, now)
-        .await
-        .map_err(|e| format!("clear before promote: {e}"))?;
+    let recovery = order.spread_recovery;
+    if !claim_park(store, trade_id, &order, now).await? {
+        return Ok(PromoteOutcome::StillWaiting);
+    }
 
     // Full entry path (RAIL 7), `EntryOrigin::Promotion`: a promotion places an
     // order we already intended, so it must not burn a `max_retries` slot nor be
@@ -158,16 +159,68 @@ where
         &cfg,
         now,
         Some(&order.signed_intent),
-        None,
-        promotion_origin(&order),
+        recovery.and(match order.bar_seconds {
+            Some(60) => Some(crate::broker::Granularity::M1),
+            Some(300) => Some(crate::broker::Granularity::M5),
+            Some(900) => Some(crate::broker::Granularity::M15),
+            Some(3600) => Some(crate::broker::Granularity::H1),
+            Some(14400) => Some(crate::broker::Granularity::H4),
+            Some(86400) => Some(crate::broker::Granularity::D1),
+            _ => None,
+        }),
+        recovery.map_or_else(
+            || promotion_origin(&order),
+            |recovery| crate::dispatch::EntryOrigin::SpreadRetry { recovery },
+        ),
     )
     .await;
+    if recovery.is_some() {
+        match &result {
+            crate::dispatch::ActionResult::AmbiguousSuccess(error) => {
+                tracing::error!(%error, trade_id, "spread-retry: broker outcome uncertain; stopping automatic retries");
+                return Ok(PromoteOutcome::Dropped("spread-retry-ambiguous-placement"));
+            }
+            crate::dispatch::ActionResult::Rejected { .. } => {
+                // A gate rejection placed nothing. Restore only if no fresher
+                // signal or alternative park took ownership while dispatch ran.
+                store
+                    .compare_set_stored_orders(trade_id, &[], std::slice::from_ref(&order))
+                    .await
+                    .map_err(|e| format!("restore spread retry: {e}"))?;
+                return Ok(PromoteOutcome::StillWaiting);
+            }
+            crate::dispatch::ActionResult::Failed(error) => {
+                tracing::error!(%error, trade_id, "spread-retry: placement failed; stopping automatic retries");
+                return Ok(PromoteOutcome::Dropped("spread-retry-placement-failed"));
+            }
+            _ => {}
+        }
+    }
     tracing::info!(
         "stored-order: PROMOTED trade={trade_id} (parked at {}) → {}",
         order.stored_at,
         result.describe(),
     );
     Ok(PromoteOutcome::Promoted(result.describe()))
+}
+
+async fn claim_park<S: StateStore>(
+    store: &S,
+    trade_id: &str,
+    order: &super::StoredOrder,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    if order.spread_recovery.is_some() {
+        store
+            .compare_set_stored_orders(trade_id, std::slice::from_ref(order), &[])
+            .await
+            .map_err(|e| format!("claim spread retry: {e}"))
+    } else {
+        clear_stored_order(store, trade_id, now)
+            .await
+            .map_err(|e| format!("clear before promote: {e}"))?;
+        Ok(true)
+    }
 }
 
 /// How a promotion re-drives `run_enter`. A park that was RE-PLACING a
@@ -216,6 +269,7 @@ mod tests {
             None,
             0.01,
             StoredOrder {
+                spread_recovery: None,
                 signed_intent: "body".into(),
                 reason: StoredReason::BelowMinR,
                 original_sl_distance: 0.0020,
@@ -467,6 +521,7 @@ mod tests {
     #[test]
     fn a_reprice_park_promotes_as_replacing_and_a_fresh_park_as_promotion() {
         let base = StoredOrder {
+            spread_recovery: None,
             signed_intent: String::new(),
             reason: StoredReason::BelowMinR,
             original_sl_distance: 0.001,

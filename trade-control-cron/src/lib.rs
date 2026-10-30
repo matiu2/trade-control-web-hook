@@ -44,6 +44,6 @@ pub use seam::CronEnv;
 pub use blackout_apply::{apply_if_ny_close_edge, widen_open_stops_for_spread_hours};
 pub use blackout_watch::watch_recovery;
 pub use breakeven_watch::watch as breakeven_watch;
-pub use order_control_tick::order_control_tick;
+pub use order_control_tick::{order_control_tick, spread_retry_tick};
 pub use reconcile::reconcile;
 pub use sweep::sweep_pending_orders;

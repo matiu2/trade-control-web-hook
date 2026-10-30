@@ -2436,6 +2436,7 @@ mod tests {
         store.set_clock(now);
         let mut rec = applied_record("AUD/CHF", "2026-07-08T21:05:00Z");
         rec.stored_orders = vec![crate::order_control::StoredOrder {
+            spread_recovery: None,
             signed_intent: "body".into(),
             reason: crate::order_control::StoredReason::BelowMinR,
             original_sl_distance: 0.0020,

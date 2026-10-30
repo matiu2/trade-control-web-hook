@@ -45,6 +45,8 @@ pub mod mt5_history;
 pub mod outcome;
 #[path = "bin/replay_candles/positions_out.rs"]
 pub mod positions_out;
+#[path = "bin/replay_candles/recovery_path.rs"]
+pub mod recovery_path;
 #[path = "bin/replay_candles/replay.rs"]
 pub mod replay;
 #[path = "bin/replay_candles/replay_broker.rs"]

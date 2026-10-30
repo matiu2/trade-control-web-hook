@@ -97,7 +97,7 @@
 ///
 /// Gate behaviour keys off [`Self::is_replacement`]: a replacement of an order
 /// we already placed must not be re-gated as if it were a fresh fire.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EntryOrigin {
     /// A **fresh fire** — a webhook alert or an engine rule firing this bar.
     /// The full gate chain applies: retry gate, blackout gate, and a successful
@@ -127,6 +127,10 @@ pub enum EntryOrigin {
     /// **no** broker order id and therefore no row to re-point: the park
     /// happened instead of a placement, not after one.
     Promotion,
+    /// First placement of a spread-blocked signal, using a bounded fresh quote.
+    SpreadRetry {
+        recovery: crate::spread_retry::Recovery,
+    },
 }
 
 impl EntryOrigin {
@@ -134,7 +138,7 @@ impl EntryOrigin {
     /// rather than firing a fresh one. Drives the retry-gate and blackout-gate
     /// bypasses, and suppresses the new-`EntryAttempt` write.
     pub fn is_replacement(&self) -> bool {
-        !matches!(self, Self::Fresh)
+        !matches!(self, Self::Fresh | Self::SpreadRetry { .. })
     }
 
     /// Only a `Replacing` re-drive skips the retry gate: it continues an
@@ -158,7 +162,7 @@ impl EntryOrigin {
             Self::Replacing {
                 old_broker_order_id,
             } => Some(old_broker_order_id),
-            Self::Fresh | Self::Promotion => None,
+            Self::Fresh | Self::Promotion | Self::SpreadRetry { .. } => None,
         }
     }
 }

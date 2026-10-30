@@ -92,6 +92,7 @@ mod reprice;
 mod reprice_pass;
 mod restore;
 mod sl_target;
+mod spread_recovery;
 mod spread_window;
 mod stored;
 mod tick;

@@ -837,6 +837,11 @@ fn arm_from_inputs(args: &Args, setup: SetupInputs, roles: Option<&Roles>) -> Re
     //     signed enter straight to the worker (placed on receipt). This
     //     short-circuits the whole pattern flow below.
     if let Some(mode) = args.position_entry_mode() {
+        if args.spread_retry.is_some() {
+            color_eyre::eyre::bail!(
+                "spread retry requires a candle-pattern entry; position-tool entries are unsupported"
+            );
+        }
         // Two sources, one trade. A live chart supplies `Roles` (a
         // TradingView drawing, SL/TP as tick offsets); a frozen spec may
         // supply `frozen_position` (absolute prices). Neither is a
@@ -2425,7 +2430,8 @@ mod tests {
             Vec::new(),
             // `--sl-anchor` default (signal): no absolute stop baked.
             None,
-        );
+        )
+        .expect("valid trade spec");
         assert_eq!(spec.pattern, cli::TradePattern::Hs);
         assert!(spec.mw.is_none());
         assert_eq!(spec.pip_size, Some(0.01));
@@ -2455,7 +2461,8 @@ mod tests {
             Vec::new(),
             // `--sl-anchor` default (signal): no absolute stop baked.
             None,
-        );
+        )
+        .expect("valid trade spec");
         assert!(
             default.needs_golden,
             "golden is on by default (every trade, always)"
@@ -2478,7 +2485,8 @@ mod tests {
             Vec::new(),
             // `--sl-anchor` default (signal): no absolute stop baked.
             None,
-        );
+        )
+        .expect("valid trade spec");
         assert!(
             !skipped.needs_golden,
             "--skip-golden must clear needs_golden on the spec"
@@ -2514,6 +2522,7 @@ mod tests {
                 // `--sl-anchor` default (signal): no absolute stop baked.
                 None,
             )
+            .expect("valid trade spec")
         };
         assert!(
             spec_for(true).close_on_news,
@@ -2565,7 +2574,8 @@ mod tests {
             Vec::new(),
             // `--sl-anchor` default (signal): no absolute stop baked.
             None,
-        );
+        )
+        .expect("valid trade spec");
         let built = cli::build_trade_from_spec(spec, now(), cli::BuildStrictness::Lenient)
             .expect("build trade bundle");
         build_trade_plan(
@@ -2787,7 +2797,8 @@ mod tests {
             Vec::new(),
             // `--sl-anchor` default (signal): no absolute stop baked.
             None,
-        );
+        )
+        .expect("valid trade spec");
         assert_eq!(spec.pip_size, Some(0.25));
     }
 

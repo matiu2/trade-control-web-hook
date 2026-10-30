@@ -402,7 +402,8 @@ mod tests {
             None,
             Vec::new(),
             None,
-        );
+        )
+        .expect("valid trade spec");
         let built = cli::build_trade_from_spec(spec, now, cli::BuildStrictness::Lenient)
             .expect("build trade bundle");
 

@@ -1277,6 +1277,21 @@ pub trait StateStore {
         trade_id: &str,
     ) -> impl Future<Output = Result<(), StateError>>;
 
+    /// Atomically replace only the parked-order array when it still equals
+    /// `expected`, preserving the held record's other fields and expiry.
+    fn compare_set_stored_orders(
+        &self,
+        _trade_id: &str,
+        _expected: &[crate::order_control::StoredOrder],
+        _replacement: &[crate::order_control::StoredOrder],
+    ) -> impl Future<Output = Result<bool, StateError>> {
+        async {
+            Err(StateError::Backend(
+                "atomic stored-order updates unsupported".into(),
+            ))
+        }
+    }
+
     /// Read the evolving M/W geometry for `(account, trade_id)`, or
     /// `None` if absent / expired (the setup hasn't updated it yet, so
     /// resolution falls back to the baked params). Global-first like the
@@ -2418,6 +2433,31 @@ mod memstore {
         async fn clear_held_trade_record(&self, trade_id: &str) -> Result<(), StateError> {
             self.delete(&format!("spread-blackout:rec:{trade_id}"));
             Ok(())
+        }
+
+        async fn compare_set_stored_orders(
+            &self,
+            trade_id: &str,
+            expected: &[crate::order_control::StoredOrder],
+            replacement: &[crate::order_control::StoredOrder],
+        ) -> Result<bool, StateError> {
+            let mut inner = self.inner.borrow_mut();
+            let Some((body, expires)) = inner.get_mut(&format!("spread-blackout:rec:{trade_id}"))
+            else {
+                return Ok(false);
+            };
+            if *expires <= self.now() {
+                return Ok(false);
+            }
+            let mut record: HeldTradeRecord =
+                serde_json::from_str(body).map_err(|e| StateError::Backend(e.to_string()))?;
+            if record.stored_orders != expected {
+                return Ok(false);
+            }
+            record.stored_orders = replacement.to_vec();
+            *body =
+                serde_json::to_string(&record).map_err(|e| StateError::Backend(e.to_string()))?;
+            Ok(true)
         }
 
         async fn get_mw_state(
@@ -4326,6 +4366,7 @@ mod tests {
                 signed_intent: "{\"x\":1}".into(),
             }],
             stored_orders: vec![crate::order_control::StoredOrder {
+                spread_recovery: None,
                 signed_intent: "{\"y\":2}".into(),
                 reason: crate::order_control::StoredReason::BelowMinR,
                 original_sl_distance: 0.0020,

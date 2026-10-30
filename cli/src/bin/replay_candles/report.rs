@@ -674,7 +674,15 @@ fn render_fire(
     // level, note it (comparing the stored placed SL to a fresh signed resolve).
     let placed_note = match &fire.placed_bracket {
         Some(resolved) => {
-            let mut note = format!("{ev} placed — {}", describe_order(resolved, plan.pip_size));
+            let mut note = match fire.recovery_quote {
+                Some(quote) => format!(
+                    "{ev} retained signal — retried {} at {:.2}p spread — {}",
+                    bne(quote.at),
+                    (quote.ask - quote.bid) / plan.pip_size,
+                    describe_order(resolved, plan.pip_size)
+                ),
+                None => format!("{ev} placed — {}", describe_order(resolved, plan.pip_size)),
+            };
             // Recover the signed (un-floored) SL for the annotation by resolving
             // the intent afresh; if it differs from the placed stop, the floor
             // moved it. (Display only — the placed stop is authoritative.)
@@ -700,22 +708,23 @@ fn render_fire(
             // `apply_entry_spread_floor` reads via `candles.first()`, so the
             // number shown is the number the floor used, not a re-derivation
             // that could drift from it.
-            if let Some(line) = fire
-                .forward
-                .first()
-                .map(|bar| {
-                    super::spread_breakdown::Breakdown::for_entry(
-                        &trade_control_core::spread_blackout::spread_lookup_key(
-                            &intent.instrument,
-                            intent.account.as_deref(),
-                        ),
-                        bar.close_spread() / plan.pip_size,
-                        resolved.entry.reference_price(),
-                        plan.pip_size,
-                        candle.time,
-                    )
-                })
-                .and_then(|b| b.render())
+            if fire.recovery_quote.is_none()
+                && let Some(line) = fire
+                    .forward
+                    .first()
+                    .map(|bar| {
+                        super::spread_breakdown::Breakdown::for_entry(
+                            &trade_control_core::spread_blackout::spread_lookup_key(
+                                &intent.instrument,
+                                intent.account.as_deref(),
+                            ),
+                            bar.close_spread() / plan.pip_size,
+                            resolved.entry.reference_price(),
+                            plan.pip_size,
+                            candle.time,
+                        )
+                    })
+                    .and_then(|b| b.render())
             {
                 note.push_str(&format!("\n      {line}"));
             }
@@ -1531,6 +1540,7 @@ mod tests {
             (None, None)
         };
         Fire {
+            recovery_quote: None,
             fired,
             forward,
             ma_warmup: Vec::new(),
@@ -1584,6 +1594,38 @@ mod tests {
         assert!(!result.kind.is_taken());
         // And resolve_fire (taken-only) drops it entirely.
         assert!(resolve_fire(&plan_for(0.0001), &fire).is_none());
+    }
+
+    #[test]
+    fn retained_signal_reports_the_actual_retry_quote_and_time() {
+        let mut fire = enter_fire(
+            golden_stop_enter(false),
+            1_781_244_000,
+            EnterGateOutcome::Placed { order_id: None },
+        );
+        let at = fire.fired.candle.time + chrono::Duration::minutes(11);
+        fire.recovery_quote = Some(super::super::replay_broker::QuoteSample {
+            at,
+            bid: 1.1000,
+            ask: 1.10012,
+        });
+        let events = render_fire(
+            &plan_for(0.0001),
+            &fire,
+            Some(1),
+            true,
+            &mut ReplayEconomics::new(),
+        );
+        let note = events
+            .iter()
+            .find(|e| e.note.contains("retained signal"))
+            .expect("retry note");
+        assert!(note.note.contains(&bne(at)));
+        assert!(note.note.contains("1.20p spread"));
+        assert!(
+            !note.note.contains("measured"),
+            "original signal's spread must not be attributed to the retry"
+        );
     }
 
     #[test]

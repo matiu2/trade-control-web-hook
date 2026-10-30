@@ -69,6 +69,8 @@ pub struct StoredOrder {
     /// exactly as [`crate::state::CancelledOrder`] does, to avoid an `Intent`
     /// dependency cycle in the state module.
     pub signed_intent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_recovery: Option<crate::spread_retry::Recovery>,
     /// Why this was parked rather than placed, for the operator-facing log.
     pub reason: StoredReason,
     /// The stop distance the trade was **drawn** with, in price units. Promotion
@@ -171,6 +173,7 @@ fn bucket(t: DateTime<Utc>, secs: i64) -> i64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StoredReason {
+    SpreadRecovery,
     /// The spread floor forced a stop so wide the trade fell under its R-floor.
     /// This is the `sl-widen-below-min-r` case — the sgdjpy loss.
     BelowMinR,
@@ -208,6 +211,7 @@ impl StoredReason {
     /// A short, stable slug for logs and `status` output.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::SpreadRecovery => "spread-recovery",
             Self::BelowMinR => "below-min-r",
             Self::BelowMinRForecast => "below-min-r-forecast",
             Self::BelowMinSize => "below-min-size",
@@ -234,9 +238,11 @@ impl StoredReason {
     /// park exists to fix, while looking like a fix.
     pub fn rechecked_per_bar(self) -> bool {
         match self {
-            Self::BelowMinR | Self::BelowMinRForecast | Self::SpreadHour | Self::MarketClosed => {
-                false
-            }
+            Self::SpreadRecovery
+            | Self::BelowMinR
+            | Self::BelowMinRForecast
+            | Self::SpreadHour
+            | Self::MarketClosed => false,
             Self::BelowMinSize => true,
         }
     }
@@ -395,6 +401,7 @@ mod tests {
 
     fn order(stored_at: &str, drop_at: &str) -> StoredOrder {
         StoredOrder {
+            spread_recovery: None,
             signed_intent: "{}".to_string(),
             reason: StoredReason::BelowMinR,
             original_sl_distance: 0.0020,
@@ -548,6 +555,7 @@ mod tests {
 
     fn size_park(shell: &str, drop_at_s: &str) -> StoredOrder {
         StoredOrder {
+            spread_recovery: None,
             reason: StoredReason::BelowMinSize,
             shell_time: at(shell),
             drop_at: at(drop_at_s),

@@ -643,6 +643,9 @@ pub struct Intent {
     /// gate while an explicit `EngineLatched` is obeyed as written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_dedup: Option<EntryDedup>,
+    /// Experimental retention of an entry blocked by spread widening.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_retry: Option<crate::spread_retry::SpreadRetry>,
     /// Optional bar-based expiry for a pending `enter` order. When set
     /// (1..=5), the worker derives a `cancel_at` for the resting order
     /// by indexing the shell's `next_candle_timestamp_1..5` menu (which
@@ -1078,6 +1081,7 @@ pub fn is_valid_trade_id(s: &str) -> bool {
 // carries an `f64` (the offending atr-pct), which is `PartialEq` but not `Eq`.
 #[derive(Debug, PartialEq)]
 pub enum IntentValidationError {
+    InvalidSpreadRetry,
     /// `trade_id` failed [`is_valid_trade_id`].
     InvalidTradeId,
     /// `max_retries` non-default without a `trade_id` — the retry gate
@@ -1202,6 +1206,9 @@ pub enum IntentValidationError {
 impl core::fmt::Display for IntentValidationError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::InvalidSpreadRetry => {
+                f.write_str("spread_retry requires valid bounds and a gate-owned enter")
+            }
             Self::InvalidTradeId => f.write_str(
                 "invalid trade_id (must be 1-64 chars of lowercase alphanumerics + hyphens, \
                  no leading/trailing or consecutive hyphens)",
@@ -1305,6 +1312,13 @@ impl Intent {
     /// pipeline; the field-by-field deser still works on its own so
     /// round-trip tests don't need to go through this gate.
     pub fn validate(&self) -> Result<(), IntentValidationError> {
+        if let Some(policy) = self.spread_retry
+            && (!policy.valid()
+                || self.action != Action::Enter
+                || !self.effective_entry_dedup().needs_retry_gate())
+        {
+            return Err(IntentValidationError::InvalidSpreadRetry);
+        }
         if let Some(id) = &self.trade_id
             && !is_valid_trade_id(id)
         {

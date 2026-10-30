@@ -119,6 +119,11 @@ pub fn resolve_mw_trade_with_spread(
     contract_multiplier: Option<f64>,
     spread_pips: f64,
 ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
+    if args.spread_retry.is_some() {
+        return Err(ResolveError::Reject(
+            "spread retry requires a candle-pattern entry; M/W uses a geometry entry".into(),
+        ));
+    }
     check_mw_required(geom)?;
     // The anchors come straight off `PlanGeometry` — the same plain-data path a
     // spec-driven arm uses — so the direction decision and the structure/retrace
@@ -378,6 +383,7 @@ pub fn build_mw_trade_spec(
         },
         // Entry SL-spread floor window baked onto the enter; `None` → worker default (5).
         spread_window: args.spread_window,
+        spread_retry: None,
     }
 }
 
