@@ -1,17 +1,17 @@
 //! Resolve the named credentials without crossing demo/live account kinds.
 
-use trade_control_core::account::{AccountKind, AccountMetadata};
+use trade_control_core::account::AccountKind;
 use tradenation_api::accounts::AccountKind as StoredKind;
 
 use super::BrokerError;
 
-pub(super) async fn session(
-    meta: &AccountMetadata,
-) -> Result<tradenation_api::Session, BrokerError> {
-    let credentials = tradenation_api::get_account(&meta.name)
-        .map_err(|error| BrokerError::TradeNationLogin(error.to_string()))?;
-    validate_kind(meta.kind, credentials.kind)?;
-    let session = match credentials.kind {
+pub(crate) async fn session(
+    name: &str,
+    kind: AccountKind,
+) -> color_eyre::Result<tradenation_api::Session> {
+    let credentials = tradenation_api::get_account(name)?;
+    validate_kind(kind, credentials.kind)?;
+    match credentials.kind {
         StoredKind::Demo => {
             tradenation_api::login_demo_with_creds(&credentials.username, &credentials.password)
                 .await
@@ -19,8 +19,7 @@ pub(super) async fn session(
         StoredKind::Live => {
             tradenation_api::login(&credentials.username, &credentials.password).await
         }
-    };
-    session.map_err(|error| BrokerError::TradeNationLogin(error.to_string()))
+    }
 }
 
 fn validate_kind(metadata: AccountKind, stored: StoredKind) -> Result<(), BrokerError> {

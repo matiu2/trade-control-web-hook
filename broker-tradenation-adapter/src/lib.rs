@@ -33,7 +33,11 @@ pub struct TradeNationAdapter(
 );
 impl TradeNationAdapter {
     pub fn new(broker: TradeNationBroker) -> Self {
-        let broker = std::sync::Arc::new(broker);
+        Self::from_shared(std::sync::Arc::new(broker))
+    }
+
+    /// Reuse an authenticated client while keeping per-adapter lookup caches local.
+    pub fn from_shared(broker: std::sync::Arc<TradeNationBroker>) -> Self {
         let candles =
             candle_puller::Puller::new("candle_cache_tradenation", candles::Source(broker.clone()));
         Self(broker, candles, std::sync::Mutex::new(None))

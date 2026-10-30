@@ -25,6 +25,8 @@ pub mod recording_pg;
 mod scheduler;
 mod secrets;
 mod trade_notifications;
+mod tradenation_sessions;
+pub use tradenation_sessions::start_tradenation_session_maintenance;
 
 pub use broker_factory::{
     BrokerError, acquire_ctrader, acquire_ibkr, acquire_mt5, acquire_oanda, acquire_tn,

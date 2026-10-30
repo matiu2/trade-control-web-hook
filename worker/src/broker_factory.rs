@@ -13,6 +13,8 @@
 //!   the enc account store (`~/.config/tradenation/accounts.enc`) keyed by the
 //!   account *name*. The whole wasm redirect-chain login (`src/tn_login.rs`) is
 //!   unnecessary off-wasm — the named credential kind selects demo or live login.
+//!   A process-wide pool reuses clients across engine, HTTP, and upkeep callers;
+//!   a Tokio task checks health and renews confirmed expired sessions.
 //!
 //! Like the wasm worker, this does **not** box the broker: the `Broker` trait
 //! is not object-safe, because its methods return `impl Future`. The native
@@ -44,7 +46,7 @@ use trade_control_core::intent::BrokerKind;
 
 use crate::Secrets;
 
-mod tradenation;
+pub(crate) mod tradenation;
 
 /// Why a broker couldn't be constructed. The dispatcher maps these to the same
 /// HTTP statuses the wasm worker used (OANDA login fail → 500, TN login fail →
@@ -136,8 +138,9 @@ pub fn acquire_oanda(
     ))
 }
 
-/// Build a [`TradeNationAdapter`] for `meta`, logging in natively against the
-/// enc account store keyed by the account *name*. (TradeNation identifies the
+/// Build a [`TradeNationAdapter`] for `meta` using the shared session pool.
+/// Cold starts authenticate against the enc account store keyed by *name*.
+/// (TradeNation identifies the
 /// account by its session credentials, not an id, so `oanda_account_id` is
 /// irrelevant here.)
 pub async fn acquire_tn(meta: &AccountMetadata) -> Result<TradeNationAdapter, BrokerError> {
@@ -147,20 +150,8 @@ pub async fn acquire_tn(meta: &AccountMetadata) -> Result<TradeNationAdapter, Br
             account: meta.broker,
         });
     }
-    // Native login walks the redirect chain and reads the enc store; no Worker
-    // Fetch, no KV session cache. A future session cache (Postgres) is an
-    // optimisation, not a correctness need — the broker re-logins on rejection.
-    let session = tradenation::session(meta).await?;
-    // `broker_tradenation::login` takes the session as a JSON string (the wasm
-    // worker fed it the KV-cached blob); serialize the fresh session to match.
-    let session_json = serde_json::to_string(&session)
-        .map_err(|e| BrokerError::TradeNationLogin(format!("serialize session: {e}")))?;
-    let broker = broker_tradenation::login(&session_json)
-        .await
-        .ok_or_else(|| {
-            BrokerError::TradeNationLogin("broker_tradenation::login returned None".into())
-        })?;
-    Ok(TradeNationAdapter::new(broker))
+    let broker = crate::tradenation_sessions::broker(meta).await?;
+    Ok(TradeNationAdapter::from_shared(broker))
 }
 
 /// Loopback address of the **paper** IB Gateway.

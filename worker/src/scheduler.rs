@@ -12,10 +12,10 @@
 //! `.tick().await`. It is emphatically **not** a per-plan / per-request timer
 //! fan-out.
 //!
-//! `session_refresh` has no loop here on purpose: it is a wasm-only KV
-//! session-cache pre-warm; the native runtime re-logins on demand via the broker
-//! factory, so it has no native scheduler job by design (a deliberate
-//! divergence, not a missing port). The expired-row GC
+//! TradeNation session maintenance runs on the main Tokio runtime via
+//! `start_tradenation_session_maintenance`, shared with HTTP and upkeep callers.
+//! It probes pooled sessions and renews only confirmed expired ones, independently
+//! of the engine cadence. The expired-row GC
 //! ([`PgStateStore::gc_expired`](crate::PgStateStore::gc_expired)) is the inverse
 //! — a *native-only* job with no wasm equivalent, since KV evicts expired rows
 //! automatically.

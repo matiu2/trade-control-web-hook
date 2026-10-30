@@ -23,7 +23,7 @@ use trace_init::init_tracing;
 use trade_control_worker::{
     Config, PgMetadataStore, PgStateStore, Secrets,
     http::{AppState, Dispatcher, router},
-    run_scheduler,
+    run_scheduler, start_tradenation_session_maintenance,
 };
 
 /// Default config path when none is passed as the first CLI argument.
@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
     // The broker dispatch returns `?Send` futures (single-threaded SDK clients),
     // so it runs on a dedicated current-thread + `LocalSet` thread owned by the
     // dispatcher; axum handlers stay `Send` and just ferry the body across.
+    let session_maintenance = start_tradenation_session_maintenance(state.accounts.clone());
     let dispatcher = Dispatcher::spawn(state.clone());
     let app = router(dispatcher).merge(trade_control_worker::account_reads::router(
         state.accounts.clone(),
@@ -96,10 +97,17 @@ async fn main() -> Result<()> {
         .wrap_err_with(|| format!("binding {bind}"))?;
     tracing::info!("listening on http://{bind}");
 
-    axum::serve(listener, app)
+    let serving = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await
-        .wrap_err("axum serve failed")?;
+        .await;
+    session_maintenance.abort();
+    match session_maintenance.await {
+        Err(error) if !error.is_cancelled() => {
+            tracing::error!(%error, "TradeNation session maintenance stopped unexpectedly")
+        }
+        _ => {}
+    }
+    serving.wrap_err("axum serve failed")?;
 
     tracing::info!("shut down cleanly");
     Ok(())
