@@ -38,7 +38,8 @@ pub(crate) fn ts_to_bne(raw: &str) -> String {
 }
 
 /// Extract an ordered list of events from the timeline JSON. Inbound `records`
-/// become `⊙` lines by `ts`; engine `ticks` that fired become `•` lines;
+/// other than journal inspection requests become `⊙` lines by `ts`;
+/// engine `ticks` that fired become `•` lines;
 /// cron-observation `notes` become `!` lines.
 pub fn parse_events(json: &str) -> Vec<Event> {
     let Ok(v) = serde_json::from_str::<Value>(json) else {
@@ -51,8 +52,13 @@ pub fn parse_events(json: &str) -> Vec<Event> {
         for rec in records {
             let ts = rec.get("ts").and_then(|x| x.as_str()).unwrap_or("");
             let action = record_action(rec);
+            // Viewing a plan is not a trade event. Keep these requests in the
+            // raw recording without filling the journal with its own reads.
+            if matches!(action.as_str(), "plan-show" | "plan-timeline") {
+                continue;
+            }
             let outcome = rec.get("outcome").and_then(|x| x.as_str()).unwrap_or("");
-            // The huge register/plan-show outcomes are dumps, not verdicts — keep
+            // The huge register outcomes are dumps, not verdicts — keep
             // the line short by only showing a compact outcome.
             let short = compact_outcome(outcome);
             events.push(Event {

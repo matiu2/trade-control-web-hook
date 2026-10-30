@@ -77,6 +77,48 @@ fn timeline_retains_server_logs_and_unrendered_evidence() {
 }
 
 #[test]
+fn timeline_hides_inspection_requests_but_retains_their_raw_logs() {
+    init_tracing();
+    let actions = [
+        "plan-show",
+        "plan-timeline",
+        "register",
+        "prep",
+        "veto",
+        "close",
+    ];
+    let records: Vec<_> = actions
+        .iter()
+        .map(|action| {
+            json!({
+                "ts":"2026-10-28T21:08:00Z", "request_id":action,
+                "method":"POST", "path":"/", "headers":[],
+                "body":format!("action: {action}\ntrade_id: trade-1\n"),
+                "intent_id":null, "trade_id":"trade-1", "status":200,
+                "outcome":"recorded", "logs":[{"level":"log","msg":"server evidence"}]
+            })
+        })
+        .collect();
+    let raw = json!({"records":records,"ticks":[],"notes":[]});
+    let timeline = RecordedTimeline::from_value(raw.clone()).unwrap();
+    assert_eq!(timeline.raw, raw);
+    let visible: Vec<_> = timeline
+        .events
+        .iter()
+        .map(|event| event.text.as_str())
+        .collect();
+    assert_eq!(
+        visible,
+        [
+            "register → recorded",
+            "prep → recorded",
+            "veto → recorded",
+            "close → recorded"
+        ]
+    );
+}
+
+#[test]
 fn malformed_timeline_is_an_error_instead_of_an_empty_success() {
     init_tracing();
     assert!(RecordedTimeline::from_value(json!({"error":"unavailable"})).is_err());
