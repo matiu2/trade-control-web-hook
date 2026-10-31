@@ -45,6 +45,7 @@ use std::sync::Arc;
 
 mod control_recording;
 mod reconciliation;
+pub(crate) mod recorded;
 mod registration;
 
 use axum::{
@@ -377,19 +378,12 @@ async fn dispatch_control(
         }
         Action::PlanList => {
             let result = handle_plan_list(store, verified, now).await;
-            if result.is_success() {
-                match crate::position_tracking::enrich_list(store.pool(), &result.body).await {
-                    Ok(body) => ControlResult::ok(body),
-                    Err(error) => {
-                        tracing::error!(%error, "plan-list position reporting unavailable");
-                        ControlResult::error("position reporting unavailable", 500)
-                    }
-                }
-            } else {
-                result
-            }
+            recorded::list(store.pool(), result, verified.intent.include_archived).await
         }
-        Action::PlanShow => handle_plan_show(store, verified, now).await,
+        Action::PlanShow => {
+            let result = handle_plan_show(store, verified, now).await;
+            recorded::show(store.pool(), result, verified.intent.trade_id.as_deref()).await
+        }
         // Recording-backed (reads `request_records`), so it can't be a generic
         // `core` handler like the others — it's dispatched here against the
         // concrete `PgStateStore` pool, the same way the R2-backed purge arms

@@ -202,6 +202,7 @@ mod tests {
         let row = PlanRow {
             positions: Vec::new(),
             position_sync: Vec::new(),
+            recorded_only: false,
             trade_id: "t-1".into(),
             account: "demo".into(),
             instrument: "EUR_USD".into(),

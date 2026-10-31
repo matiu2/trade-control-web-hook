@@ -1818,6 +1818,7 @@ mod tests {
         PlanRow {
             positions: Vec::new(),
             position_sync: Vec::new(),
+            recorded_only: false,
             trade_id: trade_id.to_string(),
             account: "acct".into(),
             instrument: "AUD_CAD".into(),

@@ -18,6 +18,9 @@ use trade_control_core::screenshot::ScreenshotUrl;
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct PlanRow {
     pub trade_id: String,
+    /// Accepted standalone order recovered from durable request evidence.
+    #[serde(default)]
+    pub recorded_only: bool,
     #[serde(default)]
     pub positions: Vec<serde_json::Value>,
     #[serde(default)]
@@ -102,6 +105,8 @@ fn sort_oldest_event_first(rows: &mut [PlanRow]) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryMode {
+    /// An accepted standalone order recorded without an engine plan.
+    Direct,
     /// `05-enter` only — the H&S break-and-close-then-retest stop entry.
     Normal,
     /// `09-enter-qm` only — the Quasimodo confirmed-candle entry.
@@ -115,6 +120,7 @@ pub enum EntryMode {
 impl EntryMode {
     pub fn label(&self) -> &'static str {
         match self {
+            EntryMode::Direct => "direct order",
             EntryMode::Normal => "normal (break+close+retest)",
             EntryMode::Quasimodo => "quasimodo (confirmed candle)",
             EntryMode::StrategyV2 => "strategy-v2 (BCR + QM)",
@@ -267,7 +273,8 @@ pub fn parse_plan_export(json: &str) -> Result<PlanDetail> {
         }
         let is_bcr = rule_id == "05-enter";
         let is_qm = rule_id == "09-enter-qm";
-        if !(is_bcr || is_qm) {
+        let is_direct = rule_id == "direct-entry";
+        if !(is_bcr || is_qm || is_direct) {
             continue;
         }
         if is_bcr {
@@ -283,7 +290,13 @@ pub fn parse_plan_export(json: &str) -> Result<PlanDetail> {
             .and_then(|t| t.as_str())
             .map(OrderType::from_str)
             .unwrap_or(OrderType::Unknown);
-        let leg = if is_bcr { "BCR" } else { "QM" };
+        let leg = if is_direct {
+            "Direct"
+        } else if is_bcr {
+            "BCR"
+        } else {
+            "QM"
+        };
         order_types.push((leg.to_string(), ot));
     }
 
@@ -291,6 +304,7 @@ pub fn parse_plan_export(json: &str) -> Result<PlanDetail> {
         (true, true) => EntryMode::StrategyV2,
         (true, false) => EntryMode::Normal,
         (false, true) => EntryMode::Quasimodo,
+        (false, false) if v["recorded_only"] == true => EntryMode::Direct,
         (false, false) => EntryMode::Unknown,
     };
 

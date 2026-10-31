@@ -30,6 +30,26 @@ fn recorded_fixture_decodes_with_shared_worker_types() {
 }
 
 #[test]
+fn direct_order_evidence_has_manual_entry_type_and_survives_client_parsing() {
+    init_tracing();
+    let raw = json!({"account":"tradenation-live","recorded_only":true,
+        "plan":{"trade_id":"pos-eur-gbp-test","instrument":"EUR/GBP","direction":"short",
+            "granularity":"","armed_at":"2026-10-30T03:34:06Z","recorded_only":true,
+            "rules":[{"rule_id":"direct-entry","intent":{"broker":"tradenation","account":"tradenation-live","entry":{"type":"limit","at":0.83568}}}]},
+        "request":{"outcome":"placed: order=96566199"}});
+    let stored = StoredPlan::from_value("pos-eur-gbp-test", raw.clone()).unwrap();
+    assert_eq!(stored.raw, raw);
+    assert_eq!(stored.detail.entry_mode, crate::plan::EntryMode::Direct);
+    assert_eq!(
+        stored.detail.order_types,
+        vec![("Direct".into(), crate::plan::OrderType::Limit)]
+    );
+    let rows =
+        parse_list_response("- trade_id: pos-eur-gbp-test\n  recorded_only: true\n").unwrap();
+    assert!(rows[0].recorded_only);
+}
+
+#[test]
 fn show_retains_state_settlement_and_unknown_fields() {
     init_tracing();
     let plan = plan();

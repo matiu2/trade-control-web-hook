@@ -21,6 +21,7 @@ mod pg_accounts;
 mod plan_admin;
 mod position_links;
 mod position_tracking;
+mod recorded_trades;
 pub mod recording_pg;
 mod scheduler;
 mod secrets;
